@@ -351,9 +351,13 @@ impl TcpNode {
                 }
                 if let Ok((n, src)) = sock.recv_from(&mut buf) {
                     if let Some(addr) = parse_beacon(&buf[..n], &chain_id, nonce, src.ip()) {
-                        // A same-chain peer announced itself — dial it (deduped by the
-                        // dial machinery; a no-op if already connected).
-                        if !shared.peers.lock().unwrap().contains_key(&addr) {
+                        // A same-chain peer announced itself — dial it UNLESS we already
+                        // have a connection to that host (its inbound link is keyed by an
+                        // ephemeral port, so check by IP, not the exact listen address —
+                        // otherwise mDNS opens a second, duplicate connection).
+                        let dup = shared.peers.lock().unwrap().contains_key(&addr)
+                            || has_connection_to_ip(&shared, addr.ip());
+                        if !dup {
                             let _ = shared.dial_tx.send(addr);
                         }
                     }
@@ -792,6 +796,25 @@ fn is_local(ip: IpAddr) -> bool {
     }
 }
 
+/// Whether we already hold a connection involving `ip` — used to suppress a REDUNDANT
+/// discovery dial (mDNS / gossip) to a peer we are already linked with. An inbound
+/// connection is keyed by the peer's ephemeral source port, so an exact-address check
+/// (the peer's *listen* address from a beacon) misses it and we open a second,
+/// duplicate connection to the same host — the "N peers from one link" inflation.
+/// LOOPBACK is exempt so single-host and loopback multi-node tests still connect many
+/// nodes behind `127.0.0.1`; private/LAN and public IPs are deduped (one node per host
+/// is the norm there, and the inbound per-IP cap still bounds genuine multi-node hosts).
+fn has_connection_to_ip(shared: &Shared, ip: IpAddr) -> bool {
+    let loopback = match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    };
+    if loopback {
+        return false;
+    }
+    shared.peers.lock().unwrap().keys().any(|a| a.ip() == ip)
+}
+
 /// Decide whether a new INBOUND connection from `candidate` is admissible given the
 /// currently-open inbound set, enforcing the global, per-IP, and per-netgroup caps.
 /// Pure (no I/O) so the eclipse policy is unit-testable with synthetic addresses.
@@ -903,8 +926,12 @@ fn reader_loop(shared: &Arc<Shared>, key: SocketAddr, mut reader: TcpStream, pee
                         for addr in list {
                             if let Ok(sa) = addr.parse::<SocketAddr>() {
                                 if sa != shared.local_addr {
+                                    // Record it for future dials, but don't open a
+                                    // SECOND connection to a host we're already linked to
+                                    // (inbound links are keyed by ephemeral port, so check
+                                    // by IP — see `has_connection_to_ip`).
                                     let unseen = shared.known.lock().unwrap().insert(sa);
-                                    if unseen {
+                                    if unseen && !has_connection_to_ip(shared, sa.ip()) {
                                         let _ = shared.dial_tx.send(sa);
                                     }
                                 }

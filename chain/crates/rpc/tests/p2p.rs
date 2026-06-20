@@ -237,6 +237,89 @@ fn late_joiner_catches_up_via_block_sync() {
     c_p2p.shutdown();
 }
 
+/// The REAL testnet config: genesis + node identities are **hybrid post-quantum**
+/// keys (Ed25519 + ML-DSA-65), not bare Ed25519. The hybrid `Hello` signature is far
+/// larger, so this proves the authenticated handshake AND the resulting block sync
+/// work end-to-end with the keys a production node actually uses — the cross-machine
+/// "connected but not indexing" report is NOT a hybrid-key handshake/sync regression.
+#[test]
+fn late_joiner_syncs_with_hybrid_pq_keys() {
+    let g = GenesisConfig {
+        chain_id: CHAIN_ID.into(),
+        timestamp_ms: 0,
+        accounts: vec![
+            GenesisAccount {
+                account: id("val01.node.sov"),
+                key: Keypair::hybrid_from_seed(VAL01_SEED).public_key(),
+                balance: Balance::ZERO,
+            },
+            GenesisAccount {
+                account: id("usa.reserve.sov"),
+                key: Keypair::hybrid_from_seed(USA_SEED).public_key(),
+                balance: Balance::from_sov(1_000).unwrap(),
+            },
+        ],
+        mining: MiningPolicy::test(),
+        vesting: vec![],
+    };
+    // Node identities (the P2P `Hello` signing keys) are hybrid too.
+    let build_hybrid = |tag: &str, account: &str, seed: [u8; 32], ops: Vec<(AccountId, Keypair)>| {
+        let daemon = Daemon::new(&g, unique_dir(tag), 1024, 256, ops).unwrap();
+        let config = P2pConfig {
+            chain_id: g.chain_id.clone(),
+            genesis_hash: daemon.genesis_hash(),
+            account: id(account),
+            keypair: Keypair::hybrid_from_seed(seed),
+        };
+        let p2p = P2p::bind(daemon.node(), config, "127.0.0.1:0")
+            .unwrap()
+            .with_block_log(daemon.block_log());
+        let daemon = daemon.with_gossip(p2p.tcp());
+        let handle = p2p.start();
+        (daemon, handle)
+    };
+
+    let (a, a_p2p) = build_hybrid(
+        "hy-a",
+        "peera.node.sov",
+        [20; 32],
+        vec![(id("val01.node.sov"), Keypair::hybrid_from_seed(VAL01_SEED))],
+    );
+    // A mines five blocks, each carrying a HYBRID-signed transfer, before any peer joins.
+    for nonce in 0..5u64 {
+        let kp = Keypair::hybrid_from_seed(USA_SEED);
+        let tx = Transaction {
+            signer: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce,
+            action: Action::Transfer {
+                to: id("ecb.reserve.sov"),
+                amount: Balance::from_sov(1).unwrap(),
+            },
+        };
+        let stx = SignedTransaction::sign(tx, &kp).unwrap();
+        a.node().lock().unwrap().submit(stx).unwrap();
+        a.node().lock().unwrap().produce(1_000 + nonce * 1_000).unwrap();
+    }
+    assert_eq!(a.height(), 5);
+
+    let (c, c_p2p) = build_hybrid("hy-c", "peerc.node.sov", [21; 32], vec![]);
+    c_p2p.connect(&a_p2p.local_addr().to_string()).unwrap();
+
+    assert!(
+        wait_until(20, || c.height() == 5),
+        "a late joiner syncs over a HYBRID-PQ authenticated handshake"
+    );
+    assert_eq!(
+        c.balance(&id("ecb.reserve.sov")),
+        Balance::from_sov(5).unwrap(),
+        "C re-derived state from the hybrid-synced blocks"
+    );
+
+    a_p2p.shutdown();
+    c_p2p.shutdown();
+}
+
 #[test]
 fn diverged_peer_backtracks_to_common_ancestor_and_reorgs() {
     // B missed A's first block and mined its own height-1 block. When it later

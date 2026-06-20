@@ -171,10 +171,13 @@ impl P2p {
                     state.handle(&tcp, &node, &config, peer, msg);
                 }
                 state.request_missing(&tcp, &node);
-                // ~every second, reclaim inbound slots from peers that connected but
-                // never authenticated (zombie-connection eclipse defense).
+                // ~every second: reclaim slots from peers that connected but never
+                // authenticated (zombie-eclipse defense), and reap dead half-open
+                // connections to a vanished peer (clears ghost peer counts AND stops
+                // catch-up from forever targeting a peer that can never answer).
                 if tick % 25 == 0 {
                     state.sweep_unauthenticated(&tcp);
+                    state.reap_dead_peers(&tcp);
                 }
                 thread::sleep(Duration::from_millis(40));
                 tick += 1;
@@ -259,6 +262,15 @@ const OVERSIZE_RESPONSE_PENALTY: f64 = 50.0;
 /// since the transport's eclipse caps count those slots until they are reclaimed here.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a connected peer may send NOTHING before it is treated as dead and its
+/// connection reaped. Healthy peers exchange `Status` every announce cycle (sub-second),
+/// so any real peer refreshes this constantly; only a half-open connection to a
+/// vanished peer (machine off, Wi-Fi drop — no TCP FIN/RST, so the blocking read never
+/// returns and the OS keepalive is hours away) goes silent this long. Reaping it both
+/// frees the ghost slot AND stops catch-up from forever targeting a dead peer that can
+/// never answer — the latter is why a node can be "connected" yet never index.
+const PEER_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// An outstanding [`GetBlock`](NetMessage::GetBlock) awaiting a response, used to
 /// detect a stalled peer. Cleared as soon as any block response arrives.
 struct InFlight {
@@ -286,6 +298,11 @@ struct SyncState {
     /// completes the transport handshake but never authenticates ([`HELLO_TIMEOUT`])
     /// can be reclaimed — it cannot squat an inbound slot.
     first_seen: HashMap<SocketAddr, Instant>,
+    /// When we last received ANY message from each peer — refreshed by every healthy
+    /// peer's periodic `Status`. A peer silent past [`PEER_INACTIVITY_TIMEOUT`] is a
+    /// dead (half-open) connection and is reaped, so it stops counting as a peer AND
+    /// stops being a catch-up target that can never answer.
+    last_recv: HashMap<SocketAddr, Instant>,
     /// The block request currently awaiting a response, if any — drives stall
     /// detection so a single slow/withholding peer cannot wedge catch-up.
     inflight: Option<InFlight>,
@@ -361,6 +378,10 @@ impl SyncState {
         peer: SocketAddr,
         msg: NetMessage,
     ) {
+        // Liveness: receiving ANY frame proves the peer is alive — refresh its
+        // last-seen so the dead-connection reaper only ever fires on a truly silent
+        // (half-open) connection.
+        self.last_recv.insert(peer, Instant::now());
         // Authenticated handshake: a Hello is trusted only if it is for our chain
         // AND bound to THIS connection's Noise channel (defeating a MITM that
         // relays a Hello from another channel). Only peers that prove same-chain
@@ -577,6 +598,31 @@ impl SyncState {
         self.sync_next.retain(|p, _| connected.contains(p));
         self.bt_step.retain(|p, _| connected.contains(p));
         self.first_seen.retain(|p, _| connected.contains(p));
+        self.last_recv.retain(|p, _| connected.contains(p));
+    }
+
+    /// Reap **dead (half-open) connections**: a peer that has sent nothing for
+    /// [`PEER_INACTIVITY_TIMEOUT`] — while every healthy peer sends `Status` each
+    /// announce cycle — is a connection whose remote vanished without a clean close
+    /// (machine off / Wi-Fi drop), which the blocking read loop and the hours-long OS
+    /// keepalive never notice. Disconnecting it both clears the ghost from the peer
+    /// count AND removes it as a catch-up target that can never answer (a dead peer
+    /// left in `peer_status` would otherwise be picked, time out, and wedge sync —
+    /// the "connected but never indexing" failure). A peer's first-seen time gives a
+    /// fresh connection the full window before its first message.
+    fn reap_dead_peers(&mut self, tcp: &TcpNode) {
+        let now = Instant::now();
+        for peer in tcp.connected_peers() {
+            let last = self
+                .last_recv
+                .get(&peer)
+                .or_else(|| self.first_seen.get(&peer))
+                .copied()
+                .unwrap_or(now);
+            if now.duration_since(last) >= PEER_INACTIVITY_TIMEOUT {
+                tcp.disconnect(&peer);
+            }
+        }
     }
 
     /// Reclaim inbound slots from **zombie connections**: a peer that completed the
@@ -845,5 +891,50 @@ mod tests {
             server.peer_count() >= 1,
             "a just-connected peer is given time to authenticate, not dropped on sight"
         );
+    }
+
+    #[test]
+    fn reaps_a_dead_silent_peer_but_spares_an_active_one() {
+        // The fix for "2 ghost peers when the remote is offline" AND "connected but
+        // never indexing": a peer silent past PEER_INACTIVITY_TIMEOUT (a half-open
+        // connection to a vanished host) is reaped, freeing the slot and removing it
+        // as a catch-up target; an actively-talking peer is left alone.
+        let server = TcpNode::bind("127.0.0.1:0").unwrap();
+        let client = TcpNode::bind("127.0.0.1:0").unwrap();
+        client.connect(&server.local_addr().to_string()).unwrap();
+        let mut connected = false;
+        for _ in 0..150 {
+            if server.peer_count() >= 1 {
+                connected = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(connected, "peer connected");
+        let peer = server.connected_peers()[0];
+
+        let mut state = SyncState::new(None);
+        // Fresh activity → spared.
+        state.last_recv.insert(peer, Instant::now());
+        state.reap_dead_peers(&server);
+        assert!(server.peer_count() >= 1, "an active (recently-heard) peer is not reaped");
+
+        // Silent past the inactivity timeout → reaped (the dead half-open case).
+        state.last_recv.insert(
+            peer,
+            Instant::now()
+                .checked_sub(PEER_INACTIVITY_TIMEOUT + Duration::from_secs(1))
+                .unwrap(),
+        );
+        state.reap_dead_peers(&server);
+        let mut reaped = false;
+        for _ in 0..150 {
+            if server.peer_count() == 0 {
+                reaped = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(reaped, "a silent (dead) peer is reaped, clearing the ghost slot");
     }
 }
