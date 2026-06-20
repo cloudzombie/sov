@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sovereign Explorer</title>
+    <meta
+      name="description"
+      content="Block explorer for Sovereign. Live blocks, transactions, accounts, miners, supply, mempool, and Nakamoto finality, read directly from a node."
+    />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="masthead">
+      <a class="brand" href="#/">
+        <svg class="seal" viewBox="0 0 64 64" width="42" height="42" aria-hidden="true">
+          <circle cx="32" cy="32" r="30.5" fill="none" stroke="#273044" stroke-width="1.5" />
+          <circle cx="32" cy="32" r="25" fill="#0d1018" stroke="#3f6fff" stroke-width="1" />
+          <g id="seal-stars" fill="#3f6fff"></g>
+          <text x="32" y="37.5" text-anchor="middle" font-family="SF Mono, Menlo, Consolas, monospace" font-size="14" font-weight="700" fill="#f3f5fb" letter-spacing="1">S</text>
+        </svg>
+        <span class="brand-text"><b>Sovereign</b><small>Block Explorer</small></span>
+      </a>
+
+      <form class="search" id="search" autocomplete="off">
+        <input
+          id="q"
+          type="text"
+          placeholder="Search by block height, block / tx hash (0x…), or account…"
+          spellcheck="false"
+        />
+        <button type="submit" aria-label="Search">Search</button>
+      </form>
+
+      <nav class="nav" id="nav">
+        <a href="#/">Overview</a>
+        <a href="#/blocks">Blocks</a>
+        <a href="#/miners">Miners</a>
+        <a href="#/sns">SNS</a>
+        <a href="#/analytics">Analytics</a>
+        <a href="#/validity">Validity</a>
+      </nav>
+
+      <div class="conn" id="conn" title="Live feed">
+        <span class="dot"></span><span id="conn-text">connecting…</span>
+      </div>
+    </header>
+
+    <div class="ticker" id="ticker" hidden>
+      <span class="ticker-label">LIVE</span>
+      <div class="ticker-items" id="ticker-items"></div>
+    </div>
+
+    <main id="view"><div class="loading">Connecting to the chain…</div></main>
+
+    <footer class="foot">
+      <span
+        >The Sovereign explorer reads only real chain data from a live node — nothing here is
+        simulated.</span
+      >
+      <span id="foot-chain"></span>
+    </footer>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

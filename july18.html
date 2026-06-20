@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SOV Station — Usability Roadmap</title>
+<style>
+  :root{
+    --bg:#0a0e14; --panel:#111722; --panel2:#0d131c; --line:#1d2735;
+    --ink:#e6edf3; --dim:#8b9bb0; --faint:#5b6b80;
+    --accent:#3ddc84; --amber:#e6aa3c; --blue:#7aa2ff; --danger:#ff5d5d;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.5}
+  .wrap{max-width:900px;margin:0 auto;padding:34px 22px 90px}
+  .badge{display:inline-block;font-family:var(--mono);font-size:11px;color:var(--accent);
+    border:1px solid var(--line);border-radius:999px;padding:2px 10px;margin-bottom:14px}
+  h1{font-size:24px;margin:0 0 4px}
+  .sub{color:var(--dim);font-size:14px;margin:0 0 8px}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;margin:16px 0 6px;font-size:12px;color:var(--dim)}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .pill{font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:999px;font-weight:600}
+  .pill.now{background:#13301f;color:var(--accent);border:1px solid #2c5a3d}
+  .pill.next{background:#241c10;color:var(--amber);border:1px solid #4a3a1c}
+  .pill.done{background:#13301f;color:var(--accent);border:1px solid #2c5a3d}
+  .summary{display:flex;gap:14px;flex-wrap:wrap;margin:18px 0 6px}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 16px;flex:1;min-width:130px}
+  .stat .n{font-size:22px;font-weight:700}
+  .stat .l{font-size:12px;color:var(--dim)}
+  .stat.now .n{color:var(--accent)} .stat.next .n{color:var(--amber)}
+  section{margin-top:26px}
+  .grouphead{display:flex;align-items:baseline;gap:10px;border-bottom:1px solid var(--line);padding-bottom:6px;margin-bottom:6px}
+  .grouphead h2{font-size:16px;margin:0}
+  .grouphead .tag{font-size:12px;color:var(--faint);font-family:var(--mono)}
+  .item{display:flex;gap:14px;align-items:flex-start;background:var(--panel);border:1px solid var(--line);
+    border-radius:10px;padding:13px 16px;margin:9px 0}
+  .item.now{border-left:3px solid var(--accent)}
+  .item.next{border-left:3px solid var(--amber)}
+  .num{flex:0 0 30px;height:30px;border-radius:7px;display:grid;place-items:center;font-family:var(--mono);
+    font-size:14px;font-weight:700;background:#0c121b;border:1px solid var(--line)}
+  .item.now .num{color:var(--accent)} .item.next .num{color:var(--amber)}
+  .body h3{font-size:15px;margin:0 0 3px}
+  .body p{font-size:13.5px;color:var(--dim);margin:0}
+  .body .star{color:var(--amber)}
+  .right{margin-left:auto;align-self:center}
+  footer{margin-top:34px;color:var(--faint);font-size:12px;font-family:var(--mono);text-align:center}
+  code{font-family:var(--mono);background:#0d131c;border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:12px;color:#cfe3ff}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <span class="badge">SOV Station · usability roadmap · 2026-06-18</span>
+  <h1>SOV Station — Usability Improvements</h1>
+  <p class="sub">The full set for the wallet + node cockpit. <b>All 16 shipped</b> — fmt + clippy clean, tests green; built against real chain/RPC (no mock data).</p>
+
+  <div class="summary">
+    <div class="stat now"><div class="n">16</div><div class="l">shipped ✓</div></div>
+    <div class="stat now"><div class="n">0</div><div class="l">remaining</div></div>
+    <div class="stat"><div class="n">16</div><div class="l">total</div></div>
+  </div>
+  <div class="legend">
+    <span><span class="pill done">DONE</span> shipped &amp; gated</span>
+    <span>★ = highest safety / clarity value</span>
+  </div>
+
+  <section>
+    <div class="grouphead"><h2>Safety</h2><span class="tag">prevent costly mistakes</span></div>
+
+    <div class="item now"><div class="num">1</div><div class="body">
+      <h3>★ Send confirmation dialog</h3>
+      <p>A review step before broadcast: amount, destination, detected route (transparent / shielded), fee, and a <b>privacy warning</b> when a send links public sender ↔ recipient. The biggest "unfuckable" win.</p>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
+
+    <div class="item now"><div class="num">2</div><div class="body">
+      <h3>★ Live send validation</h3>
+      <p>As you type the "To" field, show the detected route inline (<code>→ transparent</code> / <code>→ shielded (private)</code> / <code>✗ unrecognized</code>) and validate the amount; <b>disable Send until valid</b>.</p>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
+
+    <div class="item now"><div class="num">3</div><div class="body">
+      <h3>Balance-aware send + Max</h3>
+      <p>Block sends that exceed the spendable balance, and add a <b>Max</b> button — so a doomed transaction can't even be submitted.</p>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
+
+    <div class="item now"><div class="num">4</div><div class="body">
+      <h3>Self-send / shield-to-self clarity</h3>
+      <p>Clearly label when the destination is one of your own addresses (e.g. shielding to your own pool), so it's never mistaken for an external transfer.</p>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
+  </section>
+
+  <section>
+    <div class="grouphead"><h2>Send / Receive flow</h2><span class="tag">the core money path</span></div>
+
+    <div class="item now"><div class="num">5</div><div class="body">
+      <h3>Dedicated Receive view (with QR)</h3>
+      <p>Your address shown large with a scannable <b>QR code</b> + copy, shielded-by-default — matching "shielded receive is the default receive screen."</p>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
+
+    <div class="item now"><div class="num">6</div><div class="body">
+      <h3>Amount formatting</h3>
+      <p>Thousands separators everywhere (<code>1,000.00000000</code>) for readability of balances and amounts.</p>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
+
+    <div class="item now"><div class="num">7</div><div class="body">
+      <h3>Enter-to-submit</h3>
+      <p>Press <code>Enter</code> in a field to trigger its primary action (generate, import, send), with sensible focus order.</p>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
+  </section>
+
+  <section>
+    <div class="grouphead"><h2>Persistence / trust</h2><span class="tag">never lose a key</span></div>
+
+    <div class="item now"><div class="num">8</div><div class="body">
+      <h3>★ Unsaved-wallets banner + warn-on-quit</h3>
+      <p>A visible nudge ("N wallets not saved — set a passphrase &amp; Save") and a warning if you quit with unsaved wallets. Directly addresses "generated once isn't good enough."</p>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
+
+    <div class="item now"><div class="num">9</div><div class="body">
+      <h3>Auto-save after generate / import</h3>
+      <p>When a keystore passphrase is set, persist automatically after creating or importing a wallet — no silent in-memory-only state.</p>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
+  </section>
+
+  <section>
+    <div class="grouphead"><h2>Feedback / clarity</h2><span class="tag">know what happened</span></div>
+
+    <div class="item now"><div class="num">10</div><div class="body">
+      <h3>★ Copy feedback toast</h3>
+      <p>A transient "copied ✓" so every copy action confirms itself (currently silent).</p>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
+
+    <div class="item now"><div class="num">11</div><div class="body">
+      <h3>Activity log</h3>
+      <p>A scrollable history of actions (sent / activated / registered) with txids, instead of one overwriting status line.</p>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
+
+    <div class="item now"><div class="num">12</div><div class="body">
+      <h3>Network in window title + mainnet confirm-on-switch</h3>
+      <p><code>SOV Station — TESTNET</code> in the title bar, and a confirmation when switching to MAINNET ("real value").</p>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
+
+    <div class="item now"><div class="num">13</div><div class="body">
+      <h3>Mining: "earned by your wallet"</h3>
+      <p>Your cumulative coinbase total, front and center on the Mining tab.</p>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
+  </section>
+
+  <section>
+    <div class="grouphead"><h2>Bigger features</h2><span class="tag">more effort, roadmap</span></div>
+
+    <div class="item now"><div class="num">14</div><div class="body">
+      <h3>Tokens tab</h3>
+      <p>List / issue / transfer native SOV tokens (README Phase 4).</p>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
+
+    <div class="item now"><div class="num">15</div><div class="body">
+      <h3>Swaps tab</h3>
+      <p>HTLC / atomic-swap lifecycle UI (README Phase 6).</p>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
+
+    <div class="item now"><div class="num">16</div><div class="body">
+      <h3>Explorer deep-links</h3>
+      <p>Click a txid or height to inspect it in the explorer.</p>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
+  </section>
+
+  <footer>SOV Station · served locally · 16 items · all shipped</footer>
+</div>
+</body>
+</html>

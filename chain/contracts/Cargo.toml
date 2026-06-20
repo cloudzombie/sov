@@ -1,0 +1,13 @@
+# Guest contract workspace — built ONLY for wasm32-unknown-unknown, separate from
+# the host chain workspace. Build with:
+#   cargo build --target wasm32-unknown-unknown --release
+[workspace]
+resolver = "2"
+members = ["sov-sdk", "counter"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+codegen-units = 1
+strip = true

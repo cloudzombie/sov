@@ -1,0 +1,10 @@
+{
+  "rpc_addr": "127.0.0.1:8646",
+  "rpc_workers": 4,
+  "data_dir": "node-1/data",
+  "block_time_ms": 60000,
+  "mempool_capacity": 16384,
+  "max_block_txs": 4096,
+  "p2p_addr": "0.0.0.0:9646",
+  "bootstrap_peers": ["<MAC_LAN_IP>:9645"]
+}

@@ -1,0 +1,28 @@
+# cargo-audit baseline for the SOV chain workspace.
+#
+# Policy: `cargo audit` must report ZERO vulnerabilities and ZERO yanked crates.
+# The entries below are *informational* advisories (unmaintained crates) that are
+# reached only transitively through audited upstream dependencies and carry no
+# runtime attack surface for SOV. Each is ignored by its specific ID — never a
+# blanket suppression — so any NEW advisory against these or any other crate
+# still fails the audit. Re-review each when its upstream parent is bumped.
+#
+# Run:  cargo audit --deny warnings   (CI-equivalent: must exit 0)
+
+[advisories]
+ignore = [
+  # atomic-polyfill 1.0.3 — UNMAINTAINED.
+  # Reached only via heapless 0.7 (an OPTIONAL, feature-gated dependency of
+  # postcard). `cargo tree -i atomic-polyfill --target all` finds NO active
+  # path: it is a no-native-atomics shim that compiles only on bare-metal
+  # targets (e.g. thumbv6m). SOV targets (macOS/Windows/Linux on x86_64/aarch64)
+  # all have native atomics, so this crate is never compiled into any artifact.
+  "RUSTSEC-2023-0089",
+
+  # proc-macro-error2 2.0.1 — UNMAINTAINED.
+  # Build-time proc-macro pulled by getset, used by orchard (the Electric Coin
+  # Company's audited Zcash shielded-pool crate). Proc-macros run only at
+  # compile time and ship in no binary. Removing it requires an upstream orchard
+  # change; we will not fork the audited SNARK stack. Re-check on orchard bump.
+  "RUSTSEC-2026-0173",
+]

@@ -1,0 +1,22 @@
+# cargo-deny: supply-chain security gate.  Run: cargo deny check advisories bans
+#
+# Purpose: keep the consensus-critical zero-knowledge crates at their PATCHED
+# versions and fail on any new RustSec advisory affecting a dependency — so the
+# Orchard circuit soundness bug (a shielded-pool forgery hole) can never silently
+# return through a downgrade, and the next such advisory breaks CI automatically.
+
+[advisories]
+# Fail the build if any dependency is using a yanked release.
+yanked = "deny"
+# (Security vulnerabilities from the RustSec database are always denied.)
+
+[bans]
+multiple-versions = "allow"
+# Floor the zk stack at the fix. orchard < 0.14.0 / halo2_gadgets < 0.5.0 carry the
+# Orchard circuit soundness bug fixed 2026-06-02 (variable-base scalar
+# multiplication, halo2_gadgets::ecc::chip::mul). The fix CHANGES the verifying
+# key, so any downgrade reintroduces a forgery hole in the shielded pool.
+deny = [
+    { name = "orchard", version = "<0.14.0" },
+    { name = "halo2_gadgets", version = "<0.5.0" },
+]

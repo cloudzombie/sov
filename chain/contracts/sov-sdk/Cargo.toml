@@ -1,0 +1,8 @@
+[package]
+name = "sov-sdk"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Guest SDK for writing SOV smart contracts in Rust (compiles to wasm32)."
+
+[lib]

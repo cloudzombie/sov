@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SOV Genesis Ceremony — Tax Account Binding</title>
+<style>
+  :root{
+    --bg:#0a0e14; --panel:#111722; --panel2:#0d131c; --line:#1d2735;
+    --ink:#e6edf3; --dim:#8b9bb0; --faint:#5b6b80;
+    --accent:#3ddc84; --accent2:#f5b942; --danger:#ff5d5d; --ok:#3ddc84;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.5}
+  a{color:var(--accent)}
+  .wrap{max-width:920px;margin:0 auto;padding:32px 22px 80px}
+  header h1{font-size:23px;margin:0 0 4px;letter-spacing:.2px}
+  header .sub{color:var(--dim);font-size:14px;margin:0}
+  .badge{display:inline-block;font-family:var(--mono);font-size:11px;color:var(--accent);
+    border:1px solid var(--line);border-radius:999px;padding:2px 10px;margin-bottom:14px}
+  .principle{background:linear-gradient(180deg,#15202e,#101722);border:1px solid var(--line);
+    border-left:3px solid var(--accent2);border-radius:10px;padding:14px 16px;margin:18px 0 24px;font-size:14px}
+  .principle b{color:var(--accent2)}
+  /* progress */
+  .progress{position:sticky;top:0;z-index:5;background:rgba(10,14,20,.92);backdrop-filter:blur(6px);
+    padding:12px 0 14px;margin-bottom:6px;border-bottom:1px solid var(--line)}
+  .pbar{height:8px;background:#0c121b;border:1px solid var(--line);border-radius:99px;overflow:hidden}
+  .pfill{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width .35s ease}
+  .pmeta{display:flex;justify-content:space-between;align-items:center;margin-top:8px;font-size:13px;color:var(--dim)}
+  .pmeta .done{color:var(--accent);font-family:var(--mono)}
+  /* step */
+  .step{background:var(--panel);border:1px solid var(--line);border-radius:12px;margin:16px 0;overflow:hidden;
+    transition:border-color .25s, opacity .25s}
+  .step.complete{border-color:#234a36}
+  .step .head{display:flex;align-items:center;gap:12px;padding:15px 18px;cursor:pointer;user-select:none}
+  .num{flex:0 0 30px;height:30px;border-radius:50%;display:grid;place-items:center;font-family:var(--mono);
+    font-size:14px;background:#0c121b;border:1px solid var(--line);color:var(--dim)}
+  .step.complete .num{background:#13301f;border-color:#2c5a3d;color:var(--accent)}
+  .head h2{font-size:16px;margin:0;flex:1}
+  .head .who{font-family:var(--mono);font-size:11px;color:var(--faint);border:1px solid var(--line);
+    padding:2px 8px;border-radius:6px}
+  .who.you{color:var(--accent2);border-color:#3a3320}
+  .who.me{color:#7aa2ff;border-color:#23314d}
+  .chev{color:var(--faint);transition:transform .2s;font-size:13px}
+  .step.open .chev{transform:rotate(90deg)}
+  .body{display:none;padding:2px 18px 18px;border-top:1px solid var(--line)}
+  .step.open .body{display:block}
+  p{margin:10px 0;font-size:14px;color:var(--ink)}
+  .dim{color:var(--dim)}
+  ul{margin:8px 0;padding-left:20px}li{margin:5px 0;font-size:14px}
+  /* code */
+  .cmd{position:relative;background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+    font-family:var(--mono);font-size:13px;padding:12px 44px 12px 14px;margin:10px 0;white-space:pre-wrap;
+    word-break:break-word;color:#cfe3ff}
+  .cmd .copy{position:absolute;top:8px;right:8px;background:#16202e;border:1px solid var(--line);color:var(--dim);
+    border-radius:6px;font-size:11px;padding:4px 8px;cursor:pointer;font-family:var(--sans)}
+  .cmd .copy:hover{color:var(--ink);border-color:#2b3a50}
+  .cmd .copy.ok{color:var(--accent);border-color:#2c5a3d}
+  .sample{background:#0b1320;border:1px dashed var(--line);border-radius:8px;font-family:var(--mono);
+    font-size:12px;color:var(--dim);padding:12px 14px;margin:8px 0;white-space:pre-wrap}
+  .sample .secret{color:#6b5b3a}.sample .pub{color:var(--accent)}
+  .warn{background:#241316;border:1px solid #5b2b2b;border-left:3px solid var(--danger);border-radius:8px;
+    padding:11px 14px;margin:12px 0;font-size:13px;color:#ffd9d9}
+  .warn b{color:var(--danger)}
+  .note{background:#0f1a16;border:1px solid #234a36;border-left:3px solid var(--ok);border-radius:8px;
+    padding:11px 14px;margin:12px 0;font-size:13px;color:#d7f3e3}
+  /* inputs */
+  label.fld{display:block;margin:14px 0 4px;font-size:13px;color:var(--dim)}
+  input[type=text]{width:100%;background:#0b1320;border:1px solid var(--line);border-radius:8px;color:var(--ink);
+    font-family:var(--mono);font-size:13px;padding:10px 12px}
+  input[type=text]:focus{outline:none;border-color:#2b3a50}
+  input.good{border-color:#2c5a3d}input.bad{border-color:#5b2b2b}
+  .vmsg{font-size:12px;margin:5px 2px 0;min-height:16px;font-family:var(--mono)}
+  .vmsg.good{color:var(--accent)}.vmsg.bad{color:var(--danger)}.vmsg.warnc{color:var(--accent2)}
+  .calc{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:12px 0}
+  .calc input{width:130px}
+  .calc .out{font-family:var(--mono);font-size:13px;color:var(--ink)}
+  .calc .out b{color:var(--accent2)}
+  /* confirm */
+  .confirm{display:flex;align-items:center;gap:10px;margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}
+  .confirm input{width:18px;height:18px;accent-color:var(--accent)}
+  .confirm label{font-size:14px;cursor:pointer}
+  .confirm.locked{opacity:.5}
+  .lockmsg{font-size:12px;color:var(--faint);margin-top:8px;font-family:var(--mono)}
+  /* footer */
+  .foot{margin-top:30px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+  button.reset{background:#16202e;border:1px solid var(--line);color:var(--dim);border-radius:8px;
+    padding:8px 14px;cursor:pointer;font-size:13px}
+  button.reset:hover{color:var(--danger);border-color:#5b2b2b}
+  .facts{font-size:12px;color:var(--faint);font-family:var(--mono)}
+  .kv{font-family:var(--mono);font-size:12px;color:var(--dim)}
+  .done-banner{display:none;background:linear-gradient(180deg,#13301f,#0f2418);border:1px solid #2c5a3d;
+    border-radius:12px;padding:18px;margin:18px 0;text-align:center}
+  .done-banner.show{display:block}
+  .done-banner h3{margin:0 0 4px;color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="badge">SOV · testnet-1 · genesis ceremony</span>
+    <h1>Genesis Ceremony — Tax Account Binding</h1>
+    <p class="sub">Generate the founder (5%) &amp; dev (2%) tax accounts, hand over only the public keys, and bind them into block 0. Confirm each step as you complete it — progress is saved on this device.</p>
+  </header>
+
+  <div class="principle">
+    <b>Non-negotiable principle.</b> The seeds are generated by <b>you</b> and never touch the assistant, the repo, or the network. You share only each account's <b>public key</b> (safe to publish on-chain). Whoever holds a mnemonic owns that tax stream forever — treat the 24 words like the crown jewels. The tax accounts <b>must</b> be key-bound in genesis: a named account left keyless is claimable by the first <code>RotateKey</code> to reach it, so binding your keys at block 0 closes that window before a single coin is minted.
+  </div>
+
+  <div class="progress">
+    <div class="pbar"><div class="pfill" id="pfill"></div></div>
+    <div class="pmeta"><span id="ptext">0 of 5 steps confirmed</span><span class="done" id="pdone">○○○○○</span></div>
+  </div>
+
+  <div class="done-banner" id="doneBanner">
+    <h3>✓ Ceremony complete</h3>
+    <p class="dim">All five steps confirmed. Your tax accounts are key-bound in genesis and proven spendable. Re-run this ceremony from scratch for mainnet on an air-gapped machine.</p>
+  </div>
+
+  <!-- STEP 1 -->
+  <section class="step" data-step="1">
+    <div class="head"><span class="num">1</span><h2>Generate the two accounts (offline)</h2><span class="who you">you only</span><span class="chev">▶</span></div>
+    <div class="body">
+      <p>Build the wallet once, then generate <b>two separate accounts with two independent seeds</b>. This is fully offline — nothing is sent anywhere.</p>
+      <div class="cmd"><button class="copy">copy</button>cd chain &amp;&amp; cargo build --release</div>
+      <div class="cmd"><button class="copy">copy</button>./target/release/sov-wallet new founder.tax.sov     # the 5% account
+./target/release/sov-wallet new dev.tax.sov         # the 2% account</div>
+      <p class="dim">Each run prints — for your eyes only — a fresh 24-word mnemonic and the keys it derives (hybrid Ed25519 + ML-DSA-65, post-quantum by default):</p>
+      <div class="sample">================= SECRET — WRITE THIS DOWN, NEVER SHARE =================
+<span class="secret">mnemonic (24 words): &lt;24 words&gt;   ← the ONLY backup; never share</span>
+========================================================================
+PUBLIC — safe to share; this is what gets registered on-chain:
+path       : m/44'/5459798'/0'/0'/0'
+scheme     : hybrid65
+<span class="pub">public_key : hybrid65:0x….               ← give the assistant ONLY this line</span>
+shielded   : xus1….</div>
+      <div class="warn"><b>Write each mnemonic down on paper, store the two separately.</b> For a forever (mainnet) account, run this on an air-gapped / freshly-booted machine and never type either mnemonic into an internet-connected host except to sign. You can confirm recovery any time with <code>sov-wallet import "&lt;mnemonic&gt;"</code> — it must reprint the same <code>public_key</code>.</div>
+      <div class="confirm"><input type="checkbox" id="c1"><label for="c1">I have generated both accounts and recorded each 24-word mnemonic securely.</label></div>
+    </div>
+  </section>
+
+  <!-- STEP 2 -->
+  <section class="step" data-step="2">
+    <div class="head"><span class="num">2</span><h2>Paste the two public keys → get the message to send</h2><span class="who you">you only</span><span class="chev">▶</span></div>
+    <div class="body">
+      <p>Paste the <code>public_key:</code> line from each run below. This page validates them <b>locally</b> (nothing leaves your browser) and refuses anything that looks like a seed or mnemonic.</p>
+      <div class="warn"><b>Never paste a mnemonic, a seed, or a seed_hex here.</b> Only the <code>hybrid65:0x…</code> public key. If you paste a secret by accident, discard those accounts and regenerate.</div>
+
+      <label class="fld">founder.tax.sov — public key (5%)</label>
+      <input type="text" id="kF" placeholder="hybrid65:0x…" autocomplete="off" spellcheck="false">
+      <div class="vmsg" id="vF"></div>
+
+      <label class="fld">dev.tax.sov — public key (2%)</label>
+      <input type="text" id="kD" placeholder="hybrid65:0x…" autocomplete="off" spellcheck="false">
+      <div class="vmsg" id="vD"></div>
+
+      <p class="dim" style="margin-top:16px">Message to send the assistant (only these two lines):</p>
+      <div class="cmd" id="sendBox"><button class="copy">copy</button><span id="sendText">— fill both fields above —</span></div>
+
+      <div class="confirm locked" id="cf2wrap"><input type="checkbox" id="c2" disabled><label for="c2">I have sent the assistant exactly these two public keys.</label></div>
+      <div class="lockmsg" id="lock2">Unlocks when both keys validate as distinct hybrid65 public keys.</div>
+    </div>
+  </section>
+
+  <!-- STEP 3 -->
+  <section class="step" data-step="3">
+    <div class="head"><span class="num">3</span><h2>Assistant binds them into genesis</h2><span class="who me">assistant</span><span class="chev">▶</span></div>
+    <div class="body">
+      <p>With your two public keys (no seeds involved) the assistant adds two <b>key-bound, zero-balance</b> accounts to <code>chain/specs/testnet-1.json</code>. Zero balance keeps the <b>no-pre-mine</b> guarantee — the keys only establish <i>control</i>; the balance accrues purely from the tax.</p>
+      <div class="cmd" id="jsonBox"><button class="copy">copy</button><span id="jsonText">{ "account": "founder.tax.sov", "public_key": "hybrid65:0x…", "balance": 0 },
+{ "account": "dev.tax.sov",     "public_key": "hybrid65:0x…", "balance": 0 }</span></div>
+      <ul class="dim">
+        <li>Adding genesis accounts changes the genesis hash → the assistant re-pins the determinism KAT and re-runs it.</li>
+        <li><code>MiningPolicy</code> already names <code>founder.tax.sov</code> (500 bps) / <code>dev.tax.sov</code> (200 bps), so no Rust change is needed unless you want different names.</li>
+      </ul>
+      <div class="confirm"><input type="checkbox" id="c3"><label for="c3">The assistant has confirmed both keys are bound and the genesis hash re-pinned.</label></div>
+    </div>
+  </section>
+
+  <!-- STEP 4 -->
+  <section class="step" data-step="4">
+    <div class="head"><span class="num">4</span><h2>Relaunch &amp; watch the tax arrive</h2><span class="who you">you</span><span class="chev">▶</span></div>
+    <div class="body">
+      <p>Relaunch testnet-1, then read the live balances. Every block pays 5% / 2% of its <b>12.5&nbsp;XUS</b> coinbase to your accounts (plus the 5:2 split of any fees).</p>
+      <div class="cmd"><button class="copy">copy</button>./target/release/sov-testnet status --out &lt;dir&gt;</div>
+      <div class="sample">mining tax (5% / 2% of every coinbase + fee):
+  founder 5%  founder.tax.sov   <span class="pub">&lt;climbing&gt;</span> XUS
+  dev     2%  dev.tax.sov       <span class="pub">&lt;climbing&gt;</span> XUS</div>
+      <div class="calc">
+        <span class="dim">After</span>
+        <input type="text" id="nBlocks" placeholder="N blocks" autocomplete="off" inputmode="numeric">
+        <span class="dim">blocks, expect:</span>
+        <span class="out" id="calcOut"><b>0</b> XUS founder · <b>0</b> XUS dev</span>
+      </div>
+      <p class="kv">founder = N × 0.625 XUS&nbsp;&nbsp;·&nbsp;&nbsp;dev = N × 0.25 XUS&nbsp;&nbsp;(12.5 coinbase × 5% / 2%)</p>
+      <div class="confirm"><input type="checkbox" id="c4"><label for="c4">I can see both tax balances climbing at the expected rate.</label></div>
+    </div>
+  </section>
+
+  <!-- STEP 5 -->
+  <section class="step" data-step="5">
+    <div class="head"><span class="num">5</span><h2>Prove you control them (spend test)</h2><span class="who you">you only</span><span class="chev">▶</span></div>
+    <div class="body">
+      <p>Seeing a balance is not control. Confirm you can <b>spend</b> the tax with your mnemonic — the node accepts the transfer only if the signature matches the key bound in genesis. (Run this where it's safe to type the mnemonic.)</p>
+      <div class="cmd"><button class="copy">copy</button>./target/release/sov-wallet 127.0.0.1:8645 transfer \
+  "&lt;founder mnemonic&gt;" founder.tax.sov &lt;some-test-account&gt; 1</div>
+      <div class="note">A node-accepted spend from <code>founder.tax.sov</code> is the end-to-end proof that the tax lands in an account <b>you, and only you,</b> control. Repeat for <code>dev.tax.sov</code> if you want both proven.</div>
+      <div class="confirm"><input type="checkbox" id="c5"><label for="c5">I successfully spent from at least one tax account using its mnemonic.</label></div>
+    </div>
+  </section>
+
+  <div class="foot">
+    <button class="reset" id="resetBtn">Reset ceremony</button>
+    <span class="facts">12.5 XUS coinbase · halving 840k · founder 5% / dev 2% / miner 93% · no burn · no pre-mine</span>
+  </div>
+</div>
+
+<script>
+"use strict";
+const STORE = "sov-genesis-ceremony-v1";
+const HEX = c => /[0-9a-f]/i.test(c);
+// hybrid65 public key = 11-char prefix + (32 + 1952) bytes = 3968 hex chars.
+const HYBRID_RE = /^hybrid65:0x[0-9a-f]{3968}$/i;
+const SEED_RE   = /^(0x)?[0-9a-f]{64}$/i;           // a 32-byte seed_hex / ed25519 key
+const state = load();
+
+function load(){ try { return JSON.parse(localStorage.getItem(STORE)) || {}; } catch { return {}; } }
+function save(){ localStorage.setItem(STORE, JSON.stringify(state)); }
+
+// ---- step open/close + confirm wiring ----
+document.querySelectorAll(".step").forEach(step=>{
+  const n = step.dataset.step;
+  step.querySelector(".head").addEventListener("click",()=>step.classList.toggle("open"));
+  const cb = document.getElementById("c"+n);
+  if (cb){
+    cb.checked = !!state["c"+n];
+    cb.addEventListener("change",()=>{ state["c"+n]=cb.checked; save(); render(); });
+  }
+});
+// open the first not-yet-complete step initially
+(function openFirst(){
+  for (let i=1;i<=5;i++){ if(!state["c"+i]){ document.querySelector(`.step[data-step="${i}"]`).classList.add("open"); return; } }
+  document.querySelector('.step[data-step="5"]').classList.add("open");
+})();
+
+// ---- copy buttons ----
+document.querySelectorAll(".cmd .copy").forEach(btn=>{
+  btn.addEventListener("click",e=>{
+    e.stopPropagation();
+    const box = btn.parentElement;
+    const text = (box.querySelector("span") ? box.querySelector("span").innerText : box.innerText.replace(/^copy\s*/,"")).trim();
+    copy(text, btn);
+  });
+});
+function copy(text, btn){
+  const done=()=>{ const o=btn.textContent; btn.textContent="copied"; btn.classList.add("ok"); setTimeout(()=>{btn.textContent=o;btn.classList.remove("ok");},1200); };
+  if (navigator.clipboard && window.isSecureContext){ navigator.clipboard.writeText(text).then(done).catch(()=>fallback(text,done)); }
+  else fallback(text, done);
+}
+function fallback(text, done){ const t=document.createElement("textarea"); t.value=text; document.body.appendChild(t); t.select();
+  try{document.execCommand("copy");done();}catch{} document.body.removeChild(t); }
+
+// ---- step 2: key validation ----
+const kF=document.getElementById("kF"), kD=document.getElementById("kD");
+const vF=document.getElementById("vF"), vD=document.getElementById("vD");
+kF.value = state.kF || ""; kD.value = state.kD || "";
+
+function classify(raw){
+  const v = raw.trim();
+  if (!v) return {cls:"", msg:"", ok:false};
+  // Danger: a mnemonic (multiple words).
+  if (/\s/.test(v) && v.split(/\s+/).length >= 6)
+    return {cls:"bad", msg:"⛔ That looks like a MNEMONIC. Never paste a seed phrase — only the hybrid65 public key.", ok:false};
+  // Danger: a 32-byte seed / bare ed25519 key.
+  if (SEED_RE.test(v))
+    return {cls:"bad", msg:"⛔ That's 64 hex chars — a SEED or bare key. Paste the public_key line (starts with hybrid65:0x).", ok:false};
+  if (HYBRID_RE.test(v))
+    return {cls:"good", msg:"✓ valid hybrid65 public key (Ed25519 + ML-DSA-65, 1984 bytes)", ok:true};
+  if (/^hybrid65:0x/i.test(v)){
+    const hex=v.replace(/^hybrid65:0x/i,"");
+    const bad=[...hex].find(c=>!HEX(c));
+    if (bad) return {cls:"bad", msg:"⛔ contains a non-hex character — copy the whole public_key line exactly.", ok:false};
+    return {cls:"bad", msg:`⛔ incomplete: ${hex.length}/3968 hex chars (a hybrid65 key is 1984 bytes).`, ok:false};
+  }
+  if (/^(ed25519:)?(0x)?[0-9a-f]+$/i.test(v))
+    return {cls:"warnc", msg:"⚠ looks like a classical Ed25519 key. For a forever tax account use the default hybrid65 (re-run without --ed25519).", ok:false};
+  return {cls:"bad", msg:"⛔ not a recognizable SOV public key (expected hybrid65:0x…).", ok:false};
+}
+function validate(){
+  const rF=classify(kF.value), rD=classify(kD.value);
+  paint(kF,vF,rF); paint(kD,vD,rD);
+  let bothOk = rF.ok && rD.ok;
+  // Guard: the two keys must differ (don't bind the same key to both accounts).
+  if (bothOk && kF.value.trim().toLowerCase()===kD.value.trim().toLowerCase()){
+    vD.textContent="⛔ founder and dev keys are identical — generate two SEPARATE accounts."; vD.className="vmsg bad";
+    kD.className="bad"; bothOk=false;
+  }
+  state.kF=kF.value; state.kD=kD.value; save();
+  updateSend(rF.ok, rD.ok && bothOk, bothOk);
+  return bothOk;
+}
+function paint(input,msgEl,r){ input.className=r.cls; msgEl.textContent=r.msg; msgEl.className="vmsg "+(r.cls||""); }
+function updateSend(fOk,dOk,bothOk){
+  const sendText=document.getElementById("sendText");
+  const jsonText=document.getElementById("jsonText");
+  const c2=document.getElementById("c2"), wrap=document.getElementById("cf2wrap"), lock=document.getElementById("lock2");
+  const f=kF.value.trim(), d=kD.value.trim();
+  if (bothOk){
+    sendText.textContent = `founder (5%): ${f}\ndev     (2%): ${d}`;
+    jsonText.textContent =
+`{ "account": "founder.tax.sov", "public_key": "${f}", "balance": 0 },
+{ "account": "dev.tax.sov",     "public_key": "${d}", "balance": 0 }`;
+    c2.disabled=false; wrap.classList.remove("locked");
+    lock.textContent="✓ both keys valid and distinct — you can confirm once sent.";
+  } else {
+    sendText.textContent = "— fill both fields above with valid, distinct hybrid65 keys —";
+    jsonText.textContent =
+`{ "account": "founder.tax.sov", "public_key": "hybrid65:0x…", "balance": 0 },
+{ "account": "dev.tax.sov",     "public_key": "hybrid65:0x…", "balance": 0 }`;
+    if (c2.checked){ c2.checked=false; state.c2=false; }
+    c2.disabled=true; wrap.classList.add("locked");
+    lock.textContent="Unlocks when both keys validate as distinct hybrid65 public keys.";
+  }
+}
+kF.addEventListener("input",validate); kD.addEventListener("input",validate);
+
+// ---- step 4: calculator ----
+const nB=document.getElementById("nBlocks"), calcOut=document.getElementById("calcOut");
+nB.value = state.nB || "";
+function calc(){
+  const n = parseInt(nB.value.replace(/[^0-9]/g,""),10);
+  state.nB=nB.value; save();
+  if (!n || n<0){ calcOut.innerHTML="<b>0</b> XUS founder · <b>0</b> XUS dev"; return; }
+  const f=(n*0.625), d=(n*0.25);
+  calcOut.innerHTML=`<b>${f.toLocaleString(undefined,{maximumFractionDigits:3})}</b> XUS founder · <b>${d.toLocaleString(undefined,{maximumFractionDigits:3})}</b> XUS dev`;
+}
+nB.addEventListener("input",calc);
+
+// ---- progress ----
+function render(){
+  let done=0; for(let i=1;i<=5;i++) if(state["c"+i]) done++;
+  document.getElementById("pfill").style.width=(done/5*100)+"%";
+  document.getElementById("ptext").textContent=`${done} of 5 steps confirmed`;
+  document.getElementById("pdone").textContent="●".repeat(done)+"○".repeat(5-done);
+  for(let i=1;i<=5;i++){ const s=document.querySelector(`.step[data-step="${i}"]`); s.classList.toggle("complete",!!state["c"+i]); }
+  document.getElementById("doneBanner").classList.toggle("show",done===5);
+}
+
+// ---- reset ----
+document.getElementById("resetBtn").addEventListener("click",()=>{
+  if(!confirm("Reset all ceremony progress on this device? (Your accounts on-chain are unaffected.)")) return;
+  localStorage.removeItem(STORE);
+  for(const k in state) delete state[k];
+  document.querySelectorAll('input[type=checkbox]').forEach(c=>c.checked=false);
+  kF.value="";kD.value="";nB.value="";
+  validate(); calc(); render();
+});
+
+validate(); calc(); render();
+</script>
+</body>
+</html>

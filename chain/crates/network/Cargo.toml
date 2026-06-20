@@ -1,0 +1,24 @@
+[package]
+name = "sov-network"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "SOV peer-to-peer layer: gossip message types and an in-memory transport for deterministic testing."
+
+[dependencies]
+sov-primitives = { path = "../primitives" }
+sov-crypto = { path = "../crypto" }
+sov-types = { path = "../types" }
+borsh.workspace = true
+serde.workspace = true
+snow = "0.9"
+thiserror.workspace = true
+fips203 = "0.4.3"
+chacha20poly1305 = "0.10.1"
+blake3.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

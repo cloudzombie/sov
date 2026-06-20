@@ -1,0 +1,18 @@
+[package]
+name = "sov-governance"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "SOV on-chain governance: Bitcoin-style miner-signaled soft-fork activation (BIP-9 version-bits + threshold lock-in, optional BIP-8 mandatory activation). Hashpower, not stake, decides."
+
+[dependencies]
+sov-primitives = { path = "../primitives" }
+borsh.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

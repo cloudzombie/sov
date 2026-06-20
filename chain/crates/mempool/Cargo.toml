@@ -1,0 +1,20 @@
+[package]
+name = "sov-mempool"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The SOV transaction pool: validated, nonce-ordered pending transactions awaiting inclusion."
+
+[dependencies]
+sov-primitives = { path = "../primitives" }
+sov-types = { path = "../types" }
+thiserror.workspace = true
+
+[dev-dependencies]
+sov-crypto = { path = "../crypto" }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

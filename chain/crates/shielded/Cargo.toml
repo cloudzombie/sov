@@ -1,0 +1,31 @@
+[package]
+name = "sov-shielded"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# SECURITY: orchard 0.14.0 (2026-06-02) pulls in halo2_gadgets 0.5.0, which fixes
+# the critical Orchard circuit soundness bug in variable-base scalar multiplication
+# (halo2_gadgets::ecc::chip::mul) — the fix CHANGES the verifying key — plus
+# GHSA-2x4w-pxqw-58v9 (proof trailing-data / non-identity epk). 0.13.x is
+# vulnerable; do NOT downgrade. MSRV: this declares >= 1.85.1; the actual toolchain
+# is 1.93.1, so this only widens resolution.
+rust-version = "1.85.1"
+description = "Zcash-grade Orchard/Halo2 zk-SNARK shielded pool for SOV: shielded notes, a Sinsemilla note-commitment tree, a nullifier set, and in-consensus Halo2 proof verification. Mint lands shielded; value moves transparent<->shielded via the Orchard value balance."
+
+[dependencies]
+orchard = "0.14"
+incrementalmerkletree = "0.8"
+zcash_note_encryption = "0.4"
+nonempty = "0.11"
+rand = "0.8"
+blake3.workspace = true
+sov-primitives = { path = "../primitives" }
+thiserror.workspace = true
+borsh.workspace = true
+bridgetree = "0.7.0"
+bech32 = "0.11.1"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

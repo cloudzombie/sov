@@ -1,0 +1,25 @@
+{
+  "chain_id": "sov-testnet",
+  "timestamp_ms": 1781012803549,
+  "policy": "test",
+  "accounts": [
+    {
+      "account": "val01.node.sov",
+      "public_key": "82998c9ccb3908d9fa4992fdd72cf39b67fd9121cbefc152b84f5b3a78ae451b",
+      "balance": "0",
+      "stake": "100000000000000"
+    },
+    {
+      "account": "val02.node.sov",
+      "public_key": "549a1eec225fa662932c330aebab3cdd23f54b7499087dd201bec315addeb1f5",
+      "balance": "0",
+      "stake": "100000000000000"
+    },
+    {
+      "account": "faucet.reserve.sov",
+      "public_key": "db818232cc788f5a555b79204e6848a8263bee108004e6d94761b513b0978a7c",
+      "balance": "100000000000000",
+      "stake": "0"
+    }
+  ]
+}

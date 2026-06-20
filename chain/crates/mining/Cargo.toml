@@ -1,0 +1,19 @@
+[package]
+name = "sov-mining"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "SOV proof-of-work mint: per-miner challenges, a diminishing capped emission schedule, and multi-algorithm difficulty policy."
+
+[dependencies]
+sov-primitives = { path = "../primitives" }
+sov-pow = { path = "../pow" }
+borsh.workspace = true
+serde.workspace = true
+primitive-types = "0.13"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

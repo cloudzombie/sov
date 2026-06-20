@@ -1,0 +1,19 @@
+[package]
+name = "sov-compliance"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Multi-signature custody and institutional compliance tooling for SOV: M-of-N signed approvals, regulator freeze, allow/deny counterparty controls, and spend-velocity limits."
+
+[dependencies]
+sov-primitives = { path = "../primitives" }
+sov-crypto = { path = "../crypto" }
+borsh.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

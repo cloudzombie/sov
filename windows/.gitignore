@@ -1,0 +1,8 @@
+# Windows node package — runtime artifacts and SECRETS. Never commit.
+# The genesis bundle copied from the Mac holds real signing seeds.
+bundle/
+*.log
+*.pids
+keystore.json
+**/keystore.json
+**/data/

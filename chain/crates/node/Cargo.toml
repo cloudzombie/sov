@@ -1,0 +1,24 @@
+[package]
+name = "sov-node"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The SOV node: drives mempool, block production, and finality into a running chain; ships a local devnet binary."
+
+[dependencies]
+sov-primitives = { path = "../primitives" }
+sov-crypto = { path = "../crypto" }
+sov-types = { path = "../types" }
+sov-state = { path = "../state" }
+sov-mempool = { path = "../mempool" }
+sov-chain = { path = "../chain" }
+sov-wallet = { path = "../wallet" }
+sov-mining = { path = "../mining" }
+sov-pow = { path = "../pow" }
+thiserror.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

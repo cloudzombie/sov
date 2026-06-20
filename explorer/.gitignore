@@ -1,0 +1,7 @@
+# generated devnet config + chain data (recreate with: node devnet/gen-devnet.mjs)
+devnet/data/
+devnet/chain-spec.json
+devnet/node-config.json
+devnet/keystore.json
+node_modules/
+*.log

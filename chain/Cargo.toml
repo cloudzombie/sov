@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+# `contracts/` is guest (no_std, wasm32) code with its own workspace — excluded
+# from the host build.
+exclude = ["contracts", "fuzz"]
+members = [
+    "crates/primitives",
+    "crates/crypto",
+    "crates/types",
+    "crates/state",
+    "crates/runtime",
+    "crates/mempool",
+    "crates/pow",
+    "crates/mining",
+    "crates/intents",
+    "crates/compliance",
+    "crates/shielded",
+    "crates/rpc",
+    "crates/governance",
+    "crates/reserve",
+    "crates/verify",
+    "crates/vm",
+    "crates/chain",
+    "crates/wallet",
+    "crates/network",
+    "crates/node",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/sov/chain"
+rust-version = "1.85"
+
+[workspace.dependencies]
+blake3 = "1"
+borsh = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+hex = "0.4"
+thiserror = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

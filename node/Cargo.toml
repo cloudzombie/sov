@@ -1,0 +1,31 @@
+[package]
+name = "sov-station"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Native SOV wallet and mining-node operator station."
+
+[dependencies]
+sov-primitives = { path = "../chain/crates/primitives" }
+sov-rpc = { path = "../chain/crates/rpc" }
+sov-crypto = { path = "../chain/crates/crypto" }
+sov-wallet = { path = "../chain/crates/wallet" }
+sov-shielded = { path = "../chain/crates/shielded" }
+sov-types = { path = "../chain/crates/types" }
+serde_json = "1"
+# Native GUI: the `sov-station` desktop window (cross-platform — macOS, Windows,
+# Linux). Pure-Rust immediate-mode UI; no web stack, no JS, a single binary.
+eframe = "0.29"
+# QR encoding for the Receive view (matrix only — no image/svg backends pulled in;
+# rendered directly with the egui painter).
+qrcode = { version = "0.14", default-features = false }
+# SHA-256 for HTLC hashlocks (preimage → hashlock) in the Swaps tab.
+sha2 = "0.10"
+# AEAD for the encrypted, incremental shielded note cache (same crate the node
+# keystore uses), keyed by the device key.
+chacha20poly1305 = "0.10"
+getrandom = "0.2"
+
+[lints.rust]
+unsafe_code = "forbid"

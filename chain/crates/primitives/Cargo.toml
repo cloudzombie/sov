@@ -1,0 +1,22 @@
+[package]
+name = "sov-primitives"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Core value types for the SOV protocol: hashes, account ids, balances, heights."
+
+[dependencies]
+blake3.workspace = true
+borsh.workspace = true
+serde.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

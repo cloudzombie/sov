@@ -1,0 +1,37 @@
+# ── Build artifacts ───────────────────────────────────────────────────────
+target/
+**/target/
+dist/
+*.dmg
+*.exe
+*.zip
+
+# ── Secrets / runtime state — NEVER publish ───────────────────────────────
+# Wallet keystores carry seed material; node runtime dirs carry chain data.
+**/keystore.json
+**/testnet.json
+**/sim-actors.json
+**/node.pid
+**/blocks.log
+**/data/
+# Generated dev/test net working dirs (regenerable via `sov-testnet`).
+chain/testnet/node-*/
+chain/simnet/node-*/
+explorer/devnet/node-*/
+# Anything that looks like a private key or environment secret.
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+*.seed
+
+# ── OS / editor noise ─────────────────────────────────────────────────────
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Nested project with its own git history (separate agent) — not part of this repo
+dashboard/dash2/

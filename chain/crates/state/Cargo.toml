@@ -1,0 +1,24 @@
+[package]
+name = "sov-state"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Authenticated world state for SOV: a Sparse Merkle Tree, accounts, and the ledger over them."
+
+[dependencies]
+sov-primitives = { path = "../primitives" }
+sov-crypto = { path = "../crypto" }
+sov-shielded = { path = "../shielded" }
+sov-compliance = { path = "../compliance" }
+borsh.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

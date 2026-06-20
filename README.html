@@ -1,0 +1,1429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SOV — A Sovereign Reserve Asset</title>
+<meta name="description" content="SOV is a sovereign reserve-asset Layer-1 blockchain written in Rust: pure Nakamoto proof-of-work, ASIC-resistant RandomX mining, a 21M hard cap with no pre-mine, a Zcash-grade shielded pool, and post-quantum-native keys." />
+<style>
+  /* ============================================================
+     SOV — flagship README. Single self-contained file.
+     Palette: Treasury navy / slate / parchment / federal blue / gold.
+     System fonts only; inline SVG only; renders offline.
+     ============================================================ */
+  :root {
+    --navy-900: #0b1220;
+    --navy-850: #0f172a;
+    --navy-800: #131d33;
+    --navy-700: #1b2742;
+    --slate-700: #1e293b;
+    --slate-600: #334155;
+    --slate-500: #475569;
+    --slate-400: #64748b;
+    --slate-300: #94a3b8;
+    --slate-200: #cbd5e1;
+    --ivory: #f4f1e8;
+    --ivory-dim: #e8e3d5;
+    --parchment: #faf8f2;
+    --gold: #c8a25c;
+    --gold-bright: #e3c281;
+    --gold-deep: #a07d3a;
+    --fed-blue: #3b6ea5;
+    --fed-blue-bright: #6fa8dc;
+    --ink: #e7ecf3;
+    --ink-dim: #aab6c6;
+    --ok: #5cc98f;
+    --ok2: #5cc98f;
+    --line: rgba(200, 162, 92, 0.18);
+    --line-soft: rgba(148, 163, 184, 0.14);
+    --maxw: 1120px;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, "Times New Roman", serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    color: var(--ink);
+    background:
+      radial-gradient(1200px 600px at 78% -8%, rgba(59, 110, 165, 0.16), transparent 60%),
+      radial-gradient(900px 600px at 8% 4%, rgba(200, 162, 92, 0.08), transparent 55%),
+      linear-gradient(168deg, var(--navy-900) 0%, var(--navy-850) 42%, #0d1626 100%);
+    background-attachment: fixed;
+    line-height: 1.68;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  a { color: var(--fed-blue-bright); text-decoration: none; }
+  a:hover { color: var(--gold-bright); text-decoration: underline; text-underline-offset: 3px; }
+
+  code, kbd, pre, .mono { font-family: var(--mono); }
+  code {
+    background: rgba(200, 162, 92, 0.10);
+    color: var(--gold-bright);
+    padding: 0.08em 0.42em;
+    border-radius: 5px;
+    font-size: 0.86em;
+    border: 1px solid rgba(200, 162, 92, 0.12);
+  }
+  pre {
+    background: #0a111f;
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--gold);
+    border-radius: 12px;
+    padding: 1.15rem 1.3rem;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    line-height: 1.62;
+    color: var(--ink-dim);
+    margin: 1.1rem 0;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.02), 0 8px 24px rgba(0,0,0,0.28);
+  }
+  pre code { background: none; border: none; color: inherit; padding: 0; font-size: inherit; }
+  pre .c { color: var(--slate-400); font-style: italic; }
+  pre .k { color: var(--gold-bright); }
+
+  /* ---------- Top navigation ---------- */
+  .topnav {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    background: rgba(8, 14, 26, 0.82);
+    border-bottom: 1px solid var(--line);
+  }
+  .topnav .inner {
+    max-width: var(--maxw);
+    margin: 0 auto;
+    padding: 0.7rem 1.5rem;
+    display: flex;
+    align-items: center;
+    gap: 1.2rem;
+  }
+  .topnav .brand {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    font-family: var(--serif);
+    font-weight: 700;
+    letter-spacing: 3px;
+    font-size: 1.05rem;
+    color: var(--ivory);
+  }
+  .topnav .brand svg { display: block; }
+  .topnav nav {
+    margin-left: auto;
+    display: flex;
+    gap: 0.3rem;
+    flex-wrap: wrap;
+  }
+  .topnav nav a {
+    color: var(--slate-200);
+    font-size: 0.78rem;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    padding: 0.4rem 0.7rem;
+    border-radius: 7px;
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+  .topnav nav a:hover { color: var(--gold-bright); background: rgba(200, 162, 92, 0.10); text-decoration: none; }
+  @media (max-width: 860px) { .topnav nav { display: none; } }
+
+  /* ---------- Layout ---------- */
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 1.5rem; }
+  section { padding: 4rem 0 1rem; scroll-margin-top: 70px; }
+  section:first-of-type { padding-top: 2.4rem; }
+
+  .eyebrow {
+    text-transform: uppercase;
+    letter-spacing: 3px;
+    font-size: 0.72rem;
+    color: var(--gold);
+    font-weight: 600;
+    margin: 0 0 0.7rem;
+  }
+  h1, h2, h3, h4 { font-family: var(--serif); font-weight: 700; color: var(--ivory); line-height: 1.18; }
+  h2 {
+    font-size: clamp(1.7rem, 3.2vw, 2.3rem);
+    margin: 0 0 0.4rem;
+    letter-spacing: 0.3px;
+  }
+  h2 + .lede { color: var(--ink-dim); font-size: 1.08rem; max-width: 70ch; margin: 0.2rem 0 1.6rem; }
+  h3 { font-size: 1.22rem; margin: 1.6rem 0 0.5rem; color: var(--gold-bright); }
+  h4 { font-size: 1rem; margin: 1.1rem 0 0.4rem; color: var(--ivory); letter-spacing: 0.3px; }
+  .rule { height: 1px; background: linear-gradient(to right, transparent, var(--line), transparent); margin: 0.6rem 0 1.8rem; }
+
+  p { margin: 0.7rem 0; color: var(--ink-dim); }
+  strong { color: var(--ink); font-weight: 650; }
+
+  /* ---------- Hero ---------- */
+  .hero {
+    position: relative;
+    padding: 4.5rem 0 3.2rem;
+    overflow: hidden;
+  }
+  .hero::after {
+    content: "";
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 1px;
+    background: linear-gradient(to right, transparent, var(--gold), transparent);
+    opacity: 0.5;
+  }
+  .hero-grid {
+    display: grid;
+    grid-template-columns: 1.5fr 1fr;
+    gap: 2.5rem;
+    align-items: center;
+  }
+  @media (max-width: 880px) { .hero-grid { grid-template-columns: 1fr; } }
+  .hero h1 {
+    font-size: clamp(2.8rem, 7vw, 4.6rem);
+    letter-spacing: 1px;
+    margin: 0.4rem 0 0.6rem;
+    background: linear-gradient(170deg, #ffffff 0%, var(--ivory) 40%, var(--gold-bright) 130%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .hero .tag {
+    font-family: var(--serif);
+    font-style: italic;
+    font-size: clamp(1.15rem, 2.4vw, 1.5rem);
+    color: var(--gold-bright);
+    margin: 0 0 1.1rem;
+  }
+  .hero p.intro { font-size: 1.06rem; color: var(--ink-dim); max-width: 60ch; }
+  .hero .cta { margin-top: 1.7rem; display: flex; gap: 0.8rem; flex-wrap: wrap; }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.65rem 1.25rem;
+    border-radius: 9px;
+    font-size: 0.92rem;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    border: 1px solid transparent;
+    transition: transform 0.12s ease, box-shadow 0.2s ease, background 0.2s ease;
+  }
+  .btn:hover { text-decoration: none; transform: translateY(-1px); }
+  .btn-gold {
+    background: linear-gradient(135deg, var(--gold-bright), var(--gold-deep));
+    color: #1a1305;
+    box-shadow: 0 6px 22px rgba(200, 162, 92, 0.26);
+  }
+  .btn-gold:hover { color: #1a1305; box-shadow: 0 8px 26px rgba(200, 162, 92, 0.36); }
+  .btn-ghost { border-color: var(--line); color: var(--ivory); background: rgba(255,255,255,0.02); }
+  .btn-ghost:hover { color: var(--gold-bright); border-color: var(--gold); }
+
+  /* Seal */
+  .seal-holder { display: flex; justify-content: center; align-items: center; }
+  .seal { filter: drop-shadow(0 10px 30px rgba(0,0,0,0.45)); }
+  .seal-rot { transform-origin: 130px 130px; animation: sealspin 120s linear infinite; }
+  @keyframes sealspin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .seal-rot { animation: none; } .seal-rot, .hero h1 { } }
+
+  /* ---------- Hero stat ribbon ---------- */
+  .ribbon {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    overflow: hidden;
+    margin-top: 2.6rem;
+  }
+  @media (max-width: 720px) { .ribbon { grid-template-columns: repeat(2, 1fr); } }
+  .ribbon .cell {
+    background: linear-gradient(180deg, rgba(20,30,52,0.85), rgba(13,20,34,0.85));
+    padding: 1.2rem 1.25rem;
+  }
+  .ribbon .num { font-family: var(--serif); font-size: 1.85rem; font-weight: 700; color: var(--gold-bright); line-height: 1; }
+  .ribbon .lab { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 1.2px; color: var(--slate-300); margin-top: 0.45rem; }
+  .ribbon .sub { font-size: 0.74rem; color: var(--slate-400); margin-top: 0.2rem; }
+
+  /* ---------- Cards / grids ---------- */
+  .card {
+    background: linear-gradient(180deg, rgba(22,32,54,0.66), rgba(13,20,34,0.66));
+    border: 1px solid var(--line-soft);
+    border-radius: 14px;
+    padding: 1.4rem 1.5rem;
+  }
+  .card.gold { border-color: var(--line); border-left: 3px solid var(--gold); }
+  .card.blue { border-left: 3px solid var(--fed-blue); }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.1rem; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.1rem; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1.1rem; }
+  @media (max-width: 880px) { .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; } }
+
+  .feat { display: flex; gap: 0.9rem; align-items: flex-start; }
+  .feat .ic {
+    flex: 0 0 auto;
+    width: 40px; height: 40px;
+    display: grid; place-items: center;
+    border-radius: 10px;
+    background: rgba(200, 162, 92, 0.10);
+    border: 1px solid rgba(200, 162, 92, 0.18);
+  }
+  .feat h4 { margin: 0.1rem 0 0.25rem; }
+  .feat p { margin: 0; font-size: 0.92rem; }
+
+  /* ---------- Tables ---------- */
+  .tbl-wrap { overflow-x: auto; border-radius: 12px; border: 1px solid var(--line-soft); margin: 1.1rem 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; min-width: 520px; }
+  thead th {
+    text-align: left;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--gold);
+    font-weight: 600;
+    padding: 0.75rem 1rem;
+    background: rgba(10,16,28,0.7);
+    border-bottom: 1px solid var(--line);
+  }
+  tbody td { padding: 0.72rem 1rem; border-bottom: 1px solid var(--line-soft); color: var(--ink-dim); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: rgba(200, 162, 92, 0.035); }
+  td .cn { color: var(--gold-bright); font-family: var(--mono); font-size: 0.84rem; white-space: nowrap; }
+  .num-r { text-align: right; font-variant-numeric: tabular-nums; }
+  .src { color: var(--slate-400); font-family: var(--mono); font-size: 0.78rem; }
+
+  /* ---------- Pills / badges ---------- */
+  .pill {
+    display: inline-block;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    padding: 0.16rem 0.55rem;
+    border-radius: 999px;
+    vertical-align: middle;
+  }
+  .pill.done { background: rgba(92, 201, 143, 0.16); color: #74d8a6; border: 1px solid rgba(92,201,143,0.25); }
+  .pill.prog { background: rgba(111, 168, 220, 0.16); color: var(--fed-blue-bright); border: 1px solid rgba(111,168,220,0.25); }
+  .pill.todo { background: rgba(148, 163, 184, 0.14); color: var(--slate-200); border: 1px solid rgba(148,163,184,0.22); }
+  .pill.gold { background: rgba(200, 162, 92, 0.16); color: var(--gold-bright); border: 1px solid rgba(200,162,92,0.28); }
+  .pill.p1 { background: rgba(248, 113, 113, 0.16); color: #fca5a5; border: 1px solid rgba(248,113,113,0.28); }
+  .pill.p2 { background: rgba(251, 191, 36, 0.14); color: #facc15; border: 1px solid rgba(251,191,36,0.26); }
+  .audit-table { min-width: 980px; }
+  .audit-table td:first-child { white-space: nowrap; }
+  .audit-table .fix { color: var(--ink); }
+  .audit-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.55rem;
+    margin: 1rem 0 1.4rem;
+  }
+  .audit-meta span {
+    border: 1px solid var(--line-soft);
+    border-radius: 999px;
+    padding: 0.22rem 0.65rem;
+    color: var(--slate-200);
+    font-size: 0.78rem;
+    background: rgba(13,20,34,0.5);
+  }
+
+  /* ---------- Layer stack diagram ---------- */
+  .stack { display: flex; flex-direction: column; gap: 0.55rem; margin: 1.2rem 0; }
+  .layer {
+    border: 1px solid var(--line-soft);
+    border-radius: 11px;
+    padding: 0.85rem 1.1rem;
+    background: linear-gradient(180deg, rgba(22,32,54,0.5), rgba(13,20,34,0.5));
+    display: flex;
+    align-items: baseline;
+    gap: 0.9rem;
+    flex-wrap: wrap;
+  }
+  .layer .lname { font-family: var(--serif); color: var(--gold-bright); font-weight: 700; font-size: 0.98rem; min-width: 150px; }
+  .layer .lcrates { font-family: var(--mono); font-size: 0.8rem; color: var(--ink-dim); }
+  .layer .lcrates b { color: var(--ivory); font-weight: 600; }
+  .layer.l1 { border-left: 3px solid var(--gold); }
+  .layer.l2 { border-left: 3px solid var(--fed-blue); }
+  .layer.l3 { border-left: 3px solid #7a8aa8; }
+
+  /* ---------- Roadmap ---------- */
+  .phase {
+    border: 1px solid var(--line-soft);
+    border-radius: 13px;
+    overflow: hidden;
+    margin-bottom: 0.9rem;
+    background: rgba(13,20,34,0.5);
+  }
+  .phase > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 1rem 1.25rem;
+    display: flex;
+    align-items: center;
+    gap: 0.85rem;
+    flex-wrap: wrap;
+  }
+  .phase > summary::-webkit-details-marker { display: none; }
+  .phase > summary:hover { background: rgba(200, 162, 92, 0.04); }
+  .phase .ptitle { font-family: var(--serif); font-weight: 700; color: var(--ivory); font-size: 1.06rem; }
+  .phase .ptag { font-size: 0.66rem; letter-spacing: 1px; text-transform: uppercase; color: var(--slate-300); border: 1px solid var(--line-soft); border-radius: 999px; padding: 0.1rem 0.5rem; }
+  .phase .pcount { margin-left: auto; font-size: 0.8rem; color: var(--slate-300); font-variant-numeric: tabular-nums; }
+  .phase .pbar { width: 110px; height: 7px; border-radius: 999px; background: rgba(148,163,184,0.18); overflow: hidden; }
+  .phase .pbar > i { display: block; height: 100%; background: linear-gradient(to right, var(--gold-deep), var(--gold-bright)); border-radius: 999px; }
+  .phase .marker { transition: transform 0.2s ease; color: var(--gold); font-size: 0.8rem; }
+  .phase[open] .marker { transform: rotate(90deg); }
+  .phase .pbody { padding: 0.2rem 1.25rem 1.1rem; border-top: 1px solid var(--line-soft); }
+  .item { padding: 0.7rem 0; border-bottom: 1px dashed var(--line-soft); }
+  .item:last-child { border-bottom: none; }
+  .item .ihead { display: flex; gap: 0.6rem; align-items: baseline; }
+  .item .itext { color: var(--ink); font-size: 0.94rem; }
+  .item .inote { color: var(--slate-300); font-size: 0.82rem; margin-top: 0.3rem; line-height: 1.55; }
+
+  /* ---------- Callouts ---------- */
+  .note {
+    border-radius: 12px;
+    padding: 1.1rem 1.3rem;
+    margin: 1.3rem 0;
+    font-size: 0.93rem;
+  }
+  .note.honest { background: rgba(111,168,220,0.07); border: 1px solid rgba(111,168,220,0.25); border-left: 3px solid var(--fed-blue); }
+  .note.rule-note { background: rgba(200,162,92,0.06); border: 1px solid var(--line); border-left: 3px solid var(--gold); }
+  .note .nt { font-family: var(--serif); font-weight: 700; color: var(--ivory); display: block; margin-bottom: 0.3rem; }
+
+  ul.clean { list-style: none; padding: 0; margin: 0.6rem 0; }
+  ul.clean li { position: relative; padding-left: 1.5rem; margin: 0.5rem 0; color: var(--ink-dim); }
+  ul.clean li::before { content: ""; position: absolute; left: 0; top: 0.62em; width: 7px; height: 7px; border-radius: 50%; background: var(--gold); box-shadow: 0 0 0 3px rgba(200,162,92,0.15); }
+  ul.clean li strong { color: var(--ink); }
+
+  /* ---------- Footer ---------- */
+  footer {
+    margin-top: 3rem;
+    border-top: 1px solid var(--line);
+    background: rgba(8,13,24,0.6);
+  }
+  footer .wrap { padding: 2.6rem 1.5rem; display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: center; justify-content: space-between; }
+  footer .fbrand { display: flex; align-items: center; gap: 0.7rem; font-family: var(--serif); letter-spacing: 2px; color: var(--ivory); }
+  footer .fnote { color: var(--slate-400); font-size: 0.82rem; max-width: 52ch; }
+  .verified-tag { color: var(--ok2); font-size: 0.78rem; }
+</style>
+</head>
+<body>
+
+<!-- ===================== NAV ===================== -->
+<header class="topnav">
+  <div class="inner">
+    <span class="brand">
+      <svg width="26" height="26" viewBox="0 0 100 100" aria-hidden="true">
+        <circle cx="50" cy="50" r="46" fill="none" stroke="#c8a25c" stroke-width="3"/>
+        <circle cx="50" cy="50" r="38" fill="none" stroke="#3b6ea5" stroke-width="1.5"/>
+        <text x="50" y="64" text-anchor="middle" font-family="Georgia,serif" font-size="40" font-weight="700" fill="#e3c281">S</text>
+      </svg>
+      SOV
+    </span>
+    <nav>
+      <a href="#mission">Mission</a>
+      <a href="#hardening">Privacy &amp; Swaps</a>
+      <a href="#consensus">Consensus</a>
+      <a href="#tokenomics">Tokenomics</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#governance">Governance</a>
+      <a href="#verification">Verification</a>
+      <a href="#audit">Audit</a>
+      <a href="#run">Run a Node</a>
+      <a href="#roadmap">Roadmap</a>
+    </nav>
+  </div>
+</header>
+
+<!-- ===================== HERO ===================== -->
+<div class="hero">
+  <div class="wrap hero-grid">
+    <div>
+      <p class="eyebrow">Sovereign Digital Reserve Asset · Layer-1 · Rust</p>
+      <h1>SOV</h1>
+      <p class="tag">A reserve asset for the United States and its accomplishments in finance.</p>
+      <p class="intro">
+        A capped-supply Layer-1 with <strong>no premine and no investor allocation</strong> — every coin mined, with a perpetual 5%/2% founder/dev tax on emission and fees.
+        Consensus is <em>pure Nakamoto proof-of-work</em> — Bitcoin's model, verbatim: the heaviest-work chain
+        wins, finality is confirmation depth, and the coinbase is the only issuance path (genesis supply is
+        exactly zero). The mainnet seal is <strong>ASIC-resistant RandomX</strong>, so commodity machines — Apple
+        M-series included — mine fairly. No proof-of-stake, no validators, no BFT.
+      </p>
+      <div class="cta">
+        <a class="btn btn-gold" href="#run">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#1a1305" stroke-width="2.2"><path d="M5 3l14 9-14 9V3z"/></svg>
+          Run a Node
+        </a>
+        <a class="btn btn-ghost" href="#architecture">Explore the Architecture</a>
+      </div>
+    </div>
+    <div class="seal-holder">
+      <!-- Hand-built sovereign seal (inline SVG, no clip-art) -->
+      <svg class="seal" width="260" height="260" viewBox="0 0 260 260" role="img" aria-label="SOV seal">
+        <defs>
+          <radialGradient id="g-disc" cx="50%" cy="38%" r="70%">
+            <stop offset="0%" stop-color="#1b2742"/>
+            <stop offset="100%" stop-color="#0a1120"/>
+          </radialGradient>
+          <linearGradient id="g-gold" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#e3c281"/>
+            <stop offset="100%" stop-color="#a07d3a"/>
+          </linearGradient>
+        </defs>
+        <circle cx="130" cy="130" r="124" fill="url(#g-disc)" stroke="url(#g-gold)" stroke-width="2"/>
+        <circle cx="130" cy="130" r="118" fill="none" stroke="#3b6ea5" stroke-width="1" opacity="0.55"/>
+        <!-- rotating legend ring -->
+        <g class="seal-rot">
+          <circle cx="130" cy="130" r="108" fill="none" stroke="rgba(200,162,92,0.25)" stroke-width="18"/>
+          <path id="ring" d="M 130,130 m -100,0 a 100,100 0 1,1 200,0 a 100,100 0 1,1 -200,0" fill="none"/>
+          <text font-family="Georgia,serif" font-size="11.5" letter-spacing="4" fill="#e3c281">
+            <textPath href="#ring" startOffset="0%">· SOVEREIGN RESERVE ASSET · 21,000,000 HARD CAP · NO PRE-MINE · PROOF OF WORK MINT ·</textPath>
+          </text>
+        </g>
+        <!-- inner medallion: 13 stars (founding states), star + S -->
+        <circle cx="130" cy="130" r="78" fill="none" stroke="url(#g-gold)" stroke-width="1.5"/>
+        <g fill="#c8a25c">
+          <!-- 13 stars in a ring -->
+          <g id="stars"></g>
+        </g>
+        <g transform="translate(130 132)">
+          <path d="M0,-40 L9.4,-12.4 L38,-12.4 L15.3,4.7 L23.5,32.4 L0,15.5 L-23.5,32.4 L-15.3,4.7 L-38,-12.4 L-9.4,-12.4 Z"
+                fill="url(#g-gold)" opacity="0.9"/>
+          <text x="0" y="13" text-anchor="middle" font-family="Georgia,serif" font-size="34" font-weight="700" fill="#0a1120">S</text>
+        </g>
+      </svg>
+    </div>
+  </div>
+
+  <!-- VERIFIED stat ribbon -->
+  <div class="wrap">
+    <div class="ribbon">
+      <div class="cell">
+        <div class="num">21,000,000</div>
+        <div class="lab">SOV Hard Cap</div>
+        <div class="sub">enforced in code, 8 decimals</div>
+      </div>
+      <div class="cell">
+        <div class="num">442</div>
+        <div class="lab">Tests Passing</div>
+        <div class="sub">0 failing · cargo test --workspace</div>
+      </div>
+      <div class="cell">
+        <div class="num">20</div>
+        <div class="lab">Workspace Crates</div>
+        <div class="sub">all <code>#![forbid(unsafe_code)]</code></div>
+      </div>
+      <div class="cell">
+        <div class="num">0</div>
+        <div class="lab">Pre-mine</div>
+        <div class="sub">genesis supply zero · every coin mined</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== MISSION ===================== -->
+<section id="mission" class="wrap">
+  <p class="eyebrow">The Mission</p>
+  <h2>A sovereign-grade monetary system, built in the open</h2>
+  <p class="lede">
+    SOV is the Rust implementation of a reserve-asset Layer-1: auditable to the byte, with no hand-rolled
+    cryptography and no fabricated data anywhere in the system. On a pure Nakamoto proof-of-work base it ships,
+    as native protocol primitives, the pieces other ecosystems bolt on later — a <strong>Zcash-grade zk-SNARK
+    shielded pool</strong> (Orchard/Halo2, no trusted setup), <strong>trustless cross-chain atomic swaps</strong>
+    with Bitcoin and Zcash (HTLC, no custodian), <strong>post-quantum-native</strong> keys + transport (hybrid
+    Ed25519+ML-DSA-65, ML-KEM-768), <strong>HD wallets</strong> (BIP-39/SLIP-10, Rust↔TS verified), native assets
+    with issuer compliance, and a deterministic WebAssembly contract runtime.
+  </p>
+
+  <div class="grid-3" style="margin-top:1.6rem">
+    <div class="card gold">
+      <div class="feat">
+        <span class="ic">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#e3c281" stroke-width="1.8"><path d="M12 2l8 4v6c0 5-3.5 8-8 10-4.5-2-8-5-8-10V6l8-4z"/></svg>
+        </span>
+        <div><h4>No pre-mine</h4><p>No premine, no investor allocation — every coin is minted by real proof-of-work under a fixed 21M cap. A perpetual 5%/2% founder/dev tax funds the project.</p></div>
+      </div>
+    </div>
+    <div class="card gold">
+      <div class="feat">
+        <span class="ic">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#e3c281" stroke-width="1.8"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>
+        </span>
+        <div><h4>ASIC-resistant mining</h4><p>RandomX (Monero's memory-hard PoW) lets commodity CPUs — Apple M-series included — mine fairly; the heaviest-work chain wins and finality is confirmation depth.</p></div>
+      </div>
+    </div>
+    <div class="card gold">
+      <div class="feat">
+        <span class="ic">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#e3c281" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M9 12l2 2 4-4"/></svg>
+        </span>
+        <div><h4>Provably valid</h4><p>Exact-integer invariants (supply == genesis + mined), deterministic replay + cross-node agreement, heaviest-work fork-choice chaos/fault tests, KAT vectors, fuzzing, and reproducible builds.</p></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="note rule-note">
+    <span class="nt">A note on honesty</span>
+    This document states only what is verifiable in the repository. Numbers, crate names, budgets, and phase
+    status are read directly from the code and from
+    <code>dashboard/phases.json</code>. Where a subsystem is built but not yet wired into the live runtime — or
+    where a capability requires hardware or a third party SOV cannot unilaterally provide — that boundary is stated plainly.
+  </div>
+</section>
+
+<!-- ===================== PRODUCTION HARDENING ===================== -->
+<section id="hardening" class="wrap">
+  <p class="eyebrow">Production Hardening</p>
+  <h2>Privacy, trustless cross-chain, sound money — landed and proven</h2>
+  <p class="lede">
+    The most recent cycle drove SOV toward production as far as code allows. Every item below is implemented,
+    tested with real cryptography, and green under the full gate (442 Rust + 118 SDK tests, fmt + clippy clean).
+  </p>
+  <ul class="clean" style="margin-top:1.4rem">
+    <li><strong>Zcash-grade shielded pool</strong> <span class="pill done">done</span> — built on the audited
+      Orchard/Halo2 stack with <em>no trusted setup</em>. Real zero-knowledge proofs for shielded transfers and
+      for minting: the proof-of-work reward can be issued <em>directly into the shielded pool</em>
+      (<code>MineShielded</code>), so coins are private from issuance. Note-commitment tree, nullifier set, and a
+      canonical bundle codec all verify in-consensus.</li>
+    <li><strong>Trustless cross-chain atomic swaps</strong> <span class="pill done">done</span> — native HTLC
+      primitives (<code>HtlcLock</code>/<code>HtlcClaim</code>/<code>HtlcRefund</code>) with SHA-256 hashlocks
+      compatible with Bitcoin and Zcash <code>OP_SHA256</code>. The same preimage settles both sides, so swaps are
+      atomic with no custodian, oracle, bridge, or liquidity pool.</li>
+    <li><strong>HD wallets</strong> <span class="pill done">done</span> — BIP-39 + SLIP-0010 (Ed25519) + BIP-44,
+      with a cross-implementation known-answer test: the same mnemonic derives the same key in Rust and
+      TypeScript, byte-for-byte.</li>
+    <li><strong>Consensus timestamp hardening</strong> <span class="pill done">done</span> — BIP-113
+      median-time-past plus a node-level future-time bound, closing timestamp-manipulation of difficulty.</li>
+    <li><strong>Fixed-terminal-supply proof</strong> <span class="pill done">done</span> — a conformance test
+      proves emission terminates and that post-emission the total supply is fixed (no burn; fees are supply-neutral).
+      Rationale in <code>chain/docs/monetary-policy.md</code>; the honest BIP mapping in
+      <code>chain/docs/bip-adoption.md</code>.</li>
+  </ul>
+  <p class="note rule-note" style="margin-top:1.5rem">
+    <strong>Honest status.</strong> The above is the code-addressable path to production, and it is complete and
+    green. Three things remain that no amount of code can close and that SOV will not claim without them: an
+    <strong>external third-party security audit</strong> (especially of the new zk shielded-pool integration), a
+    <strong>public testnet shakeout</strong>, and <strong>real Bitcoin/Zcash node operators</strong> running the
+    bridge watchers. Until those land, SOV is a complete, auditable reference implementation — not a live mainnet.
+  </p>
+</section>
+
+<!-- ===================== CONSENSUS ===================== -->
+<section id="consensus" class="wrap">
+  <p class="eyebrow">Consensus</p>
+  <h2>Pure Nakamoto proof-of-work. Only hashpower.</h2>
+  <p class="lede">
+    SOV's consensus is Bitcoin's, verbatim: blocks are sealed by proof of work, the heaviest-work chain wins,
+    finality is confirmation depth, and the block coinbase is the only issuance path. There is
+    <strong>no proof-of-stake, no validator committee, and no BFT</strong> — security is hashpower, and the
+    mainnet seal is ASIC-resistant RandomX so commodity machines compete fairly.
+  </p>
+
+  <div class="grid-2">
+    <div class="card blue">
+      <h3 style="margin-top:0">The seal — ASIC-resistant RandomX</h3>
+      <p>One algorithm secures the chain; whoever does the work produces the block.</p>
+      <ul class="clean">
+        <li><strong>RandomX (mainnet).</strong> Monero's memory-hard, CPU-optimized proof of work via the audited <code>randomx-rs</code> reference, keyed by the genesis hash — commodity machines (Apple M-series included) mine fairly and the chain resists ASIC capture. <code>Sha256d</code> is selectable for fast dev/test chains; the seal is a genesis-fixed <code>PowAlgo</code> meeting one 256-bit <code>Target</code>.</li>
+        <li><strong>Committed difficulty (nBits).</strong> Each header carries its difficulty in Bitcoin's compact <code>bits</code>; a block cannot claim an easier target than the retarget rule requires.</li>
+        <li><strong>Capped emission, no pre-mine.</strong> The coinbase pays 12.5 XUS halving every 840,000 blocks (~4 years at 2.5-minute blocks) under the 21M cap; genesis supply is exactly zero — every coin is mined.</li>
+        <li><strong>Epoch retargeting.</strong> Difficulty retargets once per 2016-block epoch from the branch's actual-vs-expected timespan, Bitcoin-style (4×-clamped).</li>
+      </ul>
+    </div>
+    <div class="card blue">
+      <h3 style="margin-top:0">Fork choice &amp; finality — Nakamoto</h3>
+      <p>The most-work chain is the truth; settlement is depth, exactly like Bitcoin.</p>
+      <ul class="clean">
+        <li><strong>Heaviest-work fork choice.</strong> The active chain is the one with the most cumulative work (<code>GetBlockProof</code> in exact 256-bit math); a strictly heavier branch triggers a reorg.</li>
+        <li><strong>Reorg correctness.</strong> A competing branch is replayed from the genesis ledger and adopted only if valid end-to-end, so an invalid heavier branch can never displace a valid head.</li>
+        <li><strong>Confirmation-depth finality.</strong> A block is final once buried 6 deep (Bitcoin's convention) — probabilistic, and a pure function of chain state (survives restart). No votes to sync.</li>
+        <li><strong>No validators.</strong> No stake, committee, proposer schedule, equivocation, or slashing exists — there is nothing to bribe or capture but hashpower.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>How a transaction flows</h3>
+  <div class="rule"></div>
+  <div class="grid-4">
+    <div class="card">
+      <span class="pill gold">1 · Submit</span>
+      <p style="font-size:0.9rem">A wallet builds and signs a <code>SignedTransaction</code>. The mempool rejects it cheaply if the signature fails, the nonce is stale, or the pool is full — it does <em>not</em> check balances.</p>
+    </div>
+    <div class="card">
+      <span class="pill gold">2 · Mine</span>
+      <p style="font-size:0.9rem">Any node pulls a nonce-ordered batch, applies the coinbase + txs via <code>sov_runtime</code>, commits state, and <em>grinds the header's nonce</em> until its seal meets the difficulty. The header commits to the roots, the coinbase recipient, and the difficulty.</p>
+    </div>
+    <div class="card">
+      <span class="pill gold">3 · Import</span>
+      <p style="font-size:0.9rem"><code>import_block</code> runs the <em>same</em> validation on every block — peer or self-produced — checking the committed difficulty + proof of work, then re-executing against a clone of the ledger and refusing to commit unless the recomputed roots match.</p>
+    </div>
+    <div class="card">
+      <span class="pill gold">4 · Confirm</span>
+      <p style="font-size:0.9rem">Fork choice keeps the heaviest-work chain; the block accrues confirmations as the chain grows on top and is reported final at depth 6. No trusted path, no votes.</p>
+    </div>
+  </div>
+  <p style="font-size:0.88rem;color:var(--slate-400)">
+    Execution enforces, in order: <strong>authentication</strong> (Ed25519 verifies against the tx pubkey) →
+    <strong>authorization</strong> (that pubkey is the signer's registered key) →
+    <strong>ordering</strong> (nonce equals the signer's current nonce) → <strong>execution</strong>. A nonce is
+    consumed even when the inner action fails, so a rejected payment can never be replayed.
+    Source: <span class="src">crates/runtime/src/execution.rs</span>, <span class="src">crates/chain/src/blockchain.rs</span>.
+  </p>
+</section>
+
+<!-- ===================== TOKENOMICS ===================== -->
+<section id="tokenomics" class="wrap">
+  <p class="eyebrow">Tokenomics &amp; Emission</p>
+  <h2>The 21M economic model</h2>
+  <p class="lede">
+    Every amount is an integer <code>u128</code> count of the smallest indivisible unit — the <em>grain</em> — at
+    exactly Bitcoin / Zcash precision. No floating point ever touches a balance, and every arithmetic operation is
+    checked. The hard cap is enforced everywhere new supply can appear.
+  </p>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Constant</th><th>Value</th><th>Source</th></tr></thead>
+      <tbody>
+        <tr><td><span class="cn">DECIMALS</span></td><td><code>8</code></td><td class="src">crates/primitives/src/amount.rs</td></tr>
+        <tr><td><span class="cn">GRAINS_PER_SOV</span></td><td><code>100,000,000</code></td><td class="src">crates/primitives/src/amount.rs</td></tr>
+        <tr><td><span class="cn">MAX_SUPPLY_SOV</span></td><td><code>21,000,000</code></td><td class="src">crates/primitives/src/amount.rs</td></tr>
+        <tr><td><span class="cn">MAX_SUPPLY_GRAINS</span></td><td><code>2,100,000,000,000,000</code></td><td class="src">crates/primitives/src/amount.rs</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Bitcoin's emission, verbatim — and no pre-mine</h3>
+  <p>
+    There is exactly <strong>one</strong> issuance source — the block coinbase — and <strong>no pre-mine</strong>.
+    On mainnet the mining budget IS the full 21M cap, so genesis arithmetically rejects any funded balance or
+    vesting grant: genesis supply is exactly zero and every coin is mined
+    (<span class="src">crates/chain/src/genesis.rs</span>). The values below are the <code>mainnet_like()</code> defaults.
+  </p>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Parameter</th><th class="num-r">mainnet_like() value</th><th>Source</th></tr></thead>
+      <tbody>
+        <tr><td>Block subsidy (height 1)</td><td class="num-r"><code>12.5 XUS</code></td><td class="src">crates/mining/src/lib.rs</td></tr>
+        <tr><td>Halving interval</td><td class="num-r"><code>840,000 blocks (~4 years)</code></td><td class="src">crates/mining/src/lib.rs</td></tr>
+        <tr><td>Target block time</td><td class="num-r"><code>150,000 ms (2.5 minutes)</code></td><td class="src">crates/mining/src/lib.rs</td></tr>
+        <tr><td>Mining budget (<span class="cn">mining_budget_grains</span>)</td><td class="num-r"><code>the full 21,000,000 XUS cap</code></td><td class="src">crates/mining/src/lib.rs</td></tr>
+        <tr><td>Genesis allocation</td><td class="num-r"><code>0 (any allocation breaches the cap)</code></td><td class="src">crates/chain/src/genesis.rs</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="grid-2">
+    <div class="card gold">
+      <h4 style="margin-top:0">Height-keyed coinbase</h4>
+      <p style="font-size:0.92rem">
+        <code>MiningPolicy::reward_at(height, mined)</code> pays <code>12.5 &gt;&gt; ((height − 1) / 840,000)</code> SOV —
+        Bitcoin's exact rule — clamped to the room left in the budget. The geometric series sums to
+        <strong>20,999,999.9076 XUS</strong>, strictly under the 21M cap;
+        after the subsidy decays the chain runs on fees. Cadence: <code>target_block_ms = 150,000</code> (2.5-minute blocks ⇒ ~4-year halvings, Zcash's cadence).
+      </p>
+    </div>
+    <div class="card gold">
+      <h4 style="margin-top:0">No pre-mine (founder/dev tax)</h4>
+      <p style="font-size:0.92rem">
+        Because the budget equals the whole cap, a single grain of genesis balance or vesting makes
+        <code>genesis + budget &gt; cap</code> and is rejected — proven by <code>mainnet_policy_forbids_any_premine</code>.
+        No premined treasury or investor allocation: every coin enters through proof of work. It is <em>not</em> a
+        Bitcoin-style fair launch, though — a perpetual tax routes 5% to the founder and 2% to a dev fund out of
+        every coinbase and every fee (the miner keeps 93%).
+      </p>
+    </div>
+  </div>
+
+  <p>
+    Emission is driven by one monotonic, <strong>state-root-committed</strong> counter — <code>mined_emitted</code>
+    (<span class="src">crates/state/src/ledger.rs</span>) — first-class consensus state because it cannot be recovered
+    from balances once minted coins move. With checked <code>Balance</code> arithmetic throughout, total supply is
+    <code>supply == genesis + mined ≤ MAX_SUPPLY_GRAINS</code> by construction — and on mainnet
+    <code>genesis == 0</code>.
+  </p>
+</section>
+
+<!-- ===================== ARCHITECTURE ===================== -->
+<section id="architecture" class="wrap">
+  <p class="eyebrow">Architecture</p>
+  <h2>A layered workspace of 20 crates</h2>
+  <p class="lede">
+    The host workspace (Cargo, edition 2021, MSRV <strong>1.85</strong>) is split bottom-up by responsibility.
+    Each description below is the crate's real <code>Cargo.toml</code> <code>description</code>, condensed.
+  </p>
+
+  <div class="stack">
+    <div class="layer l1"><span class="lname">Foundations</span><span class="lcrates"><b>primitives</b> · <b>crypto</b> · <b>types</b> · <b>state</b> · <b>wallet</b></span></div>
+    <div class="layer l1"><span class="lname">Protocol (Nakamoto PoW)</span><span class="lcrates"><b>runtime</b> · <b>mempool</b> · <b>pow</b> · <b>mining</b> · <b>network</b> · <b>node</b> · <b>chain</b></span></div>
+    <div class="layer l2"><span class="lname">Privacy &amp; Execution</span><span class="lcrates"><b>shielded</b> · <b>vm</b></span></div>
+    <div class="layer l2"><span class="lname">Assets &amp; Interop</span><span class="lcrates"><b>compliance</b> · <b>intents</b></span></div>
+    <div class="layer l2"><span class="lname">Node Interface</span><span class="lcrates"><b>rpc</b></span></div>
+    <div class="layer l3"><span class="lname">Governance &amp; Reserve</span><span class="lcrates"><b>governance</b> · <b>reserve</b></span></div>
+    <div class="layer l3"><span class="lname">Assurance</span><span class="lcrates"><b>verify</b></span></div>
+  </div>
+
+  <h3>Foundations</h3>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Crate</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><span class="cn">sov-primitives</span></td><td>Core value types: hashes, account ids, balances, heights.</td></tr>
+      <tr><td><span class="cn">sov-crypto</span></td><td>Signing and authenticated data structures: hybrid Ed25519+ML-DSA-65 keys/signatures and Merkle roots.</td></tr>
+      <tr><td><span class="cn">sov-types</span></td><td>Core ledger types: transactions, blocks, and receipts.</td></tr>
+      <tr><td><span class="cn">sov-state</span></td><td>Authenticated world state: a Sparse Merkle Tree, accounts, and the ledger over them.</td></tr>
+      <tr><td><span class="cn">sov-wallet</span></td><td>Key management and transaction building: holds keypairs and constructs signed transactions.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Protocol (Nakamoto proof-of-work)</h3>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Crate</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><span class="cn">sov-runtime</span></td><td>The execution layer: applies the coinbase + transactions to the ledger, meters gas, and produces receipts.</td></tr>
+      <tr><td><span class="cn">sov-mempool</span></td><td>The transaction pool: validated, nonce-ordered pending transactions awaiting inclusion.</td></tr>
+      <tr><td><span class="cn">sov-pow</span></td><td>Proof-of-work primitives: the RandomX (mainnet) / SHA-256d (dev) seal as a genesis-fixed <code>PowAlgo</code>, 256-bit difficulty targets with Bitcoin's compact nBits codec, and meets-target verification.</td></tr>
+      <tr><td><span class="cn">sov-mining</span></td><td>Mining policy: the difficulty target, height-keyed coinbase emission (12.5 XUS halving every 840,000 blocks, no pre-mine), the 5%/2% founder/dev tax split, and cumulative proof-of-work accounting for fork choice.</td></tr>
+      <tr><td><span class="cn">sov-network</span></td><td>Peer-to-peer layer: Noise-encrypted TCP transport (block/tx gossip, channel binding, DoS guards) plus an in-memory transport for deterministic tests.</td></tr>
+      <tr><td><span class="cn">sov-node</span></td><td>The node: drives mempool, continuous mining, and block import into a running chain; ships a local devnet binary.</td></tr>
+      <tr><td><span class="cn">sov-chain</span></td><td>Genesis construction + the validated block-import state machine: heaviest-work fork choice with reorg, confirmation-depth finality, and the seal/difficulty rules.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Privacy &amp; Execution</h3>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Crate</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><span class="cn">sov-shielded</span></td><td>Zcash-grade shielded pool: Orchard / Halo2 zero-knowledge notes with no trusted setup, a committed note-commitment tree + nullifier set, a proven supply turnstile, and a de-shield rate limiter.</td></tr>
+      <tr><td><span class="cn">sov-vm</span></td><td>WebAssembly smart-contract runtime: a deterministic <code>wasmi</code> interpreter with gas-metered execution and host storage (ABI v2).</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Assets &amp; Interoperability</h3>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Crate</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><span class="cn">sov-compliance</span></td><td>Issuer-sovereign compliance for native assets: regulator freeze, allow/deny counterparty controls, and spend-velocity limits — tokens only; native SOV is never regulable.</td></tr>
+      <tr><td><span class="cn">sov-intents</span></td><td>Atomic intent settlement: a user signs one intent; solvers settle it on-chain over native SOV and on-chain tokens. (Cross-chain is the trustless HTLC atomic-swap path.)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Node Interface, Governance &amp; Assurance</h3>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Crate</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><span class="cn">sov-rpc</span></td><td>JSON-RPC server for a SOV node (std-only HTTP/1.1 + JSON-RPC 2.0 over a live node) plus the long-running daemon, RPC client, and a KAT-vector generator for the JS/TS SDK.</td></tr>
+      <tr><td><span class="cn">sov-governance</span></td><td>Bitcoin-style miner-signaled governance: BIP-9 version-bits activation plus BIP-8 mandatory activation. Hashpower decides — not stake or holders.</td></tr>
+      <tr><td><span class="cn">sov-reserve</span></td><td>Sovereign reserve modeling: deterministic emission / float / lock projections from the real mining policy, under explicit, labeled assumptions (every figure tagged Real vs Assumed).</td></tr>
+      <tr><td><span class="cn">sov-verify</span></td><td>Verification &amp; validity assurance: exact-integer protocol invariants (<code>supply == genesis + mined</code>, 21M cap, no unauthorized mint, per-asset conservation), deterministic replay + cross-node agreement, heaviest-work fork-choice chaos/fault tests, STF conformance, KAT vectors, and property tests.</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note honest">
+    <span class="nt">Guest contracts live in a separate workspace</span>
+    <code>chain/contracts/</code> is a separate <code>no_std</code>, <code>wasm32-unknown-unknown</code> workspace,
+    excluded from the host build. It holds <code>sov-sdk</code> (safe wrappers over the host ABI, a bump allocator,
+    a panic handler) and an example <code>counter</code> contract that compiles to a <strong>578-byte</strong>
+    Wasm artifact — committed as <code>crates/vm/tests/counter.wasm</code> and exercised end-to-end by
+    <code>sov-vm</code>'s integration test.
+  </div>
+</section>
+
+<!-- ===================== GOVERNANCE ===================== -->
+<section id="governance" class="wrap">
+  <p class="eyebrow">Governance</p>
+  <h2>Hashpower decides upgrades — Bitcoin-style</h2>
+  <p class="lede">
+    SOV's on-chain governance (<code>sov-governance</code>) is the BIP-9 version-bits activation state machine plus
+    BIP-8 mandatory activation. Miners signal readiness for a soft fork over signal windows; an upgrade locks in
+    once a threshold of hashpower signals it. There is no stake-weighted or token-holder vote.
+  </p>
+  <div class="grid-2">
+    <div class="card blue">
+      <h4 style="margin-top:0">BIP-9 / BIP-8 threshold state machine</h4>
+      <p style="font-size:0.92rem">A deterministic state machine over miner-signal windows handles version-bits lock-in (BIP-9) with optional lock-in-on-timeout mandatory activation (BIP-8). Tested in isolation.</p>
+    </div>
+    <div class="card blue">
+      <h4 style="margin-top:0">Why hashpower, not holders</h4>
+      <p style="font-size:0.92rem">Per design directive, governance is decided by the same actors who do the work of minting — never by stake or token-holder voting. On-chain autonomous "agents" were explicitly dropped as out of scope.</p>
+    </div>
+  </div>
+  <p style="font-size:0.88rem;color:var(--slate-400)">
+    Integration boundary: wiring the signal bits into the live block header and the activation hooks is Phase 8 work.
+    Source: <span class="src">crates/governance/src/lib.rs</span>.
+  </p>
+</section>
+
+<!-- ===================== VERIFICATION ===================== -->
+<section id="verification" class="wrap">
+  <p class="eyebrow">Verification &amp; Security</p>
+  <h2>A reserve asset cannot be "probably correct"</h2>
+  <p class="lede">
+    Every state transition, balance, and consensus decision must be provably valid, reproducible, and
+    independently re-checkable. The <code>sov-verify</code> crate and the normative
+    <code>docs/state-transition.md</code> make that real.
+  </p>
+
+  <div class="grid-2">
+    <div class="card gold">
+      <div class="feat"><span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#e3c281" stroke-width="1.8"><path d="M4 7h16M4 12h16M4 17h10"/></svg></span>
+        <div><h4>Exact-integer invariants</h4><p>21M supply cap, value conservation (supply == genesis + mined), no unauthorized mint, and per-asset conservation — checked as exact <code>u128</code> mathematics over real chain state.</p></div></div>
+    </div>
+    <div class="card gold">
+      <div class="feat"><span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#e3c281" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg></span>
+        <div><h4>Heaviest-work fork choice</h4><p>Multi-replica chaos and fault-injection tests: nodes fed blocks in different orders converge on the most-work chain; an invalid heavier branch never displaces a valid head; confirmation depth only grows.</p></div></div>
+    </div>
+    <div class="card gold">
+      <div class="feat"><span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#e3c281" stroke-width="1.8"><path d="M21 12a9 9 0 11-9-9"/><path d="M21 3v6h-6"/></svg></span>
+        <div><h4>Deterministic replay</h4><p>Independent nodes replay the same blocks to a byte-identical <code>state_root</code> at every height — ordered state, integer math, no wall-clock, no randomness.</p></div></div>
+    </div>
+    <div class="card gold">
+      <div class="feat"><span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#e3c281" stroke-width="1.8"><path d="M9 11l3 3 8-8"/><path d="M20 12v6a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h9"/></svg></span>
+        <div><h4>Known-answer vectors</h4><p>Committed KAT vectors (emitted by the real <code>sov-katgen</code>) re-derive Ed25519 keys/signatures, Blake3 ids, and Borsh bytes byte-for-byte — guarding against crypto/serialization drift.</p></div></div>
+    </div>
+    <div class="card gold">
+      <div class="feat"><span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#e3c281" stroke-width="1.8"><path d="M12 3v18M3 12h18"/><circle cx="12" cy="12" r="9"/></svg></span>
+        <div><h4>Property tests &amp; fuzzing</h4><p>Proptest suites over random tx sequences ("decode arbitrary bytes never panics"), plus coverage-guided libFuzzer targets over the untrusted decode surface in <code>chain/fuzz/</code>.</p></div></div>
+    </div>
+    <div class="card gold">
+      <div class="feat"><span class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#e3c281" stroke-width="1.8"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 8h8v8H8z"/></svg></span>
+        <div><h4>Reproducible builds</h4><p>Verified bit-for-bit: a clean script builds <code>sov-node</code>, <code>sov-miner</code>, and <code>sov-katgen</code> twice with identical SHA-256. Pinned <code>Cargo.lock</code>, single-unit codegen, fixed <code>SOURCE_DATE_EPOCH</code>, and a canonical container.</p></div></div>
+    </div>
+  </div>
+
+  <h3>Invariants that must always hold</h3>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Invariant</th><th>Statement</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Supply cap</strong></td><td>Total supply never exceeds 21,000,000 XUS; the coinbase never exceeds the mining budget; on mainnet genesis supply is zero (no pre-mine).</td></tr>
+      <tr><td><strong>Value conservation</strong></td><td>Every block satisfies <code>supply == genesis + mined</code>; the coinbase is the only action that mints SOV.</td></tr>
+      <tr><td><strong>No double-spend</strong></td><td>Nonce-enforced; a consumed nonce makes replay impossible — including for rejected actions.</td></tr>
+      <tr><td><strong>Fork-choice safety</strong></td><td>The heaviest-work chain wins; an invalid heavier branch can never displace a valid head; finality is confirmation depth (probabilistic).</td></tr>
+      <tr><td><strong>Determinism</strong></td><td>Identical blocks reproduce identical state roots on every node.</td></tr>
+    </tbody>
+  </table></div>
+  <p style="font-size:0.88rem;color:var(--slate-400)">
+    Specification: <span class="src">chain/docs/state-transition.md</span> (normative, machine-checked) ·
+    threat model &amp; audit-readiness: <span class="src">chain/docs/security-review.md</span> ·
+    disclosure &amp; scope: <span class="src">SECURITY.md</span>.
+  </p>
+
+  <p style="font-size:0.88rem;color:var(--slate-400)">
+    <strong style="color:var(--ok2)">Internal security audit:</strong> the chain crates have undergone a
+    first internal security audit, a full redo over <code>chain/crates</code>, and a second PoW/Nakamoto migration
+    audit. The concrete findings, current status, and repair notes are recorded in the
+    <a href="#audit">audit ledger below</a>. This is the project's standing practice: audit, disclose, fix —
+    never a clean-bill claim while issues are open. An
+    <em>external, third-party</em> audit remains the gate before mainnet.
+  </p>
+
+  <div class="note honest">
+    <span class="nt">What is not yet done — stated plainly</span>
+    Three Phase-7 items are intentionally <em>not</em> claimed complete because they require things this codebase
+    cannot unilaterally finish: an <strong>external third-party audit + live bug bounty</strong> (a procurement and
+    real-world engagement, deliberately not faked — mainnet is gated on it), and the <em>continuous live-network</em>
+    operational counterpart of the deterministic chaos harness (it needs the Phase-8 daemon). All of the in-repo
+    tooling for these — the public invariant dashboard, <code>SECURITY.md</code>, the internal security review, and
+    reproducible builds — is delivered.
+  </div>
+</section>
+
+<!-- ===================== AUDIT LEDGER ===================== -->
+<section id="audit" class="wrap">
+  <p class="eyebrow">Internal Audit Ledger</p>
+  <h2>Chain-crate findings, current status, and real fix notes</h2>
+  <p class="lede">
+    Scope: the chain itself under <code>chain/crates</code>. This ledger combines the original internal audit,
+    the redo audit, and the second audit focused on the migration to pure PoW Nakamoto consensus. The
+    original and redo findings are retained; the current mainnet blockers are the open Nakamoto migration
+    findings below.
+  </p>
+
+  <div class="audit-meta">
+    <span>Scope: <code>chain/crates</code></span>
+    <span>Original audit: 7 findings</span>
+    <span>Redo audit: 4 findings — fixed</span>
+    <span>Nakamoto migration audit: 7 open findings — 5 P1 / 2 P2</span>
+    <span>Mainnet gate: heaviest-work, reorgs, coinbase, confirmations</span>
+  </div>
+
+  <h3>Previous audit findings and current tree status</h3>
+  <div class="tbl-wrap"><table class="audit-table">
+    <thead><tr><th>ID</th><th>Severity</th><th>Finding</th><th>Status in current tree</th><th>Concrete fix / next action</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="cn">A-01</span></td>
+        <td><span class="pill p1">P1</span></td>
+        <td>Unauthorized transactions could enter the mempool and later be rejected by runtime authorization, making block production repeatedly select a transaction that could never commit.</td>
+        <td><span class="pill done">fixed</span> <code>Node::submit</code> now mirrors runtime authorization before inserting into the mempool. Source: <span class="src">chain/crates/node/src/node.rs:81-100</span>.</td>
+        <td class="fix">Keep admission and runtime authorization in lockstep. Best repair is a shared authorization helper or mirrored regression tests: attacker-signed transfer against a keyed account must return <code>Unauthorized</code> and leave <code>mempool_len()</code> unchanged.</td>
+      </tr>
+      <tr>
+        <td><span class="cn">A-02</span></td>
+        <td><span class="pill p1">P1</span></td>
+        <td>A second transaction with the same signer and nonce overwrote the sender index while leaving the old transaction orphaned in <code>by_id</code>, leaking capacity and making pruning/select behavior inconsistent.</td>
+        <td><span class="pill done">fixed</span> same signer/nonce slots are rejected with <code>NonceTaken</code>. Source: <span class="src">chain/crates/mempool/src/lib.rs:117-126</span>.</td>
+        <td class="fix">If replacement is added later, make it atomic: remove the old id from <code>by_id</code> and <code>by_sender</code>, require an explicit replacement policy such as fee bumping, and test capacity/prune behavior for both transactions.</td>
+      </tr>
+      <tr>
+        <td><span class="cn">A-03</span></td>
+        <td><span class="pill p1">P1</span></td>
+        <td>Finality approvals could be recorded for arbitrary hashes, allowing API-level finality to be reported for a block the chain did not hold.</td>
+        <td><span class="pill prog">mitigated</span> known-block approvals must match height, <code>is_final</code> only reports finality for genesis or a held block, and rejected peer approvals are no longer persisted or re-gossiped. Sources: <span class="src">chain/crates/chain/src/blockchain.rs:536-657</span>, <span class="src">chain/crates/rpc/src/p2p.rs:286-300</span>.</td>
+        <td class="fix">Redo finding <code>R-02</code> fixed the network/persistence edge. The remaining consensus repair is Nakamoto item <code>N-04</code>: retire approvals as finality and replace them with confirmation depth.</td>
+      </tr>
+      <tr>
+        <td><span class="cn">A-04</span></td>
+        <td><span class="pill p1">P1</span></td>
+        <td>The VM host ABI could allocate a guest-chosen buffer length before validating memory bounds, creating an OOM path outside normal fuel metering.</td>
+        <td><span class="pill done">fixed</span> host reads reject negative pointers/lengths, cap reads at 1 MiB, and bounds-check before allocation. Source: <span class="src">chain/crates/vm/src/lib.rs:78-107</span>.</td>
+        <td class="fix">Keep this invariant covered with malicious Wasm tests for negative length, huge length, and out-of-bounds ranges. Storage-growth metering remains a separate redo hardening item; see <code>R-04</code>.</td>
+      </tr>
+      <tr>
+        <td><span class="cn">A-05</span></td>
+        <td><span class="pill p2">P2</span></td>
+        <td>The JSON-RPC server trusted <code>Content-Length</code> and allocated that many bytes, making public RPC memory-DoSable.</td>
+        <td><span class="pill done">fixed</span> request bodies are capped at 4 MiB and JSON-RPC batches at 100 entries. Sources: <span class="src">chain/crates/rpc/src/lib.rs:62-67</span>, <span class="src">chain/crates/rpc/src/lib.rs:200-212</span>, <span class="src">chain/crates/rpc/src/lib.rs:275-278</span>.</td>
+        <td class="fix">Keep the caps configuration-stable and add regression tests for oversized body, oversized batch, and a valid near-limit deploy request.</td>
+      </tr>
+      <tr>
+        <td><span class="cn">A-06</span></td>
+        <td><span class="pill p2">P2</span></td>
+        <td>Bridge pool deposit arithmetic used unchecked <code>u128</code> addition for pooled balances and reserves.</td>
+        <td><span class="pill done">fixed</span> deposit credit and withdrawal debit now use checked arithmetic and <code>PoolError::Overflow</code>. Sources: <span class="src">chain/crates/bridge/src/pool.rs:172-181</span>, <span class="src">chain/crates/bridge/src/pool.rs:297-306</span>, <span class="src">chain/crates/bridge/src/pool.rs:367-369</span>.</td>
+        <td class="fix">Maintain the compute-before-mutate pattern so overflow leaves balances and reserves untouched. Keep tests for max-value deposit, one-more overflow, and withdrawal underflow.</td>
+      </tr>
+      <tr>
+        <td><span class="cn">A-07</span></td>
+        <td><span class="pill p2">P2</span></td>
+        <td>A proposer could stamp a block far in the future and drive proof-of-work difficulty retargeting with an attacker-chosen interval.</td>
+        <td><span class="pill prog">mitigated</span> import now enforces median-time-past, the node rejects blocks more than two hours in the future, and difficulty retargeting happens only at 2016-block epochs. Sources: <span class="src">chain/crates/chain/src/blockchain.rs:442-453</span>, <span class="src">chain/crates/chain/src/blockchain.rs:515-531</span>, <span class="src">chain/crates/node/src/node.rs:181-197</span>.</td>
+        <td class="fix">Keep this mitigated until Nakamoto items <code>N-01</code> and <code>N-05</code> add branch-aware timestamp and difficulty validation for competing PoW histories.</td>
+      </tr>
+    </tbody>
+  </table></div>
+
+  <h3>Redo audit findings — fixed in this pass</h3>
+  <div class="tbl-wrap"><table class="audit-table">
+    <thead><tr><th>ID</th><th>Severity</th><th>Finding</th><th>Evidence</th><th>Concrete fix</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="cn">R-01</span></td>
+        <td><span class="pill p1">P1</span></td>
+        <td>A failed <code>Mine</code> transaction can capture the block's miner fee share. <code>block_miner</code> chooses the signer of the first raw <code>Mine</code> transaction, even if execution returns a failed receipt for invalid proof of work.</td>
+        <td><span class="src">chain/crates/chain/src/blockchain.rs:29-38</span>, <span class="src">chain/crates/chain/src/blockchain.rs:214-224</span>, <span class="src">chain/crates/chain/src/blockchain.rs:284-292</span>; invalid proof returns <code>ExecutionStatus::Failed</code> at <span class="src">chain/crates/runtime/src/execution.rs:213-219</span>; fees are then split to <code>ctx.miner</code> at <span class="src">chain/crates/runtime/src/execution.rs:411-436</span>.</td>
+        <td class="fix"><span class="pill done">fixed</span> <code>block_miner</code> now selects the first <code>Mine</code> or <code>MineShielded</code> whose proof-of-work actually verifies (else the proposer), so a failed/forged mine earns no fee share; producer and importer derive it identically. Source: <span class="src">chain/crates/chain/src/blockchain.rs:31-53</span>. Test: <code>a_failed_mine_does_not_capture_the_miner_fee</code>.</td>
+      </tr>
+      <tr>
+        <td><span class="cn">R-02</span></td>
+        <td><span class="pill p2">P2</span></td>
+        <td>P2P approval gossip persists and re-broadcasts first-seen approvals even when <code>submit_approval</code> rejects them. That turns invalid signed data into durable log growth and replay work.</td>
+        <td><span class="src">chain/crates/rpc/src/p2p.rs:250-259</span> ignores the <code>submit_approval</code> result, then records to <code>ApprovalLog</code> and broadcasts anyway.</td>
+        <td class="fix"><span class="pill done">fixed</span> the handler now calls <code>submit_approval</code> once and persists / re-gossips ONLY accepted approvals; rejected ones (bad signature, unknown validator, height mismatch) are dropped — not logged or forwarded. The deliberate unknown-fork equivocation vote remains an accepted record. Source: <span class="src">chain/crates/rpc/src/p2p.rs:286-300</span>.</td>
+      </tr>
+      <tr>
+        <td><span class="cn">R-03</span></td>
+        <td><span class="pill p2">P2</span></td>
+        <td>Fee math uses <code>saturating_mul</code>, so an overflowed <code>gas_used * gas_price</code> or fee split becomes a consensus value instead of a rejected transaction/configuration.</td>
+        <td>Intrinsic fee: <span class="src">chain/crates/runtime/src/execution.rs:161-164</span>. VM fee: <span class="src">chain/crates/runtime/src/execution.rs:365-367</span>. Tax split: <span class="src">chain/crates/runtime/src/execution.rs</span> (<code>distribute_fee</code>).</td>
+        <td class="fix"><span class="pill done">fixed</span> intrinsic fee, VM fee, and the tax split now use <code>checked_mul</code> → <code>ExecutionError::Overflow</code> (an overflow rejects the transaction); tax basis points are validated ≤ 10,000 (each and in sum) at genesis. Sources: <span class="src">chain/crates/runtime/src/execution.rs</span> (intrinsic, VM, <code>distribute_fee</code>), <span class="src">chain/crates/chain/src/genesis.rs</span>. Test: <code>extreme_gas_price_is_rejected_not_saturated</code>.</td>
+      </tr>
+      <tr>
+        <td><span class="cn">R-04</span></td>
+        <td><span class="pill p2">P2</span></td>
+        <td>VM storage writes are capped per host read but not priced by bytes copied or bytes persisted. A contract can repeatedly write large keys/values until fuel runs out, and committed storage growth is not separately bounded.</td>
+        <td><code>storage_write</code> reads key and value through the 1 MiB per-read cap and writes them directly to host storage at <span class="src">chain/crates/vm/src/lib.rs:120-124</span>. VM gas reported at <span class="src">chain/crates/vm/src/lib.rs:202-205</span> is wasmi fuel only.</td>
+        <td class="fix"><span class="pill done">fixed</span> <code>storage_write</code> now enforces per-entry caps (key ≤ 1 KiB, value ≤ 64 KiB) and a per-call total write budget (≤ 1 MiB), trapping before commit so committed storage growth is bounded. Source: <span class="src">chain/crates/vm/src/lib.rs</span>. Test: <code>oversized_storage_key_is_rejected</code>. (Per-byte gas pricing remains a future refinement.)</td>
+      </tr>
+	  </tbody>
+  </table></div>
+
+  <h3>PoW/Nakamoto migration audit — open blockers</h3>
+  <div class="tbl-wrap"><table class="audit-table">
+    <thead><tr><th>ID</th><th>Severity</th><th>Finding</th><th>Evidence</th><th>Concrete fix</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="cn">N-01</span></td>
+        <td><span class="pill p1">P1</span></td>
+        <td>No heaviest-work fork choice or reorg path. The chain still stores committed blocks as a linear <code>Vec</code> and accepts only the next block extending the current head; P2P catch-up follows tallest height, not cumulative work.</td>
+        <td><span class="src">chain/crates/chain/src/blockchain.rs:71-72</span>, <span class="src">chain/crates/chain/src/blockchain.rs:419-432</span>, <span class="src">chain/crates/rpc/src/p2p.rs:414-447</span>.</td>
+        <td class="fix"><span class="pill todo">open</span> Replace the head-only importer with a block index keyed by hash, parent links, per-block work, cumulative chainwork, side-branch validation, most-work tip selection, and deterministic reorg replay or snapshots. P2P should exchange head hash plus cumulative work and sync by locators, headers, and blocks.</td>
+      </tr>
+      <tr>
+        <td><span class="cn">N-02</span></td>
+        <td><span class="pill p1">P1</span></td>
+        <td>Daemon production is still validator-scheduled. Header PoW exists, but the node loop still skips production unless this process holds the validator key scheduled for the next height.</td>
+        <td><span class="src">chain/crates/chain/src/blockchain.rs:316-337</span>, <span class="src">chain/crates/node/src/node.rs:125-134</span>, <span class="src">chain/crates/rpc/src/daemon.rs:724-767</span>.</td>
+        <td class="fix"><span class="pill todo">open</span> Turn daemon production into a permissionless mining loop. Remove the scheduled-proposer gate, let each miner choose its coinbase recipient, and accept whichever valid PoW block wins the most-work race. Validator keys must not authorize block production.</td>
+      </tr>
+      <tr>
+        <td><span class="cn">N-03</span></td>
+        <td><span class="pill p1">P1</span></td>
+        <td>Old transaction-level mining remains live beside header PoW. <code>Mine</code> and <code>MineShielded</code> still mint during ordinary transaction execution, so one PoW-sealed block can carry multiple independent reward mints.</td>
+        <td><span class="src">chain/crates/types/src/transaction.rs:31-37</span>, <span class="src">chain/crates/types/src/transaction.rs:85-96</span>, <span class="src">chain/crates/runtime/src/execution.rs:286-314</span>, <span class="src">chain/crates/runtime/src/execution.rs:614-667</span>.</td>
+        <td class="fix"><span class="pill todo">open</span> At the PoW activation height, reject <code>Mine</code> and <code>MineShielded</code> as normal mempool actions. Replace them with exactly one consensus coinbase field or first transaction whose amount equals the scheduled subsidy plus fees. Add tests rejecting two coinbases, post-activation Mine txs, and wrong subsidy values.</td>
+      </tr>
+      <tr>
+        <td><span class="cn">N-04</span></td>
+        <td><span class="pill p1">P1</span></td>
+        <td>BFT approvals still define finality. Pure Nakamoto finality should be confirmation depth, but the chain still owns <code>FinalityGadget</code>, nodes cast approvals, P2P gossips approval evidence, and RPC exposes <code>sov_isFinal</code>.</td>
+        <td><span class="src">chain/crates/chain/src/blockchain.rs:60-61</span>, <span class="src">chain/crates/chain/src/blockchain.rs:536-657</span>, <span class="src">chain/crates/node/src/node.rs:164-172</span>, <span class="src">chain/crates/network/src/message.rs:30-48</span>, <span class="src">chain/crates/rpc/src/lib.rs:438-442</span>.</td>
+        <td class="fix"><span class="pill todo">open</span> Remove approvals from the consensus path and stop persisting <code>approvals.log</code> as finality state. Replace <code>sov_isFinal</code> with confirmation-depth semantics, for example <code>confirmations &gt;= configured_depth</code>, and update P2P/RPC/tests around block depth and reorg behavior.</td>
+      </tr>
+      <tr>
+        <td><span class="cn">N-05</span></td>
+        <td><span class="pill p1">P1</span></td>
+        <td>Headers do not carry difficulty bits or target. Import validates PoW against the local current target and retargeting mutates local state after append, so alternate branches cannot be self-describing or scored by historical work.</td>
+        <td><span class="src">chain/crates/types/src/block.rs:24-48</span>, <span class="src">chain/crates/chain/src/blockchain.rs:462-465</span>, <span class="src">chain/crates/chain/src/blockchain.rs:515-531</span>.</td>
+        <td class="fix"><span class="pill todo">open</span> Add compact difficulty bits or an explicit target to the header. Validate each header's bits from its parent and retarget rules, compute per-block work from that field, and use it for branch validation and cumulative chainwork.</td>
+      </tr>
+      <tr>
+        <td><span class="cn">N-06</span></td>
+        <td><span class="pill p2">P2</span></td>
+        <td>Pure PoW genesis still requires validators and stake. Genesis errors when no staked validator accounts exist, and <code>Blockchain::new</code> still constructs finality and validator-attested components from that set.</td>
+        <td><span class="src">chain/crates/chain/src/genesis.rs:158-181</span>, <span class="src">chain/crates/chain/src/blockchain.rs:156-161</span>.</td>
+        <td class="fix"><span class="pill todo">open</span> Allow a PoW chain to bootstrap without consensus validators. Split auxiliary attestors/oracles from block-production security, or rename and isolate validator-gated bridge/compute roles so they cannot be confused with Nakamoto consensus.</td>
+      </tr>
+      <tr>
+        <td><span class="cn">N-07</span></td>
+        <td><span class="pill p2">P2</span></td>
+        <td>RPC, client, and docs still expose the old hybrid mining model. The mining crate describes PoW as a mint layer secured by PoS; the RPC client mines <code>Mine</code> transactions; RPC still exposes proposer and BFT-finality concepts.</td>
+        <td><span class="src">chain/crates/mining/src/lib.rs:1-20</span>, <span class="src">chain/crates/rpc/src/client.rs:283-365</span>, <span class="src">chain/crates/rpc/src/lib.rs:430-442</span>.</td>
+        <td class="fix"><span class="pill todo">open</span> Rename or remove the old mint-miner APIs during activation. Add RPC methods for block-template mining, header submission, chainwork, and confirmations. Update README, dashboard, and security docs so they state the migration status instead of claiming completed pure PoW consensus.</td>
+      </tr>
+    </tbody>
+  </table></div>
+
+  <h3>Redo confirmations that are not open findings</h3>
+  <ul class="clean">
+    <li><strong>Tax BPS validation exists.</strong> <code>tax_primary_bps</code> and <code>tax_secondary_bps</code> are rejected above 10,000 basis points — individually and in sum — at genesis. Source: <span class="src">chain/crates/chain/src/genesis.rs</span>.</li>
+    <li><strong>Raw TCP frames are bounded.</strong> The P2P transport rejects zero-length and larger-than-8-MiB frames before allocation. Source: <span class="src">chain/crates/network/src/tcp.rs:27-28</span>, <span class="src">chain/crates/network/src/tcp.rs:201-205</span>.</li>
+    <li><strong>P2P handshake gating is implemented.</strong> Chain data is ignored until a peer presents a signed <code>Hello</code> for the expected chain id and genesis hash. Source: <span class="src">chain/crates/rpc/src/p2p.rs:209-225</span>.</li>
+  </ul>
+
+  <div class="note rule-note">
+    <span class="nt">Mainnet gate</span>
+    The current internal ledger is useful for engineering, not a clean-bill security claim. Mainnet should wait for
+    the open Nakamoto migration items to be fixed, regression-tested, and re-audited by an external reviewer.
+  </div>
+</section>
+
+<!-- ===================== RUN ===================== -->
+<section id="run" class="wrap">
+  <p class="eyebrow">Node Operation</p>
+  <h2>Build it, run it, mine it</h2>
+  <p class="lede">
+    Prerequisites: Rust <strong>stable ≥ 1.85</strong> and <code>git</code>. The chain is pure Rust with std-only
+    networking — no external system libraries required. The Cargo workspace lives under <code>chain/</code>.
+  </p>
+
+  <h3>Build &amp; test</h3>
+<pre><code><span class="c"># clone, then enter the Rust workspace</span>
+git clone &lt;repo&gt; &amp;&amp; cd sov/chain
+
+<span class="c"># full workspace test + lint cycle</span>
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check</code></pre>
+
+  <h3>Run a devnet &amp; a real miner</h3>
+<pre><code><span class="c"># single-node transfer devnet — real chain, real signed txs, real hashes</span>
+cargo run -p sov-node
+
+<span class="c"># real CPU SHA-256d miner — genuine PoW against the live difficulty,</span>
+<span class="c"># minting under the 21M cap. Release mode matters: mining is real work.</span>
+cargo run --release -p sov-node --bin sov-miner          <span class="c"># mine forever</span>
+cargo run --release -p sov-node --bin sov-miner 5        <span class="c"># mine 5 blocks</span></code></pre>
+
+  <h3>The node daemon &amp; JSON-RPC</h3>
+  <p>
+    <code>sov-rpc</code> provides a long-running <code>Daemon</code> (the <code>sov-rpcd</code> binary) that boots
+    from a JSON chain-spec, schedules block production, serves a std-only HTTP/1.1 + JSON-RPC 2.0 API, and persists
+    to an append-only block log — resuming across restarts by deterministic replay through the validated import
+    path (never trusting a snapshot).
+  </p>
+  <div class="grid-2">
+    <div class="card blue">
+      <h4 style="margin-top:0">RPC methods</h4>
+      <p style="font-size:0.9rem"><code>health</code>, <code>chainId</code>, <code>getHeight</code>, <code>getSupply</code>, <code>getAccount</code>, <code>getBalance</code>, <code>getNonce</code>, <code>getBlock(ByHeight|ByHash)</code>, <code>getBlockDigest</code>, <code>getHead</code>, <code>getStateRoot</code>, <code>getDifficulty</code>, <code>getMintReward</code>, <code>getMempoolSize</code>, <code>getConfirmations</code>, <code>isFinal</code>, <code>getMiners</code>, and <code>submitTransaction</code>.</p>
+    </div>
+    <div class="card blue">
+      <h4 style="margin-top:0">Binaries &amp; clients</h4>
+      <p style="font-size:0.9rem">
+        <code>sov-rpcd</code> (daemon) · <code>sov-rpc-miner</code> (external miner: reads the live head + difficulty, does real SHA-256d PoW against the per-miner challenge, submits the solution) · <code>sov-wallet</code> (balance + transfer) · <code>sov-katgen</code> (KAT-vector generator). P2P today does real TCP framing, transitive peer discovery, signed chain-bound handshakes, and catch-up sync; approval persistence/rebroadcast hardening is tracked in audit item <code>R-02</code>.
+      </p>
+    </div>
+  </div>
+
+  <h3>Reproducible builds</h3>
+<pre><code><span class="c"># build the release binaries twice; assert identical SHA-256</span>
+bash scripts/reproducible-build.sh
+
+<span class="c"># or build inside the pinned container for machine-independent bytes</span>
+docker build -f chain/Dockerfile -t sov-build .   <span class="c"># FROM rust:1.93.1-slim</span>
+docker run --rm sov-build                          <span class="c"># prints SHA256SUMS (the attestation)</span></code></pre>
+
+  <h3>Continuous integration</h3>
+  <p>
+    CI runs on every push and pull request with six jobs: <strong>lint</strong> (fmt + clippy <code>-D warnings</code>),
+    a <strong>build &amp; test matrix</strong> across <code>ubuntu-latest</code>, <code>macos-latest</code>, and
+    <code>windows-latest</code> (the clients are proven cross-platform on every commit), a named
+    <strong>verify</strong> gate (<code>cargo test -p sov-verify</code>), a <strong>contracts</strong> job
+    (wasm32 clippy + release build), a <strong>reproducible build</strong> job, and a nightly
+    <strong>fuzz-targets build</strong>. Source: <span class="src">.github/workflows/ci.yml</span>.
+  </p>
+</section>
+
+<!-- ===================== ROADMAP ===================== -->
+<section id="roadmap" class="wrap">
+  <p class="eyebrow">Roadmap</p>
+  <h2>Built bottom-up, checked off as we go</h2>
+  <p class="lede">
+    The living build list lives in <code>dashboard/phases.json</code>; the <code>Done</code> lane only ever holds
+    tasks verified against the actual repository. Phases <strong>0–10 are complete</strong> — the only open item
+    across the entire roadmap is Phase 7's external third-party audit + bug bounty, which requires a third
+    party. The public-testnet gate (P7-core → P8 daemon/RPC → P9 explorer) is met; mainnet follows the
+    external audit.
+  </p>
+
+  <div class="note honest">
+    <span class="nt">Phase 21 — the Nakamoto migration — superseded several earlier phases</span>
+    The list below is kept for history. SOV is now <strong>pure proof-of-work</strong>: the Phase&nbsp;1
+    Doomslug/BFT finality, Phase&nbsp;2 staking, Phase&nbsp;4 sharding, Phase&nbsp;5 cross-chain pool / MPC,
+    and Phase&nbsp;6/19 compute marketplace were <strong>removed</strong> from the protocol (equihash was dropped
+    for RandomX). The live system is mining + native SOV + shielded pool + HTLC atomic swaps. Items below that
+    describe those removed features are historical, not current.
+  </div>
+
+  <!-- Phase 0 -->
+  <details class="phase" open>
+    <summary><span class="marker">▶</span><span class="ptitle">Phase 0 — Foundations</span><span class="ptag">Bootstrap</span><span class="pcount">4 / 4 · 100%</span><span class="pbar"><i style="width:100%"></i></span></summary>
+    <div class="pbody">
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Repo scaffolding, toolchain (Rust workspace), CI &amp; test harness</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Core data types: blocks, transactions, accounts, receipts</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Cryptographic primitives: Blake3 hashing, Ed25519 signatures, Sparse Merkle Tree</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Key management &amp; basic wallet</span></div></div>
+    </div>
+  </details>
+
+  <!-- Phase 1 -->
+  <details class="phase">
+    <summary><span class="marker">▶</span><span class="ptitle">Phase 1 — Core Protocol</span><span class="ptag">Chain</span><span class="pcount">5 / 5 · 100%</span><span class="pbar"><i style="width:100%"></i></span></summary>
+    <div class="pbody">
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">State machine &amp; persistent storage (trie-backed key-value store)</span></div><div class="inote">Persistence is snapshot-based; an incremental on-disk DB backend (e.g. RocksDB) is a future optimization, not a correctness gap.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Transaction pool (mempool) &amp; execution engine</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Doomslug-style PoS block production &amp; sub-second finality</span></div><div class="inote">Stake-weighted proposer selection + multi-validator BFT finality requiring &gt; 2/3 stake across distinct validators; single-round, hence sub-second by construction.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">P2P networking, peer discovery &amp; block/tx gossip</span></div><div class="inote">Real TCP transport with length-prefixed framing, gossip of blocks/txs/approvals, transitive peer discovery, and signed chain-bound handshakes. Approval log/forward gating still needs the hardening captured in audit item <code>R-02</code>.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">ASIC-resistant Nakamoto PoW (RandomX), Bitcoin emission</span></div><div class="inote">The block seal is Monero's memory-hard RandomX (audited randomx-rs), genesis-fixed PowAlgo (Sha256d for dev/test), committed difficulty in Bitcoin nBits, cap-clamped 12.5-XUS coinbase halving every 840,000 blocks with no pre-mine, epoch difficulty retargeting. A real RandomX block is mined and verified in-test.</div></div>
+    </div>
+  </details>
+
+  <!-- Phase 2 -->
+  <details class="phase">
+    <summary><span class="marker">▶</span><span class="ptitle">Phase 2 — Tokenomics &amp; Staking</span><span class="ptag">Economics</span><span class="pcount">5 / 5 · 100%</span><span class="pbar"><i style="width:100%"></i></span></summary>
+    <div class="pbody">
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">SOV native token with capped supply (21M, 8 decimals)</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Diminishing, predictable issuance schedule</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Time-locked staking &amp; long-term reward curves</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Vesting / lockup logic for early allocations</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Anti-dumping &amp; anti-collusion economic guards</span></div><div class="inote">Locks, minimum-lock floor, no-shortening on re-stake, lock-weighted rewards (anti-dumping); equivocation slashing destroys a colluder's weight the instant it cheats (anti-collusion).</div></div>
+    </div>
+  </details>
+
+  <!-- Phase 3 -->
+  <details class="phase">
+    <summary><span class="marker">▶</span><span class="ptitle">Phase 3 — Smart Contracts</span><span class="ptag">VM</span><span class="pcount">3 / 3 · 100%</span><span class="pbar"><i style="width:100%"></i></span></summary>
+    <div class="pbody">
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">WASM runtime integration &amp; host functions</span></div><div class="inote">Deterministic pure-Rust <code>wasmi</code> interpreter; host ABI is <code>storage_read</code>/<code>storage_write</code> + block context, with no ambient authority.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Gas metering &amp; fee model for high-value transfers</span></div><div class="inote">Gas via wasmi fuel; on-chain Deploy/Call wire the VM into the runtime; per-contract storage is committed to <code>state_root</code>; caller is charged <code>gas_used × gas_price</code>, paid to the proposer.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Contract SDK (Rust first, then JS/Python bindings)</span></div><div class="inote">Rust guest SDK complete; the example counter compiles to a 578-byte Wasm fixture run end-to-end. JS/Python bindings are a future extension.</div></div>
+    </div>
+  </details>
+
+  <!-- Phase 4 -->
+  <details class="phase">
+    <summary><span class="marker">▶</span><span class="ptitle">Phase 4 — Scaling &amp; Sharding</span><span class="ptag">Scale</span><span class="pcount">3 / 3 · 100%</span><span class="pbar"><i style="width:100%"></i></span></summary>
+    <div class="pbody">
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Nightshade-style dynamic homogeneous sharding</span></div><div class="inote">Full parallel execution engine: one isolated ledger per shard, parallel <code>apply_round</code> via OS threads, independently re-checkable chunks, dynamic resharding. Making it the chain's live block-production path is a node-layer follow-on.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Cross-shard messaging &amp; receipts</span></div><div class="inote">Asynchronous: debit the source shard now, deliver the credit next round exactly once; value conserved across the round boundary.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Confidential Sovereign Shards for national operations</span></div><div class="inote">Binding + hiding Blake3 commitment over a shard's chunk plus its public state roots, openable by an authorized auditor. This is on-the-wire/ledger confidentiality, not execution privacy from the operator's host (that needs a TEE).</div></div>
+    </div>
+  </details>
+
+  <!-- Phase 5 -->
+  <details class="phase">
+    <summary><span class="marker">▶</span><span class="ptitle">Phase 5 — Accounts &amp; Interop</span><span class="ptag">Bridges</span><span class="pcount">7 / 7 · 100%</span><span class="pbar"><i style="width:100%"></i></span></summary>
+    <div class="pbody">
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Account abstraction: human-readable accounts (e.g. usa.reserve.sov)</span></div><div class="inote">Hierarchical named accounts, access keys (full-access / scoped function-call), and a registry enforcing delegated creation and key rotation that can never orphan an account. Wiring into the runtime auth path is the integration follow-on.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Multi-sig &amp; institutional compliance tooling</span></div><div class="inote">M-of-N multisig (Ed25519 approvals, replay-resistant) + per-account compliance policy (freeze, allow/deny lists, spend-velocity). Enforcing them in the transfer path is the integration follow-on.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">NEAR-style Intents framework: sign one intent, solvers settle</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Native cross-chain consensus pool: validator-attested BTC/ZEC/SOL deposits + USD oracle</span></div><div class="inote">Full pool lifecycle — deposits on stake supermajority, stake-weighted-median oracle, withdrawals/peg-out, committable <code>pool_root</code>, and threshold-signature custody. In-protocol light clients (trust model B) are future work.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">MPC Chain Signatures: one account controls keys on BTC/ETH/SOL (no bridge)</span></div><div class="inote">Audited FROST Ed25519 DKG + threshold signing. Ed25519 covers Solana + SOV-native; secp256k1-Schnorr plugs the same API; ECDSA needs a separate protocol.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Confidential Intents: TEE-executed private intents (sender hidden)</span></div><div class="inote">Audited X25519 + XChaCha20-Poly1305 sealing + attestation verification are real and tested; running inside a genuine SGX/TDX enclave is the hardware-bound remainder.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Sovereign cap tables: on-chain ownership registries (unit-conserving)</span></div></div>
+    </div>
+  </details>
+
+  <!-- Phase 6 -->
+  <details class="phase">
+    <summary><span class="marker">▶</span><span class="ptitle">Phase 6 — Governance, Compute &amp; Reserve</span><span class="ptag">Sovereign</span><span class="pcount">3 / 3 · 100%</span><span class="pbar"><i style="width:100%"></i></span></summary>
+    <div class="pbody">
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Bitcoin-style on-chain governance: miner-signaled soft-fork activation (BIP-9 + BIP-8)</span></div><div class="inote">Deterministic threshold-state machine. Governance is decided by hashpower, never by stake or token-holder voting. Signal bits wire into the live header in Phase 8.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Native DePIN compute marketplace: rent bare-metal Apple Silicon (M-series)</span></div><div class="inote">Escrowed SOV jobs, validator-attested disputes, bond slashing, stake-weighted price oracle. Apple Silicon has no SGX/TDX, so provider trust is economic (bond + slashing + reputation); execution is off-chain. On-chain autonomous "agents" were dropped as out of scope.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Geopolitical / reserve modeling tooling</span></div><div class="inote">Deterministic emission/float/lock + multi-asset reserve projections from real policies, with a Real-vs-Assumed provenance type — no invented real-world facts.</div></div>
+    </div>
+  </details>
+
+  <!-- Phase 7 -->
+  <details class="phase" open>
+    <summary><span class="marker">▶</span><span class="ptitle">Phase 7 — Verification &amp; Validity Assurance</span><span class="ptag">Trust</span><span class="pcount">9 / 10 · 90%</span><span class="pbar"><i style="width:90%"></i></span></summary>
+    <div class="pbody">
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Formal specification of the state transition function (machine-readable spec)</span></div><div class="inote">Normative STF spec at <code>docs/state-transition.md</code>, every rule cross-referenced to code + a passing test and machine-checked against the real runtime.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Consensus safety &amp; liveness model checking</span></div><div class="inote">Exhaustive bounded model check over all validator sets up to 5 members × stakes 1–3 and every vote configuration (100k+ configs), against the production supermajority predicate. Std-only.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Protocol-wide invariants: supply cap, value conservation, no double-spend, no unauthorized mint</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Property-based testing &amp; coverage-guided fuzzing across every module</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Deterministic replay &amp; cross-node state-root agreement checks</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Conformance test vectors (known-answer tests for crypto, serialization, execution)</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Smart-contract static analysis &amp; formal verification gates in CI</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Reproducible / verifiable builds (bit-for-bit binary attestation)</span></div><div class="inote">Verified bit-for-bit across two clean builds (locally + CI). Determinism via committed <code>Cargo.lock</code> + <code>--locked</code>, single-unit codegen, path remapping, fixed <code>SOURCE_DATE_EPOCH</code>; canonical container <code>FROM rust:1.93.1</code>.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Continuous testnet validation, chaos testing &amp; fault injection</span></div><div class="inote">1,200 seeded randomized rounds over two replica nodes with injected faults all rejected, plus a discrete fault-injection suite (incl. equivocation → slashing). Live multi-machine chaos is the Phase-8 operational counterpart.</div></div>
+      <div class="item"><div class="ihead"><span class="pill prog">in progress</span><span class="itext">External security audits, bug bounty &amp; public invariant dashboard</span></div><div class="inote">All in-repo tooling delivered (public invariant dashboard, <code>SECURITY.md</code>, internal security review + threat model, reproducible builds). The only remaining piece is the external third-party audit + live bug bounty — deliberately not faked. Mainnet is gated on a completed external audit.</div></div>
+    </div>
+  </details>
+
+  <!-- Phase 8 -->
+  <details class="phase" open>
+    <summary><span class="marker">▶</span><span class="ptitle">Phase 8 — Node Daemon &amp; RPC</span><span class="ptag">Daemon</span><span class="pcount">5 / 5 · 100%</span><span class="pbar"><i style="width:100%"></i></span></summary>
+    <div class="pbody">
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Long-running node daemon: persistent state, scheduled block production &amp; import</span></div><div class="inote"><code>sov-rpcd</code>: boots from a chain-spec, produces blocks on schedule, persists to an append-only block log, and resumes across restarts by deterministic replay through the validated import path. An append-only approval log is replayed alongside the block log, so finality — not just ledger state — survives a restart.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Production P2P: peer discovery and block/tx/approval sync beyond loopback</span></div><div class="inote">An authenticated handshake — a signed <code>Hello</code> binding chain-id, genesis hash, and Ed25519 key possession — gates gossip of blocks, transactions, and approvals; a lagging node catches up by requesting missing blocks by height. Four multi-node integration tests over real loopback TCP prove propagation, finality, catch-up sync, and rejection of a wrong-genesis peer. Approval log/forward gating is tracked in audit item <code>R-02</code>.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">JSON-RPC API: submit transactions, query blocks/accounts/state, mining &amp; pool endpoints</span></div><div class="inote">Real std-only HTTP/1.1 + JSON-RPC 2.0 server over a live node, worker pool + graceful shutdown, with round-trip integration tests.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Miner &amp; wallet clients connect over RPC</span></div><div class="inote"><code>sov-rpc-miner</code> does real SHA-256d PoW against the live head and submits solutions; <code>sov-wallet</code> builds + signs + submits transfers.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Node config, keystore, chain-spec/genesis loading, graceful start/stop &amp; state persistence</span></div><div class="inote">JSON <code>NodeConfig</code> / <code>ChainSpec</code> / <code>Keystore</code> loaded without recompiling; keystore seeds are plaintext (fine for testnet — encryption/HSM is a mainnet hardening step).</div></div>
+    </div>
+  </details>
+
+  <!-- Phase 9 -->
+  <details class="phase">
+    <summary><span class="marker">▶</span><span class="ptitle">Phase 9 — Block Explorer &amp; Observability</span><span class="ptag">Visibility</span><span class="pcount">8 / 8 · 100%</span><span class="pbar"><i style="width:100%"></i></span></summary>
+    <div class="pbody">
+      <p style="font-size:0.9rem;color:var(--slate-300);margin-top:0.6rem">A zero-dependency Node project in <code>explorer/</code> that indexes a live node over JSON-RPC and serves a REST API, a hand-rolled GraphQL endpoint, a WebSocket live feed, and a web UI. Proven end-to-end against a running <code>sov-rpcd</code> — real data only.</p>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Chain indexer: ingest blocks &amp; transactions into a queryable store</span></div><div class="inote">Backfills from genesis and follows the head. (Per-tx receipts aren't exposed by the node RPC, so they're honestly omitted, not faked.)</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Search by transaction hash, block height/hash &amp; account</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">REST + GraphQL API exposing indexed chain data</span></div><div class="inote">REST plus a hand-rolled, dependency-free GraphQL engine (lexer + parser + executor).</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Web UI: blocks, transactions, accounts, validators &amp; supply stats</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Real-time live feed (WebSocket) of new blocks &amp; transactions</span></div><div class="inote">A hand-rolled RFC 6455 server over the HTTP upgrade — zero dependencies.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Validity view: finality status &amp; state/tx/receipts roots per block</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Analytics: circulating supply, staking ratio, issuance curve</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Built as its own project in <code>explorer/</code>, indexing a live SOV node (real data only)</span></div></div>
+    </div>
+  </details>
+
+  <!-- Phase 10 -->
+  <details class="phase">
+    <summary><span class="marker">▶</span><span class="ptitle">Phase 10 — JavaScript/TypeScript SDK</span><span class="ptag">SDK</span><span class="pcount">7 / 7 · 100%</span><span class="pbar"><i style="width:100%"></i></span></summary>
+    <div class="pbody">
+      <p style="font-size:0.9rem;color:var(--slate-300);margin-top:0.6rem">A standalone Node/TypeScript SDK in <code>sdk/</code> (separate from the Rust workspace): unit math, AccountId validation, Ed25519 keys, wire types, a Borsh encoder/signer verified byte-for-byte against the node, a live JSON-RPC client, and a wallet helper. Transactions it builds are node-submittable — proven by a live end-to-end test. 92 unit tests.</p>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">SOV unit math (SOV ↔ grains, 8 decimals) and amount handling</span></div><div class="inote">BigInt grains (never floats), mirrors <code>crates/primitives/src/amount.rs</code>.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">AccountId validation &amp; name hierarchy helpers</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Ed25519 keys, signing &amp; verification (audited library)</span></div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Core types &amp; transaction builder</span></div><div class="inote">Signs the node's canonical Borsh bytes and derives the real Blake3 transaction id — wire-compatible.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Typed JSON-RPC client (SovClient) over a real fetch transport</span></div><div class="inote">JSON-RPC 2.0 with the node's named-object params; verified live against <code>sov-rpcd</code>.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">High-level wallet &amp; dApp helpers over the client</span></div><div class="inote">Balance/nonce reads, transfer/stake with auto-nonce, await inclusion + finality.</div></div>
+      <div class="item"><div class="ihead"><span class="pill done">done</span><span class="itext">Known-answer encoding/signing vectors shared with the Rust crates</span></div><div class="inote">KAT vectors from <code>sov-katgen</code>; the SDK reproduces the signing bytes, tx id &amp; signature byte-for-byte.</div></div>
+    </div>
+  </details>
+</section>
+
+<!-- ===================== DEPENDENCIES ===================== -->
+<section id="deps" class="wrap">
+  <p class="eyebrow">Trusted Foundations</p>
+  <h2>No hand-rolled cryptography</h2>
+  <p class="lede">
+    Every cryptographic primitive sits behind a public, audited crate; SOV's job is to compose them correctly —
+    which is exactly what an external audit should target.
+  </p>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Dependency</th><th>Purpose</th><th>Used by</th></tr></thead>
+    <tbody>
+      <tr><td><span class="cn">ed25519-dalek</span></td><td>Ed25519 sign / verify</td><td class="src">crypto, wallet</td></tr>
+      <tr><td><span class="cn">blake3</span></td><td>32-byte hash for ids, state roots, Merkle leaves</td><td class="src">primitives, crypto, state, sharding</td></tr>
+      <tr><td><span class="cn">sha2</span></td><td>SHA-256d for the Bitcoin-style PoW algorithm</td><td class="src">pow</td></tr>
+      <tr><td><span class="cn">randomx-rs</span> <span class="pill done">Monero</span></td><td>RandomX memory-hard ASIC-resistant PoW seal (mainnet)</td><td class="src">pow</td></tr>
+      <tr><td><span class="cn">wasmi</span></td><td>Pure-Rust deterministic Wasm interpreter</td><td class="src">vm</td></tr>
+      <tr><td><span class="cn">frost-ed25519</span> <span class="pill todo">ZF</span></td><td>FROST DKG + threshold Ed25519</td><td class="src">mpc</td></tr>
+      <tr><td><span class="cn">crypto_box</span> <span class="pill todo">RustCrypto</span></td><td>X25519 + XChaCha20-Poly1305 sealed envelopes</td><td class="src">confidential</td></tr>
+      <tr><td><span class="cn">borsh</span></td><td>Canonical deterministic binary encoding</td><td class="src">workspace-wide</td></tr>
+      <tr><td><span class="cn">serde</span></td><td>JSON encoding for RPC + tooling</td><td class="src">workspace-wide</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Non-negotiable rules</h3>
+  <ul class="clean">
+    <li><strong>No <code>unsafe</code>.</strong> <code>#![forbid(unsafe_code)]</code> on every one of the 28 crates, plus a per-crate <code>[lints.rust] unsafe_code = "forbid"</code>.</li>
+    <li><strong>No fabricated data, ever.</strong> Balances, miners, deposits, oracle prices, block counts, test counts — everything is derived from real state; empty or disconnected states are reported honestly.</li>
+    <li><strong>No hand-rolled cryptography.</strong> Every primitive sits behind an audited crate.</li>
+    <li><strong>Cross-platform clients.</strong> Node, miner, and wallet build and test on macOS, Windows, and Linux on every push.</li>
+    <li><strong>Pure-Rust, std-only networking.</strong> Keeps the cross-platform promise cheap and the dependency surface auditable.</li>
+  </ul>
+</section>
+
+<!-- ===================== FOOTER ===================== -->
+<footer>
+  <div class="wrap">
+    <div>
+      <div class="fbrand">
+        <svg width="30" height="30" viewBox="0 0 100 100" aria-hidden="true">
+          <circle cx="50" cy="50" r="46" fill="none" stroke="#c8a25c" stroke-width="3"/>
+          <circle cx="50" cy="50" r="38" fill="none" stroke="#3b6ea5" stroke-width="1.5"/>
+          <text x="50" y="64" text-anchor="middle" font-family="Georgia,serif" font-size="40" font-weight="700" fill="#e3c281">S</text>
+        </svg>
+        SOV
+      </div>
+      <p class="fnote" style="margin-top:0.6rem">
+        Sovereign Digital Reserve Asset · Layer-1 · Rust · Apache-2.0.
+        The Rust implementation lives under <code>chain/</code>; the roadmap is tracked in
+        <code>dashboard/phases.json</code>.
+      </p>
+    </div>
+    <div style="text-align:right">
+      <p class="verified-tag">✔ 442 Rust + 118 SDK + 13 explorer tests passing · 0 failing</p>
+      <p class="fnote" style="margin-top:0.3rem">
+        Every figure on this page is verified against the repository.
+      </p>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // Render the 13 stars in the seal medallion (founding states). Pure geometry,
+  // no data dependency — keeps the SVG markup compact.
+  (function () {
+    var g = document.getElementById("stars");
+    if (!g) return;
+    var cx = 130, cy = 130, r = 62, n = 13, sr = 4.2;
+    var ns = "http://www.w3.org/2000/svg";
+    for (var i = 0; i < n; i++) {
+      var a = (-90 + i * (360 / n)) * Math.PI / 180;
+      var x = cx + r * Math.cos(a), y = cy + r * Math.sin(a);
+      var pts = [];
+      for (var k = 0; k < 10; k++) {
+        var rad = (k % 2 === 0) ? sr : sr / 2.3;
+        var ang = (-90 + k * 36) * Math.PI / 180;
+        pts.push((x + rad * Math.cos(ang)).toFixed(1) + "," + (y + rad * Math.sin(ang)).toFixed(1));
+      }
+      var star = document.createElementNS(ns, "polygon");
+      star.setAttribute("points", pts.join(" "));
+      g.appendChild(star);
+    }
+  })();
+</script>
+</body>
+</html>

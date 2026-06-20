@@ -1,0 +1,110 @@
+name: release
+
+# Build the SOV Station desktop wallet/node app — TESTNET build (sov-testnet-1) —
+# for Windows and macOS, and attach the artifacts to a GitHub Release. Builds run
+# natively on each OS runner (RandomX's C++ library compiles cleanly there, unlike
+# a mingw cross-build from macOS), so the binaries are real, not cross-compiled.
+#
+# Each artifact bundles BOTH the GUI (`sov-station`) and the one-time chain-setup
+# helper (`sov-testnet`) side by side, so the app is self-contained.
+#
+# Trigger: push a tag like `v0.1.0-testnet`, or run manually from the Actions tab.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build GUI + chain helper (release)
+        shell: bash
+        run: |
+          cargo build --release --manifest-path node/Cargo.toml
+          cargo build --release --manifest-path chain/Cargo.toml --bin sov-testnet
+      - name: Stage TESTNET bundle
+        shell: bash
+        run: |
+          mkdir -p "dist/SOV-Station-Testnet"
+          cp node/target/release/sov-station.exe "dist/SOV-Station-Testnet/"
+          cp chain/target/release/sov-testnet.exe "dist/SOV-Station-Testnet/"
+          cp .github/TESTNET-README.txt "dist/SOV-Station-Testnet/READ ME — TESTNET ONLY.txt" || true
+          cd dist && 7z a "SOV-Station-Testnet-${GITHUB_REF_NAME}-windows-x64.zip" "SOV-Station-Testnet"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*.zip
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build GUI + chain helper (release)
+        run: |
+          cargo build --release --manifest-path node/Cargo.toml
+          cargo build --release --manifest-path chain/Cargo.toml --bin sov-testnet
+      - name: Bundle .app + .dmg (TESTNET)
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME:-0.0.0}"
+          STAGE="dist/stage"; APP="$STAGE/SOV Station (Testnet).app"; MAC="$APP/Contents/MacOS"
+          mkdir -p "$MAC" "$APP/Contents/Resources" dist
+          cp node/target/release/sov-station "$MAC/sov-station"
+          cp chain/target/release/sov-testnet "$MAC/sov-testnet"
+          chmod +x "$MAC/"*
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>SOV Station (Testnet)</string>
+            <key>CFBundleDisplayName</key><string>SOV Station (Testnet)</string>
+            <key>CFBundleIdentifier</key><string>sov.station.testnet</string>
+            <key>CFBundleVersion</key><string>0.1.0</string>
+            <key>CFBundleShortVersionString</key><string>${VER}</string>
+            <key>CFBundleExecutable</key><string>sov-station</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict></plist>
+          PLIST
+          cp .github/TESTNET-README.txt "$STAGE/READ ME — TESTNET ONLY.txt" || true
+          codesign --force --deep --sign - "$APP" || true
+          ( cd "$STAGE" && ln -sf /Applications Applications )
+          hdiutil create -volname "SOV Station — TESTNET" -srcfolder "$STAGE" -ov -format UDZO "dist/SOV-Station-Testnet-${VER}-macOS.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*.dmg
+
+  release:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      - name: Publish TESTNET release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          prerelease: true
+          name: "SOV Station ${{ github.ref_name }} — TESTNET"
+          body: |
+            **⚠️ TESTNET BUILD (sov-testnet-1) — NOT MAINNET.**
+
+            Coins (XUS) on this network have **no value** and the chain may be reset.
+            Do not use mainnet keys or real funds.
+
+            - **macOS:** `SOV-Station-Testnet-*-macOS.dmg` (Apple Silicon). Unsigned —
+              right-click → Open the first time (Gatekeeper).
+            - **Windows:** `SOV-Station-Testnet-*-windows-x64.zip` — unzip and run
+              `sov-station.exe`. Unsigned — SmartScreen → More info → Run anyway.
+
+            The node runs **in-process** inside the app; closing the app stops it.

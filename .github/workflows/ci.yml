@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Platform-agnostic checks: run once on Linux.
+  lint:
+    name: fmt · clippy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # The Cargo workspace lives in chain/ (the explorer is a separate project).
+        working-directory: chain
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: chain
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Build + test on every supported client platform. SOV nodes, miner, and wallet
+  # must run on macOS and Windows as well as Linux — this proves it on each push.
+  test:
+    name: build · test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: chain
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: chain
+      - name: Build all binaries
+        run: cargo build --workspace --release
+      - name: Tests
+        run: cargo test --workspace
+
+  # Verification & validity assurance (Phase 7): invariants, consensus model
+  # check, deterministic replay, STF conformance, KAT vectors and fault injection
+  # are a named, required gate. (They also run inside the workspace tests above;
+  # this surfaces them as their own status check.)
+  verify:
+    name: verify (invariants · model-check · conformance · KAT)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: chain
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: chain
+      - name: Verification suite
+        run: cargo test -p sov-verify
+
+  # Smart-contract (guest) static analysis: the wasm32 contracts must pass clippy
+  # with warnings denied and build in release.
+  contracts:
+    name: contracts (wasm32 · clippy)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: chain/contracts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: chain/contracts
+      - name: Clippy (deny warnings)
+        run: cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
+      - name: Build (release wasm)
+        run: cargo build --target wasm32-unknown-unknown --release
+
+  # Reproducible builds: build the release binaries twice and assert they are
+  # bit-for-bit identical (scripts/reproducible-build.sh).
+  reproducible:
+    name: reproducible build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify bit-for-bit reproducibility
+        run: bash scripts/reproducible-build.sh
+
+  # Supply-chain security gate: cargo-deny fails on any RustSec advisory affecting a
+  # dependency AND enforces a version FLOOR on the consensus-critical zk crates, so
+  # the patched orchard/halo2_gadgets (which fix the Orchard circuit soundness /
+  # shielded-pool forgery bug) can never be silently downgraded. Config: chain/deny.toml.
+  supply-chain:
+    name: supply-chain (cargo-deny · advisories + zk floor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo-deny (advisories + bans)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: chain/Cargo.toml
+          command: check advisories bans
+
+  # The coverage-guided fuzz targets must compile (fuzzing itself runs out-of-band
+  # on nightly; this gates that the targets don't bit-rot).
+  fuzz-build:
+    name: fuzz targets build (nightly)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: chain
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Build fuzz targets
+        run: cargo fuzz build

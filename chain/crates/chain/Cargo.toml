@@ -1,0 +1,27 @@
+[package]
+name = "sov-chain"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The SOV blockchain: genesis construction and the validated block-import state machine tying state, execution, and consensus together."
+
+[dependencies]
+sov-primitives = { path = "../primitives" }
+sov-crypto = { path = "../crypto" }
+sov-types = { path = "../types" }
+sov-state = { path = "../state" }
+sov-runtime = { path = "../runtime" }
+sov-mining = { path = "../mining" }
+sov-pow = { path = "../pow" }
+sov-governance = { path = "../governance" }
+sov-verify = { path = "../verify" }
+thiserror.workspace = true
+
+[dev-dependencies]
+sov-mempool = { path = "../mempool" }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

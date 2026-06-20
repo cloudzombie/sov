@@ -1,0 +1,30 @@
+[package]
+name = "sov-runtime"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The SOV execution layer: applies transactions to the ledger, meters gas, and produces receipts."
+
+[dependencies]
+sov-primitives = { path = "../primitives" }
+sov-types = { path = "../types" }
+sov-state = { path = "../state" }
+sov-pow = { path = "../pow" }
+sov-mining = { path = "../mining" }
+sov-vm = { path = "../vm" }
+sov-shielded = { path = "../shielded" }
+sov-compliance = { path = "../compliance" }
+sov-intents = { path = "../intents" }
+sov-crypto = { path = "../crypto" }
+sha2 = "0.10"
+thiserror.workspace = true
+
+[dev-dependencies]
+sov-verify = { path = "../verify" }
+wat = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

@@ -1,0 +1,51 @@
+# SOV coverage-guided fuzzing (Phase 7, p7-i3). Run with cargo-fuzz on nightly:
+#   cargo install cargo-fuzz && cargo +nightly fuzz run signedtx_decode
+# This is its own (detached) workspace via the empty [workspace] table below, so
+# the host `cargo build/test` ignores it; it needs the libFuzzer runtime (nightly
+# only) and is therefore not part of the normal test gate. See README.md.
+[package]
+name = "sov-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+borsh = { version = "1", features = ["derive"] }
+sov-primitives = { path = "../crates/primitives" }
+sov-types = { path = "../crates/types" }
+sov-state = { path = "../crates/state" }
+
+[[bin]]
+name = "signedtx_decode"
+path = "fuzz_targets/signedtx_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_decode"
+path = "fuzz_targets/block_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "account_decode"
+path = "fuzz_targets/account_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "accountid_validate"
+path = "fuzz_targets/accountid_validate.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the host workspace — cargo-fuzz projects are their own workspace.
+[workspace]

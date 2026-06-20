@@ -1,0 +1,19 @@
+[package]
+name = "sov-pow"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "SOV proof-of-work hook: difficulty targets and hash-meets-target verification for selective/merge mining."
+
+[dependencies]
+sov-primitives = { path = "../primitives" }
+borsh.workspace = true
+serde.workspace = true
+sha2 = "0.11"
+randomx-rs = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

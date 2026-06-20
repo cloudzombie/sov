@@ -1,0 +1,19 @@
+{
+  "name": "sovereign-explorer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sovereign block explorer — indexes a live Sovereign node over JSON-RPC and serves REST + GraphQL + a WebSocket live feed and a web UI. Zero runtime dependencies (Node standard library only).",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "sovereign-explorer": "src/server.js"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test",
+    "devnet:gen": "node devnet/gen-devnet.mjs"
+  },
+  "license": "MIT"
+}
