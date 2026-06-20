@@ -156,10 +156,10 @@
       <h3>Fuzzing</h3>
       <p><code>cargo-fuzz</code> on the codec / state-transition / RPC parsers.</p>
     </div><span class="right"><span class="pill next">PROPOSED</span></span></div>
-    <div class="item next"><div class="num">12</div><div class="body">
+    <div class="item done"><div class="num">12</div><div class="body">
       <h3>Cross-implementation KAT vectors</h3>
-      <p>Known-answer test vectors so a second implementation can't silently diverge.</p>
-    </div><span class="right"><span class="pill next">PROPOSED</span></span></div>
+      <p>Known-answer test vectors so a second implementation can't silently diverge. Tx / block / state / STF + now the <b>PoW seal</b> and <b>emission schedule</b> — pinned by the node's own <code>sov-katgen</code> drift guard AND reproduced byte-for-byte by the TS second client.</p>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
     <div class="item next"><div class="num">13</div><div class="body">
       <h3>Long-running adversarial testnet</h3>
       <p>The soak/chaos multi-machine run under sustained load.</p>
