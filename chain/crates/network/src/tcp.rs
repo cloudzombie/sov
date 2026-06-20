@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fips203::ml_kem_768;
 use fips203::traits::{Decaps as _, Encaps as _, KeyGen as _, SerDes as _};
@@ -310,6 +310,10 @@ impl TcpNode {
         let shared = Arc::clone(&self.shared);
         let chain_id = chain_id.to_string();
         let p2p_port = self.shared.local_addr.port();
+        // A per-node-instance nonce so a node IGNORES its own announcement (some
+        // platforms loop multicast back regardless of `multicast_loop`), preventing
+        // a node from dialing itself (the "ghost self-peer").
+        let nonce = node_nonce();
         thread::spawn(move || {
             // Bind the discovery port and join the multicast group. Reuse is fine —
             // one node per machine; failure just disables discovery (best-effort).
@@ -326,7 +330,7 @@ impl TcpNode {
             // Don't loop our own announcements back to ourselves (no self-dial).
             let _ = sock.set_multicast_loop_v4(false);
             let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
-            let beacon = format!("{LAN_DISCO_TAG}|{chain_id}|{p2p_port}");
+            let beacon = format!("{LAN_DISCO_TAG}|{chain_id}|{p2p_port}|{nonce}");
             let mut last = Instant::now()
                 .checked_sub(LAN_DISCO_INTERVAL)
                 .unwrap_or_else(Instant::now);
@@ -337,7 +341,7 @@ impl TcpNode {
                     last = Instant::now();
                 }
                 if let Ok((n, src)) = sock.recv_from(&mut buf) {
-                    if let Some(addr) = parse_beacon(&buf[..n], &chain_id, src.ip()) {
+                    if let Some(addr) = parse_beacon(&buf[..n], &chain_id, nonce, src.ip()) {
                         // A same-chain peer announced itself — dial it (deduped by the
                         // dial machinery; a no-op if already connected).
                         if !shared.peers.lock().unwrap().contains_key(&addr) {
@@ -694,11 +698,23 @@ fn read_raw(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
+/// A per-node-instance nonce (pid + time), embedded in the discovery beacon so a
+/// node can recognize and ignore its OWN announcement looped back to it — different
+/// processes/machines get different values; the same node always sends the same one.
+fn node_nonce() -> u64 {
+    let pid = std::process::id() as u64;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    (pid << 40) ^ nanos
+}
+
 /// Parse a LAN discovery beacon, returning the announcing peer's dial-able P2P
 /// address — the packet's `src` IP plus the advertised port — only if the beacon is
-/// well-formed AND for the SAME chain. Nodes on a different chain/network are never
-/// dialed, so unrelated multicast traffic is ignored.
-fn parse_beacon(data: &[u8], our_chain_id: &str, src: IpAddr) -> Option<SocketAddr> {
+/// well-formed, for the SAME chain, and NOT our own (nonce differs). Nodes on a
+/// different chain are never dialed, and a node never dials itself.
+fn parse_beacon(data: &[u8], our_chain_id: &str, our_nonce: u64, src: IpAddr) -> Option<SocketAddr> {
     let text = std::str::from_utf8(data).ok()?;
     let mut parts = text.split('|');
     if parts.next()? != LAN_DISCO_TAG {
@@ -708,6 +724,10 @@ fn parse_beacon(data: &[u8], our_chain_id: &str, src: IpAddr) -> Option<SocketAd
         return None; // a different chain — never dial it
     }
     let port: u16 = parts.next()?.parse().ok()?;
+    let nonce: u64 = parts.next()?.parse().ok()?;
+    if nonce == our_nonce {
+        return None; // our own beacon looped back — never dial ourselves
+    }
     Some(SocketAddr::new(src, port))
 }
 
@@ -1165,21 +1185,26 @@ mod tests {
     }
 
     #[test]
-    fn lan_beacon_parses_same_chain_and_rejects_others() {
+    fn lan_beacon_parses_same_chain_rejects_others_and_self() {
         let src = IpAddr::V4(Ipv4Addr::new(192, 168, 0, 244));
-        // Well-formed, same chain → dial src_ip:advertised_port.
-        let good = format!("{LAN_DISCO_TAG}|sov-testnet-1|9645");
+        let me = 42u64; // our nonce
+        let peer = 7u64; // a different node's nonce
+        // Well-formed, same chain, different node → dial src_ip:advertised_port.
+        let good = format!("{LAN_DISCO_TAG}|sov-testnet-1|9645|{peer}");
         assert_eq!(
-            parse_beacon(good.as_bytes(), "sov-testnet-1", src),
+            parse_beacon(good.as_bytes(), "sov-testnet-1", me, src),
             Some(SocketAddr::new(src, 9645))
         );
-        // Different chain → ignored (never dial a foreign network).
-        let other = format!("{LAN_DISCO_TAG}|sov-mainnet|9645");
-        assert_eq!(parse_beacon(other.as_bytes(), "sov-testnet-1", src), None);
+        // OUR OWN beacon looped back (same nonce) → ignored (no self-dial / ghost).
+        let mine = format!("{LAN_DISCO_TAG}|sov-testnet-1|9645|{me}");
+        assert_eq!(parse_beacon(mine.as_bytes(), "sov-testnet-1", me, src), None);
+        // Different chain → ignored.
+        let other = format!("{LAN_DISCO_TAG}|sov-mainnet|9645|{peer}");
+        assert_eq!(parse_beacon(other.as_bytes(), "sov-testnet-1", me, src), None);
         // Garbage / wrong tag / bad port → ignored.
-        assert_eq!(parse_beacon(b"hello world", "sov-testnet-1", src), None);
+        assert_eq!(parse_beacon(b"hello world", "sov-testnet-1", me, src), None);
         assert_eq!(
-            parse_beacon(b"sov-disco1|sov-testnet-1|notaport", "sov-testnet-1", src),
+            parse_beacon(b"sov-disco1|sov-testnet-1|notaport|7", "sov-testnet-1", me, src),
             None
         );
     }
