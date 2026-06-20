@@ -1167,12 +1167,21 @@ impl Blockchain {
             return Vec::new();
         };
         // Walk back from the heaviest tip to genesis, then reverse to ascending order.
+        // Hard cap the walk at the block count: an acyclic chain can visit each block at
+        // most once, so exceeding that means the (corrupt) log forms a prev_hash CYCLE —
+        // bail rather than loop forever (a real, valid log can't cycle, since prev_hash
+        // is a cryptographic digest, but a damaged data dir must never hang a boot).
         let mut chain = Vec::new();
         let mut cur = tip;
-        while cur != self.genesis_hash {
+        while cur != self.genesis_hash && chain.len() <= blocks.len() {
             let Some(b) = by_hash.get(&cur) else { break };
             chain.push((*b).clone());
             cur = b.header.prev_hash;
+        }
+        // A cycle (didn't terminate at genesis within the bound) yields no usable chain;
+        // the caller falls back to the fully-verified import path.
+        if cur != self.genesis_hash && chain.len() > blocks.len() {
+            return Vec::new();
         }
         chain.reverse();
         chain

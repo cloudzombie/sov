@@ -812,7 +812,15 @@ fn has_connection_to_ip(shared: &Shared, ip: IpAddr) -> bool {
     if loopback {
         return false;
     }
-    shared.peers.lock().unwrap().keys().any(|a| a.ip() == ip)
+    // Established connections...
+    if shared.peers.lock().unwrap().keys().any(|a| a.ip() == ip) {
+        return true;
+    }
+    // ...and connections still HANDSHAKING. The inbound set is populated at TCP-accept
+    // (before the slow Noise+ML-KEM handshake registers the peer), so checking it closes
+    // the startup race where a peer dials us AND our mDNS dials it back in the gap before
+    // its inbound link appears in `peers` — the cause of "one machine counted as two".
+    shared.inbound.lock().unwrap().iter().any(|a| a.ip() == ip)
 }
 
 /// Decide whether a new INBOUND connection from `candidate` is admissible given the
