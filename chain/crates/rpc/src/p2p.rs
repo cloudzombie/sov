@@ -24,9 +24,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use sov_chain::ChainError;
 use sov_crypto::Keypair;
 use sov_network::{NetMessage, TcpNode};
-use sov_node::Node;
+use sov_node::{Node, NodeError};
 use sov_primitives::{AccountId, Hash};
 use sov_types::Block;
 
@@ -170,6 +171,11 @@ impl P2p {
                     state.handle(&tcp, &node, &config, peer, msg);
                 }
                 state.request_missing(&tcp, &node);
+                // ~every second, reclaim inbound slots from peers that connected but
+                // never authenticated (zombie-connection eclipse defense).
+                if tick % 25 == 0 {
+                    state.sweep_unauthenticated(&tcp);
+                }
                 thread::sleep(Duration::from_millis(40));
                 tick += 1;
             }
@@ -233,6 +239,26 @@ const SYNC_BATCH: u16 = 64;
 /// requests instead of one height at a time.
 const BACKTRACK_CAP: u64 = 256;
 
+/// Misbehavior points charged (via [`TcpNode::penalize_peer`]) to a peer that sends a
+/// block which FAILS validation — bad proof of work, a fabricated state/receipts root,
+/// a broken supply invariant, etc.: things an honest peer never produces. It is NOT
+/// charged for a block that merely can't connect yet (an unknown parent, the ordinary
+/// backtrack signal). Calibrated against the transport ban threshold (100), so a
+/// couple of fabricated blocks ban + drop the peer.
+const INVALID_BLOCK_PENALTY: f64 = 50.0;
+
+/// Misbehavior points for a [`BlocksResponse`](NetMessage::BlocksResponse) carrying
+/// more blocks than we ever request ([`SYNC_BATCH`]) — a memory/CPU amplification an
+/// honest (server-capped) peer never sends.
+const OVERSIZE_RESPONSE_PENALTY: f64 = 50.0;
+
+/// How long a freshly-connected peer may go without completing the authenticated
+/// `Hello` handshake before its inbound slot is reclaimed (it is DISCONNECTED, not
+/// banned — a slow or old client may simply reconnect). Bounds a zombie-connection
+/// eclipse: an attacker cannot pin inbound slots open by connecting and going silent,
+/// since the transport's eclipse caps count those slots until they are reclaimed here.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// An outstanding [`GetBlock`](NetMessage::GetBlock) awaiting a response, used to
 /// detect a stalled peer. Cleared as soon as any block response arrives.
 struct InFlight {
@@ -256,6 +282,10 @@ struct SyncState {
     /// download); >0 = walking back to a common ancestor by this many heights, then
     /// doubling, so a deep fork is located in O(log) requests.
     bt_step: HashMap<SocketAddr, u64>,
+    /// When each currently-connected peer was first observed, so a connection that
+    /// completes the transport handshake but never authenticates ([`HELLO_TIMEOUT`])
+    /// can be reclaimed — it cannot squat an inbound slot.
+    first_seen: HashMap<SocketAddr, Instant>,
     /// The block request currently awaiting a response, if any — drives stall
     /// detection so a single slow/withholding peer cannot wedge catch-up.
     inflight: Option<InFlight>,
@@ -273,9 +303,16 @@ struct PeerStatus {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ImportOutcome {
+    /// Accepted and newly added to the chain (extended, stored, or reorged onto).
     New,
+    /// Already known — a no-op (e.g. a duplicate in a batch).
     Known,
+    /// Did not connect to a known parent — the ordinary "walk back to a common
+    /// ancestor" signal during sync. NOT misbehavior.
     Rejected,
+    /// FAILED validation (bad PoW, a fabricated state/receipts root, a broken
+    /// invariant, …) — a block an honest peer never sends. The sender is penalized.
+    Invalid,
 }
 
 impl SyncState {
@@ -299,8 +336,16 @@ impl SyncState {
         if n.chain().contains_block(&block.hash()) {
             return ImportOutcome::Known;
         }
-        if n.import_block(block.clone()).is_err() {
-            return ImportOutcome::Rejected;
+        match n.import_block(block.clone()) {
+            Ok(_) => {}
+            // "Does not extend a known parent" is the ordinary backtrack signal during
+            // sync; a too-far-future timestamp is clock skew ("not yet valid", as in
+            // Bitcoin) — neither is misbehavior, so keep walking back without penalty.
+            Err(NodeError::Chain(ChainError::PrevHashMismatch))
+            | Err(NodeError::TimestampTooFarInFuture { .. }) => return ImportOutcome::Rejected,
+            // EVERY other error (bad PoW, fabricated state/receipts root, a broken
+            // invariant, …) is a block an honest peer never sends: the peer misbehaves.
+            Err(_) => return ImportOutcome::Invalid,
         }
         if let Some(log) = &self.block_log {
             let _ = log.append(&block);
@@ -386,8 +431,16 @@ impl SyncState {
                 // re-validates everything and fork choice decides what it does to
                 // the chain. Persisted under the node lock (order == commit
                 // order); the lock is released before any network I/O.
-                if self.import_and_persist(node, block.clone()) == ImportOutcome::New {
-                    tcp.broadcast(&NetMessage::NewBlock(block)); // forward once
+                match self.import_and_persist(node, block.clone()) {
+                    ImportOutcome::New => {
+                        tcp.broadcast(&NetMessage::NewBlock(block)); // forward once
+                    }
+                    ImportOutcome::Invalid => {
+                        tcp.penalize_peer(peer, INVALID_BLOCK_PENALTY);
+                    }
+                    // Known, or an orphan we can't connect yet (it arrives via sync) —
+                    // neither is misbehavior.
+                    ImportOutcome::Known | ImportOutcome::Rejected => {}
                 }
             }
             NetMessage::GetBlock { height } => {
@@ -438,6 +491,13 @@ impl SyncState {
                         self.sync_next.insert(peer, h.saturating_sub(step).max(1));
                         self.bt_step.insert(peer, (step * 2).min(BACKTRACK_CAP));
                     }
+                    ImportOutcome::Invalid => {
+                        // A fabricated block while backtracking: penalize and stop
+                        // syncing from this peer (don't keep walking its bogus chain).
+                        tcp.penalize_peer(peer, INVALID_BLOCK_PENALTY);
+                        self.sync_next.remove(&peer);
+                        self.bt_step.remove(&peer);
+                    }
                 }
             }
             NetMessage::BlockResponse(None) => {
@@ -449,11 +509,18 @@ impl SyncState {
                 // peer's chain, so they import in order; the first one only fails if
                 // its parent isn't ours (a fork), which flips us into backtrack.
                 self.inflight = None;
+                // A peer must never return more than we ask for ([`SYNC_BATCH`]); a
+                // larger batch is a memory/CPU amplification — penalize and ignore it.
+                if blocks.len() > SYNC_BATCH as usize {
+                    tcp.penalize_peer(peer, OVERSIZE_RESPONSE_PENALTY);
+                    return;
+                }
                 if blocks.is_empty() {
                     self.sync_next.remove(&peer); // at/past the peer's head
                 } else {
                     let mut last_ok: Option<u64> = None;
                     let mut rejected: Option<u64> = None;
+                    let mut invalid = false;
                     for block in blocks {
                         let h = block.header.height.get();
                         match self.import_and_persist(node, block) {
@@ -462,9 +529,19 @@ impl SyncState {
                                 rejected = Some(h);
                                 break;
                             }
+                            ImportOutcome::Invalid => {
+                                // A fabricated block in the batch (any valid prefix is
+                                // already committed): penalize and stop trusting this peer.
+                                tcp.penalize_peer(peer, INVALID_BLOCK_PENALTY);
+                                invalid = true;
+                                break;
+                            }
                         }
                     }
-                    if let Some(h) = last_ok {
+                    if invalid {
+                        self.sync_next.remove(&peer);
+                        self.bt_step.remove(&peer);
+                    } else if let Some(h) = last_ok {
                         self.bt_step.remove(&peer);
                         self.advance_or_done(peer, h);
                     } else if let Some(h) = rejected {
@@ -499,6 +576,24 @@ impl SyncState {
         self.peer_status.retain(|p, _| connected.contains(p));
         self.sync_next.retain(|p, _| connected.contains(p));
         self.bt_step.retain(|p, _| connected.contains(p));
+        self.first_seen.retain(|p, _| connected.contains(p));
+    }
+
+    /// Reclaim inbound slots from **zombie connections**: a peer that completed the
+    /// encrypted transport handshake but never sent a valid `Hello` within
+    /// [`HELLO_TIMEOUT`] is disconnected (not banned — it may legitimately reconnect).
+    /// Without this an attacker could connect and stay silent to pin inbound slots
+    /// (which the transport's eclipse caps count) and crowd out honest peers.
+    fn sweep_unauthenticated(&mut self, tcp: &TcpNode) {
+        let now = Instant::now();
+        for peer in tcp.connected_peers() {
+            let first = *self.first_seen.entry(peer).or_insert(now);
+            if !self.authenticated.contains(&peer)
+                && now.duration_since(first) >= HELLO_TIMEOUT
+            {
+                tcp.disconnect(&peer);
+            }
+        }
     }
 
     /// Drive catch-up against trusted peers: request the next block from the best
@@ -659,5 +754,96 @@ mod tests {
         // Mirror what handle() does on receiving a (None) block response.
         s.inflight = None;
         assert!(s.inflight.is_none());
+    }
+
+    #[test]
+    fn import_classifies_orphan_as_rejected_and_fabricated_as_invalid() {
+        // The safety-critical distinction behind sync misbehavior penalties: a block
+        // that can't connect yet (unknown parent) is the ORDINARY backtrack signal and
+        // must be `Rejected` (NO penalty), while a fabricated/invalid block must be
+        // `Invalid` so the sender is banned. Mis-classifying the first would ban honest
+        // peers mid-sync; mis-classifying the second would let an attacker waste sync
+        // forever for free.
+        use sov_chain::{Blockchain, GenesisAccount, GenesisConfig};
+        use sov_mining::MiningPolicy;
+        use sov_primitives::{Balance, BlockHeight};
+        use std::sync::Mutex;
+
+        let val = AccountId::new("val01.node.sov").unwrap();
+        let config = GenesisConfig {
+            chain_id: "sov-test".into(),
+            timestamp_ms: 1_000,
+            accounts: vec![GenesisAccount {
+                account: val.clone(),
+                key: Keypair::from_seed([1; 32]).public_key(),
+                balance: Balance::ZERO,
+            }],
+            mining: MiningPolicy::test(),
+            vesting: vec![],
+        };
+        let chain = Blockchain::new(&config).unwrap();
+        let genesis_hash = chain.head().hash();
+        let node = Mutex::new(Node::new(chain, 1024, 256));
+        let state = SyncState::new(None);
+
+        // Orphan: parent unknown → Rejected (drives backtracking; not misbehavior).
+        let orphan = Block::assemble(
+            BlockHeight::new(9),
+            Hash::digest(b"unknown-parent"),
+            Hash::ZERO,
+            Hash::ZERO,
+            2_000,
+            val.clone(),
+            vec![],
+        );
+        assert_eq!(
+            state.import_and_persist(&node, orphan),
+            ImportOutcome::Rejected,
+            "an unknown-parent block is the benign backtrack signal"
+        );
+
+        // Fabricated: extends genesis but is unmined (declares no valid difficulty /
+        // carries no valid proof of work) → Invalid.
+        let bad = Block::assemble(
+            BlockHeight::new(1),
+            genesis_hash,
+            Hash::ZERO,
+            Hash::ZERO,
+            2_000,
+            val,
+            vec![],
+        );
+        assert_eq!(
+            state.import_and_persist(&node, bad),
+            ImportOutcome::Invalid,
+            "a block that fails validation flags the sender as misbehaving"
+        );
+    }
+
+    #[test]
+    fn sweep_spares_a_recently_connected_unauthenticated_peer() {
+        // A peer that just connected but hasn't sent its Hello yet is given time
+        // (HELLO_TIMEOUT) — the sweep records when it was first seen and does NOT drop
+        // it immediately, so honest inbound peers aren't churned mid-handshake.
+        let server = TcpNode::bind("127.0.0.1:0").unwrap();
+        let client = TcpNode::bind("127.0.0.1:0").unwrap();
+        client.connect(&server.local_addr().to_string()).unwrap();
+        let mut connected = false;
+        for _ in 0..150 {
+            if server.peer_count() >= 1 {
+                connected = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(connected, "peer connected");
+
+        let mut state = SyncState::new(None);
+        state.sweep_unauthenticated(&server);
+        assert_eq!(state.first_seen.len(), 1, "the new peer's first-seen time is recorded");
+        assert!(
+            server.peer_count() >= 1,
+            "a just-connected peer is given time to authenticate, not dropped on sight"
+        );
     }
 }

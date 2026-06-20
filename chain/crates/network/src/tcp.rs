@@ -436,6 +436,36 @@ impl TcpNode {
         self.shared.peers.lock().unwrap().keys().copied().collect()
     }
 
+    /// Score `peer` for **application-layer** misbehavior the transport cannot see by
+    /// itself — an invalid block during sync, an over-sized response, etc. The points
+    /// feed the SAME per-IP decaying misbehavior score and ban machinery as a
+    /// transport-level flood or malformed frame (so abuse across layers accumulates
+    /// toward one ban), and if this crosses the ban threshold the live connection is
+    /// dropped IMMEDIATELY — a proven-bad peer is gone now, not merely barred from
+    /// reconnecting. Returns whether the peer's IP is now banned. A brief, bounded
+    /// amount is forgiven by the score's exponential decay.
+    pub fn penalize_peer(&self, peer: SocketAddr, points: f64) -> bool {
+        let banned = penalize(&self.shared, peer.ip(), points);
+        if banned {
+            self.disconnect(&peer);
+        }
+        banned
+    }
+
+    /// Drop the live connection to `peer` now: remove it from the peer set and shut
+    /// its socket down (its reader thread then unblocks and exits). A no-op if not
+    /// connected. Unlike a ban, this does not bar reconnection — it is used both by
+    /// [`penalize_peer`] (after a ban) and to reclaim a slot from a connection that
+    /// never authenticated.
+    pub fn disconnect(&self, peer: &SocketAddr) {
+        let writer = self.shared.peers.lock().unwrap().remove(peer);
+        if let Some(p) = writer {
+            if let Ok(stream) = p.stream.lock() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
     /// The Noise handshake hash for the connection to `peer` (its channel
     /// fingerprint), or `None` if not connected. Used to bind the signed `Hello`.
     pub fn peer_handshake_hash(&self, peer: &SocketAddr) -> Option<Vec<u8>> {
@@ -1376,5 +1406,74 @@ mod tests {
         }
         assert!(banned, "a handful of malformed frames bans the peer");
         assert!(is_banned(&shared, ip));
+    }
+
+    #[test]
+    fn penalize_peer_bans_and_drops_for_app_layer_misbehavior() {
+        // The sync layer reports application-level misbehavior (e.g. a fabricated
+        // block) the transport can't see; a penalty at the ban threshold must drop the
+        // live connection AND ban the IP, exactly like a transport-level flood.
+        let server = TcpNode::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().to_string();
+        let client = TcpNode::bind("127.0.0.1:0").unwrap();
+        client.connect(&addr).unwrap();
+        assert!(wait_until(3, || server.peer_count() >= 1), "peer connected");
+        let peer = server.connected_peers()[0];
+
+        let banned = server.penalize_peer(peer, MISBEHAVIOR_BAN);
+        assert!(banned, "a threshold penalty bans");
+        // The IP is banned in the authoritative ban state (so it cannot reconnect —
+        // that the ban blocks a reconnect is covered by the flood test)...
+        assert!(
+            is_banned(&server.shared, peer.ip()),
+            "the misbehaving peer's IP is banned"
+        );
+        // ...and the live connection is dropped immediately, not merely barred later.
+        assert!(
+            wait_until(3, || server.peer_count() == 0),
+            "the penalized peer is dropped immediately"
+        );
+    }
+
+    #[test]
+    fn a_sub_threshold_penalty_is_forgiven() {
+        // A single, bounded penalty (below the ban threshold) does not drop a peer —
+        // an honest peer that trips one check is not punished off the network.
+        let server = TcpNode::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().to_string();
+        let client = TcpNode::bind("127.0.0.1:0").unwrap();
+        client.connect(&addr).unwrap();
+        assert!(wait_until(3, || server.peer_count() >= 1), "peer connected");
+        let peer = server.connected_peers()[0];
+
+        let banned = server.penalize_peer(peer, MISBEHAVIOR_BAN / 4.0);
+        assert!(!banned, "one sub-threshold strike does not ban");
+        // The peer stays connected.
+        assert!(server.peer_count() >= 1, "a forgiven peer keeps its connection");
+    }
+
+    #[test]
+    fn disconnect_drops_a_peer_without_banning_it() {
+        // Reclaiming a slot (e.g. a connection that never authenticated) drops the
+        // peer but does NOT ban it — a slow/old client may simply reconnect.
+        let server = TcpNode::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().to_string();
+        let client = TcpNode::bind("127.0.0.1:0").unwrap();
+        client.connect(&addr).unwrap();
+        assert!(wait_until(3, || server.peer_count() >= 1), "peer connected");
+        let peer = server.connected_peers()[0];
+
+        server.disconnect(&peer);
+        assert!(
+            wait_until(3, || server.peer_count() == 0),
+            "the peer is dropped"
+        );
+        // NOT banned: a fresh connection from the same host is admitted.
+        let client2 = TcpNode::bind("127.0.0.1:0").unwrap();
+        client2.connect(&addr).unwrap();
+        assert!(
+            wait_until(3, || server.peer_count() >= 1),
+            "disconnect does not ban — the host can reconnect"
+        );
     }
 }

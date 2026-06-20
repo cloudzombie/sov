@@ -136,10 +136,11 @@
       <div class="metrics">tests: per-sender cap bounds one account · full pool evicts heaviest sender's highest nonce · fair full pool rejects (no thrash) ✓ · in-memory only (chain-safe)</div>
     </div><span class="right"><span class="pill done">DONE</span></span></div>
 
-    <div class="item next"><div class="num">9</div><div class="body">
+    <div class="item done"><div class="num">9</div><div class="body">
       <h3>P2P hardening</h3>
-      <p>Peer scoring, sync robustness, eclipse resistance (the flood/ban path is timing-fragile under load).</p>
-    </div><span class="right"><span class="pill next">PROPOSED</span></span></div>
+      <p>Per-IP misbehavior scoring with <b>exponential decay</b> (not fixed windows — so the flood/ban path is stable under load, not timing-fragile) + token-bucket rate limiting; <b>eclipse caps</b> (global / per-IP / per-netgroup, loopback-exempt); Noise-XX + ML-KEM-768 transport. <b>Now extended to the sync layer:</b> a peer that sends a <b>fabricated/invalid block</b> (vs a benign can't-connect-yet orphan) is penalized into the same ban path; an <b>over-sized <code>BlocksResponse</code></b> is rejected + penalized; and a connection that completes the transport handshake but never authenticates is <b>reclaimed</b> (zombie-slot eclipse defense).</p>
+      <div class="metrics">tests: penalize_peer bans+drops · sub-threshold forgiven · disconnect (no ban) reconnects · import classifies orphan→Rejected vs fabricated→Invalid · sweep spares a fresh peer · existing flood/eclipse/token-bucket ✓</div>
+    </div><span class="right"><span class="pill done">DONE</span></span></div>
   </section>
 
   <section>
