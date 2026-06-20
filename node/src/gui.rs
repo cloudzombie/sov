@@ -931,11 +931,14 @@ impl Station {
         // or keep mining headless. From here on, the node's lifetime is the app's.
         stop_tracked_node();
         let _ = std::fs::remove_file(node_pid_path());
-        // The app IS the node: on a sandbox network, bring the embedded node up
-        // automatically when a wallet is available, so opening sov-station starts the
-        // node (and closing it stops it). Safe — `build_and_run_node` refuses to
-        // touch a chain mined to a different wallet, so this can never wipe or stack.
-        if station.network.is_sandbox() && !station.wallets.is_empty() {
+        // First-run guidance: a node mines to a wallet, so with no wallet yet, open
+        // on the Wallet tab (where you create/import one) rather than the Node tab
+        // with a silently-greyed "Start". With a wallet present, the app IS the node:
+        // bring the embedded node up automatically (closing the app stops it). Safe —
+        // `build_and_run_node` refuses to touch a chain mined to a different wallet.
+        if station.wallets.is_empty() {
+            station.tab = Tab::Wallet;
+        } else if station.network.is_sandbox() {
             station.start_local_node();
         }
         station
@@ -1906,6 +1909,18 @@ impl eframe::App for Station {
                             .clicked()
                         {
                             self.reset_local_chain();
+                        }
+                        // VISIBLE guidance (not just a hover) for the most common
+                        // first-run confusion: a greyed "Start" because there is no
+                        // wallet yet. A node must mine to a wallet you control.
+                        if !enabled {
+                            ui.label(
+                                egui::RichText::new(
+                                    "← create or import a wallet in the Wallet tab first \
+                                     (a node mines to a wallet you control)",
+                                )
+                                .color(egui::Color32::from_rgb(230, 170, 60)),
+                            );
                         }
                     }
                 } else {
@@ -5494,6 +5509,24 @@ fn stop_tracked_node() {
     let _ = std::fs::remove_file(node_pid_path());
 }
 
+/// The testnet-1 genesis spec, COMPILED INTO the binary so a shipped app is fully
+/// self-contained — no source checkout, no reliance on the build-machine path in
+/// `CARGO_MANIFEST_DIR` (which does not exist on a user's machine). This is the same
+/// frozen spec the dev tree ships in `chain/specs/testnet-1.json`.
+const TESTNET_1_SPEC: &str = include_str!("../../chain/specs/testnet-1.json");
+
+/// The genesis spec text for `spec_filename`, from the embedded copy. Only the
+/// shipped testnet is bundled; other networks return a clear error rather than a
+/// confusing missing-file failure.
+fn embedded_spec(spec_filename: &str) -> Result<&'static str, String> {
+    match spec_filename {
+        "testnet-1.json" => Ok(TESTNET_1_SPEC),
+        other => Err(format!(
+            "no genesis spec bundled for this network ({other}) — this is a testnet build"
+        )),
+    }
+}
+
 /// Set up (if needed) and start a local node **in-process**, returning a handle
 /// whose lifetime is the app's. The one-time chain setup (`sov-testnet join`, which
 /// writes the genesis spec + config) is a transient helper that runs and exits; the
@@ -5525,19 +5558,18 @@ fn build_and_run_node(
     }
 
     // One-time setup: wrap a local node around the frozen spec, mining to THIS
-    // wallet's implicit account (so its coinbase is claimable only by its key).
+    // wallet's implicit account (so its coinbase is claimable only by its key). The
+    // genesis spec is EMBEDDED in the binary (see `embedded_spec`), so a shipped
+    // app is self-contained — it does not depend on a source checkout or the
+    // build-machine path baked into `CARGO_MANIFEST_DIR`.
     if !node_dir.join("testnet.json").exists() {
-        let spec = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .ok_or("no repo root")?
-            .join("chain/specs")
-            .join(spec_filename);
-        if !spec.exists() {
-            return Err(format!("no chain-spec for this network yet ({spec_filename})"));
-        }
+        let spec_text = embedded_spec(spec_filename)?;
+        std::fs::create_dir_all(&node_dir).map_err(|e| format!("create node dir: {e}"))?;
+        let spec_path = node_dir.join(spec_filename);
+        std::fs::write(&spec_path, spec_text).map_err(|e| format!("write spec: {e}"))?;
         let status = Command::new(&testnet)
             .args(["join", "--spec"])
-            .arg(&spec)
+            .arg(&spec_path)
             .args(["--out"])
             .arg(&node_dir)
             .args(["--name", account])
