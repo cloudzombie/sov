@@ -79,6 +79,14 @@ pub enum NetMessage {
         /// Ed25519 signature over [`handshake_bytes`]`(chain_id, genesis_hash, channel_binding)`.
         signature: Signature,
     },
+    // WIRE-COMPATIBILITY RULE: Borsh encodes an enum variant by its declaration-order
+    // index, so a NEW variant MUST be appended HERE, at the end — never inserted
+    // between existing ones, which would shift every later discriminant and break the
+    // handshake with peers on an older binary. (`GetBlocks`/`BlocksResponse` sit
+    // mid-enum because they shipped that way in v0.1.6; they are deliberately left in
+    // place — moving them now would break compatibility with deployed nodes for a
+    // purely cosmetic reordering.) NetMessage is wire-only; it is never persisted, so
+    // its ordering does not affect the block log or genesis KAT.
 }
 
 impl NetMessage {

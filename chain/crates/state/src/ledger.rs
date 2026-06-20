@@ -1007,6 +1007,14 @@ impl Ledger {
     /// is guaranteed to reproduce the exact same `state_root`. This makes the
     /// trie-backed store durable across restarts.
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        std::fs::write(path, self.to_snapshot_bytes())
+    }
+
+    /// Serialize the full ledger state to a Borsh snapshot blob — the same content
+    /// [`save`](Ledger::save) writes, exposed so a caller can bundle it into a larger
+    /// atomic snapshot file. The Merkle commitment is omitted (rebuilt on load), so
+    /// the blob alone deterministically reproduces the `state_root`.
+    pub fn to_snapshot_bytes(&self) -> Vec<u8> {
         let accounts: Vec<AccountEntry> = self
             .accounts
             .iter()
@@ -1052,7 +1060,7 @@ impl Ledger {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let bytes = borsh::to_vec(&(
+        borsh::to_vec(&(
             accounts,
             storage,
             self.mined_emitted,
@@ -1071,14 +1079,19 @@ impl Ledger {
             nfts,
             multisig,
         ))
-        .expect("ledger snapshot serialization is infallible");
-        std::fs::write(path, bytes)
+        .expect("ledger snapshot serialization is infallible")
     }
 
     /// Load a ledger previously written by [`save`](Ledger::save), rebuilding the
     /// Merkle commitment from the stored accounts and contract storage.
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Ledger> {
-        let bytes = std::fs::read(path)?;
+        Self::from_snapshot_bytes(&std::fs::read(path)?)
+    }
+
+    /// Rebuild a ledger from a [`to_snapshot_bytes`](Ledger::to_snapshot_bytes) blob,
+    /// reconstructing the Merkle commitment so the loaded ledger reproduces the exact
+    /// `state_root` the snapshot was taken at.
+    pub fn from_snapshot_bytes(bytes: &[u8]) -> std::io::Result<Ledger> {
         #[allow(clippy::type_complexity)]
         let (
             accounts,
@@ -1116,7 +1129,7 @@ impl Ledger {
             Vec<NftClassEntry>,
             Vec<NftEntry>,
             Vec<MultisigEntry>,
-        ) = borsh::from_slice(&bytes)
+        ) = borsh::from_slice(bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let mut ledger = Ledger::new();
         for (id, account) in accounts {

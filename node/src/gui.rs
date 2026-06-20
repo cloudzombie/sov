@@ -5645,9 +5645,13 @@ fn add_firewall_rule() {
              program=\"{}\" enable=yes profile=any'",
             exe.display()
         );
+        // Fire-and-forget (`spawn`, not `status`): the elevated `Start-Process -Verb
+        // RunAs` raises a UAC prompt, and waiting on it would BLOCK node startup until
+        // the user clicks (or indefinitely if they ignore it). Spawning lets the node
+        // come up immediately while the rule is added in the background.
         let _ = Command::new("powershell")
             .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps])
-            .status();
+            .spawn();
     }
 }
 #[cfg(not(windows))]

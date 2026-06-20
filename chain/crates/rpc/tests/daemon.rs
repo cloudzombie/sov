@@ -223,6 +223,67 @@ fn daemon_persists_blocks_and_resumes_state_after_restart() {
 }
 
 #[test]
+fn daemon_fast_resumes_from_chainstate_snapshot() {
+    // The normal restart path: a daemon checkpoints its chainstate, then a fresh
+    // daemon on the same data dir resumes from that snapshot (tier 1) — reproducing
+    // the exact head + state root WITHOUT replaying the block log from genesis.
+    let dir = unique_dir("snapshot-resume");
+    let _ = std::fs::remove_dir_all(&dir);
+    let genesis = ChainSpec::from_json(&chain_spec_json())
+        .unwrap()
+        .to_genesis_config()
+        .unwrap();
+    let miner_keys = || vec![(id("val01.node.sov"), Keypair::from_seed([1; 32]))];
+
+    let root_after;
+    {
+        let d1 = Daemon::new(&genesis, &dir, 1024, 256, miner_keys()).unwrap();
+        assert!(
+            !d1.resumed_from_snapshot(),
+            "first boot has no snapshot to resume from"
+        );
+        // Produce three blocks (a transfer in the first to populate the receipt index).
+        let kp = Keypair::from_seed([2; 32]);
+        for i in 0..3u64 {
+            let tx = Transaction {
+                signer: id("usa.reserve.sov"),
+                public_key: kp.public_key(),
+                nonce: i,
+                action: Action::Transfer {
+                    to: id("ecb.reserve.sov"),
+                    amount: Balance::from_sov(10).unwrap(),
+                },
+            };
+            d1.node()
+                .lock()
+                .unwrap()
+                .submit(SignedTransaction::sign(tx, &kp).unwrap())
+                .unwrap();
+            assert!(d1.produce_once(2_000 + i * 1_000).unwrap());
+        }
+        assert_eq!(d1.height(), 3);
+        root_after = d1.state_root_hex();
+        // Explicit checkpoint (what the app does on quit / the run loop does on shutdown).
+        d1.write_snapshot_now().unwrap();
+    }
+
+    // Fresh daemon, same data dir: must resume FROM THE SNAPSHOT, not a replay.
+    let d2 = Daemon::new(&genesis, &dir, 1024, 256, miner_keys()).unwrap();
+    assert!(
+        d2.resumed_from_snapshot(),
+        "second boot resumes from the chainstate snapshot (tier 1)"
+    );
+    assert_eq!(d2.height(), 3);
+    assert_eq!(d2.state_root_hex(), root_after);
+    assert_eq!(
+        d2.balance(&id("ecb.reserve.sov")),
+        Balance::from_sov(30).unwrap()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn confirmations_survive_restart() {
     // Nakamoto finality is a function of chain state alone, so a restart that
     // replays the block log reproduces the exact same confirmation depths —

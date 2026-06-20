@@ -937,6 +937,247 @@ impl Blockchain {
         Ok(receipts)
     }
 
+    /// **Trusted fast-replay** of a block from this node's OWN persisted, checksummed
+    /// block log: append it WITHOUT re-verifying proof of work, committed roots, or
+    /// invariants — all were checked when the block was first accepted, and the log is
+    /// integrity-checked on read. Crucially it executes **directly on the live ledger**
+    /// (no per-block clone) and skips the per-block state-root recompute/compare, so
+    /// resuming a long chain takes seconds instead of minutes. Blocks must arrive in
+    /// order, each extending the head (true for a sequential log). The caller verifies
+    /// the final state root ONCE via [`replayed_state_matches_head`]. This is for local
+    /// replay only — network blocks always go through the fully-verified `import_block`.
+    pub fn extend_trusted(&mut self, block: Block) -> Result<(), ChainError> {
+        if block.header.prev_hash != self.head {
+            return Err(ChainError::PrevHashMismatch); // not a sequential extend
+        }
+        let block_hash = block.hash();
+        let height = block.header.height.get();
+        // Trust the committed difficulty (validated when first accepted).
+        let sha_target = canonical_target(
+            Target::from_compact(block.header.bits).ok_or(ChainError::BadDifficultyBits {
+                expected: block.header.bits,
+                got: block.header.bits,
+            })?,
+        );
+        let parent_work = self
+            .index
+            .get(&self.head)
+            .expect("head is always indexed")
+            .chain_work;
+        let new_work = parent_work.saturating_add(Work::of_target(&sha_target));
+
+        // Execute on the live ledger with no clone: move it out, apply, move back.
+        // (Borrow-safe — `self` is only read while `self.ledger` is a local.)
+        let mut ledger = std::mem::take(&mut self.ledger);
+        let receipts = match self.execute_block_on(&mut ledger, &block, sha_target, &self.signals) {
+            Ok(r) => r,
+            Err(e) => {
+                self.ledger = ledger; // restore before bailing
+                return Err(e);
+            }
+        };
+        self.ledger = ledger;
+
+        let cand = Candidate {
+            sha_target,
+            new_work,
+            height,
+        };
+        self.signals
+            .record(block.header.height, block.header.version_bits);
+        self.blocks.push(block.clone());
+        self.head = block_hash;
+        self.index_block_receipts(height, &receipts);
+        self.insert_entry(block, &cand);
+        self.sync_active_difficulty();
+        Ok(())
+    }
+
+    /// Whether a trusted fast-replay landed on the committed head state — the single
+    /// integrity check that replaces the per-block root verification. If this is false
+    /// the local log is inconsistent and the caller should rebuild with full
+    /// verification.
+    pub fn replayed_state_matches_head(&self) -> bool {
+        self.ledger.state_root() == self.head().header.state_root
+    }
+
+    /// **Fast trusted replay of a persisted block log**, which may contain orphan
+    /// side-branches from past reorgs (so it is NOT a single linear chain). Rather
+    /// than re-running fork choice block-by-block (each reorg replays from genesis —
+    /// O(reorgs × n), the source of minute-long startups), this first reconstructs
+    /// the **heaviest chain** by cumulative work, then trusted-replays just that
+    /// linear chain ([`extend_trusted`]). Returns `true` if the result matches the
+    /// committed head state; on `false` (or `Err`) the caller rebuilds with the
+    /// fully-verified path. Local log only — network blocks use `import_block`.
+    pub fn replay_log_trusted(&mut self, blocks: &[Block]) -> Result<bool, ChainError> {
+        if blocks.is_empty() {
+            return Ok(true);
+        }
+        for block in self.heaviest_chain(blocks) {
+            self.extend_trusted(block)?;
+        }
+        Ok(self.replayed_state_matches_head())
+    }
+
+    /// The active-chain receipt index as a serializable list, for inclusion in a
+    /// chainstate snapshot (pairs with [`resume_from_snapshot`]).
+    pub fn active_receipts_snapshot(&self) -> Vec<(u64, Vec<Receipt>)> {
+        self.active_receipts
+            .iter()
+            .map(|(h, r)| (*h, r.clone()))
+            .collect()
+    }
+
+    /// **Fast-resume from a trusted local chainstate snapshot** instead of replaying
+    /// every block. The snapshot is the ledger + active receipt index at some height
+    /// `snapshot_height` (identified by `snapshot_head`) on the chain. This:
+    ///
+    /// 1. reconstructs the active chain's `blocks` / fork-choice `index` / signal
+    ///    history for the snapshot-covered prefix from each block's COMMITTED bits —
+    ///    NO transaction execution (the snapshot supplies that state);
+    /// 2. installs the snapshot ledger + receipts and VERIFIES the loaded state root
+    ///    equals the prefix tip's committed root (the backstop against a stale or
+    ///    tampered snapshot);
+    /// 3. trusted-replays (executing) only the blocks AFTER the snapshot up to the
+    ///    heaviest tip — a bounded gap, so a snapshot that lags the tip (periodic
+    ///    snapshot + unclean exit) still resumes fast instead of replaying everything.
+    ///
+    /// Returns `Ok(true)` on a clean, fully-verified resume; `Ok(false)` (the caller
+    /// rebuilds via replay) if the snapshot is not an ancestor of the log's heaviest
+    /// tip or its state root does not verify — so a stale/tampered snapshot can never
+    /// boot a node onto unverified state. Startup is then bounded by state size + the
+    /// post-snapshot gap, NOT by chain length — the Bitcoin/Zcash chainstate model.
+    /// Call on a freshly constructed (genesis-only) chain.
+    pub fn resume_from_snapshot(
+        &mut self,
+        ledger: Ledger,
+        active_receipts: Vec<(u64, Vec<Receipt>)>,
+        snapshot_head: Hash,
+        snapshot_height: u64,
+        log: &[Block],
+    ) -> Result<bool, ChainError> {
+        if self.height() != 0 {
+            return Ok(false); // only meaningful as the first load on a fresh chain
+        }
+        let chain = self.heaviest_chain(log);
+        // The snapshot must sit ON this heaviest chain. `chain` is genesis-exclusive
+        // and ascending/contiguous (it is walked parent→genesis), so the block at
+        // `snapshot_height` is `chain[snapshot_height - 1]`.
+        if snapshot_height == 0 || snapshot_height as usize > chain.len() {
+            return Ok(false);
+        }
+        let at = &chain[snapshot_height as usize - 1];
+        if at.hash() != snapshot_head || at.header.height.get() != snapshot_height {
+            return Ok(false); // snapshot is on an orphaned branch / a different chain
+        }
+        // Phase 1 — header-only reconstruction of the snapshot-covered prefix
+        // [1..=snapshot_height]: same trust basis as `extend_trusted` (committed bits),
+        // but no execution, since the snapshot already holds the resulting state.
+        for block in chain.iter().take(snapshot_height as usize) {
+            if block.header.prev_hash != self.head {
+                return Ok(false);
+            }
+            let Some(target) = Target::from_compact(block.header.bits).map(canonical_target) else {
+                return Ok(false);
+            };
+            let parent_work = self
+                .index
+                .get(&self.head)
+                .expect("head is indexed")
+                .chain_work;
+            let cand = Candidate {
+                sha_target: target,
+                new_work: parent_work.saturating_add(Work::of_target(&target)),
+                height: block.header.height.get(),
+            };
+            self.signals
+                .record(block.header.height, block.header.version_bits);
+            self.blocks.push(block.clone());
+            self.head = block.hash();
+            self.insert_entry(block.clone(), &cand);
+        }
+        // Install the snapshot state and VERIFY against the prefix tip — reject a
+        // snapshot whose state root does not match before we build anything on it.
+        self.ledger = ledger;
+        self.rebuild_receipt_index(active_receipts);
+        self.sync_active_difficulty();
+        if !self.replayed_state_matches_head() {
+            return Ok(false);
+        }
+        // Phase 2 — trusted replay (with execution) of any blocks after the snapshot
+        // up to the heaviest tip. Bounded by how far the snapshot lags, not by length.
+        for block in chain.into_iter().skip(snapshot_height as usize) {
+            self.extend_trusted(block)?;
+        }
+        Ok(self.replayed_state_matches_head())
+    }
+
+    /// Reconstruct the heaviest (active) chain — genesis-exclusive, ascending height —
+    /// from an unordered block set that may include orphan side-branches. Cumulative
+    /// work is computed in height order (a block's parent has a lower height, so it is
+    /// processed first), then we walk back from the max-work tip to genesis.
+    fn heaviest_chain(&self, blocks: &[Block]) -> Vec<Block> {
+        let by_hash: HashMap<Hash, &Block> = blocks.iter().map(|b| (b.hash(), b)).collect();
+        let genesis_work = self
+            .index
+            .get(&self.genesis_hash)
+            .map(|e| e.chain_work)
+            .unwrap_or_else(Work::zero);
+        let mut sorted: Vec<&Block> = blocks.iter().collect();
+        sorted.sort_by_key(|b| b.header.height.get());
+        let mut cum: HashMap<Hash, Work> = HashMap::new();
+        for b in &sorted {
+            let parent = b.header.prev_hash;
+            let parent_work = if parent == self.genesis_hash {
+                Some(genesis_work)
+            } else {
+                cum.get(&parent).copied()
+            };
+            // A block whose parent isn't genesis or a known earlier block is an
+            // orphan with a missing ancestor — skip it (it cannot be the head).
+            let Some(pw) = parent_work else { continue };
+            let Some(target) = Target::from_compact(b.header.bits) else {
+                continue;
+            };
+            let w = pw.saturating_add(Work::of_target(&canonical_target(target)));
+            cum.insert(b.hash(), w);
+        }
+        // Pick the heaviest tip, breaking work ties by FIRST-SEEN to match live fork
+        // choice exactly (`new_work > head_work` is strict, so an equal-work competitor
+        // never displaces the incumbent — test `heavier_branch_triggers_reorg`). The log
+        // is in commit (== seen) order, so on a work tie the earliest-logged tip is the
+        // one the running node committed as head; `max_by_key` over a HashMap would pick
+        // an arbitrary tip and could boot onto a different (though equal-work) head.
+        let mut pos: HashMap<Hash, usize> = HashMap::new();
+        for (i, b) in blocks.iter().enumerate() {
+            pos.entry(b.hash()).or_insert(i);
+        }
+        let mut best: Option<(Hash, Work, usize)> = None;
+        for (h, w) in &cum {
+            let idx = pos.get(h).copied().unwrap_or(usize::MAX);
+            let better = match &best {
+                None => true,
+                Some((_, bw, bi)) => *w > *bw || (*w == *bw && idx < *bi),
+            };
+            if better {
+                best = Some((*h, *w, idx));
+            }
+        }
+        let Some((tip, _, _)) = best else {
+            return Vec::new();
+        };
+        // Walk back from the heaviest tip to genesis, then reverse to ascending order.
+        let mut chain = Vec::new();
+        let mut cur = tip;
+        while cur != self.genesis_hash {
+            let Some(b) = by_hash.get(&cur) else { break };
+            chain.push((*b).clone());
+            cur = b.header.prev_hash;
+        }
+        chain.reverse();
+        chain
+    }
+
     /// The consensus invariant backstop run on every committed block: value
     /// conservation across the transition (`supply_after == supply_before + Δmined`)
     /// and the per-state invariants (supply cap, mining budget, per-asset
@@ -2335,5 +2576,125 @@ mod tests {
             !node1.contains_block(&b1_hash),
             "invalid side branch was not inserted into the block index"
         );
+    }
+
+    // ---- Chainstate snapshot fast-resume ----
+
+    /// Mine `count` blocks onto `chain` (one transfer in the first, the rest empty),
+    /// committing each through the normal validated import path. Timestamps are keyed
+    /// to height so they stay strictly increasing across multiple calls.
+    fn mine_blocks(chain: &mut Blockchain, count: u64) {
+        for _ in 0..count {
+            let height = chain.height();
+            let txs = if height == 0 {
+                vec![usa_transfer("ecb.reserve.sov", 250, 0)]
+            } else {
+                vec![]
+            };
+            let ts = 2_000 + (height + 1) * 1_000;
+            let block = chain.produce_block(txs, ts).unwrap();
+            chain.import_block(block).unwrap();
+        }
+    }
+
+    /// The active block log (heights 1..=tip), exactly what the daemon persists and
+    /// replays (genesis is not logged).
+    fn active_log(chain: &Blockchain) -> Vec<Block> {
+        (1..=chain.height())
+            .map(|h| chain.block_by_height(h).unwrap().clone())
+            .collect()
+    }
+
+    #[test]
+    fn snapshot_resume_reproduces_full_replay_state() {
+        // Build a chain, take a snapshot of its tip, and resume a FRESH chain from it
+        // (round-tripping the ledger through its Borsh snapshot bytes, as the daemon
+        // does). The resumed chain must be byte-identical: same head, state root, and
+        // receipt lookups — with NO block execution beyond the snapshot.
+        let mut chain = fresh_chain();
+        mine_blocks(&mut chain, 6);
+        let tip = chain.head().clone();
+        let log = active_log(&chain);
+
+        let ledger = Ledger::from_snapshot_bytes(&chain.ledger().to_snapshot_bytes()).unwrap();
+        let receipts = chain.active_receipts_snapshot();
+
+        let mut resumed = fresh_chain();
+        let ok = resumed
+            .resume_from_snapshot(ledger, receipts, tip.hash(), tip.header.height.get(), &log)
+            .unwrap();
+        assert!(ok, "snapshot resume verified against the committed head");
+        assert_eq!(resumed.height(), chain.height());
+        assert_eq!(resumed.head().hash(), chain.head().hash());
+        assert_eq!(resumed.ledger().state_root(), chain.ledger().state_root());
+        // The transfer's receipt is found on the resumed chain (receipt index restored).
+        let tx_id = chain.block_by_height(1).unwrap().transactions[0].id();
+        assert!(
+            resumed.receipt(&tx_id).is_some(),
+            "restored snapshot serves historical receipts"
+        );
+    }
+
+    #[test]
+    fn snapshot_resume_replays_the_post_snapshot_gap() {
+        // A snapshot that LAGS the tip (periodic snapshot + later blocks) must still
+        // resume correctly by trusted-replaying only the gap — not the whole chain.
+        let mut chain = fresh_chain();
+        mine_blocks(&mut chain, 4);
+        // Snapshot at height 4.
+        let snap_head = chain.head().hash();
+        let snap_height = chain.height();
+        let snap_ledger = Ledger::from_snapshot_bytes(&chain.ledger().to_snapshot_bytes()).unwrap();
+        let snap_receipts = chain.active_receipts_snapshot();
+        // ...then mine 5 more (the gap the resume must replay).
+        mine_blocks(&mut chain, 5);
+        assert_eq!(chain.height(), 9);
+        let log = active_log(&chain);
+
+        let mut resumed = fresh_chain();
+        let ok = resumed
+            .resume_from_snapshot(snap_ledger, snap_receipts, snap_head, snap_height, &log)
+            .unwrap();
+        assert!(ok);
+        assert_eq!(resumed.height(), 9);
+        assert_eq!(resumed.head().hash(), chain.head().hash());
+        assert_eq!(resumed.ledger().state_root(), chain.ledger().state_root());
+    }
+
+    #[test]
+    fn stale_snapshot_is_rejected_for_replay_fallback() {
+        // A snapshot whose height exceeds the log's heaviest chain (e.g. the log was
+        // truncated / the snapshot is from a longer foreign chain) is rejected, so the
+        // caller falls back to a full replay rather than booting on unverified state.
+        let mut chain = fresh_chain();
+        mine_blocks(&mut chain, 5);
+        let ledger = Ledger::from_snapshot_bytes(&chain.ledger().to_snapshot_bytes()).unwrap();
+        let receipts = chain.active_receipts_snapshot();
+        let snap_head = chain.head().hash();
+
+        // Present only the first 3 blocks of the log, but claim a height-5 snapshot.
+        let short_log: Vec<Block> = active_log(&chain).into_iter().take(3).collect();
+        let mut resumed = fresh_chain();
+        let ok = resumed
+            .resume_from_snapshot(ledger, receipts, snap_head, 5, &short_log)
+            .unwrap();
+        assert!(!ok, "a snapshot ahead of the log's heaviest tip is rejected");
+    }
+
+    #[test]
+    fn snapshot_head_not_on_heaviest_chain_is_rejected() {
+        // A snapshot whose claimed head hash is not the block at that height on the
+        // log's heaviest chain (wrong fork / corruption) is rejected.
+        let mut chain = fresh_chain();
+        mine_blocks(&mut chain, 5);
+        let ledger = Ledger::from_snapshot_bytes(&chain.ledger().to_snapshot_bytes()).unwrap();
+        let receipts = chain.active_receipts_snapshot();
+        let log = active_log(&chain);
+
+        let mut resumed = fresh_chain();
+        let ok = resumed
+            .resume_from_snapshot(ledger, receipts, Hash::digest(b"wrong head"), 5, &log)
+            .unwrap();
+        assert!(!ok, "a snapshot head off the heaviest chain is rejected");
     }
 }

@@ -139,8 +139,10 @@ const BAN_DURATION: Duration = Duration::from_secs(300);
 const LAN_DISCO_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 90, 45);
 /// UDP port the discovery beacon is sent to / listened on (P2P itself is elsewhere).
 const LAN_DISCO_PORT: u16 = 9646;
-/// How often a node re-announces itself on the LAN.
-const LAN_DISCO_INTERVAL: Duration = Duration::from_secs(3);
+/// How often a node re-announces itself on the LAN. Kept short (1s) so a peer that
+/// starts later, or whose first beacon was dropped (UDP multicast is lossy), is
+/// discovered within ~a second — one tiny packet per second per node is negligible.
+const LAN_DISCO_INTERVAL: Duration = Duration::from_secs(1);
 /// Beacon wire format tag (versioned), then `chain_id`, then the P2P listen port.
 const LAN_DISCO_TAG: &str = "sov-disco1";
 
@@ -331,9 +333,16 @@ impl TcpNode {
             let _ = sock.set_multicast_loop_v4(false);
             let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
             let beacon = format!("{LAN_DISCO_TAG}|{chain_id}|{p2p_port}|{nonce}");
-            let mut last = Instant::now()
-                .checked_sub(LAN_DISCO_INTERVAL)
-                .unwrap_or_else(Instant::now);
+            // Startup burst: UDP multicast is lossy, so fire a few beacons up front
+            // (briefly spaced) rather than betting first contact on a single packet —
+            // discovery then survives an early dropped datagram and lands in well under
+            // a second. Inbound peer beacons arriving meanwhile are buffered by the OS
+            // socket and read in the loop right after, so none are missed.
+            for _ in 0..3 {
+                let _ = sock.send_to(beacon.as_bytes(), (LAN_DISCO_GROUP, LAN_DISCO_PORT));
+                thread::sleep(Duration::from_millis(150));
+            }
+            let mut last = Instant::now();
             let mut buf = [0u8; 256];
             while !shared.shutdown.load(Ordering::SeqCst) {
                 if last.elapsed() >= LAN_DISCO_INTERVAL {

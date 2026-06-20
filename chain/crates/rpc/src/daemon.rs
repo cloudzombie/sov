@@ -30,7 +30,8 @@ use sov_mining::MiningPolicy;
 use sov_network::{NetMessage, TcpNode};
 use sov_node::{Node, NodeError, Produced};
 use sov_primitives::{AccountId, Balance, Hash};
-use sov_types::Block;
+use sov_state::Ledger;
+use sov_types::{Block, Receipt};
 
 use crate::{RpcHandle, RpcServer};
 
@@ -553,6 +554,89 @@ fn load_blocks(path: &Path) -> io::Result<Vec<Block>> {
     Ok(blocks)
 }
 
+/// Path of the chainstate snapshot within a data dir.
+fn snapshot_path(dir: &Path) -> PathBuf {
+    dir.join("chainstate.snapshot")
+}
+
+/// How often (in committed blocks of active-head advance) a running daemon refreshes
+/// its chainstate snapshot. Frequent enough that even an unclean exit leaves only a
+/// small post-snapshot gap to trusted-replay; the snapshot write is cheap and done off
+/// the node lock, so this costs little. A clean shutdown always writes a final one.
+const SNAPSHOT_EVERY_BLOCKS: u64 = 50;
+
+/// On-disk snapshot format version (independent of the block-log schema). A snapshot
+/// with a different version, a bad checksum, or any decode error is simply IGNORED —
+/// the node falls back to replaying the (authoritative) block log — so this never
+/// blocks a boot or risks mis-loading state.
+const SNAPSHOT_VERSION: u32 = 1;
+
+/// Serialize a chainstate snapshot of `chain` to a checksummed byte blob:
+/// `[checksum: 32-byte BLAKE3 of payload][payload]`, where the payload is Borsh
+/// `(version, head_hash, head_height, head_state_root, ledger_bytes, active_receipts)`.
+/// Cheap (no I/O) so it can be produced under a brief node lock; pair with
+/// [`write_snapshot_bytes`], which does the (off-lock) durable write.
+fn snapshot_bytes(chain: &Blockchain) -> Vec<u8> {
+    let head = chain.head();
+    let payload = borsh::to_vec(&(
+        SNAPSHOT_VERSION,
+        head.hash(),
+        head.header.height.get(),
+        head.header.state_root,
+        chain.ledger().to_snapshot_bytes(),
+        chain.active_receipts_snapshot(),
+    ))
+    .expect("snapshot serialization is infallible");
+    let checksum = Hash::digest(&payload);
+    let mut out = Vec::with_capacity(Hash::LEN + payload.len());
+    out.extend_from_slice(checksum.as_bytes());
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// Atomically write snapshot `bytes` to `path` (temp file + fsync + rename), so a
+/// crash mid-write can never corrupt a prior good snapshot. The snapshot is a
+/// fast-start CACHE — the block log stays the source of truth and the snapshot is
+/// re-verified against it on load.
+fn write_snapshot_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)
+}
+
+/// Read + integrity-check a snapshot written by [`snapshot_bytes`], returning the
+/// resume inputs `(ledger, active_receipts, head_hash, head_height)`. `None` on
+/// absence, a short file, a bad checksum, a version mismatch, or any decode error —
+/// the caller then replays the log.
+#[allow(clippy::type_complexity)]
+fn load_snapshot(path: &Path) -> Option<(Ledger, Vec<(u64, Vec<Receipt>)>, Hash, u64)> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() < Hash::LEN {
+        return None;
+    }
+    let (checksum, payload) = bytes.split_at(Hash::LEN);
+    if Hash::digest(payload).as_bytes() != checksum {
+        return None; // corrupt / torn snapshot — ignore, replay the log
+    }
+    let (version, head_hash, head_height, _state_root, ledger_bytes, active_receipts): (
+        u32,
+        Hash,
+        u64,
+        Hash,
+        Vec<u8>,
+        Vec<(u64, Vec<Receipt>)>,
+    ) = borsh::from_slice(payload).ok()?;
+    if version != SNAPSHOT_VERSION {
+        return None;
+    }
+    let ledger = Ledger::from_snapshot_bytes(&ledger_bytes).ok()?;
+    Some((ledger, active_receipts, head_hash, head_height))
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -569,6 +653,11 @@ pub struct Daemon {
     /// If set, blocks this daemon mines are gossiped to peers over this
     /// transport (attached via [`Daemon::with_gossip`]).
     gossip: Option<Arc<TcpNode>>,
+    /// Where the chainstate fast-start snapshot is written/refreshed.
+    snapshot_path: PathBuf,
+    /// Whether this boot resumed from a chainstate snapshot (tier 1) rather than
+    /// replaying the block log. Observability for operators/tests.
+    resumed_fast: bool,
 }
 
 /// A running daemon's RPC + block-production threads, with graceful shutdown.
@@ -610,13 +699,43 @@ impl Daemon {
         // rather than mis-replaying it (node-data stability across upgrades).
         check_schema_version(&data_dir)?;
 
-        let mut chain = Blockchain::new(genesis)?;
         let persisted = load_blocks(&blocks_path(&data_dir))?;
         let resumed = persisted.len();
-        // Deterministic replay through the validated import path: state, difficulty,
-        // and roots are re-derived, never trusted from a snapshot.
-        for block in persisted {
-            chain.import_block(block)?;
+        let snap_path = snapshot_path(&data_dir);
+        // THREE-TIER fast start, each tier falling back to the next on ANY
+        // inconsistency, so a node ALWAYS boots on a state verified against its own
+        // (authoritative, integrity-checked) block log:
+        //   1. Chainstate SNAPSHOT — load the tip state directly and rebuild the
+        //      fork-choice index from block headers (no execution), then trusted-replay
+        //      only the small post-snapshot gap. Bounded by state size, independent of
+        //      chain length (the Bitcoin/Zcash chainstate model). Sub-second.
+        //   2. Trusted REPLAY — re-execute the heaviest chain on the live ledger (no
+        //      per-block clone / root recompute / PoW re-verify). Seconds.
+        //   3. Full VERIFIED import — re-validate every block from genesis. Minutes;
+        //      the last-resort source of truth if both caches are unusable.
+        let mut chain = Blockchain::new(genesis)?;
+        let resumed_fast = match load_snapshot(&snap_path) {
+            Some((ledger, receipts, head, height)) => chain
+                .resume_from_snapshot(ledger, receipts, head, height, &persisted)
+                .unwrap_or(false),
+            None => false,
+        };
+        if !resumed_fast {
+            chain = Blockchain::new(genesis)?;
+            if !chain.replay_log_trusted(&persisted).unwrap_or(false) {
+                chain = Blockchain::new(genesis)?;
+                for block in persisted {
+                    chain.import_block(block)?;
+                }
+            }
+            // We replayed a non-empty chain rather than resuming a snapshot (none
+            // existed, or it was stale). Write one NOW so the next start is an instant
+            // tier-1 resume even if this process exits before the periodic/shutdown
+            // snapshot runs (a force-quit or crash). Best-effort: a write failure just
+            // means the next start replays again.
+            if resumed > 0 {
+                let _ = write_snapshot_bytes(&snap_path, &snapshot_bytes(&chain));
+            }
         }
         let block_log = Arc::new(BlockLog::open(&blocks_path(&data_dir))?);
 
@@ -634,6 +753,8 @@ impl Daemon {
             resumed,
             block_log,
             gossip: None,
+            snapshot_path: snap_path,
+            resumed_fast,
         })
     }
 
@@ -645,6 +766,28 @@ impl Daemon {
     /// How many blocks were replayed from the log at startup.
     pub fn resumed_blocks(&self) -> usize {
         self.resumed
+    }
+
+    /// Whether this boot resumed instantly from a chainstate snapshot (tier 1) rather
+    /// than replaying the block log (tier 2/3).
+    pub fn resumed_from_snapshot(&self) -> bool {
+        self.resumed_fast
+    }
+
+    /// Write a chainstate snapshot of the current head NOW, atomically. The running
+    /// daemon also snapshots periodically and on clean shutdown; this lets an operator
+    /// (or the desktop app on quit) force a checkpoint so the next start is an instant
+    /// tier-1 resume. The (cheap) serialization happens under a brief node lock; the
+    /// durable write does not.
+    pub fn write_snapshot_now(&self) -> io::Result<()> {
+        let bytes = {
+            let n = self
+                .node
+                .lock()
+                .map_err(|_| io::Error::other("node lock poisoned"))?;
+            snapshot_bytes(n.chain())
+        };
+        write_snapshot_bytes(&self.snapshot_path, &bytes)
     }
 
     /// Attach a P2P transport so blocks this daemon produces are gossiped to
@@ -757,10 +900,16 @@ impl Daemon {
         let node = self.node();
         let gossip = self.gossip.clone();
         let block_log = Arc::clone(&self.block_log);
+        let snap_path = self.snapshot_path.clone();
         let sd = Arc::clone(&shutdown);
         let interval = block_time_ms.max(1);
 
         let produce = thread::spawn(move || {
+            // Refresh the chainstate snapshot when the head advances by this many
+            // blocks. Start at 0 so the just-loaded state is snapshotted soon after
+            // boot — making the very NEXT restart a tier-1 instant resume even if THIS
+            // boot had to replay (no snapshot existed yet, or it was stale).
+            let mut last_snap_height = 0u64;
             while !sd.load(Ordering::SeqCst) {
                 // Sleep up to `interval` in small steps so shutdown is prompt.
                 let mut waited = 0u64;
@@ -795,18 +944,42 @@ impl Daemon {
                 if sd.load(Ordering::SeqCst) {
                     break;
                 }
-                let Ok(mut n) = node.lock() else { break };
-                match n.commit_mined(sealed) {
-                    Ok(produced) => {
-                        // Persist under the node lock (order == commit order).
-                        let _ = block_log.append(&produced.block);
-                        drop(n);
-                        if let Some(tcp) = &gossip {
-                            tcp.broadcast(&NetMessage::NewBlock(produced.block.clone()));
+                {
+                    let Ok(mut n) = node.lock() else { break };
+                    match n.commit_mined(sealed) {
+                        Ok(produced) => {
+                            // Persist under the node lock (order == commit order).
+                            let _ = block_log.append(&produced.block);
+                            drop(n);
+                            if let Some(tcp) = &gossip {
+                                tcp.broadcast(&NetMessage::NewBlock(produced.block.clone()));
+                            }
                         }
+                        Err(_) => drop(n),
                     }
-                    Err(_) => drop(n),
                 }
+                // Periodic chainstate snapshot — keyed off the ACTIVE-head height, so it
+                // captures blocks this node IMPORTED from peers as well as ones it mined.
+                // Serialize under a brief lock, then fsync OFF the lock so mining, RPC,
+                // and block import aren't stalled by disk.
+                let pending = {
+                    let Ok(n) = node.lock() else { break };
+                    let h = n.chain().height();
+                    (h >= last_snap_height + SNAPSHOT_EVERY_BLOCKS)
+                        .then(|| (h, snapshot_bytes(n.chain())))
+                };
+                if let Some((h, bytes)) = pending {
+                    if write_snapshot_bytes(&snap_path, &bytes).is_ok() {
+                        last_snap_height = h;
+                    }
+                }
+            }
+            // Final snapshot on clean shutdown, so the next start is a tier-1 instant
+            // resume with NO post-snapshot gap to replay.
+            if let Ok(n) = node.lock() {
+                let bytes = snapshot_bytes(n.chain());
+                drop(n);
+                let _ = write_snapshot_bytes(&snap_path, &bytes);
             }
         });
 
@@ -1021,6 +1194,46 @@ mod tests {
 
         let err = load_blocks(&path).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn snapshot_bytes_round_trip_and_corruption_is_detected() {
+        // A snapshot blob written by `snapshot_bytes` loads back to the same head and
+        // receipts; a single flipped byte fails the checksum and is rejected (the node
+        // then falls back to replaying the authoritative block log).
+        let mut chain = {
+            let config = GenesisConfig {
+                chain_id: "sov-test".into(),
+                timestamp_ms: 1_000,
+                accounts: vec![GenesisAccount {
+                    account: AccountId::new("val01.node.sov").unwrap(),
+                    key: Keypair::from_seed([1; 32]).public_key(),
+                    balance: Balance::from_sov(10).unwrap(),
+                }],
+                mining: MiningPolicy::test(),
+                vesting: vec![],
+            };
+            Blockchain::new(&config).unwrap()
+        };
+        let block = chain.produce_block(vec![], 2_000).unwrap();
+        chain.import_block(block).unwrap();
+
+        let path = tmp_path("snap");
+        write_snapshot_bytes(&path, &snapshot_bytes(&chain)).unwrap();
+        let (_ledger, _receipts, head, height) = load_snapshot(&path).expect("snapshot loads");
+        assert_eq!(head, chain.head().hash());
+        assert_eq!(height, chain.height());
+
+        // Flip a byte in the payload — the checksum must reject it.
+        let mut raw = fs::read(&path).unwrap();
+        let n = raw.len();
+        raw[n - 1] ^= 0xff;
+        fs::write(&path, &raw).unwrap();
+        assert!(
+            load_snapshot(&path).is_none(),
+            "a corrupt snapshot is rejected, not loaded"
+        );
         let _ = fs::remove_file(&path);
     }
 }
