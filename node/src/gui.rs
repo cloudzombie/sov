@@ -676,6 +676,20 @@ impl EmbeddedNode {
         }
         self.daemon.shutdown();
     }
+
+    /// Dial a peer (`host:port`) now — non-blocking; the engine keeps retrying so
+    /// the link forms once the peer is reachable. No-op if P2P is off.
+    fn dial(&self, addr: &str) {
+        if let Some(p2p) = &self.p2p {
+            p2p.tcp().request_reconnect(addr);
+        }
+    }
+
+    /// Number of currently-connected peers (live, read straight from the in-process
+    /// transport — no RPC needed since the node runs inside this app).
+    fn peer_count(&self) -> usize {
+        self.p2p.as_ref().map(|p| p.tcp().peer_count()).unwrap_or(0)
+    }
 }
 
 /// Lifecycle state of the embedded node, shared between the UI thread and the
@@ -708,6 +722,11 @@ pub struct Station {
     // Real, timestamped node logs (startup, replay timing, RPC up, block production,
     // errors), shared with the start worker + poller and shown in the Node tab.
     node_logs: Arc<Mutex<Vec<String>>>,
+    // A peer to bootstrap the local node to (`host:port`), so two machines join the
+    // SAME testnet (same genesis + a P2P link). Persisted in the node config.
+    peer_addr: String,
+    // This machine's LAN address to hand to the OTHER machine (cached at launch).
+    lan_addr: Option<String>,
     network: Network,
     // Wallet state (held in-session; secrets never leave this process).
     wallets: Vec<LoadedWallet>,
@@ -861,6 +880,8 @@ impl Station {
             node_run: Arc::new(Mutex::new(NodeRun::Stopped)),
             node_status: String::new(),
             node_logs: Arc::new(Mutex::new(Vec::new())),
+            peer_addr: read_saved_peer(),
+            lan_addr: lan_ipv4(),
             network: Network::Testnet,
             wallets: Vec::new(),
             selected: 0,
@@ -1689,8 +1710,9 @@ impl Station {
         // would otherwise freeze the window), then publish the running handle.
         let run = Arc::clone(&self.node_run);
         let logs = Arc::clone(&self.node_logs);
+        let peer = self.peer_addr.clone();
         std::thread::spawn(move || {
-            let result = build_and_run_node(&spec, &account, seed, &logs);
+            let result = build_and_run_node(&spec, &account, seed, &peer, &logs);
             let mut slot = run.lock().unwrap();
             match result {
                 Ok(node) => {
@@ -1736,6 +1758,93 @@ impl Station {
         self.mining_account = None;
         self.node_status = "local node stopped".to_string();
         push_log(&self.node_logs, "node stopped — RPC + P2P halted, ports released");
+    }
+
+    /// Node-tab peering controls (Bitcoin/Zcash style): designate a seed peer once;
+    /// it is persisted and **auto-dialed on every start**, and gossip discovers the
+    /// rest of the network from there. Also shows the live peer count and this
+    /// machine's own dial-able address so the other node can seed back to it.
+    fn node_peering_ui(&mut self, ui: &mut egui::Ui) {
+        if !self.network.is_sandbox() {
+            return;
+        }
+        ui.add_space(12.0);
+        ui.separator();
+        ui.heading("Peering");
+        ui.label(
+            egui::RichText::new(
+                "Join other machines to this testnet. Enter one peer's address — it is saved \
+                 and auto-dialed every start, then the rest of the network is discovered \
+                 automatically (gossip). Solo mining works with zero peers.",
+            )
+            .weak(),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Seed peer");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.peer_addr)
+                    .hint_text("other machine — host:port (e.g. 192.168.0.244:9645)")
+                    .desired_width(320.0),
+            );
+            if ui
+                .button("Connect")
+                .on_hover_text("save + dial now, and auto-dial on every start")
+                .clicked()
+            {
+                let p = self.peer_addr.trim().to_string();
+                self.peer_addr = p.clone();
+                save_peer(&p);
+                if let NodeRun::Running(node) = &*self.node_run.lock().unwrap() {
+                    node.dial(&p);
+                }
+                self.node_status = if p.is_empty() {
+                    "seed peer cleared".into()
+                } else {
+                    format!("seeding to {p} (auto-dial on)")
+                };
+                push_log(
+                    &self.node_logs,
+                    if p.is_empty() {
+                        "seed peer cleared".to_string()
+                    } else {
+                        format!("seed peer set to {p} — dialing")
+                    },
+                );
+            }
+        });
+        // Live peer count, read straight from the in-process transport.
+        let peers = match &*self.node_run.lock().unwrap() {
+            NodeRun::Running(node) => Some(node.peer_count()),
+            _ => None,
+        };
+        match peers {
+            Some(n) if n > 0 => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(60, 200, 90),
+                    format!("● {n} peer(s) connected — on the same testnet"),
+                );
+            }
+            Some(_) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 170, 60),
+                    "● 0 peers (solo) — mining still works; set a seed peer to join another machine",
+                );
+            }
+            None => {
+                ui.label(egui::RichText::new("node stopped").weak());
+            }
+        }
+        if let Some(ip) = &self.lan_addr {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "This machine's address (enter THIS in the other node's Seed peer): {ip}:9645",
+                ))
+                .monospace()
+                .size(12.0),
+            );
+        }
     }
 
     /// Wipe the local node's chain entirely — back to genesis (height 0). Stops
@@ -1998,6 +2107,7 @@ impl eframe::App for Station {
                         .id_salt("scroll_node")
                         .show(ui, |ui| {
                             node_panel(ui, &snap);
+                            self.node_peering_ui(ui);
                             node_log_panel(ui, &logs);
                         });
                 }
@@ -5469,6 +5579,49 @@ fn local_node_dir() -> PathBuf {
     std::env::temp_dir().join("sov-station-node")
 }
 
+/// The seed/bootstrap peer saved in the local node config (if any), so the Peer
+/// field is pre-filled and the node auto-dials it on every launch (Bitcoin-style:
+/// configure a seed once, then it is automatic).
+fn read_saved_peer() -> String {
+    std::fs::read_to_string(local_node_dir().join("node-1/node-config.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| {
+            v.get("bootstrap_peers")
+                .and_then(|b| b.as_array())
+                .and_then(|a| a.first())
+                .and_then(|s| s.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_default()
+}
+
+/// Persist the seed/bootstrap peer into the local node config so a running node's
+/// choice survives restarts and is auto-dialed on every launch.
+fn save_peer(peer: &str) {
+    let cfg_path = local_node_dir().join("node-1/node-config.json");
+    if let Ok(text) = std::fs::read_to_string(&cfg_path) {
+        if let Ok(mut v) = serde_json::from_str::<Value>(&text) {
+            v["bootstrap_peers"] = if peer.is_empty() { json!([]) } else { json!([peer]) };
+            let _ = std::fs::write(&cfg_path, v.to_string());
+        }
+    }
+}
+
+/// This machine's LAN IPv4 address, for telling the operator what to seed the
+/// OTHER machine to (e.g. `192.168.0.244`). Best-effort; `None` if offline.
+fn lan_ipv4() -> Option<String> {
+    // Open a UDP socket "to" a public address (no packets are sent for UDP connect)
+    // and read back the local address the OS would route from — the standard
+    // dependency-free way to discover the primary LAN IP.
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    match sock.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v4) if !v4.is_loopback() => Some(v4.to_string()),
+        _ => None,
+    }
+}
+
 /// File holding the running local node's PID, so it can be stopped even across a
 /// GUI restart (otherwise an orphaned node keeps mining with no way to halt it).
 fn node_pid_path() -> PathBuf {
@@ -5536,6 +5689,7 @@ fn build_and_run_node(
     spec_filename: &str,
     account: &str,
     seed: [u8; 32],
+    peer: &str,
     logs: &Arc<Mutex<Vec<String>>>,
 ) -> Result<EmbeddedNode, String> {
     let node_dir = local_node_dir();
@@ -5612,6 +5766,20 @@ fn build_and_run_node(
         .join(&config.data_dir)
         .to_string_lossy()
         .into_owned();
+    // Seed/bootstrap peer (Bitcoin `addnode` style): auto-dial it on startup and
+    // gossip-discover the rest. Persist it into the node config so it is automatic
+    // on every future launch — configure a seed once, then it just works.
+    let peer = peer.trim();
+    if !peer.is_empty() {
+        config.bootstrap_peers = vec![peer.to_string()];
+        let cfg_path = node_dir.join("node-1/node-config.json");
+        if let Ok(text) = std::fs::read_to_string(&cfg_path) {
+            if let Ok(mut v) = serde_json::from_str::<Value>(&text) {
+                v["bootstrap_peers"] = json!([peer]);
+                let _ = std::fs::write(&cfg_path, v.to_string());
+            }
+        }
+    }
     let spec = ChainSpec::from_json(&read(&node_dir.join("chain-spec.json"))?)
         .map_err(|e| format!("chain-spec: {e}"))?;
     let keystore = Keystore::from_encrypted_or_plain(&read(&node_dir.join("node-1/keystore.json"))?, None)
@@ -5675,6 +5843,7 @@ fn build_and_run_node(
             .with_bootstrap(config.bootstrap_peers.clone());
             for peer in &config.bootstrap_peers {
                 let _ = p2p.connect(peer);
+                push_log(logs, format!("dialing seed peer {peer}…"));
             }
             let bound = p2p.local_addr();
             daemon = daemon.with_gossip(p2p.tcp());
