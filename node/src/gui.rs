@@ -1812,6 +1812,18 @@ impl Station {
                     },
                 );
             }
+            // Windows only: a one-click firewall fix (re-request the inbound allow),
+            // for the case where the first-run UAC prompt was dismissed.
+            if cfg!(windows)
+                && ui
+                    .button("Allow through Windows Firewall")
+                    .on_hover_text("re-add the inbound allow rule (one UAC prompt)")
+                    .clicked()
+            {
+                add_firewall_rule();
+                self.node_status = "requested Windows Firewall allow — accept the UAC prompt".into();
+                push_log(&self.node_logs, "re-requested Windows Firewall inbound allow");
+            }
         });
         // Live peer count, read straight from the in-process transport.
         let peers = match &*self.node_run.lock().unwrap() {
@@ -5618,6 +5630,59 @@ fn save_peer(peer: &str) {
     }
 }
 
+/// Add an inbound Windows Defender Firewall allow-rule for this executable, so LAN
+/// peers can reach the P2P (9645/TCP) + discovery (9646/UDP) ports. Unsigned apps
+/// are inbound-blocked by default on Windows, which silently prevents peering; this
+/// requests the exception (one UAC prompt). Best-effort; a no-op off Windows.
+#[cfg(windows)]
+fn add_firewall_rule() {
+    if let Ok(exe) = std::env::current_exe() {
+        // Elevate via UAC and add a program-scoped inbound allow rule (covers both
+        // the P2P and the multicast discovery ports).
+        let ps = format!(
+            "Start-Process netsh -Verb RunAs -WindowStyle Hidden -ArgumentList \
+             'advfirewall firewall add rule name=\"SOV Station\" dir=in action=allow \
+             program=\"{}\" enable=yes profile=any'",
+            exe.display()
+        );
+        let _ = Command::new("powershell")
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps])
+            .status();
+    }
+}
+#[cfg(not(windows))]
+fn add_firewall_rule() {}
+
+/// Ensure the firewall exception exists, ONCE per machine (marker-gated), so a
+/// fresh Windows install auto-allows itself on first node start — keeping LAN
+/// discovery zero-config (no manual firewall navigation, no IP entry). No-op off
+/// Windows and after the first successful attempt.
+fn ensure_firewall(logs: &Arc<Mutex<Vec<String>>>) {
+    #[cfg(windows)]
+    {
+        let marker = match home_dir() {
+            Ok(h) => h.join(".sov-station").join("firewall.ok"),
+            Err(_) => return,
+        };
+        if marker.exists() {
+            return;
+        }
+        add_firewall_rule();
+        if let Some(d) = marker.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(&marker, "1");
+        push_log(
+            logs,
+            "requested Windows Firewall inbound allow for LAN peers (one-time)",
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = logs;
+    }
+}
+
 /// This machine's LAN IPv4 address, for telling the operator what to seed the
 /// OTHER machine to (e.g. `192.168.0.244`). Best-effort; `None` if offline.
 fn lan_ipv4() -> Option<String> {
@@ -5702,6 +5767,9 @@ fn build_and_run_node(
     peer: &str,
     logs: &Arc<Mutex<Vec<String>>>,
 ) -> Result<EmbeddedNode, String> {
+    // On Windows, make sure we're allowed inbound through the firewall (once), so LAN
+    // peers can actually reach this node — otherwise discovery silently never connects.
+    ensure_firewall(logs);
     let node_dir = local_node_dir();
     let testnet = chain_bin("sov-testnet")
         .ok_or("sov-testnet not built (run `cargo build --release` in chain/)")?;
