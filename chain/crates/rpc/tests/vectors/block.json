@@ -1,0 +1,41 @@
+{
+  "block_hash": "0xeaa89f9f5fb6a6fc23c80245b248a63579d471c0299ab06d2e954f90b46cf42e",
+  "header": {
+    "bits": 504365055,
+    "height": 1,
+    "nonce": 0,
+    "prev_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "proposer": "val01.node.sov",
+    "receipts_root": "0x3102a309b9f30c98c031825e790f6402fbadb52abc11861f6431b1c2387d8373",
+    "state_root": "0x615ed00990831552eaebce8ac7d39330914533bde9d7dfe267a161779583478e",
+    "timestamp_ms": 1000,
+    "tx_root": "0x6833c378c8919ba99eb78f5842438b8769a83d66574eb88e9cebc3f489d2b024",
+    "version_bits": 0
+  },
+  "transactions": [
+    {
+      "action": {
+        "amount": "500000000",
+        "to": "ecb.reserve.sov",
+        "type": "transfer"
+      },
+      "nonce": 0,
+      "public_key_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "signer": "usa.reserve.sov"
+    },
+    {
+      "action": {
+        "amount": "700000000",
+        "to": "boj.reserve.sov",
+        "type": "transfer"
+      },
+      "nonce": 1,
+      "public_key_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "signer": "usa.reserve.sov"
+    }
+  ],
+  "tx_ids": [
+    "0xf20fe8e431eb688f037140b6d81727653974cd07827c130f8f9cec5ee7766e8e",
+    "0x5881ec60df98cc89e85f1fff29382c1e884ac6f25c359e7b6842a5f20e113609"
+  ]
+}

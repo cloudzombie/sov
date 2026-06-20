@@ -11,7 +11,7 @@
 
 use serde_json::{json, Value};
 use sov_crypto::Keypair;
-use sov_mining::MiningPolicy;
+use sov_mining::{MiningPolicy, Target};
 use sov_primitives::{AccountId, Balance, BlockHeight, Hash};
 use sov_runtime::{apply_coinbase, apply_transactions, BlockContext};
 use sov_state::{Account, Ledger};
@@ -435,25 +435,10 @@ fn stf_vector() -> Value {
     })
 }
 
-fn main() {
-    // `sov-katgen block` emits the block vector, `state` the world-state vector,
-    // `stf` the state-transition vector; otherwise the transaction vectors.
-    match std::env::args().nth(1).as_deref() {
-        Some("block") => {
-            println!("{}", serde_json::to_string_pretty(&block_vector()).unwrap());
-            return;
-        }
-        Some("state") => {
-            println!("{}", serde_json::to_string_pretty(&state_vector()).unwrap());
-            return;
-        }
-        Some("stf") => {
-            println!("{}", serde_json::to_string_pretty(&stf_vector()).unwrap());
-            return;
-        }
-        _ => {}
-    }
-
+/// The transaction known-answer vectors: one per `Action` shape, each with its
+/// deterministic Borsh signing bytes, Blake3 tx id, Ed25519 signature, and full
+/// signed-transaction Borsh.
+fn transaction_vectors() -> Value {
     let grains = |sov: u128| Balance::from_sov(sov).unwrap();
     let grains_str = |b: Balance| b.grains().to_string();
 
@@ -464,7 +449,7 @@ fn main() {
     // this wire-format vector.
     let shielded_bundle: Vec<u8> = (0u8..64).collect();
 
-    let vectors = json!([
+    json!([
         vector(
             "transfer",
             [1; 32],
@@ -506,7 +491,265 @@ fn main() {
             },
             json!({ "type": "shielded", "bundle": shielded_bundle }),
         ),
-    ]);
+    ])
+}
 
-    println!("{}", serde_json::to_string_pretty(&vectors).unwrap());
+/// The **proof-of-work seal** known-answer vector. With (eventually) tens of
+/// thousands of independent miners, every implementation MUST agree bit-for-bit on
+/// what a header hashes to and whether that hash meets a target — any divergence
+/// forks the chain. This pins: the header's Borsh PoW preimage, the SHA-256d seal
+/// (`pow_hash`) over a range of nonces, and the `hash <= target` threshold check
+/// against both the easiest and a mainnet-grade target. (The mainnet seal is RandomX
+/// — a memory-hard VM, not a static vector; its INPUT is this same Borsh preimage,
+/// so a RandomX miner reuses `pow_preimage_hex`, while `seal_samples` pins the
+/// Sha256d the testnet runs.)
+fn pow_vector() -> Value {
+    let mut header = Block::assemble(
+        BlockHeight::new(1),
+        Hash::ZERO,
+        Hash::digest(b"pow-kat-state-root"),
+        Hash::digest(b"pow-kat-receipts-root"),
+        1_000,
+        id("val01.node.sov"),
+        vec![],
+    )
+    .header;
+    let mainnet = MiningPolicy::mainnet_like().sha256d_target;
+    header.bits = mainnet.to_compact();
+    header.nonce = 0;
+
+    // Seal samples: sha256d(borsh(header @ nonce)). A second miner reconstructs the
+    // header at each nonce, Borsh-encodes it, SHA-256d's it, and must match.
+    let seal_samples: Vec<Value> = (0u64..8)
+        .map(|nonce| {
+            let mut h = header.clone();
+            h.nonce = nonce;
+            json!({ "nonce": nonce, "pow_hash_hex": hex::encode(h.pow_hash().as_bytes()) })
+        })
+        .collect();
+
+    // Threshold check (`hash <= target`). A target is carried on the wire as compact
+    // nBits, so the threshold a miner actually checks is `from_compact(bits)` — pin
+    // each via its `bits` (the target then round-trips by construction; note nBits is
+    // a lossy float-like form, so not every 256-bit value is representable). `0x207fffff`
+    // is the standard very-easy ("regtest") target, met by this low-work hash; the
+    // mainnet target is not. This exercises `is_met_by` deterministically both ways.
+    let probe = header.pow_hash();
+    let target_checks: Vec<Value> = [("easy", 0x207f_ffff_u32), ("mainnet", mainnet.to_compact())]
+        .into_iter()
+        .map(|(name, bits)| {
+            let target = Target::from_compact(bits).unwrap();
+            json!({
+                "name": name,
+                "bits": bits,
+                "target_hex": hex::encode(target.as_hash().as_bytes()),
+                "probe_hash_hex": hex::encode(probe.as_bytes()),
+                "meets_target": target.is_met_by(&probe),
+            })
+        })
+        .collect();
+    let target_checks = Value::Array(target_checks);
+
+    json!({
+        "algo": "sha256d",
+        "header": serde_json::to_value(&header).unwrap(),
+        "pow_preimage_hex": hex::encode(header.pow_preimage()),
+        "seal_samples": seal_samples,
+        "target_checks": target_checks,
+    })
+}
+
+/// The **emission schedule** known-answer vector: `reward_at(height, mined_supply)`
+/// across halving boundaries, the budget backstop, and decay to zero. Every miner
+/// must compute the SAME coinbase subsidy at a given height or it produces an
+/// over/under-paying coinbase that the rest of the network rejects. Bitcoin's
+/// halving rule at Zcash's cadence: `subsidy = base >> ((height-1)/interval)`,
+/// clamped by the remaining mining budget; height 0 (genesis) mints nothing.
+fn emission_vector() -> Value {
+    let policy = MiningPolicy::mainnet_like();
+    let interval = policy.halving_interval_blocks;
+    let zero = Balance::ZERO;
+    let mk = |height: u64, mined: Balance| -> Value {
+        json!({
+            "height": height,
+            "mined_supply_grains": mined.grains().to_string(),
+            "reward_grains": policy.reward_at(height, mined).grains().to_string(),
+        })
+    };
+    // A mined_supply 3 grains below the budget cap, to exercise the remaining-budget clamp.
+    let near_cap = Balance::from_grains(policy.mining_budget_grains - 3);
+    let samples = json!([
+        mk(0, zero),                  // genesis: never mined
+        mk(1, zero),                  // epoch 0 start: full base
+        mk(interval, zero),           // epoch 0 end: full base
+        mk(interval + 1, zero),       // epoch 1: base/2
+        mk(2 * interval + 1, zero),   // epoch 2: base/4
+        mk(3 * interval + 1, zero),   // epoch 3: base/8
+        mk(1, near_cap),              // budget backstop: clamps to the 3 remaining grains
+        mk(200 * interval + 1, zero), // far future: subsidy decayed to zero
+    ]);
+    json!({
+        "policy": {
+            "base_reward_grains": policy.base_reward.grains().to_string(),
+            "halving_interval_blocks": interval,
+            "mining_budget_grains": policy.mining_budget_grains.to_string(),
+        },
+        "samples": samples,
+    })
+}
+
+fn main() {
+    // Each subcommand emits one vector set; the default is the transaction vectors.
+    let out = match std::env::args().nth(1).as_deref() {
+        Some("block") => block_vector(),
+        Some("state") => state_vector(),
+        Some("stf") => stf_vector(),
+        Some("pow") => pow_vector(),
+        Some("emission") => emission_vector(),
+        _ => transaction_vectors(),
+    };
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DRIFT GUARD: every committed cross-implementation vector under `tests/vectors/`
+    /// MUST reproduce from the current generators. If a consensus encoding, hash, PoW
+    /// seal, or emission rule changes, the committed vectors no longer match and these
+    /// fail — forcing a conscious regenerate-and-review rather than letting the
+    /// published contract silently drift away from the node's real consensus code.
+    /// With tens of thousands of independent miners, that contract is what keeps the
+    /// network from forking.
+    fn assert_no_drift(committed: &str, generated: Value, name: &str) {
+        let committed: Value =
+            serde_json::from_str(committed).unwrap_or_else(|e| panic!("[{name}] parse: {e}"));
+        assert_eq!(
+            committed, generated,
+            "[{name}] committed KAT vector drifted from the generator — regenerate \
+             tests/vectors/{name}.json (and sdk/vectors/) and review the change"
+        );
+    }
+
+    #[test]
+    fn transaction_vectors_match_committed() {
+        // The transaction vectors are ALSO independently re-derived in
+        // sov-verify/tests/kat.rs; here we just guard them against generator drift.
+        assert_no_drift(
+            include_str!("../../../verify/tests/vectors/transactions.json"),
+            transaction_vectors(),
+            "transactions",
+        );
+    }
+    #[test]
+    fn block_vector_matches_committed() {
+        assert_no_drift(
+            include_str!("../../tests/vectors/block.json"),
+            block_vector(),
+            "block",
+        );
+    }
+    #[test]
+    fn state_vector_matches_committed() {
+        assert_no_drift(
+            include_str!("../../tests/vectors/state.json"),
+            state_vector(),
+            "state",
+        );
+    }
+    #[test]
+    fn stf_vector_matches_committed() {
+        assert_no_drift(
+            include_str!("../../tests/vectors/stf.json"),
+            stf_vector(),
+            "stf",
+        );
+    }
+    #[test]
+    fn pow_vector_matches_committed() {
+        assert_no_drift(
+            include_str!("../../tests/vectors/pow.json"),
+            pow_vector(),
+            "pow",
+        );
+    }
+    #[test]
+    fn emission_vector_matches_committed() {
+        assert_no_drift(
+            include_str!("../../tests/vectors/emission.json"),
+            emission_vector(),
+            "emission",
+        );
+    }
+
+    /// CROSS-IMPL MINING CONTRACT: from the published `pow.json` alone, a second miner
+    /// reconstructs the header, sets each nonce, Borsh-encodes, SHA-256d's, and must
+    /// get the pinned `pow_hash`; and `hash <= target` (`is_met_by`) must match. This
+    /// re-derives from the committed file's structured fields, not the generator.
+    #[test]
+    fn pow_seal_reproduces_from_published_vector() {
+        let v: Value = serde_json::from_str(include_str!("../../tests/vectors/pow.json")).unwrap();
+        let header: sov_types::BlockHeader = serde_json::from_value(v["header"].clone()).unwrap();
+        assert_eq!(
+            hex::encode(header.pow_preimage()),
+            v["pow_preimage_hex"].as_str().unwrap(),
+            "header Borsh PoW preimage"
+        );
+        for s in v["seal_samples"].as_array().unwrap() {
+            let mut h = header.clone();
+            h.nonce = s["nonce"].as_u64().unwrap();
+            assert_eq!(
+                hex::encode(h.pow_hash().as_bytes()),
+                s["pow_hash_hex"].as_str().unwrap(),
+                "sha256d seal at nonce {}",
+                h.nonce
+            );
+        }
+        for c in v["target_checks"].as_array().unwrap() {
+            let target = Target::from_compact(c["bits"].as_u64().unwrap() as u32).unwrap();
+            // Target round-trips through its compact nBits form.
+            assert_eq!(
+                hex::encode(target.as_hash().as_bytes()),
+                c["target_hex"].as_str().unwrap(),
+                "target from_compact"
+            );
+            let probe = Hash::from_hex(c["probe_hash_hex"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                target.is_met_by(&probe),
+                c["meets_target"].as_bool().unwrap(),
+                "hash<=target check ({})",
+                c["name"].as_str().unwrap()
+            );
+        }
+    }
+
+    /// CROSS-IMPL EMISSION CONTRACT: from the published `emission.json` alone, a second
+    /// implementation computes `reward_at(height, mined_supply)` and must match every
+    /// pinned subsidy — across halvings, the budget backstop, and decay to zero.
+    #[test]
+    fn emission_reproduces_from_published_vector() {
+        let v: Value =
+            serde_json::from_str(include_str!("../../tests/vectors/emission.json")).unwrap();
+        let policy = MiningPolicy::mainnet_like();
+        // The policy's emission parameters match the vector.
+        assert_eq!(
+            policy.base_reward.grains().to_string(),
+            v["policy"]["base_reward_grains"].as_str().unwrap()
+        );
+        assert_eq!(
+            policy.halving_interval_blocks,
+            v["policy"]["halving_interval_blocks"].as_u64().unwrap()
+        );
+        for s in v["samples"].as_array().unwrap() {
+            let height = s["height"].as_u64().unwrap();
+            let mined =
+                Balance::from_grains(s["mined_supply_grains"].as_str().unwrap().parse().unwrap());
+            assert_eq!(
+                policy.reward_at(height, mined).grains().to_string(),
+                s["reward_grains"].as_str().unwrap(),
+                "reward_at(height={height})"
+            );
+        }
+    }
 }

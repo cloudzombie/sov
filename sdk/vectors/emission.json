@@ -1,0 +1,49 @@
+{
+  "policy": {
+    "base_reward_grains": "1250000000",
+    "halving_interval_blocks": 840000,
+    "mining_budget_grains": "2100000000000000"
+  },
+  "samples": [
+    {
+      "height": 0,
+      "mined_supply_grains": "0",
+      "reward_grains": "0"
+    },
+    {
+      "height": 1,
+      "mined_supply_grains": "0",
+      "reward_grains": "1250000000"
+    },
+    {
+      "height": 840000,
+      "mined_supply_grains": "0",
+      "reward_grains": "1250000000"
+    },
+    {
+      "height": 840001,
+      "mined_supply_grains": "0",
+      "reward_grains": "625000000"
+    },
+    {
+      "height": 1680001,
+      "mined_supply_grains": "0",
+      "reward_grains": "312500000"
+    },
+    {
+      "height": 2520001,
+      "mined_supply_grains": "0",
+      "reward_grains": "156250000"
+    },
+    {
+      "height": 1,
+      "mined_supply_grains": "2099999999999997",
+      "reward_grains": "3"
+    },
+    {
+      "height": 168000001,
+      "mined_supply_grains": "0",
+      "reward_grains": "0"
+    }
+  ]
+}

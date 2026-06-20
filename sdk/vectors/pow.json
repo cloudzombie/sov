@@ -1,0 +1,66 @@
+{
+  "algo": "sha256d",
+  "header": {
+    "bits": 504365055,
+    "height": 1,
+    "nonce": 0,
+    "prev_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "proposer": "val01.node.sov",
+    "receipts_root": "0xab1d1f8ea55d20e986f39b4203d8563a69f32db49941100fdcb93c1f0eccdeb7",
+    "state_root": "0x84d3e539f5df2d5e126104737d6ce7e79ef8d2c0ad750d259d3c5250ca96c502",
+    "timestamp_ms": 1000,
+    "tx_root": "0x2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213",
+    "version_bits": 0
+  },
+  "pow_preimage_hex": "010000000000000000000000000000000000000000000000000000000000000000000000000000002d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213ab1d1f8ea55d20e986f39b4203d8563a69f32db49941100fdcb93c1f0eccdeb784d3e539f5df2d5e126104737d6ce7e79ef8d2c0ad750d259d3c5250ca96c502e8030000000000000e00000076616c30312e6e6f64652e736f7600000000ffff0f1e0000000000000000",
+  "seal_samples": [
+    {
+      "nonce": 0,
+      "pow_hash_hex": "2c2fd26620258414de71b7c601a362ccd7ba2a0b169ef123e34808c213bc0d2f"
+    },
+    {
+      "nonce": 1,
+      "pow_hash_hex": "40e2e449bd6aefd7d3108e5b8076893dd296cb259e2511ee2573a8634969d331"
+    },
+    {
+      "nonce": 2,
+      "pow_hash_hex": "b5fa8397d349ffdea1cb14a76759c305c6e8efd79c72fbaf48245a4ee3dbfbb5"
+    },
+    {
+      "nonce": 3,
+      "pow_hash_hex": "9bdc198ab99d3e8fd4a8e4ddae50af2a23d4fcb9bb09e5e1f6782a65c0ba3460"
+    },
+    {
+      "nonce": 4,
+      "pow_hash_hex": "ddd1402eb6131120a40759f7bf722de739c8e73775545abf990f14a2453e205a"
+    },
+    {
+      "nonce": 5,
+      "pow_hash_hex": "95a813bb4c647e728c3520977a59055e4790c9f02b47ba77e73e5f34c3dd19ef"
+    },
+    {
+      "nonce": 6,
+      "pow_hash_hex": "825c83ee3758066052278a485881a785f7700563e2ae03dec4c6030550ce452b"
+    },
+    {
+      "nonce": 7,
+      "pow_hash_hex": "dd17c5eb591fa56684a693197c6fabe76726b378ff170606a37458b7ca66f587"
+    }
+  ],
+  "target_checks": [
+    {
+      "bits": 545259519,
+      "meets_target": true,
+      "name": "easy",
+      "probe_hash_hex": "2c2fd26620258414de71b7c601a362ccd7ba2a0b169ef123e34808c213bc0d2f",
+      "target_hex": "7fffff0000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "bits": 504365055,
+      "meets_target": false,
+      "name": "mainnet",
+      "probe_hash_hex": "2c2fd26620258414de71b7c601a362ccd7ba2a0b169ef123e34808c213bc0d2f",
+      "target_hex": "00000fffff000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}
