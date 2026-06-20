@@ -5994,18 +5994,39 @@ pub fn run(rpc: String) -> Result<(), String> {
 /// Background poller: every second, read the node into the shared snapshot and
 /// nudge the UI to repaint. Honors the (UI-editable) RPC endpoint and accounts.
 fn spawn_poller(snapshot: Arc<Mutex<Snapshot>>, config: Arc<Mutex<Config>>, ctx: egui::Context) {
-    thread::spawn(move || loop {
-        let cfg = match config.lock() {
-            Ok(c) => c.clone(),
-            Err(_) => break,
-        };
-        let client = RpcClient::new(cfg.rpc.clone()).with_timeout(Duration::from_secs(2));
-        let snap = poll(&client, &cfg);
-        if let Ok(mut s) = snapshot.lock() {
-            *s = snap;
+    thread::spawn(move || {
+        // Count consecutive failed polls so a TRANSIENT timeout — e.g. while the
+        // node is busy importing a batch during catch-up — does not flicker the UI
+        // to "offline/transport error". We keep showing the last good snapshot and
+        // only surface offline after several misses in a row.
+        let mut consecutive_fail = 0u32;
+        loop {
+            let cfg = match config.lock() {
+                Ok(c) => c.clone(),
+                Err(_) => break,
+            };
+            // A generous timeout: RPC shares the node lock with block import, which
+            // can briefly hold it during a sync burst.
+            let client = RpcClient::new(cfg.rpc.clone()).with_timeout(Duration::from_secs(6));
+            let snap = poll(&client, &cfg);
+            if snap.online {
+                consecutive_fail = 0;
+                if let Ok(mut s) = snapshot.lock() {
+                    *s = snap;
+                }
+            } else {
+                consecutive_fail += 1;
+                // Only commit the offline/error snapshot after 3 straight misses, so
+                // a single busy/slow poll doesn't replace good live data.
+                if consecutive_fail >= 3 {
+                    if let Ok(mut s) = snapshot.lock() {
+                        *s = snap;
+                    }
+                }
+            }
+            ctx.request_repaint();
+            thread::sleep(Duration::from_millis(1000));
         }
-        ctx.request_repaint();
-        thread::sleep(Duration::from_millis(1000));
     });
 }
 

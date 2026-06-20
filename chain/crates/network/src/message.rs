@@ -40,6 +40,19 @@ pub enum NetMessage {
     },
     /// Response to [`NetMessage::GetBlock`]; `None` if the peer lacks it.
     BlockResponse(Option<Block>),
+    /// Request up to `count` consecutive blocks starting at `start` (batched
+    /// catch-up). Lets a lagging node fetch many blocks per round-trip instead of
+    /// one-at-a-time, so a long reorg/sync completes in seconds, not minutes — and
+    /// with far fewer messages, staying well under the per-peer rate limit.
+    GetBlocks {
+        /// First height to return.
+        start: u64,
+        /// Maximum number of consecutive blocks to return (server-capped).
+        count: u16,
+    },
+    /// Response to [`NetMessage::GetBlocks`]: consecutive blocks from `start`, in
+    /// ascending height order (possibly fewer than requested, empty if none).
+    BlocksResponse(Vec<Block>),
     /// Peer discovery: a list of known peer addresses (`host:port`). On receipt,
     /// a node dials any addresses it does not already know, so knowledge of the
     /// network propagates transitively.

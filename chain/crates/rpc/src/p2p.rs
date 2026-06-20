@@ -222,6 +222,17 @@ fn status(node: &Mutex<Node>) -> Option<NetMessage> {
 /// round-trip, short enough that a withholding or dead peer cannot wedge sync.
 const BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How many consecutive blocks one [`GetBlocks`](NetMessage::GetBlocks) fetches.
+/// Batching turns a long catch-up from one-block-per-round-trip (minutes) into a
+/// handful of round-trips (seconds), with far fewer messages — well under the
+/// per-peer rate limit. The serving node caps the response to this many.
+const SYNC_BATCH: u16 = 64;
+
+/// Largest exponential backtrack step when walking back to a common ancestor on a
+/// fork: 1, 2, 4, … capped here, so even a deep divergence is located in O(log)
+/// requests instead of one height at a time.
+const BACKTRACK_CAP: u64 = 256;
+
 /// An outstanding [`GetBlock`](NetMessage::GetBlock) awaiting a response, used to
 /// detect a stalled peer. Cleared as soon as any block response arrives.
 struct InFlight {
@@ -241,6 +252,10 @@ struct SyncState {
     /// Next height to request from each peer while walking backward to a common
     /// ancestor, then forward along that peer's heavier active chain.
     sync_next: HashMap<SocketAddr, u64>,
+    /// Per-peer exponential backtrack step. Absent/0 = forward mode (batched
+    /// download); >0 = walking back to a common ancestor by this many heights, then
+    /// doubling, so a deep fork is located in O(log) requests.
+    bt_step: HashMap<SocketAddr, u64>,
     /// The block request currently awaiting a response, if any — drives stall
     /// detection so a single slow/withholding peer cannot wedge catch-up.
     inflight: Option<InFlight>,
@@ -382,39 +397,97 @@ impl SyncState {
                     .and_then(|n| n.chain().block_by_height(height).cloned());
                 tcp.send(peer, &NetMessage::BlockResponse(block));
             }
-            NetMessage::BlockResponse(Some(block)) => {
-                // The outstanding request is answered; let the next round pick the
-                // best peer afresh (and not treat this peer as stalled).
-                self.inflight = None;
-                // Catch-up import; succeeds only when it is our next height (or a
-                // branch fork choice accepts). No votes to fetch — confirmations
-                // accumulate as further blocks arrive.
-                let requested_height = block.header.height.get();
-                match self.import_and_persist(node, block) {
-                    ImportOutcome::New | ImportOutcome::Known => {
-                        if let Some(s) = self.peer_status.get(&peer) {
-                            if requested_height < s.height {
-                                self.sync_next.insert(peer, requested_height + 1);
-                            } else {
-                                self.sync_next.remove(&peer);
+            NetMessage::GetBlocks { start, count } => {
+                // Serve up to `count` (server-capped) consecutive blocks from `start`
+                // for a peer doing batched catch-up — a few round-trips instead of one
+                // request per block.
+                let want = count.min(SYNC_BATCH) as usize;
+                let blocks: Vec<Block> = node
+                    .lock()
+                    .ok()
+                    .map(|n| {
+                        let mut v = Vec::with_capacity(want);
+                        let mut h = start;
+                        while v.len() < want {
+                            match n.chain().block_by_height(h) {
+                                Some(b) => {
+                                    v.push(b.clone());
+                                    h += 1;
+                                }
+                                None => break,
                             }
                         }
+                        v
+                    })
+                    .unwrap_or_default();
+                tcp.send(peer, &NetMessage::BlocksResponse(blocks));
+            }
+            NetMessage::BlockResponse(Some(block)) => {
+                // A single-block response — used while BACKTRACKING to a common
+                // ancestor. If it connects, we've found the fork point; resume
+                // forward (batched). If not, keep walking back, doubling the step.
+                self.inflight = None;
+                let h = block.header.height.get();
+                match self.import_and_persist(node, block) {
+                    ImportOutcome::New | ImportOutcome::Known => {
+                        self.bt_step.remove(&peer); // ancestor found → forward mode
+                        self.advance_or_done(peer, h);
                     }
                     ImportOutcome::Rejected => {
-                        if requested_height > 1 {
-                            self.sync_next.insert(peer, requested_height - 1);
-                        } else {
-                            self.sync_next.remove(&peer);
-                        }
+                        let step = self.bt_step.get(&peer).copied().unwrap_or(1).max(1);
+                        self.sync_next.insert(peer, h.saturating_sub(step).max(1));
+                        self.bt_step.insert(peer, (step * 2).min(BACKTRACK_CAP));
                     }
                 }
             }
             NetMessage::BlockResponse(None) => {
-                // The peer does not have the requested height (e.g. we walked past
-                // its head): the request is answered, so stop waiting on it.
+                // The peer does not have the requested height: stop waiting on it.
                 self.inflight = None;
             }
+            NetMessage::BlocksResponse(blocks) => {
+                // A batch of consecutive blocks (forward catch-up). They are on the
+                // peer's chain, so they import in order; the first one only fails if
+                // its parent isn't ours (a fork), which flips us into backtrack.
+                self.inflight = None;
+                if blocks.is_empty() {
+                    self.sync_next.remove(&peer); // at/past the peer's head
+                } else {
+                    let mut last_ok: Option<u64> = None;
+                    let mut rejected: Option<u64> = None;
+                    for block in blocks {
+                        let h = block.header.height.get();
+                        match self.import_and_persist(node, block) {
+                            ImportOutcome::New | ImportOutcome::Known => last_ok = Some(h),
+                            ImportOutcome::Rejected => {
+                                rejected = Some(h);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(h) = last_ok {
+                        self.bt_step.remove(&peer);
+                        self.advance_or_done(peer, h);
+                    } else if let Some(h) = rejected {
+                        // First block didn't connect → on a fork; start backtracking.
+                        self.sync_next.insert(peer, h.saturating_sub(1).max(1));
+                        self.bt_step.insert(peer, 1);
+                    }
+                }
+            }
             NetMessage::Peers(_) | NetMessage::Hello { .. } => {}
+        }
+    }
+
+    /// After importing up to height `h` from `peer`, continue forward from `h + 1`
+    /// or stop if we've reached the peer's head.
+    fn advance_or_done(&mut self, peer: SocketAddr, h: u64) {
+        match self.peer_status.get(&peer) {
+            Some(s) if h < s.height => {
+                self.sync_next.insert(peer, h + 1);
+            }
+            _ => {
+                self.sync_next.remove(&peer);
+            }
         }
     }
 
@@ -425,6 +498,7 @@ impl SyncState {
         self.authenticated.retain(|p| connected.contains(p));
         self.peer_status.retain(|p, _| connected.contains(p));
         self.sync_next.retain(|p, _| connected.contains(p));
+        self.bt_step.retain(|p, _| connected.contains(p));
     }
 
     /// Drive catch-up against trusted peers: request the next block from the best
@@ -488,7 +562,18 @@ impl SyncState {
                 }
             })
             .clamp(1, peer_height);
-        if tcp.send(peer, &NetMessage::GetBlock { height }) {
+        // Forward: fetch a BATCH of blocks (fast, few round-trips). Backtracking to a
+        // common ancestor: a single block at a time (we're probing for the fork).
+        let backtracking = self.bt_step.get(&peer).copied().unwrap_or(0) > 0;
+        let msg = if backtracking {
+            NetMessage::GetBlock { height }
+        } else {
+            NetMessage::GetBlocks {
+                start: height,
+                count: SYNC_BATCH,
+            }
+        };
+        if tcp.send(peer, &msg) {
             self.inflight = Some(InFlight {
                 peer,
                 since: Instant::now(),
