@@ -33,7 +33,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -131,6 +131,18 @@ const MALFORMED_FRAME_PENALTY: f64 = 25.0;
 
 /// How long a misbehaving IP stays banned once its score crosses the threshold.
 const BAN_DURATION: Duration = Duration::from_secs(300);
+
+/// LAN auto-discovery (mDNS-style): nodes announce themselves on this
+/// administratively-scoped IPv4 multicast group + port, so peers on the SAME LAN
+/// find and dial each other with **zero configuration**. The group is site-local
+/// (239.0.0.0/8) and never routed off the local network.
+const LAN_DISCO_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 90, 45);
+/// UDP port the discovery beacon is sent to / listened on (P2P itself is elsewhere).
+const LAN_DISCO_PORT: u16 = 9646;
+/// How often a node re-announces itself on the LAN.
+const LAN_DISCO_INTERVAL: Duration = Duration::from_secs(3);
+/// Beacon wire format tag (versioned), then `chain_id`, then the P2P listen port.
+const LAN_DISCO_TAG: &str = "sov-disco1";
 
 /// Shared state behind a [`TcpNode`], accessible from its background threads.
 struct Shared {
@@ -285,6 +297,56 @@ impl TcpNode {
                 }
             }
         }
+    }
+
+    /// Enable **mDNS-style LAN auto-discovery**: periodically announce this node on
+    /// the local network and dial any same-chain peer that announces itself — so two
+    /// machines on the same LAN join one network with **zero configuration** (no
+    /// seed address needed). Best-effort: if the multicast socket can't bind, it is
+    /// silently skipped. The thread stops with the node (shared shutdown flag). The
+    /// beacon advertises only the chain id + P2P port; the dial-able IP is the
+    /// packet's source address, so no node needs to know its own IP.
+    pub fn enable_lan_discovery(&self, chain_id: &str) {
+        let shared = Arc::clone(&self.shared);
+        let chain_id = chain_id.to_string();
+        let p2p_port = self.shared.local_addr.port();
+        thread::spawn(move || {
+            // Bind the discovery port and join the multicast group. Reuse is fine —
+            // one node per machine; failure just disables discovery (best-effort).
+            let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, LAN_DISCO_PORT)) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            if sock
+                .join_multicast_v4(&LAN_DISCO_GROUP, &Ipv4Addr::UNSPECIFIED)
+                .is_err()
+            {
+                return;
+            }
+            // Don't loop our own announcements back to ourselves (no self-dial).
+            let _ = sock.set_multicast_loop_v4(false);
+            let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
+            let beacon = format!("{LAN_DISCO_TAG}|{chain_id}|{p2p_port}");
+            let mut last = Instant::now()
+                .checked_sub(LAN_DISCO_INTERVAL)
+                .unwrap_or_else(Instant::now);
+            let mut buf = [0u8; 256];
+            while !shared.shutdown.load(Ordering::SeqCst) {
+                if last.elapsed() >= LAN_DISCO_INTERVAL {
+                    let _ = sock.send_to(beacon.as_bytes(), (LAN_DISCO_GROUP, LAN_DISCO_PORT));
+                    last = Instant::now();
+                }
+                if let Ok((n, src)) = sock.recv_from(&mut buf) {
+                    if let Some(addr) = parse_beacon(&buf[..n], &chain_id, src.ip()) {
+                        // A same-chain peer announced itself — dial it (deduped by the
+                        // dial machinery; a no-op if already connected).
+                        if !shared.peers.lock().unwrap().contains_key(&addr) {
+                            let _ = shared.dial_tx.send(addr);
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// The address this node is listening on.
@@ -630,6 +692,23 @@ fn read_raw(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     let mut data = vec![0u8; n];
     stream.read_exact(&mut data)?;
     Ok(data)
+}
+
+/// Parse a LAN discovery beacon, returning the announcing peer's dial-able P2P
+/// address — the packet's `src` IP plus the advertised port — only if the beacon is
+/// well-formed AND for the SAME chain. Nodes on a different chain/network are never
+/// dialed, so unrelated multicast traffic is ignored.
+fn parse_beacon(data: &[u8], our_chain_id: &str, src: IpAddr) -> Option<SocketAddr> {
+    let text = std::str::from_utf8(data).ok()?;
+    let mut parts = text.split('|');
+    if parts.next()? != LAN_DISCO_TAG {
+        return None;
+    }
+    if parts.next()? != our_chain_id {
+        return None; // a different chain — never dial it
+    }
+    let port: u16 = parts.next()?.parse().ok()?;
+    Some(SocketAddr::new(src, port))
 }
 
 /// The network group an IP belongs to for eclipse accounting: the /16 for IPv4 and
@@ -1083,6 +1162,26 @@ mod tests {
         let c_addr = c.local_addr();
         let learned = wait_until(4, || a.known_peers().contains(&c_addr));
         assert!(learned, "A discovered C transitively through B");
+    }
+
+    #[test]
+    fn lan_beacon_parses_same_chain_and_rejects_others() {
+        let src = IpAddr::V4(Ipv4Addr::new(192, 168, 0, 244));
+        // Well-formed, same chain → dial src_ip:advertised_port.
+        let good = format!("{LAN_DISCO_TAG}|sov-testnet-1|9645");
+        assert_eq!(
+            parse_beacon(good.as_bytes(), "sov-testnet-1", src),
+            Some(SocketAddr::new(src, 9645))
+        );
+        // Different chain → ignored (never dial a foreign network).
+        let other = format!("{LAN_DISCO_TAG}|sov-mainnet|9645");
+        assert_eq!(parse_beacon(other.as_bytes(), "sov-testnet-1", src), None);
+        // Garbage / wrong tag / bad port → ignored.
+        assert_eq!(parse_beacon(b"hello world", "sov-testnet-1", src), None);
+        assert_eq!(
+            parse_beacon(b"sov-disco1|sov-testnet-1|notaport", "sov-testnet-1", src),
+            None
+        );
     }
 
     #[test]

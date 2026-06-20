@@ -2082,17 +2082,27 @@ impl eframe::App for Station {
                     let age = now_ms().saturating_sub(snap.updated_ms);
                     ui.label(egui::RichText::new(format!("updated {age} ms ago")).weak());
                 }
-                // Transient "copied ✓" toast (~1.5s after any copy).
-                if let Some(t) = self.copied_at {
-                    if now_ms().saturating_sub(t) < 1500 {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Right-aligned: the app version (always visible) + a "copied ✓" toast.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "SOV Station v{} · {} (testnet)",
+                            env!("CARGO_PKG_VERSION"),
+                            self.network.label()
+                        ))
+                        .weak()
+                        .monospace(),
+                    );
+                    if let Some(t) = self.copied_at {
+                        if now_ms().saturating_sub(t) < 1500 {
+                            ui.separator();
                             ui.colored_label(egui::Color32::from_rgb(120, 200, 120), "copied ✓");
-                        });
-                        ctx.request_repaint(); // keep ticking so it fades on time
-                    } else {
-                        self.copied_at = None;
+                            ctx.request_repaint(); // keep ticking so it fades on time
+                        } else {
+                            self.copied_at = None;
+                        }
                     }
-                }
+                });
             });
             ui.add_space(3.0);
         });
@@ -5846,8 +5856,14 @@ fn build_and_run_node(
                 push_log(logs, format!("dialing seed peer {peer}…"));
             }
             let bound = p2p.local_addr();
+            // mDNS-style LAN auto-discovery: find + dial same-chain peers on the
+            // local network with zero configuration (no seed address needed).
+            p2p.tcp().enable_lan_discovery(&genesis.chain_id);
             daemon = daemon.with_gossip(p2p.tcp());
-            push_log(logs, format!("P2P gossip listening on {bound} (peers welcome)"));
+            push_log(
+                logs,
+                format!("P2P on {bound} — LAN auto-discovery on (peers welcome)"),
+            );
             Some(p2p.start())
         }
         None => {
