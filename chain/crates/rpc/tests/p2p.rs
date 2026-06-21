@@ -428,6 +428,102 @@ fn diverged_peer_backtracks_to_common_ancestor_and_reorgs() {
 }
 
 #[test]
+fn node_that_mined_its_own_multiblock_fork_recovers_by_deep_reorg() {
+    // THE bootstrap-recovery scenario behind the cross-machine "two chains" report: a
+    // node that was mining ITS OWN chain (here B built a 3-block fork) before it ever
+    // connected must, on joining the heavier network (A's 6-block chain), backtrack to
+    // the common ancestor, download A's blocks as a side branch, and DEEP-REORG onto
+    // them — abandoning its own fork. (Going forward, the mining gate stops this fork
+    // from forming in the first place; this proves an ALREADY-forked node still heals.)
+    let g = genesis_2op();
+    let a = Daemon::new(
+        &g,
+        unique_dir("deep-a"),
+        1024,
+        256,
+        vec![(id("val01.node.sov"), Keypair::from_seed(VAL01_SEED))],
+    )
+    .unwrap();
+    let b = Daemon::new(
+        &g,
+        unique_dir("deep-b"),
+        1024,
+        256,
+        vec![(id("val02.node.sov"), Keypair::from_seed(VAL02_SEED))],
+    )
+    .unwrap();
+
+    // A: a 6-block chain, paying 1 SOV per block (total 6 to ecb).
+    for nonce in 0..6u64 {
+        a.node()
+            .lock()
+            .unwrap()
+            .submit(usa_transfer("ecb.reserve.sov", 1, nonce))
+            .unwrap();
+        a.node().lock().unwrap().produce(1_000 + nonce * 1_000).unwrap();
+    }
+    let a_head = a.node().lock().unwrap().chain().head().hash();
+    assert_eq!(a.height(), 6);
+
+    // B: its OWN conflicting 3-block fork, paying 7 SOV per block (total 21 on its fork).
+    for nonce in 0..3u64 {
+        b.node()
+            .lock()
+            .unwrap()
+            .submit(usa_transfer("ecb.reserve.sov", 7, nonce))
+            .unwrap();
+        b.node().lock().unwrap().produce(1_500 + nonce * 1_000).unwrap();
+    }
+    assert_eq!(b.height(), 3);
+    assert_eq!(b.balance(&id("ecb.reserve.sov")), Balance::from_sov(21).unwrap());
+
+    let a_p2p = P2p::bind(
+        a.node(),
+        P2pConfig {
+            chain_id: g.chain_id.clone(),
+            genesis_hash: a.genesis_hash(),
+            account: id("val01.node.sov"),
+            keypair: Keypair::from_seed([33; 32]),
+        },
+        "127.0.0.1:0",
+    )
+    .unwrap()
+    .start();
+    let b_p2p = P2p::bind(
+        b.node(),
+        P2pConfig {
+            chain_id: g.chain_id.clone(),
+            genesis_hash: b.genesis_hash(),
+            account: id("val02.node.sov"),
+            keypair: Keypair::from_seed([34; 32]),
+        },
+        "127.0.0.1:0",
+    )
+    .unwrap()
+    .with_block_log(b.block_log())
+    .start();
+    b_p2p.connect(&a_p2p.local_addr().to_string()).unwrap();
+
+    let reorged = wait_until(30, || {
+        let node = b.node();
+        let n = node.lock().unwrap();
+        n.chain().height() == 6 && n.chain().head().hash() == a_head
+    });
+    assert!(
+        reorged,
+        "B abandoned its own 3-block fork and deep-reorged onto A's heavier 6-block chain"
+    );
+    assert_eq!(
+        b.balance(&id("ecb.reserve.sov")),
+        Balance::from_sov(6).unwrap(),
+        "B's state now reflects A's chain (6), not its abandoned fork (21)"
+    );
+
+    a_p2p.shutdown();
+    b_p2p.shutdown();
+}
+
+#[test]
 fn peer_with_wrong_genesis_is_rejected() {
     let g = genesis();
     let (a, a_p2p) = build_node(

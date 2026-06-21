@@ -512,8 +512,19 @@ fn attempt_dial(shared: &Arc<Shared>, addr: SocketAddr) -> std::io::Result<()> {
     if addr == shared.local_addr {
         return Ok(());
     }
-    if shared.peers.lock().unwrap().contains_key(&addr) {
-        return Ok(()); // already connected
+    // Already linked to this host? Skip. This is the AUTHORITATIVE duplicate check that
+    // ALL dial sources funnel through (bootstrap/`request_reconnect`, mDNS, gossip,
+    // explicit `connect`) — so it must match by IP, not just the exact address: when a
+    // pair of nodes dial each other, dedup keeps ONE link, which may be our INBOUND
+    // (keyed by the peer's ephemeral port). A bootstrap reconnect dials the peer's
+    // fixed LISTEN port, which an exact-address check would miss — re-opening a
+    // duplicate that dedup then tears down, every retry, flapping the peer count 1↔0
+    // forever (and starving the surviving link of the chance to authenticate + sync).
+    // `dial_would_duplicate` matches by IP (loopback-exempt, so single-host tests still
+    // run many nodes) and checks the in-flight `inbound` set; it does all its own
+    // locking and we hold none across it.
+    if dial_would_duplicate(shared, addr) {
+        return Ok(());
     }
     // Claim the in-flight slot; if another dial already holds it, defer to that one.
     if !shared.dialing.lock().unwrap().insert(addr) {
@@ -1099,6 +1110,48 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         cond()
+    }
+
+    #[test]
+    fn reconnect_to_listen_port_is_suppressed_when_inbound_link_exists() {
+        // THE peer-count-flap regression. When two machines dial each other, dedup keeps
+        // ONE link — often our INBOUND, keyed by the peer's ephemeral port. The 2s
+        // bootstrap retry then dials the peer's fixed LISTEN port; an exact-address check
+        // would miss the existing inbound and re-open a duplicate that dedup tears down,
+        // flapping the count 1↔0 forever and starving the survivor of time to sync.
+        // `dial_would_duplicate` (the gate ALL dials funnel through in `attempt_dial`)
+        // must therefore match by IP for real hosts.
+        let node = TcpNode::bind("127.0.0.1:0").unwrap();
+        let peer_listen: SocketAddr = "203.0.113.7:9645".parse().unwrap();
+        let peer_inbound: SocketAddr = "203.0.113.7:51234".parse().unwrap(); // same host, ephemeral
+        node.shared.inbound.lock().unwrap().insert(peer_inbound);
+        assert!(
+            dial_would_duplicate(&node.shared, peer_listen),
+            "a dial to the peer's listen port must be recognized as a duplicate of the \
+             existing inbound link from the same host"
+        );
+        // A genuinely different host is NOT a duplicate — we still dial it.
+        let other_host: SocketAddr = "198.51.100.9:9645".parse().unwrap();
+        assert!(
+            !dial_would_duplicate(&node.shared, other_host),
+            "a different host is not a duplicate"
+        );
+        node.shutdown();
+    }
+
+    #[test]
+    fn loopback_is_exempt_so_many_nodes_can_run_on_one_host() {
+        // The IP-based dedup must NOT collapse distinct loopback nodes (the test/dev
+        // single-host topology): only an EXACT loopback address counts as a duplicate.
+        let node = TcpNode::bind("127.0.0.1:0").unwrap();
+        let a: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        node.shared.inbound.lock().unwrap().insert(a);
+        assert!(
+            !dial_would_duplicate(&node.shared, b),
+            "a different loopback port is a distinct node, not a duplicate"
+        );
+        node.shutdown();
     }
 
     #[test]

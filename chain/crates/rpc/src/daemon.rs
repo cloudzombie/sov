@@ -33,6 +33,7 @@ use sov_primitives::{AccountId, Balance, Hash};
 use sov_state::Ledger;
 use sov_types::{Block, Receipt};
 
+use crate::sync_status::SyncShared;
 use crate::{RpcHandle, RpcServer};
 
 /// Why a daemon operation failed.
@@ -658,6 +659,11 @@ pub struct Daemon {
     /// Whether this boot resumed from a chainstate snapshot (tier 1) rather than
     /// replaying the block log. Observability for operators/tests.
     resumed_fast: bool,
+    /// Live sync telemetry, shared with the [`P2p`](crate::p2p::P2p) engine. When set,
+    /// the production loop GATES mining on it — a node does not mine while it is still
+    /// catching up to a heavier peer chain (so a freshly-joined node syncs the existing
+    /// chain instead of extending its own competing fork).
+    sync_status: Option<Arc<SyncShared>>,
 }
 
 /// A running daemon's RPC + block-production threads, with graceful shutdown.
@@ -793,6 +799,7 @@ impl Daemon {
             gossip: None,
             snapshot_path: snap_path,
             resumed_fast,
+            sync_status: None,
         })
     }
 
@@ -833,6 +840,18 @@ impl Daemon {
     /// same [`node`](Self::node) handle for the receive/sync side.
     pub fn with_gossip(mut self, tcp: Arc<TcpNode>) -> Self {
         self.gossip = Some(tcp);
+        self
+    }
+
+    /// Gate block production on sync state: while the shared [`SyncShared`] reports we
+    /// are behind a heavier peer chain, the production loop does NOT mine. Share the
+    /// SAME handle with [`P2p::with_sync_status`](crate::p2p::P2p::with_sync_status) (the
+    /// engine that writes it). Without this a freshly-joined node mines its own fork
+    /// from its local height while it should be downloading the existing chain, and the
+    /// network only reconverges after a deep reorg; with it, a node joins cleanly —
+    /// sync first, mine once caught up. A solo node (no heavier peer) is never gated.
+    pub fn with_sync_status(mut self, status: Arc<SyncShared>) -> Self {
+        self.sync_status = Some(status);
         self
     }
 
@@ -940,6 +959,7 @@ impl Daemon {
         let gossip = self.gossip.clone();
         let block_log = Arc::clone(&self.block_log);
         let snap_path = self.snapshot_path.clone();
+        let sync_status = self.sync_status.clone();
         let sd = Arc::clone(&shutdown);
         let interval = block_time_ms.max(1);
 
@@ -966,35 +986,44 @@ impl Daemon {
                 // competing blocks the heaviest-work fork choice resolves the
                 // race exactly as in Bitcoin.
                 //
-                // Build the candidate under a BRIEF lock, then grind the proof of
-                // work OFF the lock so RPC and block import stay responsive while
-                // this node mines — essential at mainnet/RandomX difficulty,
-                // where the grind runs for ~the target block time. Commit the
-                // sealed block under another brief lock.
-                let candidate = {
-                    let Ok(n) = node.lock() else { break };
-                    n.build_candidate(now_ms())
-                };
-                let Ok(candidate) = candidate else { continue };
-                let sealed = match candidate.into_sealed_block() {
-                    Ok(block) => block,
-                    Err(_) => continue,
-                };
-                if sd.load(Ordering::SeqCst) {
-                    break;
-                }
-                {
-                    let Ok(mut n) = node.lock() else { break };
-                    match n.commit_mined(sealed) {
-                        Ok(produced) => {
-                            // Persist under the node lock (order == commit order).
-                            let _ = block_log.append(&produced.block);
-                            drop(n);
-                            if let Some(tcp) = &gossip {
-                                tcp.broadcast(&NetMessage::NewBlock(produced.block.clone()));
+                // SYNC GATE (Nakamoto "no mining during initial block download"): while a
+                // heavier peer chain exists that we have not caught up to, do NOT mine —
+                // a joining node must download the existing chain, not extend its own
+                // competing fork from its local height (which only reconverges after a
+                // deep reorg, the "two chains / not indexing" failure). A solo node, or
+                // one already at the network's tip, is not behind and mines normally, so
+                // the network still bootstraps and never stalls. Re-checked every tick,
+                // so mining resumes the instant catch-up completes.
+                let behind = sync_status.as_ref().map(|s| s.is_behind()).unwrap_or(false);
+                if !behind {
+                    // Build the candidate under a BRIEF lock, then grind the proof of
+                    // work OFF the lock so RPC and block import stay responsive while
+                    // this node mines — essential at mainnet/RandomX difficulty. Commit
+                    // the sealed block under another brief lock.
+                    let candidate = {
+                        let Ok(n) = node.lock() else { break };
+                        n.build_candidate(now_ms())
+                    };
+                    if let Ok(candidate) = candidate {
+                        if let Ok(sealed) = candidate.into_sealed_block() {
+                            if sd.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            let Ok(mut n) = node.lock() else { break };
+                            match n.commit_mined(sealed) {
+                                Ok(produced) => {
+                                    // Persist under the node lock (order == commit order).
+                                    let _ = block_log.append(&produced.block);
+                                    drop(n);
+                                    if let Some(tcp) = &gossip {
+                                        tcp.broadcast(&NetMessage::NewBlock(
+                                            produced.block.clone(),
+                                        ));
+                                    }
+                                }
+                                Err(_) => drop(n),
                             }
                         }
-                        Err(_) => drop(n),
                     }
                 }
                 // Periodic chainstate snapshot — keyed off the ACTIVE-head height, so it
@@ -1082,7 +1111,14 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("sov-rec-{tag}-{nanos}.log"))
+        // Give each test file its OWN created subdirectory, rather than a bare file in
+        // the shared temp root: the parent then provably exists at write time (no
+        // dependence on a transient temp root) and tests can never collide on a path —
+        // removing a parallel-run flake where an atomic snapshot write (temp + rename)
+        // raced the temp directory.
+        let dir = std::env::temp_dir().join(format!("sov-rec-{tag}-{nanos}"));
+        fs::create_dir_all(&dir).expect("create temp test dir");
+        dir.join("data.log")
     }
 
     #[test]
@@ -1235,6 +1271,114 @@ mod tests {
         let err = load_blocks(&path).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         let _ = fs::remove_file(&path);
+    }
+
+    fn gate_test_genesis() -> GenesisConfig {
+        GenesisConfig {
+            chain_id: "sov-gate-test".into(),
+            timestamp_ms: 1_000,
+            accounts: vec![GenesisAccount {
+                account: AccountId::new("val01.node.sov").unwrap(),
+                key: Keypair::from_seed([7; 32]).public_key(),
+                balance: Balance::ZERO,
+            }],
+            mining: MiningPolicy::test(),
+            vesting: vec![],
+        }
+    }
+
+    #[test]
+    fn mining_is_gated_while_behind_then_resumes_when_caught_up() {
+        // The bootstrap-correctness guarantee: a node that is BEHIND a heavier peer
+        // chain does not mine (it would only fork), and it resumes mining the instant
+        // it has caught up. This is what makes a freshly-joined node converge onto the
+        // existing chain instead of extending its own competing one.
+        let genesis = gate_test_genesis();
+        let dir = std::env::temp_dir().join(format!(
+            "sov-gate-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sync = Arc::new(SyncShared::new());
+        // Start gated: pretend an authenticated peer advertises a heavier chain.
+        sync.update(true, 100, 1);
+        let daemon = Daemon::new(
+            &genesis,
+            &dir,
+            1024,
+            256,
+            vec![(
+                AccountId::new("val01.node.sov").unwrap(),
+                Keypair::from_seed([7; 32]),
+            )],
+        )
+        .unwrap()
+        .with_sync_status(Arc::clone(&sync));
+        // Fast cadence so the test is quick; the node mines empty blocks each interval.
+        let handle = daemon.run("127.0.0.1:0", 1, 20).unwrap();
+
+        // Across many intervals while "behind", the chain must NOT advance past genesis.
+        thread::sleep(Duration::from_millis(300));
+        let gated_height = handle.node().lock().unwrap().chain().height();
+        assert_eq!(
+            gated_height, 0,
+            "a node behind a heavier peer must not mine its own fork"
+        );
+
+        // Catch up: the gate clears and mining resumes.
+        sync.update(false, 100, 1);
+        let mut resumed = false;
+        for _ in 0..200 {
+            if handle.node().lock().unwrap().chain().height() > 0 {
+                resumed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(resumed, "mining resumes once caught up to the network tip");
+
+        handle.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn without_sync_status_a_solo_node_mines_freely() {
+        // No telemetry attached (or no heavier peer) ⇒ never gated, so a solo seed node
+        // bootstraps the network by mining normally. Guards against the gate ever
+        // wedging a lone node.
+        let genesis = gate_test_genesis();
+        let dir = std::env::temp_dir().join(format!(
+            "sov-solo-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let daemon = Daemon::new(
+            &genesis,
+            &dir,
+            1024,
+            256,
+            vec![(
+                AccountId::new("val01.node.sov").unwrap(),
+                Keypair::from_seed([7; 32]),
+            )],
+        )
+        .unwrap();
+        let handle = daemon.run("127.0.0.1:0", 1, 20).unwrap();
+        let mut mined = false;
+        for _ in 0..200 {
+            if handle.node().lock().unwrap().chain().height() > 0 {
+                mined = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(mined, "a solo node with no heavier peer mines normally");
+        handle.shutdown();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -67,6 +67,9 @@ pub use daemon::{
 pub mod p2p;
 pub use p2p::{P2p, P2pConfig, P2pHandle};
 
+pub mod sync_status;
+pub use sync_status::SyncShared;
+
 /// Maximum accepted request body (4 MiB) — large enough for a contract-deploy
 /// transaction, small enough that a public bind cannot be memory-DoSed.
 const MAX_RPC_BODY_BYTES: usize = 4 * 1024 * 1024;

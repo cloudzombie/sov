@@ -31,6 +31,7 @@ use sov_node::{Node, NodeError};
 use sov_primitives::{AccountId, Hash};
 use sov_types::Block;
 
+use crate::sync_status::SyncShared;
 use crate::BlockLog;
 
 /// The identity and chain binding a node presents in its handshake.
@@ -56,6 +57,10 @@ pub struct P2p {
     /// Bootstrap peers to keep connected, retried periodically by the engine so a
     /// link survives the seed being down at startup or a peer sleeping and waking.
     bootstrap: Vec<String>,
+    /// If set, the engine publishes live sync telemetry here each tick (whether we
+    /// are behind a heavier peer, the best peer height, distinct authenticated peer
+    /// count) — read by the mining loop to gate production and by the UI for status.
+    sync_status: Option<Arc<SyncShared>>,
 }
 
 /// A running gossip/sync engine. Stop it with [`P2pHandle::shutdown`].
@@ -104,6 +109,7 @@ impl P2p {
             config: Arc::new(config),
             block_log: None,
             bootstrap: Vec::new(),
+            sync_status: None,
         })
     }
 
@@ -139,6 +145,16 @@ impl P2p {
         self
     }
 
+    /// Publish live sync telemetry to `status` each tick: whether we are behind a
+    /// heavier peer chain (which gates the miner — share the SAME handle with
+    /// [`Daemon::with_sync_status`](crate::Daemon::with_sync_status) so a node syncs
+    /// before it mines), the best peer height, and the count of DISTINCT
+    /// authenticated peers (so a redundant link never shows as a ghost peer).
+    pub fn with_sync_status(mut self, status: Arc<SyncShared>) -> Self {
+        self.sync_status = Some(status);
+        self
+    }
+
     /// Start the gossip + sync loop, returning a handle that controls it.
     pub fn start(self) -> P2pHandle {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -148,6 +164,7 @@ impl P2p {
         let config = Arc::clone(&self.config);
         let block_log = self.block_log.clone();
         let bootstrap = self.bootstrap.clone();
+        let sync_status = self.sync_status.clone();
         let stop = Arc::clone(&shutdown);
 
         let worker = thread::spawn(move || {
@@ -171,6 +188,14 @@ impl P2p {
                     state.handle(&tcp, &node, &config, peer, msg);
                 }
                 state.request_missing(&tcp, &node);
+                // Publish live telemetry every tick: are we behind a heavier peer
+                // (gates the miner), the best peer height, and the DISTINCT
+                // authenticated-peer count (so the UI never shows a redundant link as
+                // a ghost). Cheap — a few map scans + atomic stores, no extra locks.
+                if let Some(s) = &sync_status {
+                    let (behind, best, peers) = state.telemetry(&node);
+                    s.update(behind, best, peers);
+                }
                 // ~every second: reclaim slots from peers that connected but never
                 // authenticated (zombie-eclipse defense), and reap dead half-open
                 // connections to a vanished peer (clears ghost peer counts AND stops
@@ -638,7 +663,11 @@ impl SyncState {
             .identity
             .iter()
             .filter(|(_, a)| *a == account)
-            .map(|(p, _)| (*p, tcp.peer_handshake_hash(p).unwrap_or_default()))
+            // Only connections with a retrievable channel binding are survivor
+            // candidates: a connection mid-teardown returns `None` here, and treating
+            // its (empty) binding as the lexicographically smallest would KEEP the dying
+            // link and disconnect the healthy one — a self-inflicted churn. Skip them.
+            .filter_map(|(p, _)| tcp.peer_handshake_hash(p).map(|b| (*p, b)))
             .collect();
         if dupes.len() < 2 {
             return;
@@ -778,6 +807,42 @@ impl SyncState {
             // re-evaluates against the live peer set.
             self.inflight = None;
         }
+    }
+
+    /// Snapshot the node's sync position for [`SyncShared`]: `(behind, best_peer_height,
+    /// distinct_peers)`.
+    ///
+    /// * `behind` — some authenticated peer advertises strictly more cumulative work
+    ///   than our chain, so the miner must wait (we are catching up).
+    /// * `best_peer_height` — the tallest authenticated peer chain we have heard of.
+    /// * `distinct_peers` — the number of distinct authenticated node IDENTITIES, NOT
+    ///   raw socket connections. A redundant inbound+outbound link to the same node
+    ///   (briefly present before [`dedup_identity`](Self::dedup_identity) collapses it)
+    ///   therefore never shows up as an extra "ghost" peer — the count the operator
+    ///   sees is simply how many real remote nodes we are talking to.
+    fn telemetry(&self, node: &Mutex<Node>) -> (bool, u64, usize) {
+        let distinct: HashSet<&AccountId> = self
+            .identity
+            .iter()
+            .filter(|(p, _)| self.authenticated.contains(p))
+            .map(|(_, a)| a)
+            .collect();
+        let best = self
+            .peer_status
+            .iter()
+            .filter(|(p, _)| self.authenticated.contains(p))
+            .map(|(_, s)| s.height)
+            .max()
+            .unwrap_or(0);
+        let behind = match local_status(node) {
+            Some(local) => self
+                .peer_status
+                .iter()
+                .filter(|(p, _)| self.authenticated.contains(p))
+                .any(|(_, s)| s.chain_work > local.chain_work),
+            None => false,
+        };
+        (behind, best, distinct.len())
     }
 }
 

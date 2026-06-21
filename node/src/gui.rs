@@ -21,7 +21,7 @@ use sov_crypto::{Keypair, PublicKey};
 use sov_primitives::{AccountId, Balance, Hash};
 use sov_rpc::{
     ChainSpec, Daemon, DaemonHandle, Keystore, KeystoreEntry, NodeConfig, P2p, P2pConfig,
-    P2pHandle, RpcClient,
+    P2pHandle, RpcClient, SyncShared,
 };
 use sov_shielded::{
     encode_shielded, shielded_transfer_with_change, unshield_amount, AnyAddress, NoteStore,
@@ -97,6 +97,18 @@ struct Snapshot {
     deshield_resets_at: Option<u64>,
     error: Option<String>,
     updated_ms: u64,
+    /// LIVE peer/sync telemetry, read in-process from the embedded node every frame
+    /// (not over RPC), so the Node tab shows a rolling, never-stale picture even while
+    /// the loopback RPC poller is momentarily unreachable.
+    ///
+    /// `peers` is the count of DISTINCT authenticated remote nodes (a redundant link is
+    /// never double-counted). `best_peer_height` is the tallest peer chain we have heard
+    /// of. `syncing` means we are still catching up to a heavier peer chain — while true
+    /// the node is downloading, not mining (it joins the existing chain before extending
+    /// it). `None`/false when there is no embedded node or no P2P.
+    peers: Option<usize>,
+    best_peer_height: Option<u64>,
+    syncing: bool,
 }
 
 /// UI-editable polling config, shared with the poller thread.
@@ -668,6 +680,34 @@ struct EmbeddedNode {
     p2p: Option<P2pHandle>,
     /// The account the node mines its coinbase to (for the status badge).
     account: String,
+    /// Live sync telemetry, written by the P2P engine and read by the production loop
+    /// (to gate mining) and the UI (for a rolling status). Shared by clone with both.
+    sync: Arc<SyncShared>,
+}
+
+/// A socket-free, in-process snapshot of the embedded node's CHAIN state — read every
+/// frame so the Node tab rolls in real time even when the loopback RPC poller blips.
+/// Requires the node lock (so it can be momentarily unavailable mid-commit; the
+/// lock-free [`SyncView`] is not).
+struct ChainView {
+    height: u64,
+    chain_id: String,
+    head_hash: String,
+    state_root: String,
+    /// Total mined supply, in grains (every coin is mined; genesis supply is zero).
+    supply_grains: String,
+    mempool: usize,
+}
+
+/// A lock-free view of peering/sync, always available (atomics) so the Node tab's peer
+/// and sync status never blank out just because the node is busy committing a block.
+struct SyncView {
+    /// Distinct authenticated peer nodes (never double-counts a redundant link).
+    peers: usize,
+    /// Tallest peer chain height we have heard of (0 if none).
+    best_peer_height: u64,
+    /// Still catching up to a heavier peer chain — downloading, not mining.
+    syncing: bool,
 }
 
 impl EmbeddedNode {
@@ -693,16 +733,40 @@ impl EmbeddedNode {
         self.p2p.as_ref().map(|p| p.tcp().peer_count()).unwrap_or(0)
     }
 
-    /// A SOCKET-FREE status read of the embedded node: `(height, chain_id)`, read
-    /// directly from the in-process chain. Uses `try_lock`, so a momentarily-busy node
-    /// (mid-commit / mid-reorg) returns `None` rather than blocking the UI — the node
-    /// is still up, just busy this instant. This is why the desktop app never needs to
-    /// "connect" to its own node over a loopback RPC socket (the source of the spurious
-    /// "Transport: … did not properly respond" on Windows).
-    fn local_status(&self) -> Option<(u64, String)> {
+    /// A SOCKET-FREE read of the embedded node's CHAIN state, straight from the
+    /// in-process chain. Uses `try_lock`, so a momentarily-busy node (mid-commit /
+    /// mid-reorg) returns `None` rather than blocking the UI — the node is still up,
+    /// just busy this instant. This is why the desktop app never needs to "connect" to
+    /// its own node over a loopback RPC socket (the source of the spurious "Transport:
+    /// … did not properly respond" on Windows).
+    fn chain_view(&self) -> Option<ChainView> {
         let node = self.daemon.node();
         let guard = node.try_lock().ok()?;
-        Some((guard.chain().height(), guard.chain().chain_id().to_string()))
+        let chain = guard.chain();
+        Some(ChainView {
+            height: chain.height(),
+            chain_id: chain.chain_id().to_string(),
+            head_hash: chain.head().hash().to_hex(),
+            state_root: chain.ledger().state_root().to_hex(),
+            supply_grains: chain
+                .ledger()
+                .total_supply()
+                .map(|b| b.grains().to_string())
+                .unwrap_or_default(),
+            mempool: guard.mempool_len(),
+        })
+    }
+
+    /// A LOCK-FREE read of peering/sync telemetry (atomics, written by the P2P engine),
+    /// so the peer count and sync status never blank just because the node is busy
+    /// committing. The peer count is DISTINCT authenticated nodes — a redundant link is
+    /// never shown as a ghost.
+    fn sync_view(&self) -> SyncView {
+        SyncView {
+            peers: self.sync.authed_peers(),
+            best_peer_height: self.sync.best_peer_height(),
+            syncing: self.sync.is_behind(),
+        }
     }
 }
 
@@ -746,6 +810,12 @@ pub struct Station {
     log_prev_peers: Option<usize>,
     log_prev_online: Option<bool>,
     log_prev_height: Option<u64>,
+    // Sync-pipeline observables, so the operator SEES the join progress stage by stage
+    // (authenticated peers, catch-up starting/finishing, the peer chain height we are
+    // pulling toward) instead of a silent "connected but nothing happening".
+    log_prev_authed: Option<usize>,
+    log_prev_syncing: Option<bool>,
+    log_prev_best: Option<u64>,
     // A peer to bootstrap the local node to (`host:port`), so two machines join the
     // SAME testnet (same genesis + a P2P link). Persisted in the node config.
     peer_addr: String,
@@ -907,6 +977,9 @@ impl Station {
             log_prev_peers: None,
             log_prev_online: None,
             log_prev_height: None,
+            log_prev_authed: None,
+            log_prev_syncing: None,
+            log_prev_best: None,
             peer_addr: read_saved_peer(),
             lan_addr: lan_ipv4(),
             network: Network::Testnet,
@@ -1774,11 +1847,24 @@ impl Station {
         if let NodeRun::Running(node) = &*self.node_run.lock().unwrap() {
             snap.online = true;
             snap.error = None;
-            if let Some((height, chain_id)) = node.local_status() {
-                snap.height = Some(height);
-                if !chain_id.is_empty() {
-                    snap.chain_id = chain_id;
+            // Lock-free peer/sync telemetry — always available, so these never blank
+            // out while the node is mid-commit.
+            let sv = node.sync_view();
+            snap.peers = Some(sv.peers);
+            snap.best_peer_height = Some(sv.best_peer_height);
+            snap.syncing = sv.syncing;
+            // Live chain state, read in-process every frame so height + supply + head
+            // ROLL in real time (no dependency on the loopback RPC poller, which blips
+            // on Windows). Skipped silently if the node is busy this instant.
+            if let Some(cv) = node.chain_view() {
+                snap.height = Some(cv.height);
+                if !cv.chain_id.is_empty() {
+                    snap.chain_id = cv.chain_id;
                 }
+                snap.head_hash = cv.head_hash;
+                snap.state_root = cv.state_root;
+                snap.supply_mined = cv.supply_grains;
+                snap.mempool = Some(cv.mempool);
             }
         }
     }
@@ -1794,7 +1880,11 @@ impl Station {
         };
         match (self.log_prev_peers, peers) {
             (Some(prev), Some(now)) if prev != now => {
-                push_log(&self.node_logs, format!("peers {prev} → {now}"));
+                // RAW TCP links (an inbound + an outbound to one node briefly count as
+                // two before dedup collapses them) — distinct from "authenticated peers"
+                // below, which is the real remote-node count. Labeling them apart stops a
+                // transient link reading as a ghost peer.
+                push_log(&self.node_logs, format!("TCP links {prev} → {now}"));
                 self.log_prev_peers = Some(now);
             }
             (None, Some(now)) => self.log_prev_peers = Some(now),
@@ -1827,6 +1917,48 @@ impl Station {
                 None => self.log_prev_height = Some(h),
                 _ => {}
             }
+        }
+        // Authenticated-peer transitions — the stage AFTER raw TCP connect: a peer is
+        // only counted here once it has proven same chain + genesis + key over the
+        // encrypted channel. If raw peers climb but this stays 0, the operator can see
+        // the handshake is the thing failing (wrong network / version), not the sync.
+        if let Some(now) = snap.peers {
+            match self.log_prev_authed {
+                Some(prev) if prev != now => {
+                    push_log(&self.node_logs, format!("authenticated peers {prev} → {now}"));
+                    self.log_prev_authed = Some(now);
+                }
+                None => self.log_prev_authed = Some(now),
+                _ => {}
+            }
+        }
+        // The height of the peer chain we are pulling toward — so a catch-up shows a
+        // concrete target ("syncing to 8400"), not an opaque spinner.
+        if let Some(best) = snap.best_peer_height.filter(|b| *b > 0) {
+            match self.log_prev_best {
+                Some(prev) if prev != best => {
+                    push_log(&self.node_logs, format!("peer chain height: {best}"));
+                    self.log_prev_best = Some(best);
+                }
+                None => self.log_prev_best = Some(best),
+                _ => {}
+            }
+        }
+        // Catch-up start/finish: the explicit "downloading vs mining" state the user
+        // asked to see — the node downloads the existing chain first, then mines.
+        if self.log_prev_syncing != Some(snap.syncing) {
+            if self.log_prev_syncing.is_some() {
+                push_log(
+                    &self.node_logs,
+                    if snap.syncing {
+                        "syncing — downloading the existing chain from a peer (mining paused)"
+                            .to_string()
+                    } else {
+                        "✓ synced — caught up to the network tip, mining enabled".to_string()
+                    },
+                );
+            }
+            self.log_prev_syncing = Some(snap.syncing);
         }
     }
 
@@ -2413,8 +2545,43 @@ fn node_panel(ui: &mut egui::Ui, s: &Snapshot) {
                 "Mempool",
                 &s.mempool.map(|m| m.to_string()).unwrap_or_default(),
             );
+            kv(
+                ui,
+                "Peers",
+                &s.peers.map(|p| p.to_string()).unwrap_or_default(),
+            );
         });
     ui.add_space(8.0);
+    // Sync status: the join-progress line the operator watches. While catching up it
+    // shows a concrete target (our height → the peer chain height); once level it
+    // confirms the node is on the network tip and mining.
+    if s.online {
+        let local_h = s.height.unwrap_or(0);
+        let best = s.best_peer_height.unwrap_or(0);
+        if s.syncing {
+            let behind = best.saturating_sub(local_h);
+            ui.label(
+                egui::RichText::new(format!(
+                    "⟳ Syncing — downloading the existing chain: {local_h} / {best}  ({behind} behind, mining paused)"
+                ))
+                .color(egui::Color32::from_rgb(230, 170, 60))
+                .strong(),
+            );
+        } else if s.peers.unwrap_or(0) > 0 {
+            ui.label(
+                egui::RichText::new(format!("✓ Synced — on the network tip at height {local_h}, mining"))
+                    .color(egui::Color32::from_rgb(90, 200, 130))
+                    .strong(),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(format!(
+                    "● Solo — no peers yet; mining at height {local_h}. Add a seed peer below to join others."
+                ))
+                .weak(),
+            );
+        }
+    }
     if !s.online {
         ui.label(
             egui::RichText::new(
@@ -6062,6 +6229,12 @@ fn build_and_run_node(
         daemon = daemon.with_checkpoints(checkpoints);
     }
 
+    // Shared sync telemetry: the P2P engine writes it, the mining loop reads it to GATE
+    // production (a joining node downloads the existing chain BEFORE it mines, instead of
+    // forking), and the UI reads it for the live peer/sync status. One handle, cloned to
+    // every party — this is what makes bootstrapping a new node deterministic.
+    let sync = Arc::new(SyncShared::new());
+
     // P2P is ALWAYS on (the node discovers + peers with other machines); solo
     // mining works regardless, since a node produces blocks with zero peers. Bound
     // to the same shared node so blocks/txs flow both ways.
@@ -6085,7 +6258,8 @@ fn build_and_run_node(
             )
             .map_err(|e| format!("p2p bind: {e}"))?
             .with_block_log(daemon.block_log())
-            .with_bootstrap(config.bootstrap_peers.clone());
+            .with_bootstrap(config.bootstrap_peers.clone())
+            .with_sync_status(Arc::clone(&sync));
             for peer in &config.bootstrap_peers {
                 let _ = p2p.connect(peer);
                 push_log(logs, format!("dialing seed peer {peer}…"));
@@ -6107,13 +6281,17 @@ fn build_and_run_node(
         }
     };
 
+    // Gate mining on the SAME telemetry the P2P engine writes: while behind a heavier
+    // peer chain, the production loop does not mine (it would only fork). A solo node is
+    // never behind, so it still bootstraps the network.
     let handle = daemon
+        .with_sync_status(Arc::clone(&sync))
         .run(&config.rpc_addr, config.rpc_workers, config.block_time_ms)
         .map_err(|e| format!("run: {e}"))?;
     push_log(
         logs,
         format!(
-            "node up — RPC on http://{} — mining every {}ms",
+            "node up — RPC on http://{} — mining every {}ms (paused while syncing a heavier peer)",
             handle.rpc_addr(),
             config.block_time_ms
         ),
@@ -6122,6 +6300,7 @@ fn build_and_run_node(
         daemon: handle,
         p2p,
         account: account.to_string(),
+        sync,
     })
 }
 
