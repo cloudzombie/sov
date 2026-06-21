@@ -5853,6 +5853,42 @@ fn stop_tracked_node() {
     let _ = std::fs::remove_file(node_pid_path());
 }
 
+/// SINGLE INSTANCE: terminate any OTHER running copy of this app before we start a node,
+/// so a stale ghost (a previous launch that didn't fully exit and release its sockets)
+/// cannot hold the P2P/RPC port and fail the start with "address already in use"
+/// (os error 10048 on Windows, 48 on macOS). Best-effort; never kills THIS process. This
+/// is the "I want exactly ONE node, no ghosts" guarantee enforced at the OS level.
+fn kill_other_instances() {
+    let self_pid = std::process::id();
+    let Some(name) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+    else {
+        return;
+    };
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", &name, "/FI", &format!("PID ne {self_pid}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        if let Ok(out) = Command::new("pgrep").arg("-x").arg(&name).output() {
+            for pid in String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse::<u32>().ok())
+            {
+                if pid != self_pid {
+                    kill_pid(pid);
+                }
+            }
+        }
+    }
+}
+
 /// The testnet-1 genesis spec, COMPILED INTO the binary so a shipped app is fully
 /// self-contained — no source checkout, no reliance on the build-machine path in
 /// `CARGO_MANIFEST_DIR` (which does not exist on a user's machine). This is the same
@@ -5883,6 +5919,11 @@ fn build_and_run_node(
     peer: &str,
     logs: &Arc<Mutex<Vec<String>>>,
 ) -> Result<EmbeddedNode, String> {
+    // SINGLE INSTANCE: kill any ghost copy of this app first, so a leftover process from
+    // a previous launch can't still hold the P2P/RPC ports and fail our bind with
+    // "address already in use" (os error 10048/48) — the real cause of "node start
+    // FAILED: p2p bind". One node, no ghosts.
+    kill_other_instances();
     // On Windows, make sure we're allowed inbound through the firewall (once), so LAN
     // peers can actually reach this node — otherwise discovery silently never connects.
     ensure_firewall(logs);

@@ -221,7 +221,27 @@ impl TcpNode {
     /// Bind a listener on `addr` (e.g. `127.0.0.1:0` for an ephemeral port) and
     /// start serving connections.
     pub fn bind(addr: &str) -> std::io::Result<TcpNode> {
-        let listener = TcpListener::bind(addr)?;
+        // Retry briefly on "address in use": when the app restarts (or a prior instance
+        // is being killed for single-instance), the OS can hold the port for a short
+        // release/TIME_WAIT window. Retrying a few times rides through it instead of
+        // failing the whole node start with os error 48 / 10048.
+        let listener = {
+            let mut attempt = TcpListener::bind(addr);
+            for _ in 0..20 {
+                match attempt {
+                    Ok(l) => {
+                        attempt = Ok(l);
+                        break;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                        thread::sleep(Duration::from_millis(150));
+                        attempt = TcpListener::bind(addr);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            attempt?
+        };
         let local_addr = listener.local_addr()?;
         let (dial_tx, dial_rx) = channel::<SocketAddr>();
 
