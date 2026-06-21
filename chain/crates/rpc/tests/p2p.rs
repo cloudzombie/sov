@@ -24,7 +24,8 @@ use sov_crypto::Keypair;
 use sov_mining::MiningPolicy;
 use sov_network::{NetMessage, TcpNode};
 use sov_primitives::{AccountId, Balance, Hash};
-use sov_rpc::{Daemon, P2p, P2pConfig, P2pHandle};
+use sov_rpc::{Daemon, P2p, P2pConfig, P2pHandle, SyncShared};
+use std::sync::Arc;
 use sov_types::{Action, SignedTransaction, Transaction};
 
 const CHAIN_ID: &str = "sov-p2p-testnet";
@@ -521,6 +522,104 @@ fn node_that_mined_its_own_multiblock_fork_recovers_by_deep_reorg() {
 
     a_p2p.shutdown();
     b_p2p.shutdown();
+}
+
+#[test]
+fn two_miners_share_one_chain_and_both_earn_blocks() {
+    // THE end-to-end guarantee the operator is betting on: two nodes BOTH mining (each
+    // its own miner identity), connected as peers, must converge on ONE chain and each
+    // win blocks — rewards distributed between them — instead of fork-warring into two
+    // divergent chains ("the chain was lost as soon as both were mining"). This exercises
+    // the real production paths together: daemon mining (jittered cadence), P2P gossip +
+    // sync, the mining gate (don't extend while behind), and the deterministic fork-choice
+    // tie-break (equal-work competitors converge on the smaller hash).
+    let g = genesis_2op();
+
+    // Build a fully-live mining node: a daemon producing blocks via `run`, plus a P2P
+    // engine sharing ONE `SyncShared` so the miner is gated on sync. 100 ms blocks keep
+    // the test quick while leaving room for gossip to land between blocks.
+    let build_miner = |tag: &str, miner: &str, miner_seed: [u8; 32], p2p_seed: [u8; 32]| {
+        let sync = Arc::new(SyncShared::new());
+        let d = Daemon::new(
+            &g,
+            unique_dir(tag),
+            1024,
+            256,
+            vec![(id(miner), Keypair::from_seed(miner_seed))],
+        )
+        .unwrap();
+        let p2p = P2p::bind(
+            d.node(),
+            P2pConfig {
+                chain_id: g.chain_id.clone(),
+                genesis_hash: d.genesis_hash(),
+                account: id(miner),
+                keypair: Keypair::from_seed(p2p_seed),
+            },
+            "127.0.0.1:0",
+        )
+        .unwrap()
+        .with_block_log(d.block_log())
+        .with_sync_status(Arc::clone(&sync));
+        let d = d.with_gossip(p2p.tcp()).with_sync_status(Arc::clone(&sync));
+        let net = p2p.start();
+        let dae = d.run("127.0.0.1:0", 1, 100).unwrap();
+        (dae, net)
+    };
+
+    let (a_dae, a_net) = build_miner("two-a", "val01.node.sov", VAL01_SEED, [51; 32]);
+    let (b_dae, b_net) = build_miner("two-b", "val02.node.sov", VAL02_SEED, [52; 32]);
+    b_net.connect(&a_net.local_addr().to_string()).unwrap();
+
+    // Converge while BOTH mine: agree on a BURIED block (5 deep), which is robust against
+    // the live tip differing by a block mid-propagation. If they diverged into competing
+    // forks, this buried block would differ and the wait would time out.
+    let converged = wait_until(60, || {
+        let an = a_dae.node();
+        let an = an.lock().unwrap();
+        let bn = b_dae.node();
+        let bn = bn.lock().unwrap();
+        let (ah, bh) = (an.chain().height(), bn.chain().height());
+        if ah < 30 || bh < 30 {
+            return false;
+        }
+        let common = ah.min(bh).saturating_sub(5).max(1);
+        an.chain().block_by_height(common).map(|b| b.hash())
+            == bn.chain().block_by_height(common).map(|b| b.hash())
+    });
+    assert!(
+        converged,
+        "two miners converged on a single shared chain while both mining"
+    );
+
+    // Rewards are distributed between them: the agreed chain contains blocks proposed by
+    // BOTH miners. Over 25+ jittered blocks at ~50/50 odds, both appear (one winning all
+    // is ~1e-7). Scan the buried, agreed prefix on A.
+    let (val01, val02) = (id("val01.node.sov"), id("val02.node.sov"));
+    let (mut a_blocks, mut b_blocks) = (0u32, 0u32);
+    {
+        let an = a_dae.node();
+        let an = an.lock().unwrap();
+        let scan_to = an.chain().height().saturating_sub(5).max(1);
+        for height in 1..=scan_to {
+            if let Some(b) = an.chain().block_by_height(height) {
+                if b.header.proposer == val01 {
+                    a_blocks += 1;
+                } else if b.header.proposer == val02 {
+                    b_blocks += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        a_blocks > 0 && b_blocks > 0,
+        "both miners earned blocks on the shared chain (val01={a_blocks}, val02={b_blocks})"
+    );
+
+    a_net.shutdown();
+    b_net.shutdown();
+    a_dae.shutdown();
+    b_dae.shutdown();
 }
 
 #[test]
