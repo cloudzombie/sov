@@ -6259,7 +6259,8 @@ fn build_and_run_node(
             .map_err(|e| format!("p2p bind: {e}"))?
             .with_block_log(daemon.block_log())
             .with_bootstrap(config.bootstrap_peers.clone())
-            .with_sync_status(Arc::clone(&sync));
+            .with_sync_status(Arc::clone(&sync))
+            .with_log_sink(logs.clone());
             for peer in &config.bootstrap_peers {
                 let _ = p2p.connect(peer);
                 push_log(logs, format!("dialing seed peer {peer}…"));

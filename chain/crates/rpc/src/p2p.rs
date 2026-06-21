@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sov_chain::ChainError;
 use sov_crypto::Keypair;
@@ -33,6 +33,43 @@ use sov_types::Block;
 
 use crate::sync_status::SyncShared;
 use crate::BlockLog;
+
+/// An optional human-readable diagnostics sink (the desktop app's Node-log buffer),
+/// so an operator SEES the join/sync pipeline — authentication, block requests,
+/// serving, and stalls — instead of an opaque "connected but nothing happening". When
+/// `None` (headless/tests) it costs nothing.
+type LogSink = Option<Arc<Mutex<Vec<String>>>>;
+
+/// Append one timestamped P2P diagnostic line to `sink` (capped, like the GUI's own
+/// logger). A no-op when there is no sink.
+fn p2p_log(sink: &LogSink, msg: impl AsRef<str>) {
+    let Some(sink) = sink else { return };
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        % 86_400;
+    let line = format!(
+        "{:02}:{:02}:{:02}  p2p: {}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+        msg.as_ref()
+    );
+    if let Ok(mut v) = sink.lock() {
+        v.push(line);
+        let n = v.len();
+        if n > 5_000 {
+            v.drain(0..n - 5_000);
+        }
+    }
+}
+
+/// A short, log-friendly tag for a peer address (the IP:port is enough to correlate
+/// across the two machines without dumping noise).
+fn short_peer(p: &SocketAddr) -> String {
+    p.to_string()
+}
 
 /// The identity and chain binding a node presents in its handshake.
 pub struct P2pConfig {
@@ -61,6 +98,8 @@ pub struct P2p {
     /// are behind a heavier peer, the best peer height, distinct authenticated peer
     /// count) — read by the mining loop to gate production and by the UI for status.
     sync_status: Option<Arc<SyncShared>>,
+    /// Optional Node-log sink for human-readable sync diagnostics.
+    log_sink: LogSink,
 }
 
 /// A running gossip/sync engine. Stop it with [`P2pHandle::shutdown`].
@@ -110,6 +149,7 @@ impl P2p {
             block_log: None,
             bootstrap: Vec::new(),
             sync_status: None,
+            log_sink: None,
         })
     }
 
@@ -155,6 +195,15 @@ impl P2p {
         self
     }
 
+    /// Surface human-readable sync diagnostics (authentication, block requests,
+    /// serving, stalls) into `sink` — typically the desktop app's Node-log buffer — so
+    /// an operator can see the join pipeline progress (or pinpoint exactly where it
+    /// stops) on each machine.
+    pub fn with_log_sink(mut self, sink: Arc<Mutex<Vec<String>>>) -> Self {
+        self.log_sink = Some(sink);
+        self
+    }
+
     /// Start the gossip + sync loop, returning a handle that controls it.
     pub fn start(self) -> P2pHandle {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -165,47 +214,67 @@ impl P2p {
         let block_log = self.block_log.clone();
         let bootstrap = self.bootstrap.clone();
         let sync_status = self.sync_status.clone();
+        let log_sink = self.log_sink.clone();
         let stop = Arc::clone(&shutdown);
 
         let worker = thread::spawn(move || {
-            let mut state = SyncState::new(block_log);
-            let mut tick: u64 = 0;
+            let mut state = SyncState::new(block_log, log_sink);
+            // Periodic tasks are driven by ELAPSED TIME, not a fixed tick count, so the
+            // POLL cadence can be adaptive (fast while catching up) without also firing
+            // announce/reconnect/sweep far too often. Seed each timer in the past so it
+            // fires on the first iteration.
+            let past = Instant::now()
+                .checked_sub(Duration::from_secs(3_600))
+                .unwrap_or_else(Instant::now);
+            let mut last_announce = past;
+            let mut last_reconnect = past;
+            let mut last_sweep = past;
             while !stop.load(Ordering::SeqCst) {
-                // Periodically announce our identity + head so peers authenticate
-                // us and learn whether they need to sync from us.
-                if tick % 8 == 0 {
+                // Announce our identity + head so peers authenticate us and learn whether
+                // they need to sync from us.
+                if last_announce.elapsed() >= ANNOUNCE_INTERVAL {
                     announce(&tcp, &node, &config);
+                    last_announce = Instant::now();
                 }
-                // Keep bootstrap links up: ~every 2s ask to (re)connect any that are
-                // down. Cheap no-op when already connected; recovers a seed that was
-                // asleep at startup or a link that dropped.
-                if tick % 50 == 0 {
+                // Keep bootstrap links up: a cheap no-op when already connected; recovers
+                // a seed that was asleep at startup or a link that dropped.
+                if last_reconnect.elapsed() >= RECONNECT_INTERVAL {
                     for addr in &bootstrap {
                         tcp.request_reconnect(addr);
                     }
+                    last_reconnect = Instant::now();
                 }
                 for (peer, msg) in tcp.drain() {
                     state.handle(&tcp, &node, &config, peer, msg);
                 }
                 state.request_missing(&tcp, &node);
-                // Publish live telemetry every tick: are we behind a heavier peer
-                // (gates the miner), the best peer height, and the DISTINCT
-                // authenticated-peer count (so the UI never shows a redundant link as
-                // a ghost). Cheap — a few map scans + atomic stores, no extra locks.
+                // Publish live telemetry every poll: are we behind a heavier peer (gates
+                // the miner), the best peer height, and the DISTINCT authenticated-peer
+                // count (so the UI never shows a redundant link as a ghost). Cheap — a few
+                // map scans + atomic stores, no extra locks.
+                let (behind, best, peers) = state.telemetry(&node);
                 if let Some(s) = &sync_status {
-                    let (behind, best, peers) = state.telemetry(&node);
                     s.update(behind, best, peers);
                 }
-                // ~every second: reclaim slots from peers that connected but never
-                // authenticated (zombie-eclipse defense), and reap dead half-open
-                // connections to a vanished peer (clears ghost peer counts AND stops
-                // catch-up from forever targeting a peer that can never answer).
-                if tick % 25 == 0 {
+                // Reclaim slots from peers that connected but never authenticated
+                // (zombie-eclipse defense), and reap dead half-open connections to a
+                // vanished peer (clears ghost counts AND stops catch-up forever targeting
+                // a peer that can never answer).
+                if last_sweep.elapsed() >= SWEEP_INTERVAL {
                     state.sweep_unauthenticated(&tcp);
                     state.reap_dead_peers(&tcp);
+                    last_sweep = Instant::now();
                 }
-                thread::sleep(Duration::from_millis(40));
-                tick += 1;
+                // ADAPTIVE poll: while a block request is in flight (actively catching
+                // up) poll fast so batches stream back-to-back, turning a long initial
+                // sync from minutes of idle-tick overhead into seconds; otherwise idle at
+                // the slow cadence so a caught-up node sips CPU.
+                let nap = if state.has_inflight() {
+                    SYNC_ACTIVE_POLL
+                } else {
+                    IDLE_POLL
+                };
+                thread::sleep(nap);
             }
         });
 
@@ -259,8 +328,28 @@ const BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// How many consecutive blocks one [`GetBlocks`](NetMessage::GetBlocks) fetches.
 /// Batching turns a long catch-up from one-block-per-round-trip (minutes) into a
 /// handful of round-trips (seconds), with far fewer messages — well under the
-/// per-peer rate limit. The serving node caps the response to this many.
-const SYNC_BATCH: u16 = 64;
+/// per-peer rate limit. The serving node caps the response to this many. 256 small
+/// blocks fit comfortably under the 8 MiB transport frame, so a 10k-block chain is a
+/// few dozen round-trips. Wire-compatible: the cap is `min(requested, SYNC_BATCH)`, so
+/// a newer/older peer simply serves the smaller of the two.
+const SYNC_BATCH: u16 = 256;
+
+/// Poll cadence while a block request is in flight (actively catching up): batches
+/// stream back-to-back instead of one per idle tick, so a long initial sync is bound by
+/// import + network, not by a fixed sleep.
+const SYNC_ACTIVE_POLL: Duration = Duration::from_millis(2);
+
+/// Poll cadence when caught up / idle — slow, so a synced node uses negligible CPU.
+const IDLE_POLL: Duration = Duration::from_millis(40);
+
+/// How often to re-announce our identity + head to peers.
+const ANNOUNCE_INTERVAL: Duration = Duration::from_millis(320);
+
+/// How often to re-dial configured bootstrap peers that are not currently connected.
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How often to sweep unauthenticated zombies and reap dead half-open connections.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Largest exponential backtrack step when walking back to a common ancestor on a
 /// fork: 1, 2, 4, … capped here, so even a deep divergence is located in O(log)
@@ -352,6 +441,17 @@ struct SyncState {
     /// If set, blocks imported from peers are persisted here so a follower replays
     /// its own log on restart instead of re-syncing the whole chain.
     block_log: Option<Arc<BlockLog>>,
+    /// Optional Node-log sink for human-readable sync diagnostics (see [`LogSink`]).
+    log: LogSink,
+    /// Peers we have already logged an "ignoring … from unauthenticated peer" line for,
+    /// so the diagnostic fires ONCE per peer rather than every frame.
+    unauth_logged: HashSet<SocketAddr>,
+    /// The last `(peer, height)` we logged a block request for, so a repeated request to
+    /// the same target (the "stuck at the same height" case) logs once, not every tick.
+    last_req_log: Option<(SocketAddr, u64)>,
+    /// Whether we have logged the current stall, so "no reply, retrying" fires on the
+    /// stall transition rather than continuously.
+    stalled_logged: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -376,9 +476,10 @@ enum ImportOutcome {
 }
 
 impl SyncState {
-    fn new(block_log: Option<Arc<BlockLog>>) -> Self {
+    fn new(block_log: Option<Arc<BlockLog>>, log: LogSink) -> Self {
         SyncState {
             block_log,
+            log,
             ..Default::default()
         }
     }
@@ -450,10 +551,39 @@ impl SyncState {
                 // so dedup here (not on every repeat Hello — that would be O(peers²) at
                 // scale). Collapse any duplicate connections to this node down to one.
                 self.dedup_identity(tcp, &account);
+                self.unauth_logged.remove(&peer); // it's authed now; allow future warnings
+                p2p_log(
+                    &self.log,
+                    format!(
+                        "✓ authenticated {} as {} ({} peer(s))",
+                        short_peer(&peer),
+                        account,
+                        self.authenticated.len()
+                    ),
+                );
             }
             return;
         }
         if !self.authenticated.contains(&peer) {
+            // A peer asking us for blocks before it has completed the handshake WITH US
+            // is the asymmetric-auth case behind "connected but nothing is pulled": we
+            // received its Status (so WE think it's a peer) but it never authenticated to
+            // US, so we must drop its requests. Surface it ONCE so the operator sees the
+            // handshake — not the sync — is the thing that's incomplete.
+            if matches!(
+                msg,
+                NetMessage::GetBlocks { .. } | NetMessage::GetBlock { .. }
+            ) && self.unauth_logged.insert(peer)
+            {
+                p2p_log(
+                    &self.log,
+                    format!(
+                        "⚠ {} is requesting blocks but has NOT completed the handshake with us \
+                         — dropping its request (asymmetric auth; it cannot sync from us yet)",
+                        short_peer(&peer)
+                    ),
+                );
+            }
             return; // untrusted: ignore until it completes the handshake
         }
 
@@ -540,6 +670,17 @@ impl SyncState {
                         v
                     })
                     .unwrap_or_default();
+                if !blocks.is_empty() {
+                    p2p_log(
+                        &self.log,
+                        format!(
+                            "→ served {} block(s) from height {} to {}",
+                            blocks.len(),
+                            start,
+                            short_peer(&peer)
+                        ),
+                    );
+                }
                 tcp.send(peer, &NetMessage::BlocksResponse(blocks));
             }
             NetMessage::BlockResponse(Some(block)) => {
@@ -547,6 +688,7 @@ impl SyncState {
                 // ancestor. If it connects, we've found the fork point; resume
                 // forward (batched). If not, keep walking back, doubling the step.
                 self.inflight = None;
+                self.stalled_logged = false; // a reply arrived — clear the stall latch
                 let h = block.header.height.get();
                 match self.import_and_persist(node, block) {
                     ImportOutcome::New | ImportOutcome::Known => {
@@ -570,12 +712,14 @@ impl SyncState {
             NetMessage::BlockResponse(None) => {
                 // The peer does not have the requested height: stop waiting on it.
                 self.inflight = None;
+                self.stalled_logged = false;
             }
             NetMessage::BlocksResponse(blocks) => {
                 // A batch of consecutive blocks (forward catch-up). They are on the
                 // peer's chain, so they import in order; the first one only fails if
                 // its parent isn't ours (a fork), which flips us into backtrack.
                 self.inflight = None;
+                self.stalled_logged = false; // a reply arrived — clear the stall latch
                 // A peer must never return more than we ask for ([`SYNC_BATCH`]); a
                 // larger batch is a memory/CPU amplification — penalize and ignore it.
                 if blocks.len() > SYNC_BATCH as usize {
@@ -608,13 +752,24 @@ impl SyncState {
                     if invalid {
                         self.sync_next.remove(&peer);
                         self.bt_step.remove(&peer);
+                        p2p_log(
+                            &self.log,
+                            format!("✗ {} sent an invalid block — penalized", short_peer(&peer)),
+                        );
                     } else if let Some(h) = last_ok {
                         self.bt_step.remove(&peer);
                         self.advance_or_done(peer, h);
+                        p2p_log(&self.log, format!("← imported blocks up to height {h}"));
                     } else if let Some(h) = rejected {
                         // First block didn't connect → on a fork; start backtracking.
                         self.sync_next.insert(peer, h.saturating_sub(1).max(1));
                         self.bt_step.insert(peer, 1);
+                        p2p_log(
+                            &self.log,
+                            format!(
+                                "↩ height {h} didn't connect — backtracking to find the fork point"
+                            ),
+                        );
                     }
                 }
             }
@@ -748,6 +903,22 @@ impl SyncState {
         // A request that survived to here stalled (timed out or its peer is gone):
         // avoid that peer this round so it cannot keep wedging catch-up.
         let stalled_peer = self.inflight.as_ref().map(|f| f.peer);
+        if let Some(sp) = stalled_peer {
+            if !self.stalled_logged {
+                // The smoking gun for "connected but nothing pulled": WE asked, the peer
+                // never answered. (If the peer instead logs "requesting blocks but has
+                // NOT completed the handshake", the failure is auth in the OTHER direction.)
+                p2p_log(
+                    &self.log,
+                    format!(
+                        "… no reply from {} to our block request within {}s — retrying",
+                        short_peer(&sp),
+                        BLOCK_REQUEST_TIMEOUT.as_secs()
+                    ),
+                );
+                self.stalled_logged = true;
+            }
+        }
 
         // Candidate peers ahead of us that we can actually reach, best work first.
         let mut candidates: Vec<SocketAddr> = self
@@ -797,6 +968,22 @@ impl SyncState {
                 count: SYNC_BATCH,
             }
         };
+        // Log a (new) request target so the operator sees us actively pulling — and, if
+        // it never advances, exactly which height we're stuck asking for.
+        if self.last_req_log != Some((peer, height)) {
+            p2p_log(
+                &self.log,
+                format!(
+                    "→ requesting {} from {} at height {} (we're at {}, peer at {})",
+                    if backtracking { "a block" } else { "blocks" },
+                    short_peer(&peer),
+                    height,
+                    local.height,
+                    peer_height
+                ),
+            );
+            self.last_req_log = Some((peer, height));
+        }
         if tcp.send(peer, &msg) {
             self.inflight = Some(InFlight {
                 peer,
@@ -807,6 +994,12 @@ impl SyncState {
             // re-evaluates against the live peer set.
             self.inflight = None;
         }
+    }
+
+    /// Whether a block request is currently outstanding — i.e. we are actively catching
+    /// up, so the worker should poll fast rather than idle.
+    fn has_inflight(&self) -> bool {
+        self.inflight.is_some()
     }
 
     /// Snapshot the node's sync position for [`SyncShared`]: `(behind, best_peer_height,
@@ -877,7 +1070,7 @@ mod tests {
         // since disconnected, must be forgotten — otherwise catch-up keeps targeting
         // it (its `send` silently fails) and sync wedges. This is the core of the
         // sync-robustness fix.
-        let mut s = SyncState::new(None);
+        let mut s = SyncState::new(None, None);
         let live = addr(7001);
         let gone = addr(7002);
         s.authenticated.insert(live);
@@ -911,7 +1104,7 @@ mod tests {
     fn an_answered_request_is_no_longer_in_flight() {
         // A block response clears the in-flight marker so the next round picks the
         // best peer afresh rather than treating the responder as stalled.
-        let mut s = SyncState::new(None);
+        let mut s = SyncState::new(None, None);
         s.inflight = Some(InFlight {
             peer: addr(7003),
             since: Instant::now(),
@@ -949,7 +1142,7 @@ mod tests {
         let chain = Blockchain::new(&config).unwrap();
         let genesis_hash = chain.head().hash();
         let node = Mutex::new(Node::new(chain, 1024, 256));
-        let state = SyncState::new(None);
+        let state = SyncState::new(None, None);
 
         // Orphan: parent unknown → Rejected (drives backtracking; not misbehavior).
         let orphan = Block::assemble(
@@ -1003,7 +1196,7 @@ mod tests {
         }
         assert!(connected, "peer connected");
 
-        let mut state = SyncState::new(None);
+        let mut state = SyncState::new(None, None);
         state.sweep_unauthenticated(&server);
         assert_eq!(state.first_seen.len(), 1, "the new peer's first-seen time is recorded");
         assert!(
@@ -1032,7 +1225,7 @@ mod tests {
         assert!(connected, "peer connected");
         let peer = server.connected_peers()[0];
 
-        let mut state = SyncState::new(None);
+        let mut state = SyncState::new(None, None);
         // Fresh activity → spared.
         state.last_recv.insert(peer, Instant::now());
         state.reap_dead_peers(&server);
