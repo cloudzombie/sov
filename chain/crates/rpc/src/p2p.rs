@@ -271,6 +271,18 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 /// never answer — the latter is why a node can be "connected" yet never index.
 const PEER_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Of several connections to the SAME node, pick the deterministic survivor: the one
+/// with the lexicographically smallest channel binding (Noise handshake hash). Both
+/// ends of a connection share its binding, so each node picks the SAME survivor with
+/// no coordination — the property that makes duplicate-connection collapse converge
+/// without a flap. `None` only for empty input.
+fn survivor(candidates: &[(SocketAddr, Vec<u8>)]) -> Option<SocketAddr> {
+    candidates
+        .iter()
+        .min_by(|a, b| a.1.cmp(&b.1))
+        .map(|(p, _)| *p)
+}
+
 /// An outstanding [`GetBlock`](NetMessage::GetBlock) awaiting a response, used to
 /// detect a stalled peer. Cleared as soon as any block response arrives.
 struct InFlight {
@@ -285,6 +297,12 @@ struct InFlight {
 struct SyncState {
     /// Peers that completed the authenticated handshake.
     authenticated: HashSet<SocketAddr>,
+    /// The authenticated node IDENTITY (its account) per connection. Lets us collapse
+    /// MULTIPLE connections to the SAME node down to one — the definitive fix for "one
+    /// machine shows up as several peers" (a redundant inbound + outbound, or a startup
+    /// race) that IP/timing dedup can't fully prevent. Identity-keyed, so it works the
+    /// same on a LAN or across the internet.
+    identity: HashMap<SocketAddr, AccountId>,
     /// Last-known head status per peer (drives chainwork-based catch-up).
     peer_status: HashMap<SocketAddr, PeerStatus>,
     /// Next height to request from each peer while walking backward to a common
@@ -387,15 +405,14 @@ impl SyncState {
         // relays a Hello from another channel). Only peers that prove same-chain
         // membership and key control are trusted with any chain data.
         let binding = tcp.peer_handshake_hash(&peer);
-        let is_authed_hello = binding
-            .as_ref()
-            .map(|b| {
-                msg.authenticated_account(&config.chain_id, &config.genesis_hash, b)
-                    .is_some()
-            })
-            .unwrap_or(false);
-        if is_authed_hello {
-            if self.authenticated.insert(peer) {
+        let authed_account = binding.as_ref().and_then(|b| {
+            msg.authenticated_account(&config.chain_id, &config.genesis_hash, b)
+                .cloned()
+        });
+        if let Some(account) = authed_account {
+            let first_time = self.authenticated.insert(peer);
+            self.identity.insert(peer, account.clone());
+            if first_time {
                 // Reciprocate, bound to this same channel, so the peer authenticates
                 // us and learns our height.
                 if let Some(b) = &binding {
@@ -404,6 +421,10 @@ impl SyncState {
                 if let Some(status) = status(node) {
                     tcp.send(peer, &status);
                 }
+                // A duplicate link can only form when a connection FIRST authenticates,
+                // so dedup here (not on every repeat Hello — that would be O(peers²) at
+                // scale). Collapse any duplicate connections to this node down to one.
+                self.dedup_identity(tcp, &account);
             }
             return;
         }
@@ -594,11 +615,44 @@ impl SyncState {
     /// per-peer state cannot grow without bound across reconnects.
     fn retain_connected(&mut self, connected: &HashSet<SocketAddr>) {
         self.authenticated.retain(|p| connected.contains(p));
+        self.identity.retain(|p, _| connected.contains(p));
         self.peer_status.retain(|p, _| connected.contains(p));
         self.sync_next.retain(|p, _| connected.contains(p));
         self.bt_step.retain(|p, _| connected.contains(p));
         self.first_seen.retain(|p, _| connected.contains(p));
         self.last_recv.retain(|p, _| connected.contains(p));
+    }
+
+    /// Collapse MULTIPLE live connections to the SAME node identity down to exactly
+    /// one — the definitive fix for "one machine counted as several peers." When a
+    /// node ends up with both an inbound and an outbound link to the same peer (a
+    /// bootstrap dial + an mDNS/gossip dial, or a startup race), keep the single
+    /// connection with the lexicographically smallest **channel binding** (Noise
+    /// handshake hash) and disconnect the rest. The binding is identical on BOTH ends
+    /// of a given connection, so both nodes independently pick the SAME survivor with
+    /// no coordination and no flap — and a disconnect on either side tears the
+    /// redundant link down for both. Identity-keyed, so it works on a LAN and across
+    /// the internet alike.
+    fn dedup_identity(&mut self, tcp: &TcpNode, account: &AccountId) {
+        let mut dupes: Vec<(SocketAddr, Vec<u8>)> = self
+            .identity
+            .iter()
+            .filter(|(_, a)| *a == account)
+            .map(|(p, _)| (*p, tcp.peer_handshake_hash(p).unwrap_or_default()))
+            .collect();
+        if dupes.len() < 2 {
+            return;
+        }
+        let keep = survivor(&dupes);
+        dupes.retain(|(p, _)| Some(*p) != keep);
+        for (p, _) in dupes {
+            tcp.disconnect(&p);
+            self.identity.remove(&p);
+            self.authenticated.remove(&p);
+            self.peer_status.remove(&p);
+            self.sync_next.remove(&p);
+            self.bt_step.remove(&p);
+        }
     }
 
     /// Reap **dead (half-open) connections**: a peer that has sent nothing for
@@ -936,5 +990,25 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(reaped, "a silent (dead) peer is reaped, clearing the ghost slot");
+    }
+
+    #[test]
+    fn survivor_is_the_smallest_channel_binding_and_order_independent() {
+        // Duplicate connections to one node collapse to the link with the smallest
+        // channel binding. Both ends share each connection's binding, so this MUST be
+        // order-independent — both nodes compute the same survivor and converge.
+        let a = addr(9101);
+        let b = addr(9102);
+        let c = addr(9103);
+        assert_eq!(
+            survivor(&[(a, vec![0x33]), (b, vec![0x11]), (c, vec![0x22])]),
+            Some(b)
+        );
+        assert_eq!(
+            survivor(&[(c, vec![0x22]), (a, vec![0x33]), (b, vec![0x11])]),
+            Some(b),
+            "same survivor regardless of input order"
+        );
+        assert_eq!(survivor(&[]), None);
     }
 }
