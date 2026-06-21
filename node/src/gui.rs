@@ -6214,9 +6214,10 @@ fn build_and_run_node(
     push_log(
         logs,
         format!(
-            "✓ indexed {} block(s) in {:.1}s — chain at head",
+            "✓ indexed {} block(s) in {:.1}s — chain head at height {}",
             daemon.resumed_blocks(),
-            t0.elapsed().as_secs_f64()
+            t0.elapsed().as_secs_f64(),
+            daemon.height()
         ),
     );
     let checkpoints = config
@@ -6287,6 +6288,7 @@ fn build_and_run_node(
     // never behind, so it still bootstraps the network.
     let handle = daemon
         .with_sync_status(Arc::clone(&sync))
+        .with_log_sink(logs.clone())
         .run(&config.rpc_addr, config.rpc_workers, config.block_time_ms)
         .map_err(|e| format!("run: {e}"))?;
     push_log(

@@ -659,6 +659,33 @@ fn jittered_wait_ms(base: u64) -> u64 {
     base / 2 + (u64::from_le_bytes(b) % base)
 }
 
+/// Append a timestamped mining diagnostic to the optional Node-log sink (the desktop
+/// app's log buffer), capped like the GUI's own logger. A no-op when there is no sink.
+/// This makes the block-production loop OBSERVABLE — whether it mined, paused to sync,
+/// or could not build a candidate — instead of a silent thread.
+fn daemon_log(sink: &Option<Arc<Mutex<Vec<String>>>>, msg: impl AsRef<str>) {
+    let Some(sink) = sink else { return };
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        % 86_400;
+    let line = format!(
+        "{:02}:{:02}:{:02}  mine: {}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+        msg.as_ref()
+    );
+    if let Ok(mut v) = sink.lock() {
+        v.push(line);
+        let n = v.len();
+        if n > 5_000 {
+            v.drain(0..n - 5_000);
+        }
+    }
+}
+
 /// A node daemon: a shared [`Node`] plus its persistence directory.
 pub struct Daemon {
     node: Arc<Mutex<Node>>,
@@ -678,6 +705,10 @@ pub struct Daemon {
     /// catching up to a heavier peer chain (so a freshly-joined node syncs the existing
     /// chain instead of extending its own competing fork).
     sync_status: Option<Arc<SyncShared>>,
+    /// Optional Node-log sink so the block-production loop reports what it is doing
+    /// (mined a block, paused to sync, or could not build a candidate) — observability
+    /// for an operator instead of a silent mining thread.
+    log: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 /// A running daemon's RPC + block-production threads, with graceful shutdown.
@@ -814,6 +845,7 @@ impl Daemon {
             snapshot_path: snap_path,
             resumed_fast,
             sync_status: None,
+            log: None,
         })
     }
 
@@ -866,6 +898,14 @@ impl Daemon {
     /// sync first, mine once caught up. A solo node (no heavier peer) is never gated.
     pub fn with_sync_status(mut self, status: Arc<SyncShared>) -> Self {
         self.sync_status = Some(status);
+        self
+    }
+
+    /// Surface block-production diagnostics (mined a block / paused to sync / could not
+    /// build a candidate) into `sink` — typically the desktop app's Node-log buffer — so
+    /// the mining loop is never a silent black box.
+    pub fn with_log_sink(mut self, sink: Arc<Mutex<Vec<String>>>) -> Self {
+        self.log = Some(sink);
         self
     }
 
@@ -974,6 +1014,7 @@ impl Daemon {
         let block_log = Arc::clone(&self.block_log);
         let snap_path = self.snapshot_path.clone();
         let sync_status = self.sync_status.clone();
+        let log = self.log.clone();
         let sd = Arc::clone(&shutdown);
         let interval = block_time_ms.max(1);
 
@@ -983,6 +1024,9 @@ impl Daemon {
             // boot — making the very NEXT restart a tier-1 instant resume even if THIS
             // boot had to replay (no snapshot existed yet, or it was stale).
             let mut last_snap_height = 0u64;
+            // Track the mining-gate state so a pause/resume is logged on TRANSITION (not
+            // every interval) — the operator sees exactly when/why mining stops & starts.
+            let mut was_behind = false;
             while !sd.load(Ordering::SeqCst) {
                 // Wait a JITTERED interval (not a fixed one) so independent miners do not
                 // produce in lockstep. Two miners firing on the same fixed cadence emit
@@ -1019,6 +1063,30 @@ impl Daemon {
                 // the network still bootstraps and never stalls. Re-checked every tick,
                 // so mining resumes the instant catch-up completes.
                 let behind = sync_status.as_ref().map(|s| s.is_behind()).unwrap_or(false);
+                // Log the gate transition so "not mining" is never a mystery: paused =>
+                // we are catching up to a heavier peer; resumed => caught up to the tip.
+                if behind != was_behind {
+                    if behind {
+                        let (h, peer) = {
+                            let local = node.lock().map(|n| n.chain().height()).unwrap_or(0);
+                            let best = sync_status
+                                .as_ref()
+                                .map(|s| s.best_peer_height())
+                                .unwrap_or(0);
+                            (local, best)
+                        };
+                        daemon_log(
+                            &log,
+                            format!(
+                                "⏸ mining PAUSED — catching up to a heavier peer (we're at {h}, peer at {peer})"
+                            ),
+                        );
+                    } else {
+                        let h = node.lock().map(|n| n.chain().height()).unwrap_or(0);
+                        daemon_log(&log, format!("▶ caught up — mining RESUMED at height {h}"));
+                    }
+                    was_behind = behind;
+                }
                 if !behind {
                     // Build the candidate under a BRIEF lock, then grind the proof of
                     // work OFF the lock so RPC and block import stay responsive while
@@ -1028,26 +1096,36 @@ impl Daemon {
                         let Ok(n) = node.lock() else { break };
                         n.build_candidate(now_ms())
                     };
-                    if let Ok(candidate) = candidate {
-                        if let Ok(sealed) = candidate.into_sealed_block() {
-                            if sd.load(Ordering::SeqCst) {
-                                break;
-                            }
-                            let Ok(mut n) = node.lock() else { break };
-                            match n.commit_mined(sealed) {
-                                Ok(produced) => {
-                                    // Persist under the node lock (order == commit order).
-                                    let _ = block_log.append(&produced.block);
-                                    drop(n);
-                                    if let Some(tcp) = &gossip {
-                                        tcp.broadcast(&NetMessage::NewBlock(
-                                            produced.block.clone(),
-                                        ));
+                    match candidate {
+                        Ok(candidate) => {
+                            if let Ok(sealed) = candidate.into_sealed_block() {
+                                if sd.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                let Ok(mut n) = node.lock() else { break };
+                                match n.commit_mined(sealed) {
+                                    Ok(produced) => {
+                                        let height = produced.block.header.height.get();
+                                        // Persist under the node lock (order == commit order).
+                                        let _ = block_log.append(&produced.block);
+                                        drop(n);
+                                        daemon_log(&log, format!("⛏ mined block {height}"));
+                                        if let Some(tcp) = &gossip {
+                                            tcp.broadcast(&NetMessage::NewBlock(
+                                                produced.block.clone(),
+                                            ));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        drop(n);
+                                        daemon_log(&log, format!("commit rejected: {e}"));
                                     }
                                 }
-                                Err(_) => drop(n),
                             }
                         }
+                        // A candidate that won't build (e.g. coinbase/emission edge) is the
+                        // silent "won't mine" case — surface it so it is never a mystery.
+                        Err(e) => daemon_log(&log, format!("could not build a block candidate: {e}")),
                     }
                 }
                 // Periodic chainstate snapshot — keyed off the ACTIVE-head height, so it
