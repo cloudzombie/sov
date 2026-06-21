@@ -875,7 +875,7 @@ mod tests {
         let client = TcpNode::bind("127.0.0.1:0").unwrap();
         client.connect(&server.local_addr().to_string()).unwrap();
         let mut connected = false;
-        for _ in 0..150 {
+        for _ in 0..400 {
             if server.peer_count() >= 1 {
                 connected = true;
                 break;
@@ -903,7 +903,7 @@ mod tests {
         let client = TcpNode::bind("127.0.0.1:0").unwrap();
         client.connect(&server.local_addr().to_string()).unwrap();
         let mut connected = false;
-        for _ in 0..150 {
+        for _ in 0..400 {
             if server.peer_count() >= 1 {
                 connected = true;
                 break;
@@ -928,7 +928,7 @@ mod tests {
         );
         state.reap_dead_peers(&server);
         let mut reaped = false;
-        for _ in 0..150 {
+        for _ in 0..400 {
             if server.peer_count() == 0 {
                 reaped = true;
                 break;

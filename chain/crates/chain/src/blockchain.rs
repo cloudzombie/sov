@@ -1009,14 +1009,52 @@ impl Blockchain {
     /// linear chain ([`extend_trusted`]). Returns `true` if the result matches the
     /// committed head state; on `false` (or `Err`) the caller rebuilds with the
     /// fully-verified path. Local log only — network blocks use `import_block`.
-    pub fn replay_log_trusted(&mut self, blocks: &[Block]) -> Result<bool, ChainError> {
+    pub fn replay_log_trusted(
+        &mut self,
+        blocks: &[Block],
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<bool, ChainError> {
         if blocks.is_empty() {
             return Ok(true);
         }
-        for block in self.heaviest_chain(blocks) {
+        let chain = self.heaviest_chain(blocks);
+        let total = chain.len() as u64;
+        progress(0, total);
+        for (i, block) in chain.into_iter().enumerate() {
             self.extend_trusted(block)?;
+            let done = i as u64 + 1;
+            if done % 128 == 0 || done == total {
+                progress(done, total);
+            }
         }
         Ok(self.replayed_state_matches_head())
+    }
+
+    /// **Last-resort FULLY-VALIDATED replay** of a persisted log — used only when the
+    /// trusted fast-replay's final state root does not verify. Like [`replay_log_trusted`]
+    /// it first reconstructs the **heaviest chain**, then imports each block IN
+    /// ACTIVE-CHAIN ORDER through the normal validated [`import_block`] path. The key
+    /// point: because the blocks arrive in order, each one *fast-path extends the head*
+    /// (no reorg), so this is **O(N) fully-validated** — NOT the O(reorgs × N) of
+    /// importing the RAW log, where every historical fork re-triggers a from-genesis
+    /// branch rebuild (the cause of a multi-minute / apparently-hung boot on a long,
+    /// contested cross-machine chain). Call on a freshly constructed (genesis) chain.
+    pub fn replay_log_verified(
+        &mut self,
+        blocks: &[Block],
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<(), ChainError> {
+        let chain = self.heaviest_chain(blocks);
+        let total = chain.len() as u64;
+        progress(0, total);
+        for (i, block) in chain.into_iter().enumerate() {
+            self.import_block(block)?;
+            let done = i as u64 + 1;
+            if done % 64 == 0 || done == total {
+                progress(done, total);
+            }
+        }
+        Ok(())
     }
 
     /// The active-chain receipt index as a serializable list, for inclusion in a

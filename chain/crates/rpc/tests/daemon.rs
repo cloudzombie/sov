@@ -284,6 +284,62 @@ fn daemon_fast_resumes_from_chainstate_snapshot() {
 }
 
 #[test]
+fn boot_streams_indexing_progress_on_replay() {
+    // When a node re-indexes its block log on boot (no snapshot yet), it must STREAM
+    // progress so a UI shows a live "indexing N/total" counter instead of appearing to
+    // hang. This drives the real boot via `new_with_progress` and asserts the callback
+    // fired, ending at total/total.
+    let dir = unique_dir("progress");
+    let _ = std::fs::remove_dir_all(&dir);
+    let genesis = ChainSpec::from_json(&chain_spec_json())
+        .unwrap()
+        .to_genesis_config()
+        .unwrap();
+    let miner_keys = || vec![(id("val01.node.sov"), Keypair::from_seed([1; 32]))];
+
+    // Build three blocks (no snapshot is written by the produce_once path), then drop.
+    {
+        let d1 = Daemon::new(&genesis, &dir, 1024, 256, miner_keys()).unwrap();
+        let kp = Keypair::from_seed([2; 32]);
+        for i in 0..3u64 {
+            let tx = Transaction {
+                signer: id("usa.reserve.sov"),
+                public_key: kp.public_key(),
+                nonce: i,
+                action: Action::Transfer {
+                    to: id("ecb.reserve.sov"),
+                    amount: Balance::from_sov(1).unwrap(),
+                },
+            };
+            d1.node()
+                .lock()
+                .unwrap()
+                .submit(SignedTransaction::sign(tx, &kp).unwrap())
+                .unwrap();
+            assert!(d1.produce_once(2_000 + i * 1_000).unwrap());
+        }
+        assert_eq!(d1.height(), 3);
+    }
+
+    // Restart with no snapshot present → the REPLAY tier, which streams progress.
+    let mut updates: Vec<(u64, u64)> = Vec::new();
+    let d2 = Daemon::new_with_progress(&genesis, &dir, 1024, 256, miner_keys(), &mut |done, total| {
+        updates.push((done, total))
+    })
+    .unwrap();
+    assert!(!d2.resumed_from_snapshot(), "no snapshot existed — replay path");
+    assert_eq!(d2.height(), 3);
+    assert!(!updates.is_empty(), "the replay streamed indexing progress");
+    assert_eq!(
+        updates.last().copied(),
+        Some((3, 3)),
+        "progress ends at total/total (fully indexed)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn confirmations_survive_restart() {
     // Nakamoto finality is a function of chain state alone, so a restart that
     // replays the block log reproduces the exact same confirmation depths —

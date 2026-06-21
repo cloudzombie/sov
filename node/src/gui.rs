@@ -5940,21 +5940,31 @@ fn build_and_run_node(
     let miner_keys = keystore.keys().map_err(|e| format!("keys: {e}"))?;
 
     // Build + replay the persisted block log to resume state. This is the bulk of
-    // startup time on a long chain; log how long it took and how many blocks.
-    push_log(logs, "replaying block log to resume chain state…");
+    // startup time on a long chain — so STREAM live "indexing N/total" progress to the
+    // node log (instead of appearing to hang), and log how long it took at the end.
+    push_log(logs, "indexing local chain — replaying block log…");
     let t0 = std::time::Instant::now();
-    let mut daemon = Daemon::new(
+    let mut last_pct = u64::MAX;
+    let mut daemon = Daemon::new_with_progress(
         &genesis,
         &config.data_dir,
         config.mempool_capacity,
         config.max_block_txs,
         miner_keys,
+        &mut |done, total| {
+            // One line per ~percent so it streams visibly without flooding.
+            let pct = if total == 0 { 100 } else { done * 100 / total };
+            if pct != last_pct {
+                last_pct = pct;
+                push_log(logs, format!("  indexing… {done}/{total} blocks ({pct}%)"));
+            }
+        },
     )
     .map_err(|e| format!("daemon: {e}"))?;
     push_log(
         logs,
         format!(
-            "resumed {} block(s) in {:.1}s",
+            "✓ indexed {} block(s) in {:.1}s — chain at head",
             daemon.resumed_blocks(),
             t0.elapsed().as_secs_f64()
         ),

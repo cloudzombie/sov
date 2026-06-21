@@ -693,6 +693,29 @@ impl Daemon {
         max_block_txs: usize,
         miner_keys: Vec<(AccountId, Keypair)>,
     ) -> Result<Self, DaemonError> {
+        Self::new_with_progress(
+            genesis,
+            data_dir,
+            mempool_capacity,
+            max_block_txs,
+            miner_keys,
+            &mut |_, _| {},
+        )
+    }
+
+    /// Like [`new`](Self::new), but STREAMS replay progress to `on_progress(done,
+    /// total)` as the block log is re-indexed on boot — so a UI can show a live
+    /// "indexing N/total" counter instead of appearing to hang during a one-time
+    /// replay of a long chain. Fired only on the replay tiers (a snapshot resume is
+    /// effectively instant); throttled inside the chain so it's cheap.
+    pub fn new_with_progress(
+        genesis: &GenesisConfig,
+        data_dir: impl AsRef<Path>,
+        mempool_capacity: usize,
+        max_block_txs: usize,
+        miner_keys: Vec<(AccountId, Keypair)>,
+        on_progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<Self, DaemonError> {
         let data_dir = data_dir.as_ref().to_path_buf();
         fs::create_dir_all(&data_dir)?;
         // Refuse to boot against a data dir written by an incompatible schema,
@@ -722,11 +745,16 @@ impl Daemon {
         };
         if !resumed_fast {
             chain = Blockchain::new(genesis)?;
-            if !chain.replay_log_trusted(&persisted).unwrap_or(false) {
+            if !chain
+                .replay_log_trusted(&persisted, on_progress)
+                .unwrap_or(false)
+            {
+                // Trusted replay's state root didn't verify — rebuild with FULL
+                // validation, but along the heaviest chain IN ORDER (O(N)). Importing
+                // the raw `persisted` log here instead would re-run every historical
+                // reorg from genesis (O(reorgs×N)) — the multi-minute / "hung" boot.
                 chain = Blockchain::new(genesis)?;
-                for block in persisted {
-                    chain.import_block(block)?;
-                }
+                chain.replay_log_verified(&persisted, on_progress)?;
             }
             // We replayed a non-empty chain rather than resuming a snapshot (none
             // existed, or it was stale). Write one NOW so the next start is an instant
