@@ -788,11 +788,24 @@ impl Blockchain {
                 receipts,
                 reverted_txs: Vec::new(),
             })
-        } else if cand.new_work > head_work {
-            // Reorg: this block tips a branch heavier than the active chain.
-            // Re-validate and re-execute the whole branch from genesis; adopt it
-            // only if it is valid end-to-end (so an invalid heavier branch can
-            // never displace a valid lighter one).
+        } else if cand.new_work > head_work
+            || (cand.new_work == head_work && block_hash < self.head)
+        {
+            // Reorg: this block tips a branch at least as heavy as the active chain,
+            // AND wins the deterministic tie-break. Strictly-heavier always wins;
+            // at EQUAL cumulative work we adopt the branch whose tip hash is smaller.
+            //
+            // The tie-break is what makes two independent miners CONVERGE. Without it,
+            // when both mine a competing block at the same height (equal work), each
+            // node keeps its own (subjective first-seen) and they fork-war forever —
+            // "the chain was lost as soon as both were mining." A smaller hash is a
+            // total order EVERY node computes identically (and, since hash < target,
+            // literally means more proof of work was found), so both nodes pick the
+            // SAME head each round and stay on one chain. `heaviest_chain` (boot
+            // reconstruction) applies the identical rule, so live and restart agree.
+            // Re-validate and re-execute the whole branch from genesis; adopt it only
+            // if it is valid end-to-end (so an invalid heavier branch can never
+            // displace a valid lighter one).
             let rebuilt = self.rebuild_branch(&block, &cand)?;
             // Capture transactions orphaned by the reorg: those in the OLD active
             // chain whose block is not on the NEW active chain. They return to the
@@ -1180,28 +1193,23 @@ impl Blockchain {
             let w = pw.saturating_add(Work::of_target(&canonical_target(target)));
             cum.insert(b.hash(), w);
         }
-        // Pick the heaviest tip, breaking work ties by FIRST-SEEN to match live fork
-        // choice exactly (`new_work > head_work` is strict, so an equal-work competitor
-        // never displaces the incumbent — test `heavier_branch_triggers_reorg`). The log
-        // is in commit (== seen) order, so on a work tie the earliest-logged tip is the
-        // one the running node committed as head; `max_by_key` over a HashMap would pick
-        // an arbitrary tip and could boot onto a different (though equal-work) head.
-        let mut pos: HashMap<Hash, usize> = HashMap::new();
-        for (i, b) in blocks.iter().enumerate() {
-            pos.entry(b.hash()).or_insert(i);
-        }
-        let mut best: Option<(Hash, Work, usize)> = None;
+        // Pick the heaviest tip, breaking work ties by SMALLER TIP HASH — the exact same
+        // deterministic rule live fork choice uses (`import_block_tracked`), so a node
+        // reconstructs on boot the identical head it would hold live, and any two nodes
+        // independently agree on the one canonical chain even when miners produced
+        // equal-work competitors. (A smaller hash is a total order all nodes compute
+        // identically and, since hash < target, reflects more proof of work.)
+        let mut best: Option<(Hash, Work)> = None;
         for (h, w) in &cum {
-            let idx = pos.get(h).copied().unwrap_or(usize::MAX);
             let better = match &best {
                 None => true,
-                Some((_, bw, bi)) => *w > *bw || (*w == *bw && idx < *bi),
+                Some((bh, bw)) => *w > *bw || (*w == *bw && h < bh),
             };
             if better {
-                best = Some((*h, *w, idx));
+                best = Some((*h, *w));
             }
         }
-        let Some((tip, _, _)) = best else {
+        let Some((tip, _)) = best else {
             return Vec::new();
         };
         // Walk back from the heaviest tip to genesis, then reverse to ascending order.
@@ -2562,11 +2570,16 @@ mod tests {
         let b1 = node2
             .produce_block(vec![usa_transfer("ecb.reserve.sov", 250, 0)], 3_000)
             .unwrap();
+        let b1_hash = b1.hash();
         node2.import_block(b1.clone()).unwrap();
         let mut b2 = node2
             .produce_block(vec![usa_transfer("ecb.reserve.sov", 1, 1)], 4_000)
             .unwrap();
-        node1.import_block(b1).unwrap(); // stored side branch
+        // An equal-work competitor at height 1: kept as a side branch, or adopted by
+        // the deterministic tie-break if its hash is smaller. Either way the head is the
+        // VALID tie-break winner at height 1.
+        node1.import_block(b1).unwrap();
+        let valid_head = a1_hash.min(b1_hash);
 
         // Forge the heavier tip's state root, then re-mine valid PoW against the
         // exact genesis target so it clears the work check but fails replay.
@@ -2582,9 +2595,10 @@ mod tests {
             node1.import_block(b2),
             Err(ChainError::StateRootMismatch)
         ));
-        // Head unmoved: still branch A at height 1.
+        // The FORGED heavier tip did not move the head: still height 1, on the valid
+        // tie-break winner (proof of work buys consideration, not unverified state).
         assert_eq!(node1.height(), 1);
-        assert_eq!(node1.head().hash(), a1_hash);
+        assert_eq!(node1.head().hash(), valid_head);
     }
 
     #[test]
@@ -2622,6 +2636,49 @@ mod tests {
         assert!(
             !node1.contains_block(&b1_hash),
             "invalid side branch was not inserted into the block index"
+        );
+    }
+
+    #[test]
+    fn equal_work_fork_converges_on_smaller_hash() {
+        // THE convergence guarantee for many simultaneous miners. When two miners
+        // produce competing blocks at the same height (EQUAL cumulative work), every
+        // node must deterministically pick the SAME one — the block with the smaller
+        // hash (which, since hash < target, also reflects more proof of work). Without
+        // this, equal-work competitors each keep their own (subjective first-seen) and
+        // independent nodes diverge permanently — the "both mining and the chain was
+        // lost" failure. The choice is order-independent, so a node that saw either
+        // block first ends up on the same head.
+        let mut node1 = fresh_chain();
+        let node2 = fresh_chain();
+        let a1 = node1
+            .produce_block(vec![usa_transfer("ecb.reserve.sov", 100, 0)], 2_000)
+            .unwrap();
+        node1.import_block(a1.clone()).unwrap();
+        // A competing, equally valid height-1 block (different timestamp ⇒ different
+        // hash), built on the same genesis by an independent miner.
+        let b1 = node2
+            .produce_block(vec![usa_transfer("ecb.reserve.sov", 100, 0)], 3_000)
+            .unwrap();
+        assert_ne!(a1.hash(), b1.hash());
+        let winner = a1.hash().min(b1.hash());
+
+        node1.import_block(b1.clone()).unwrap();
+        assert_eq!(node1.height(), 1);
+        assert_eq!(
+            node1.head().hash(),
+            winner,
+            "a node converges on the smaller-hash competitor at equal work"
+        );
+
+        // Order-independent: a node that imported b1 first reaches the SAME head.
+        let mut node3 = fresh_chain();
+        node3.import_block(b1).unwrap();
+        node3.import_block(a1).unwrap();
+        assert_eq!(
+            node3.head().hash(),
+            winner,
+            "convergence is independent of which competitor arrived first"
         );
     }
 

@@ -71,6 +71,16 @@ fn short_peer(p: &SocketAddr) -> String {
     p.to_string()
 }
 
+/// An abbreviated block hash for logs: `abcdef…1234`.
+fn short_hash(h: &Hash) -> String {
+    let s = h.to_hex();
+    if s.len() > 12 {
+        format!("{}…{}", &s[..6], &s[s.len() - 4..])
+    } else {
+        s
+    }
+}
+
 /// The identity and chain binding a node presents in its handshake.
 pub struct P2pConfig {
     /// The network/chain id this node belongs to.
@@ -497,6 +507,8 @@ impl SyncState {
         if n.chain().contains_block(&block.hash()) {
             return ImportOutcome::Known;
         }
+        let prev_head = n.chain().head().hash();
+        let prev_height = n.chain().height();
         match n.import_block(block.clone()) {
             Ok(_) => {}
             // "Does not extend a known parent" is the ordinary backtrack signal during
@@ -508,8 +520,29 @@ impl SyncState {
             // invariant, …) is a block an honest peer never sends: the peer misbehaves.
             Err(_) => return ImportOutcome::Invalid,
         }
+        let new_head = n.chain().head().hash();
+        let new_height = n.chain().height();
+        // Persist under the node lock so the on-disk order matches commit order.
         if let Some(log) = &self.block_log {
             let _ = log.append(&block);
+        }
+        drop(n);
+        // A head move to a block that does NOT simply extend the prior head is a REORG —
+        // we abandoned our current tip for a competing branch. NEVER silent: log both
+        // heads + height, so an operator always knows EXACTLY what happened to the chain
+        // (this is the "lost where it is" event made explicit). With the deterministic
+        // fork-choice tie-break + jittered block timing, these are rare and convergent.
+        if new_head != prev_head && block.header.prev_hash != prev_head {
+            p2p_log(
+                &self.log,
+                format!(
+                    "⚠ REORG: head {}@{} → {}@{} (adopted a heavier/smaller-hash competing block)",
+                    short_hash(&prev_head),
+                    prev_height,
+                    short_hash(&new_head),
+                    new_height,
+                ),
+            );
         }
         ImportOutcome::New
     }

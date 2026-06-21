@@ -645,6 +645,20 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// A randomized block-production wait around `base` ms: uniform in `[base/2, 3·base/2)`.
+/// De-correlates independent miners' phases so they do not emit competing equal-work
+/// blocks in lockstep (the cause of a reorg every round). The mean stays `~base`, so the
+/// difficulty retarget — which targets the mean block time — is unaffected. Models the
+/// memoryless (Poisson) nature of real proof-of-work discovery.
+fn jittered_wait_ms(base: u64) -> u64 {
+    if base <= 1 {
+        return base;
+    }
+    let mut b = [0u8; 8];
+    let _ = getrandom::getrandom(&mut b);
+    base / 2 + (u64::from_le_bytes(b) % base)
+}
+
 /// A node daemon: a shared [`Node`] plus its persistence directory.
 pub struct Daemon {
     node: Arc<Mutex<Node>>,
@@ -970,10 +984,20 @@ impl Daemon {
             // boot had to replay (no snapshot existed yet, or it was stale).
             let mut last_snap_height = 0u64;
             while !sd.load(Ordering::SeqCst) {
-                // Sleep up to `interval` in small steps so shutdown is prompt.
+                // Wait a JITTERED interval (not a fixed one) so independent miners do not
+                // produce in lockstep. Two miners firing on the same fixed cadence emit
+                // competing equal-work blocks every round, which — even with a
+                // deterministic fork-choice tie-break — forces a reorg every round; with
+                // de-correlated phases one miner leads each round and the others adopt its
+                // block via the O(1) extend path, so reorgs become rare. The mean stays
+                // ~`interval`, so difficulty retargeting (which targets the mean) is
+                // unchanged. This models real PoW, where block discovery is a memoryless
+                // (Poisson) process, not a metronome. Sleep in small steps so shutdown is
+                // prompt.
+                let target = jittered_wait_ms(interval);
                 let mut waited = 0u64;
-                while waited < interval && !sd.load(Ordering::SeqCst) {
-                    let step = interval.saturating_sub(waited).min(50);
+                while waited < target && !sd.load(Ordering::SeqCst) {
+                    let step = target.saturating_sub(waited).min(50);
                     thread::sleep(Duration::from_millis(step));
                     waited += step;
                 }
