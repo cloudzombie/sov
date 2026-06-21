@@ -692,11 +692,27 @@ impl EmbeddedNode {
     fn peer_count(&self) -> usize {
         self.p2p.as_ref().map(|p| p.tcp().peer_count()).unwrap_or(0)
     }
+
+    /// A SOCKET-FREE status read of the embedded node: `(height, chain_id)`, read
+    /// directly from the in-process chain. Uses `try_lock`, so a momentarily-busy node
+    /// (mid-commit / mid-reorg) returns `None` rather than blocking the UI — the node
+    /// is still up, just busy this instant. This is why the desktop app never needs to
+    /// "connect" to its own node over a loopback RPC socket (the source of the spurious
+    /// "Transport: … did not properly respond" on Windows).
+    fn local_status(&self) -> Option<(u64, String)> {
+        let node = self.daemon.node();
+        let guard = node.try_lock().ok()?;
+        Some((guard.chain().height(), guard.chain().chain_id().to_string()))
+    }
 }
 
 /// Lifecycle state of the embedded node, shared between the UI thread and the
 /// background start worker (which builds the daemon and replays the block log off
 /// the UI thread, so the window never freezes during startup).
+// The `Running` variant owns the live node handles (intentionally the large one); it
+// is held in a single long-lived slot, not stored in bulk, so boxing it would only add
+// indirection on every status read.
+#[allow(clippy::large_enum_variant)]
 #[derive(Default)]
 enum NodeRun {
     /// No node running.
@@ -1747,6 +1763,26 @@ impl Station {
         });
     }
 
+    /// For the in-process embedded node, trust the DIRECT read over any loopback-RPC
+    /// poll: a Running local node is ONLINE (it lives in this process), its height and
+    /// chain id come straight from the chain, and a transient poll error is cleared —
+    /// the node is never reached over a socket, so a socket timeout is meaningless and
+    /// must not surface as "offline" / a transport error (the Windows symptom). On a
+    /// momentary `try_lock` miss (node mid-commit) we keep the last height; it's still
+    /// online.
+    fn apply_local_status(&self, snap: &mut Snapshot) {
+        if let NodeRun::Running(node) = &*self.node_run.lock().unwrap() {
+            snap.online = true;
+            snap.error = None;
+            if let Some((height, chain_id)) = node.local_status() {
+                snap.height = Some(height);
+                if !chain_id.is_empty() {
+                    snap.chain_id = chain_id;
+                }
+            }
+        }
+    }
+
     /// Append a node-log line whenever a watched observable changes — the live peer
     /// count (in-process), RPC online/offline, and head height — so the Node log shows
     /// peering churn and sync progress as they happen instead of a frozen number. Only
@@ -1982,7 +2018,13 @@ impl eframe::App for Station {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let snap = self.snapshot.lock().map(|s| s.clone()).unwrap_or_default();
+        let mut snap = self.snapshot.lock().map(|s| s.clone()).unwrap_or_default();
+
+        // The desktop app's node runs IN-PROCESS — read its status DIRECTLY rather than
+        // trusting a loopback-RPC poll that can spuriously time out ("Transport: … did
+        // not properly respond") and falsely read offline. A running local node is
+        // online, period; its height/chain come straight from the chain.
+        self.apply_local_status(&mut snap);
 
         // Live change-logging: append peer-count / online-offline / height changes to
         // the node log the moment they happen, so the operator sees peering churn and

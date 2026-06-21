@@ -666,12 +666,22 @@ pub struct DaemonHandle {
     shutdown: Arc<AtomicBool>,
     produce: JoinHandle<()>,
     rpc: RpcHandle,
+    /// The shared in-process node — so a co-located UI (the desktop app) can read
+    /// live state DIRECTLY instead of over a loopback RPC socket (which can time out
+    /// and falsely read "offline" while the node is actually fine).
+    node: Arc<Mutex<Node>>,
 }
 
 impl DaemonHandle {
     /// The bound RPC address.
     pub fn rpc_addr(&self) -> std::net::SocketAddr {
         self.rpc_addr
+    }
+
+    /// The shared in-process node, for direct (no-socket) status reads by a co-located
+    /// UI. Use `try_lock` so a momentarily-busy node never blocks the caller.
+    pub fn node(&self) -> Arc<Mutex<Node>> {
+        Arc::clone(&self.node)
     }
 
     /// Stop block production and the RPC server, then wait for both to finish.
@@ -926,6 +936,7 @@ impl Daemon {
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let node = self.node();
+        let handle_node = self.node(); // for the DaemonHandle's direct-read accessor
         let gossip = self.gossip.clone();
         let block_log = Arc::clone(&self.block_log);
         let snap_path = self.snapshot_path.clone();
@@ -1016,6 +1027,7 @@ impl Daemon {
             shutdown,
             produce,
             rpc,
+            node: handle_node,
         })
     }
 }
