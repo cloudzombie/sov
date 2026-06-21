@@ -351,13 +351,11 @@ impl TcpNode {
                 }
                 if let Ok((n, src)) = sock.recv_from(&mut buf) {
                     if let Some(addr) = parse_beacon(&buf[..n], &chain_id, nonce, src.ip()) {
-                        // A same-chain peer announced itself — dial it UNLESS we already
-                        // have a connection to that host (its inbound link is keyed by an
-                        // ephemeral port, so check by IP, not the exact listen address —
-                        // otherwise mDNS opens a second, duplicate connection).
-                        let dup = shared.peers.lock().unwrap().contains_key(&addr)
-                            || has_connection_to_ip(&shared, addr.ip());
-                        if !dup {
+                        // A same-chain peer announced itself — dial it UNLESS that would
+                        // just duplicate a link we already have. `dial_would_duplicate`
+                        // does all its own locking; we must NOT hold a `peers` lock across
+                        // it (that self-deadlocks the non-reentrant Mutex and wedges the node).
+                        if !dial_would_duplicate(&shared, addr) {
                             let _ = shared.dial_tx.send(addr);
                         }
                     }
@@ -796,30 +794,37 @@ fn is_local(ip: IpAddr) -> bool {
     }
 }
 
-/// Whether we already hold a connection involving `ip` — used to suppress a REDUNDANT
-/// discovery dial (mDNS / gossip) to a peer we are already linked with. An inbound
-/// connection is keyed by the peer's ephemeral source port, so an exact-address check
-/// (the peer's *listen* address from a beacon) misses it and we open a second,
-/// duplicate connection to the same host — the "N peers from one link" inflation.
-/// LOOPBACK is exempt so single-host and loopback multi-node tests still connect many
-/// nodes behind `127.0.0.1`; private/LAN and public IPs are deduped (one node per host
-/// is the norm there, and the inbound per-IP cap still bounds genuine multi-node hosts).
-fn has_connection_to_ip(shared: &Shared, ip: IpAddr) -> bool {
-    let loopback = match ip {
+/// Whether a DISCOVERY dial to `addr` (mDNS / gossip) would just DUPLICATE a link we
+/// already have, so it should be skipped. Two cases collapse one machine into "two
+/// peers": its inbound link is keyed by an ephemeral source port, while a beacon
+/// advertises its fixed *listen* port — so an exact-address check misses it. We match
+/// by IP for non-loopback hosts (one node per host is the norm; the inbound per-IP cap
+/// still bounds genuine multi-node hosts), AND we check the `inbound` admission set,
+/// which is populated at TCP-accept — before the slow Noise+ML-KEM handshake registers
+/// the peer in `peers` — closing the startup race that produced the duplicate.
+///
+/// CRITICAL: this acquires each lock in its OWN statement and releases it before the
+/// next, and callers must NOT hold any of these locks across the call — a `peers` lock
+/// held by the caller while this re-locks `peers` would self-deadlock the (single,
+/// non-reentrant) `Mutex` and wedge the whole node. It is self-contained for exactly
+/// that reason.
+fn dial_would_duplicate(shared: &Shared, addr: SocketAddr) -> bool {
+    // Exact address already connected (this is the only check for loopback).
+    if shared.peers.lock().unwrap().contains_key(&addr) {
+        return true;
+    }
+    let loopback = match addr.ip() {
         IpAddr::V4(v4) => v4.is_loopback(),
         IpAddr::V6(v6) => v6.is_loopback(),
     };
     if loopback {
-        return false;
+        return false; // single-host / loopback tests legitimately run many nodes
     }
-    // Established connections...
+    let ip = addr.ip();
     if shared.peers.lock().unwrap().keys().any(|a| a.ip() == ip) {
-        return true;
+        return true; // an established link to this host (e.g. its inbound by ephemeral port)
     }
-    // ...and connections still HANDSHAKING. The inbound set is populated at TCP-accept
-    // (before the slow Noise+ML-KEM handshake registers the peer), so checking it closes
-    // the startup race where a peer dials us AND our mDNS dials it back in the gap before
-    // its inbound link appears in `peers` — the cause of "one machine counted as two".
+    // A link to this host still completing its handshake (admitted, not yet in `peers`).
     shared.inbound.lock().unwrap().iter().any(|a| a.ip() == ip)
 }
 
@@ -936,10 +941,10 @@ fn reader_loop(shared: &Arc<Shared>, key: SocketAddr, mut reader: TcpStream, pee
                                 if sa != shared.local_addr {
                                     // Record it for future dials, but don't open a
                                     // SECOND connection to a host we're already linked to
-                                    // (inbound links are keyed by ephemeral port, so check
-                                    // by IP — see `has_connection_to_ip`).
+                                    // (see `dial_would_duplicate`). The `known` lock is
+                                    // released at this statement's end, before the call.
                                     let unseen = shared.known.lock().unwrap().insert(sa);
-                                    if unseen && !has_connection_to_ip(shared, sa.ip()) {
+                                    if unseen && !dial_would_duplicate(shared, sa) {
                                         let _ = shared.dial_tx.send(sa);
                                     }
                                 }
@@ -1510,5 +1515,33 @@ mod tests {
             wait_until(3, || server.peer_count() >= 1),
             "disconnect does not ban — the host can reconnect"
         );
+    }
+
+    #[test]
+    fn dial_dedup_matches_inflight_inbound_and_exempts_loopback_without_deadlock() {
+        // The discovery-dial dedup must (a) treat a LAN host we already have an
+        // in-flight inbound from as a duplicate (matched by IP, since the inbound is
+        // keyed by an ephemeral port), (b) exempt loopback, and (c) acquire its locks
+        // self-contained — if it re-locked `peers` while a guard were still held it
+        // would self-deadlock and this test would HANG instead of returning.
+        let (tx, _rx) = channel();
+        let shared = Shared {
+            local_addr: "127.0.0.1:1".parse().unwrap(),
+            peers: Mutex::new(HashMap::new()),
+            inbox: Mutex::new(VecDeque::new()),
+            known: Mutex::new(HashSet::new()),
+            dialing: Mutex::new(HashSet::new()),
+            // An inbound from 192.168.1.5 still completing its handshake (ephemeral port).
+            inbound: Mutex::new(["192.168.1.5:54321".parse().unwrap()].into_iter().collect()),
+            scores: Mutex::new(HashMap::new()),
+            dial_tx: tx,
+            shutdown: AtomicBool::new(false),
+        };
+        // Same host, its advertised LISTEN port → duplicate (matched by IP).
+        assert!(dial_would_duplicate(&shared, "192.168.1.5:9645".parse().unwrap()));
+        // A different host → not a duplicate.
+        assert!(!dial_would_duplicate(&shared, "192.168.1.9:9645".parse().unwrap()));
+        // Loopback is exempt so single-host / loopback multi-node tests still connect.
+        assert!(!dial_would_duplicate(&shared, "127.0.0.1:9645".parse().unwrap()));
     }
 }

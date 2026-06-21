@@ -126,8 +126,10 @@ fn push_log(logs: &Arc<Mutex<Vec<String>>>, msg: impl Into<String>) {
     if let Ok(mut v) = logs.lock() {
         v.push(format!("{}  {}", clock_hms(), msg.into()));
         let n = v.len();
-        if n > 400 {
-            v.drain(0..n - 400);
+        // Keep a deep ring buffer so an operator can scroll back through a whole
+        // session's history (peering churn, sync, restarts) when diagnosing.
+        if n > 5_000 {
+            v.drain(0..n - 5_000);
         }
     }
 }
@@ -722,6 +724,12 @@ pub struct Station {
     // Real, timestamped node logs (startup, replay timing, RPC up, block production,
     // errors), shared with the start worker + poller and shown in the Node tab.
     node_logs: Arc<Mutex<Vec<String>>>,
+    // Last-logged node observables, so a CHANGE — peer count, RPC online/offline,
+    // height progress — is appended to the node log as it happens (live visibility
+    // into peering churn and sync, the things the operator is watching for).
+    log_prev_peers: Option<usize>,
+    log_prev_online: Option<bool>,
+    log_prev_height: Option<u64>,
     // A peer to bootstrap the local node to (`host:port`), so two machines join the
     // SAME testnet (same genesis + a P2P link). Persisted in the node config.
     peer_addr: String,
@@ -880,6 +888,9 @@ impl Station {
             node_run: Arc::new(Mutex::new(NodeRun::Stopped)),
             node_status: String::new(),
             node_logs: Arc::new(Mutex::new(Vec::new())),
+            log_prev_peers: None,
+            log_prev_online: None,
+            log_prev_height: None,
             peer_addr: read_saved_peer(),
             lan_addr: lan_ipv4(),
             network: Network::Testnet,
@@ -1736,6 +1747,53 @@ impl Station {
         });
     }
 
+    /// Append a node-log line whenever a watched observable changes — the live peer
+    /// count (in-process), RPC online/offline, and head height — so the Node log shows
+    /// peering churn and sync progress as they happen instead of a frozen number. Only
+    /// transitions are logged (most frames change nothing), so the log stays readable.
+    fn log_node_changes(&mut self, snap: &Snapshot) {
+        let peers = match &*self.node_run.lock().unwrap() {
+            NodeRun::Running(node) => Some(node.peer_count()),
+            _ => None,
+        };
+        match (self.log_prev_peers, peers) {
+            (Some(prev), Some(now)) if prev != now => {
+                push_log(&self.node_logs, format!("peers {prev} → {now}"));
+                self.log_prev_peers = Some(now);
+            }
+            (None, Some(now)) => self.log_prev_peers = Some(now),
+            (Some(_), None) => self.log_prev_peers = None, // node stopped
+            _ => {}
+        }
+        // RPC reachability transitions (this is the "offline up top" the user sees).
+        if self.log_prev_online != Some(snap.online) {
+            if let Some(prev) = self.log_prev_online {
+                if prev != snap.online {
+                    push_log(
+                        &self.node_logs,
+                        if snap.online {
+                            "RPC online — node responding".to_string()
+                        } else {
+                            "RPC OFFLINE — node not responding".to_string()
+                        },
+                    );
+                }
+            }
+            self.log_prev_online = Some(snap.online);
+        }
+        // Head-height progress (mining and/or sync catching up).
+        if let Some(h) = snap.height {
+            match self.log_prev_height {
+                Some(prev) if prev != h => {
+                    push_log(&self.node_logs, format!("height {prev} → {h}"));
+                    self.log_prev_height = Some(h);
+                }
+                None => self.log_prev_height = Some(h),
+                _ => {}
+            }
+        }
+    }
+
     /// Whether the embedded node is up or coming up. In-process, so this is the true
     /// state — there is no external process to fall out of sync with.
     fn local_node_running(&self) -> bool {
@@ -1925,6 +1983,11 @@ impl eframe::App for Station {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let snap = self.snapshot.lock().map(|s| s.clone()).unwrap_or_default();
+
+        // Live change-logging: append peer-count / online-offline / height changes to
+        // the node log the moment they happen, so the operator sees peering churn and
+        // sync progress as it occurs (not just a frozen number).
+        self.log_node_changes(&snap);
 
         // Keep the window title in sync with the selected network.
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
@@ -2250,21 +2313,28 @@ fn node_log_panel(ui: &mut egui::Ui, logs: &[String]) {
     ui.separator();
     ui.horizontal(|ui| {
         ui.heading("Node log");
-        ui.label(egui::RichText::new("(embedded node — in-process)").weak());
+        ui.label(
+            egui::RichText::new(format!("(embedded node — in-process · {} lines)", logs.len()))
+                .weak(),
+        );
     });
     ui.add_space(4.0);
     if logs.is_empty() {
         ui.label(egui::RichText::new("no node activity yet — Start local node to begin").weak());
         return;
     }
+    // A tall, scrollable, monospace view so an operator can watch live activity and
+    // scroll back through the whole session — the primary window into what the node
+    // is doing (peering, sync, restarts, errors).
     egui::Frame::group(ui.style()).show(ui, |ui| {
         egui::ScrollArea::vertical()
             .id_salt("node_log_scroll")
-            .max_height(220.0)
+            .max_height(520.0)
+            .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                for line in logs.iter().rev().take(200).rev() {
-                    ui.label(egui::RichText::new(line).monospace().size(12.0));
+                for line in logs.iter().rev().take(2_000).rev() {
+                    ui.label(egui::RichText::new(line).monospace().size(12.5));
                 }
             });
     });
