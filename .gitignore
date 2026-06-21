@@ -35,3 +35,11 @@ explorer/devnet/node-*/
 
 # Nested project with its own git history (separate agent) — not part of this repo
 dashboard/dash2/
+
+# ── Local working docs (planning logs, scopes, roadmaps) — NEVER track ────────
+# Root-level dated/scope HTML are personal working artifacts, not repo content.
+# (Product HTML lives in subdirs — explorer/, dashboard/, chain/specs/ — and stays.)
+/july*.html
+/solanadex.html
+/*-scope.html
+/*-plan.html
