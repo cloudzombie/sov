@@ -24,6 +24,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Cache compiled dependencies across runs. The heavy deps (egui, halo2/orchard,
+      # RandomX, the PQ crypto) dominate a cold release build; caching them turns a ~9
+      # min from-scratch compile into a couple of minutes that only rebuilds OUR crates.
+      # (The first run after this is added still populates the cache.)
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            node
+            chain
+          cache-on-failure: true
       - name: Build GUI + chain helper (release)
         shell: bash
         run: |
@@ -47,6 +57,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            node
+            chain
+          cache-on-failure: true
       - name: Build GUI + chain helper (release)
         run: |
           cargo build --release --manifest-path node/Cargo.toml
