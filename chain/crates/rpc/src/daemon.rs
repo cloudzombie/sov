@@ -664,6 +664,26 @@ const GRIND_SLICE: Duration = Duration::from_millis(15);
 /// instead of going silent and looking hung.
 const MINING_HEARTBEAT: Duration = Duration::from_secs(10);
 
+/// On startup, how long to wait for peers to connect (and to sync to the tip) BEFORE
+/// grinding any proof of work. Peer connection must happen before mining: it gives the
+/// (CPU-heavy) handshake full processor time so links actually form, and it guarantees a
+/// joining node downloads the existing chain instead of mining a fork ahead of the
+/// network. If no peer has connected by the end of this window, a solo/seed node starts
+/// mining anyway to bootstrap — it cannot wait forever for peers that may not exist.
+const CONNECT_GRACE: Duration = Duration::from_secs(15);
+
+/// What the block-production loop is doing right now — tracked so each transition is
+/// logged once (not every iteration).
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum MinePhase {
+    /// Waiting for peers to connect before mining (startup grace).
+    Connecting,
+    /// Connected but behind a heavier peer chain — downloading, not mining.
+    Syncing,
+    /// At the tip (or solo past the grace) — actively mining.
+    Mining,
+}
+
 /// A random 64-bit nonce start, so independent miners search different regions of the
 /// space rather than racing the same nonces (Monero/Bitcoin practice).
 fn random_nonce_start() -> u64 {
@@ -1037,9 +1057,10 @@ impl Daemon {
             // boot had to replay (no snapshot existed yet, or it was stale).
             let _ = block_time_ms; // block cadence now comes from difficulty, not a sleep
             let mut last_snap_height = 0u64;
-            // Track the mining-gate state so a pause/resume is logged on TRANSITION (not
-            // every iteration) — the operator sees exactly when/why mining stops & starts.
-            let mut was_behind = false;
+            // Track the mining phase so each transition (connecting → syncing → mining) is
+            // logged once. `start_at` bounds the connect-before-mining grace window.
+            let mut last_phase: Option<MinePhase> = None;
+            let start_at = Instant::now();
             // CONTINUOUS MINING (the Monero/Zcash/Bitcoin model, not "sleep then mine"):
             // the node grinds proof of work on a template built on the CURRENT tip,
             // batch after batch, abandoning the template the instant a better tip arrives.
@@ -1066,36 +1087,60 @@ impl Daemon {
                     }
                 }
 
-                // IBD GATE: pause mining ONLY during a real initial download (many blocks
-                // behind), never during a 1-block race — otherwise the moment a peer wins
-                // a block we'd stop and only sync, and the leader would lap us forever.
-                // Within a block of the tip we keep grinding so our blocks compete at the
-                // tip height and rewards are shared.
+                // CONNECT-then-SYNC-then-MINE. Decide the phase:
+                //   • Connecting — startup grace, no peer yet: wait so handshakes get full
+                //     CPU and we never mine ahead of the network. (Past the grace with no
+                //     peers, a solo/seed node falls through to Mining to bootstrap.)
+                //   • Syncing — connected but behind a heavier peer chain: download first
+                //     (the IBD gate; only a real >1-block deficit, never a 1-block race, so
+                //     two miners at the tip both keep mining and share rewards).
+                //   • Mining — at the tip: grind.
+                let peers = sync_status.as_ref().map(|s| s.authed_peers()).unwrap_or(0);
                 let behind = sync_status
                     .as_ref()
                     .map(|s| s.should_gate_mining())
                     .unwrap_or(false);
-                if behind != was_behind {
-                    if behind {
-                        let local = node.lock().map(|n| n.chain().height()).unwrap_or(0);
-                        let best = sync_status
-                            .as_ref()
-                            .map(|s| s.best_peer_height())
-                            .unwrap_or(0);
-                        daemon_log(
-                            &log,
-                            format!(
-                                "⏸ mining PAUSED — downloading the existing chain (we're at {local}, peer at {best})"
-                            ),
-                        );
-                    } else {
-                        let h = node.lock().map(|n| n.chain().height()).unwrap_or(0);
-                        daemon_log(&log, format!("▶ caught up — mining RESUMED at height {h}"));
+                let phase = if sync_status.is_some()
+                    && peers == 0
+                    && start_at.elapsed() < CONNECT_GRACE
+                {
+                    // P2P is active but no peer has connected yet — wait (grace), so the
+                    // handshake gets full CPU and we don't mine ahead of the network. With
+                    // no P2P at all (standalone), there is nothing to wait for, so mine.
+                    MinePhase::Connecting
+                } else if behind {
+                    MinePhase::Syncing
+                } else {
+                    MinePhase::Mining
+                };
+                if last_phase != Some(phase) {
+                    match phase {
+                        MinePhase::Connecting => {
+                            daemon_log(&log, "⏳ connecting to peers before mining…")
+                        }
+                        MinePhase::Syncing => {
+                            let local = node.lock().map(|n| n.chain().height()).unwrap_or(0);
+                            let best = sync_status
+                                .as_ref()
+                                .map(|s| s.best_peer_height())
+                                .unwrap_or(0);
+                            daemon_log(
+                                &log,
+                                format!(
+                                    "⏸ mining PAUSED — downloading the existing chain (we're at {local}, peer at {best})"
+                                ),
+                            );
+                        }
+                        MinePhase::Mining => {
+                            let h = node.lock().map(|n| n.chain().height()).unwrap_or(0);
+                            let how = if peers > 0 { "at the network tip" } else { "solo" };
+                            daemon_log(&log, format!("▶ mining {how} at height {h}"));
+                        }
                     }
-                    was_behind = behind;
+                    last_phase = Some(phase);
                 }
-                if behind {
-                    // Let the P2P engine download; don't grind a fork. Re-check shortly.
+                if phase != MinePhase::Mining {
+                    // Connecting or syncing: don't grind. Re-check shortly.
                     let mut waited = 0u64;
                     while waited < 200 && !sd.load(Ordering::SeqCst) {
                         thread::sleep(Duration::from_millis(50));
