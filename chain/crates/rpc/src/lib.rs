@@ -587,6 +587,7 @@ fn call(node: &Arc<Mutex<Node>>, method: &str, params: &Value) -> Result<Value, 
                 };
                 json!({
                     "hash": to_value(b.hash()),
+                    "timestampMs": b.header.timestamp_ms,
                     "txIds": b
                         .transactions
                         .iter()

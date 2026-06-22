@@ -285,6 +285,10 @@ fn cmd_gen(flags: &Flags) -> Result<(), Box<dyn Error>> {
         }
         Some(other) => return Err(format!("--pow must be sha256d|randomx, got `{other}`").into()),
     };
+    // Genesis difficulty (leading zero bits). A testnet defaults LOW (8) so a single
+    // machine mines trivially from block 1; per-block LWMA then tracks the live hashrate.
+    // Pass `--difficulty-zeros 20` for a mainnet-difficulty rehearsal.
+    let difficulty_zeros: u32 = flags.parse_or("difficulty-zeros", 8u32)?;
 
     let actors: usize = flags.parse_or("actors", 0usize)?;
     let actor_sov: u128 = flags.parse_or("actor-sov", 2_000u128)?;
@@ -390,6 +394,7 @@ fn cmd_gen(flags: &Flags) -> Result<(), Box<dyn Error>> {
         policy,
         block_time_ms: Some(block_time_ms),
         pow: pow.clone(),
+        difficulty_leading_zeros: Some(difficulty_zeros),
         accounts,
     };
     write_json(&out.join("chain-spec.json"), &spec)?;

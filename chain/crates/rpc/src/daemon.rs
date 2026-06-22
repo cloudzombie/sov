@@ -117,6 +117,15 @@ pub struct ChainSpec {
     /// Sha256d (default, single-box friendly).
     #[serde(default)]
     pub pow: Option<String>,
+    /// Override the GENESIS proof-of-work difficulty, as the count of required
+    /// leading zero bits ([`Target::from_leading_zero_bits`]). `None` uses the
+    /// policy's native difficulty. A testnet sets this LOW (e.g. `8`) so a single
+    /// machine mines trivially from the start; the per-block LWMA retarget then
+    /// tracks the live hashrate from there. Only the genesis difficulty is set —
+    /// difficulty is otherwise determined by consensus — so this never weakens a
+    /// running chain. (Affects only the sha256d target the seal compares against.)
+    #[serde(default)]
+    pub difficulty_leading_zeros: Option<u32>,
     /// Funded accounts.
     pub accounts: Vec<SpecAccount>,
 }
@@ -160,6 +169,9 @@ impl ChainSpec {
                     )))
                 }
             };
+        }
+        if let Some(lz) = self.difficulty_leading_zeros {
+            mining.sha256d_target = sov_mining::Target::from_leading_zero_bits(lz);
         }
         Ok(GenesisConfig {
             chain_id: self.chain_id.clone(),
@@ -1280,7 +1292,8 @@ mod tests {
         let spec = ChainSpec::from_json(TESTNET_1_SPEC).expect("frozen spec parses");
         assert_eq!(spec.chain_id, "sov-testnet-1");
         assert_eq!(spec.pow.as_deref(), Some("sha256d"));
-        assert_eq!(spec.block_time_ms, Some(30_000));
+        assert_eq!(spec.block_time_ms, Some(5_000));
+        assert_eq!(spec.difficulty_leading_zeros, Some(8));
         let genesis = spec
             .to_genesis_config()
             .expect("spec -> genesis config")
@@ -1301,7 +1314,7 @@ mod tests {
         );
         assert_eq!(
             genesis_hash,
-            "9d6e4b331b0e62af909bfb363bfeca17b3b6a5b84f374f01ddaaeba0ae636b84"
+            "5e9f3cc54cc3f9e3fdb798019cec9aee8cf0c3881a7e4901e1840aff6f7aa2b1"
         );
     }
 

@@ -224,8 +224,8 @@ async function renderOverview() {
       </div>
       <div>
         <h2>Latest Transactions</h2>
-        <div class="panel"><table><thead><tr><th>Tx</th><th>Type</th><th>Signer</th><th class="right">Block</th></tr></thead>
-        <tbody id="ov-txs">${txs.map(txRow).join('') || emptyRow(4)}</tbody></table></div>
+        <div class="panel"><table><thead><tr><th>Tx</th><th>Type</th><th>Age</th><th>Signer</th><th class="right">Block</th></tr></thead>
+        <tbody id="ov-txs">${txs.map(txRow).join('') || emptyRow(5)}</tbody></table></div>
       </div>
     </div>
   `);
@@ -233,10 +233,10 @@ async function renderOverview() {
 
 function blockRow(b) {
   const coinbase = b.coinbase ? fmtCoin(b.coinbase.reward) + ' ' + COIN_SYMBOL : '<span class="dim">—</span>';
-  return `<tr><td>${blockLink(b.height)}</td><td>${acctLink(b.proposer)}</td><td class="right num">${b.txCount}</td><td class="right num">${coinbase}</td><td class="dim">${timeAgo(b.timestampMs)}</td><td>${finalBadge(b.final)}</td></tr>`;
+  return `<tr><td>${blockLink(b.height)}</td><td>${acctLinkShort(b.proposer)}</td><td class="right num">${b.txCount}</td><td class="right num">${coinbase}</td><td class="dim" title="${esc(new Date(b.timestampMs).toLocaleString())}">${timeAgo(b.timestampMs)}</td><td>${finalBadge(b.final)}</td></tr>`;
 }
 function txRow(t) {
-  return `<tr><td>${txLink(t.id)}</td><td>${actionBadge(t.action)}</td><td>${acctLink(t.signer)}</td><td class="right">${blockLink(t.blockHeight)}</td></tr>`;
+  return `<tr><td>${txLink(t.id)}</td><td>${actionBadge(t.action)}</td><td class="dim" title="${esc(new Date(t.timestampMs).toLocaleString())}">${timeAgo(t.timestampMs)}</td><td>${acctLinkShort(t.signer)}</td><td class="right">${blockLink(t.blockHeight)}</td></tr>`;
 }
 function emptyRow(cols) {
   return `<tr><td colspan="${cols}" class="empty">No data yet — waiting for blocks.</td></tr>`;
@@ -248,7 +248,7 @@ async function renderBlocks() {
   setView(`
     <h1>Blocks</h1>
     <div class="panel"><table><thead><tr><th>Height</th><th>Hash</th><th>Miner</th><th class="right">Txs</th><th class="right">Coinbase</th><th>Timestamp</th><th></th></tr></thead>
-    <tbody>${blocks.map((b) => `<tr><td>${blockLink(b.height)}</td><td>${blockHashLink(b.hash)}</td><td>${acctLink(b.proposer)}</td><td class="right num">${b.txCount}</td><td class="right num">${b.coinbase ? fmtCoin(b.coinbase.reward) + ' ' + COIN_SYMBOL : '<span class="dim">—</span>'}</td><td class="dim">${new Date(b.timestampMs).toLocaleString()}</td><td>${finalBadge(b.final)}</td></tr>`).join('') || emptyRow(7)}</tbody></table></div>
+    <tbody>${blocks.map((b) => `<tr><td>${blockLink(b.height)}</td><td>${blockHashLink(b.hash)}</td><td>${acctLinkShort(b.proposer)}</td><td class="right num">${b.txCount}</td><td class="right num">${b.coinbase ? fmtCoin(b.coinbase.reward) + ' ' + COIN_SYMBOL : '<span class="dim">—</span>'}</td><td class="dim">${new Date(b.timestampMs).toLocaleString()}</td><td>${finalBadge(b.final)}</td></tr>`).join('') || emptyRow(7)}</tbody></table></div>
   `);
 }
 
@@ -278,7 +278,7 @@ async function renderBlock(ref) {
     ${coinbasePanel(b.coinbase)}
     <h2>Transactions</h2>
     <div class="panel"><table><thead><tr><th>Tx</th><th>Type</th><th>Signer</th><th>Detail</th></tr></thead>
-    <tbody>${txs.map((t) => `<tr><td>${txLink(t.id)}</td><td>${actionBadge(t.action)}</td><td>${acctLink(t.signer)}</td><td>${actionSummary(t.action)}</td></tr>`).join('') || emptyRow(4)}</tbody></table></div>
+    <tbody>${txs.map((t) => `<tr><td>${txLink(t.id)}</td><td>${actionBadge(t.action)}</td><td>${acctLinkShort(t.signer)}</td><td>${actionSummary(t.action)}</td></tr>`).join('') || emptyRow(4)}</tbody></table></div>
   `);
 }
 

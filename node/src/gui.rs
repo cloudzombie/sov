@@ -65,6 +65,8 @@ struct AccountRow {
 #[derive(Clone, Default)]
 struct BlockRow {
     height: u64,
+    /// The block header's wall-clock timestamp (Unix ms), surfaced in the Blocks tab.
+    timestamp_ms: u64,
     miner: String,
     reward: String,
     miner_amount: String,
@@ -379,6 +381,10 @@ fn account_row(client: &RpcClient, account: &str) -> AccountRow {
 fn block_row(height: u64, digest: &Value) -> BlockRow {
     let mut row = BlockRow {
         height,
+        timestamp_ms: digest
+            .get("timestampMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         ..Default::default()
     };
     let cb = digest.get("coinbase");
@@ -4981,6 +4987,28 @@ impl Station {
     }
 }
 
+/// Format a block's wall-clock timestamp (Unix ms) as `HH:MM:SS` (UTC, matching the
+/// node log) plus a relative age, for the Blocks tab. `0` (genesis/unknown) shows `—`.
+fn block_time(ts_ms: u64) -> String {
+    if ts_ms == 0 {
+        return "—".to_string();
+    }
+    let secs = (ts_ms / 1000) % 86_400;
+    let hms = format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60);
+    let now = now_ms();
+    if now < ts_ms {
+        return hms;
+    }
+    let age = (now - ts_ms) / 1000;
+    if age < 60 {
+        format!("{hms}  ({age}s ago)")
+    } else if age < 3_600 {
+        format!("{hms}  ({}m ago)", age / 60)
+    } else {
+        format!("{hms}  ({}h ago)", age / 3_600)
+    }
+}
+
 fn blocks_panel(ui: &mut egui::Ui, s: &Snapshot) {
     ui.heading("Blocks");
     ui.label(egui::RichText::new("each block's coinbase — newly minted issuance and its 93% / 5% / 2% miner / founder / dev split").weak());
@@ -4991,12 +5019,13 @@ fn blocks_panel(ui: &mut egui::Ui, s: &Snapshot) {
     ui.add_space(8.0);
     egui::ScrollArea::vertical().show(ui, |ui| {
         egui::Grid::new("blocks")
-            .num_columns(6)
+            .num_columns(7)
             .striped(true)
             .spacing([18.0, 5.0])
             .show(ui, |ui| {
                 for h in [
                     "Height",
+                    "Time",
                     "Miner",
                     "Coinbase",
                     "Miner 93%",
@@ -5016,6 +5045,7 @@ fn blocks_panel(ui: &mut egui::Ui, s: &Snapshot) {
                         b.height.to_string(),
                         format!("{EXPLORER_URL}/#/block/{}", b.height),
                     );
+                    ui.monospace(block_time(b.timestamp_ms));
                     ui.monospace(short(&b.miner));
                     ui.monospace(xus(&b.reward));
                     ui.monospace(xus(&b.miner_amount));
