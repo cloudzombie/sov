@@ -645,11 +645,19 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// How many nonces the continuous miner grinds per batch before pausing to check for a
-/// new tip or shutdown. Big enough that the per-batch bookkeeping (a non-blocking
-/// `try_lock`) is negligible, small enough that a peer's block is noticed within a few
-/// milliseconds (Sha256d) so no work is wasted on a stale template.
-const GRIND_BATCH: u64 = 16_384;
+/// Nonces per inner micro-batch. Small, so the grind can stop near the end of a time
+/// SLICE for ANY algorithm — microseconds-per-hash Sha256d or milliseconds-per-hash
+/// RandomX alike — keeping the throttle and tip-following responsive.
+const GRIND_MICRO_BATCH: u64 = 64;
+
+/// How long the miner grinds before YIELDING the CPU. It then sleeps for a comparable
+/// span, so mining runs at roughly a 50% duty cycle on one core. This is the fix for
+/// "the node stopped connecting once it started mining": a tight, 100%-pegging grind
+/// loop starves the P2P worker and the (CPU-heavy ML-KEM) handshake threads enough that
+/// peers time out and drop. A desktop wallet must stay responsive and KEEP ITS PEERS
+/// while it mines. The difficulty retarget adapts to the resulting effective hashrate,
+/// so block time is unaffected; rewards still split by each miner's *relative* hashpower.
+const GRIND_SLICE: Duration = Duration::from_millis(15);
 
 /// How often the miner logs a "still searching" heartbeat while grinding a block, so the
 /// Node log shows live activity between blocks (which are ~`target_block_ms` apart)
@@ -1097,11 +1105,11 @@ impl Daemon {
                 }
 
                 // Build a template on the CURRENT tip (brief lock); grind OFF the lock.
-                let (mut candidate, tip) = {
+                let (mut candidate, tip_height) = {
                     let Ok(n) = node.lock() else { break };
-                    let tip = n.chain().head().hash();
+                    let h = n.chain().height();
                     match n.build_candidate(now_ms()) {
-                        Ok(c) => (c, tip),
+                        Ok(c) => (c, h),
                         Err(e) => {
                             drop(n);
                             daemon_log(&log, format!("could not build a block candidate: {e}"));
@@ -1111,23 +1119,35 @@ impl Daemon {
                     }
                 };
 
-                // Grind in bounded batches; between batches, abandon the template if
-                // shutdown is requested or the tip moved (we adopted a peer's block), so
-                // no work is wasted on a stale tip.
+                // Grind OFF the lock, in time slices that YIELD the CPU between them, so
+                // the network/handshake/RPC/UI threads always get scheduled (a 100%-pegged
+                // grind drops peers — see GRIND_SLICE). Between slices, abandon the
+                // template if shutdown is requested or the tip moved (we adopted a peer's
+                // block), so no work is wasted on a stale tip.
                 let mining_height = candidate.block().header.height.get();
                 let grind_started = Instant::now();
                 let mut last_beat = grind_started;
                 let mut nonce = random_nonce_start();
                 let mut sealed = None;
-                loop {
+                'grind: loop {
                     if sd.load(Ordering::SeqCst) {
                         break;
                     }
-                    if let Some(block) = candidate.try_seal_batch(nonce, GRIND_BATCH) {
-                        sealed = Some(block);
-                        break;
+                    // Grind one slice (bounded by wall-clock, so it works for any PoW algo).
+                    let slice_start = Instant::now();
+                    while slice_start.elapsed() < GRIND_SLICE {
+                        if let Some(block) = candidate.try_seal_batch(nonce, GRIND_MICRO_BATCH) {
+                            sealed = Some(block);
+                            break 'grind;
+                        }
+                        nonce = nonce.wrapping_add(GRIND_MICRO_BATCH);
+                        if sd.load(Ordering::SeqCst) {
+                            break 'grind;
+                        }
                     }
-                    nonce = nonce.wrapping_add(GRIND_BATCH);
+                    // YIELD: sleep ~the slice's own grind time (≈50% duty), capped, so the
+                    // miner never starves the rest of the node. THE peer-drop fix.
+                    thread::sleep(slice_start.elapsed().min(Duration::from_millis(250)));
                     // Liveness heartbeat so the operator sees active mining between blocks.
                     if last_beat.elapsed() >= MINING_HEARTBEAT {
                         daemon_log(
@@ -1141,7 +1161,7 @@ impl Daemon {
                     }
                     // A new tip? `try_lock` so a momentarily-busy node never stalls the grind.
                     if let Ok(n) = node.try_lock() {
-                        if n.chain().head().hash() != tip {
+                        if n.chain().height() != tip_height {
                             break; // rebuild on the new tip
                         }
                     }
