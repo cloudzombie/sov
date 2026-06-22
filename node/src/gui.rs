@@ -186,13 +186,191 @@ fn is_named_account(account: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// SOV Station palette — one cohesive, bank-grade dark theme (a GitHub-dark family):
+/// a deep slate base, restrained hairline borders, a confident SOV-green accent, and
+/// unambiguous success / error / warning signal colors. All new UI color flows from
+/// here so the app reads as one designed surface instead of ad-hoc tints.
+mod palette {
+    use eframe::egui::Color32;
+    pub const BG: Color32 = Color32::from_rgb(13, 17, 23); // app background (deepest)
+    pub const PANEL: Color32 = Color32::from_rgb(22, 27, 34); // raised panels / cards / windows
+    pub const SURFACE: Color32 = Color32::from_rgb(33, 38, 45); // buttons / inputs at rest
+    pub const SURFACE_HI: Color32 = Color32::from_rgb(48, 54, 61); // hovered
+    pub const FIELD: Color32 = Color32::from_rgb(9, 12, 17); // recessed text-input wells
+    pub const BORDER: Color32 = Color32::from_rgb(48, 54, 61); // subtle hairline borders
+    pub const TEXT: Color32 = Color32::from_rgb(230, 237, 243); // primary text
+    pub const TEXT_DIM: Color32 = Color32::from_rgb(139, 148, 158); // secondary / neutral text
+    pub const ACCENT: Color32 = Color32::from_rgb(46, 160, 67); // SOV green — primary action
+    pub const ACCENT_HI: Color32 = Color32::from_rgb(63, 185, 80);
+    pub const SUCCESS: Color32 = Color32::from_rgb(63, 185, 80); // a transaction landed
+    pub const ERROR: Color32 = Color32::from_rgb(248, 81, 73); // a transaction failed
+    pub const WARNING: Color32 = Color32::from_rgb(210, 153, 34);
+    pub const LINK: Color32 = Color32::from_rgb(88, 166, 255);
+    /// A faint translucent tint of `c` (for status-banner fills/strokes).
+    pub fn tint(c: Color32, alpha: u8) -> Color32 {
+        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
+    }
+}
+
+/// Install the cohesive dark theme once, at startup. Sets the whole widget palette
+/// (rest / hover / press), recessed input wells, accent selection, link color, and a
+/// little more breathing room — so every panel inherits one consistent look.
+fn install_theme(ctx: &egui::Context) {
+    use egui::{Rounding, Stroke};
+    let mut style = (*ctx.style()).clone();
+    let mut v = egui::Visuals::dark();
+    let r = Rounding::same(6.0);
+
+    v.widgets.noninteractive.bg_fill = palette::PANEL;
+    v.widgets.noninteractive.weak_bg_fill = palette::PANEL;
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette::BORDER);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, palette::TEXT);
+    v.widgets.noninteractive.rounding = r;
+
+    v.widgets.inactive.bg_fill = palette::SURFACE;
+    v.widgets.inactive.weak_bg_fill = palette::SURFACE;
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, palette::BORDER);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0, palette::TEXT);
+    v.widgets.inactive.rounding = r;
+
+    v.widgets.hovered.bg_fill = palette::SURFACE_HI;
+    v.widgets.hovered.weak_bg_fill = palette::SURFACE_HI;
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, palette::ACCENT);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0, palette::TEXT);
+    v.widgets.hovered.rounding = r;
+
+    v.widgets.active.bg_fill = palette::ACCENT;
+    v.widgets.active.weak_bg_fill = palette::ACCENT;
+    v.widgets.active.bg_stroke = Stroke::new(1.0, palette::ACCENT_HI);
+    v.widgets.active.fg_stroke = Stroke::new(1.0, egui::Color32::WHITE);
+    v.widgets.active.rounding = r;
+
+    v.widgets.open = v.widgets.inactive;
+
+    v.selection.bg_fill = palette::tint(palette::ACCENT, 90);
+    v.selection.stroke = Stroke::new(1.0, palette::ACCENT_HI);
+    v.hyperlink_color = palette::LINK;
+    v.warn_fg_color = palette::WARNING;
+    v.error_fg_color = palette::ERROR;
+    v.window_fill = palette::PANEL;
+    v.window_stroke = Stroke::new(1.0, palette::BORDER);
+    v.window_rounding = Rounding::same(10.0);
+    v.panel_fill = palette::BG;
+    v.extreme_bg_color = palette::FIELD; // text-edit / code wells
+    v.faint_bg_color = egui::Color32::from_rgb(26, 31, 38); // striped rows
+    v.code_bg_color = egui::Color32::from_rgb(28, 33, 40);
+
+    style.visuals = v;
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.spacing.interact_size.y = 24.0;
+    style.spacing.indent = 18.0;
+    ctx.set_style(style);
+}
+
+/// The outcome of an action/transaction, for at-a-glance green/red coloring.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TxStatus {
+    Ok,
+    Err,
+    Info,
+}
+
+/// Classify a result message as success, failure, or neutral. Robust to BOTH
+/// conventions in this codebase — a leading `✓` / `✗` marker AND plain
+/// "… failed: …" strings — so a failure for ANY reason colors red.
+fn tx_status(msg: &str) -> TxStatus {
+    if msg.contains('✗') {
+        return TxStatus::Err;
+    }
+    let lower = msg.to_ascii_lowercase();
+    const FAIL: &[&str] = &[
+        "fail",
+        "error",
+        "reject",
+        "insufficient",
+        "invalid",
+        "unable",
+        "denied",
+        "unauthorized",
+        "unrecognized",
+        "not a ",
+        "no such",
+        "too ",
+        "exceeded",
+        "refused",
+        "timed out",
+        "timeout",
+        "cannot",
+        "can't",
+    ];
+    if FAIL.iter().any(|k| lower.contains(k)) {
+        return TxStatus::Err;
+    }
+    if msg.contains('✓') {
+        return TxStatus::Ok;
+    }
+    TxStatus::Info
+}
+
+/// The signal color for a status (green / red / neutral).
+fn status_color(s: TxStatus) -> egui::Color32 {
+    match s {
+        TxStatus::Ok => palette::SUCCESS,
+        TxStatus::Err => palette::ERROR,
+        TxStatus::Info => palette::TEXT_DIM,
+    }
+}
+
+/// A highlighted result banner — a faint status-tinted card with the message in the
+/// success (green) or failure (red) color. This is the at-a-glance "did my
+/// transaction land?" signal the wallet shows after every action.
+fn status_banner(ui: &mut egui::Ui, msg: &str) {
+    if msg.is_empty() {
+        return;
+    }
+    let st = tx_status(msg);
+    let col = status_color(st);
+    let glyph = match st {
+        TxStatus::Ok => "✓",
+        TxStatus::Err => "✗",
+        TxStatus::Info => "•",
+    };
+    let body = msg
+        .trim_start_matches('✓')
+        .trim_start_matches('✗')
+        .trim_start_matches('•')
+        .trim_start();
+    egui::Frame::none()
+        .fill(palette::tint(col, 28))
+        .stroke(egui::Stroke::new(1.0, palette::tint(col, 130)))
+        .rounding(egui::Rounding::same(6.0))
+        .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(glyph).color(col).strong());
+                ui.label(egui::RichText::new(body).color(col));
+            });
+        });
+}
+
+/// Render a one-line result message colored by outcome — green on success, red on
+/// failure (for any reason), dim for neutral/progress. The inline counterpart to
+/// [`status_banner`], used for the per-panel result lines (tokens, swaps, register…).
+fn status_label(ui: &mut egui::Ui, msg: &str) {
+    if msg.is_empty() {
+        return;
+    }
+    ui.label(egui::RichText::new(msg).color(status_color(tx_status(msg))));
+}
+
 /// Green for a named account, amber for an unnamed (implicit) one — the colors
 /// the wallet UI uses everywhere to delineate the two at a glance.
 fn named_color(named: bool) -> egui::Color32 {
     if named {
-        egui::Color32::from_rgb(90, 200, 130)
+        palette::SUCCESS
     } else {
-        egui::Color32::from_rgb(230, 170, 60)
+        palette::WARNING
     }
 }
 
@@ -1463,12 +1641,12 @@ impl Station {
             let msg = send_payment(&rpc, seed, &from, &to, grains, &params, &action)
                 .map(|id| {
                     format!(
-                        "sent {} XUS to {to} (tx {})",
+                        "✓ sent {} XUS to {to} (tx {})",
                         xus(&grains.to_string()),
                         &id[..id.len().min(14)]
                     )
                 })
-                .unwrap_or_else(|e| format!("send failed: {e}"));
+                .unwrap_or_else(|e| format!("✗ send failed: {e}"));
             finish(&action, &msg);
             record(&activity, &msg);
             ctx.request_repaint();
@@ -2884,7 +3062,7 @@ impl Station {
             }
         });
         if !tv.message.is_empty() {
-            ui.label(egui::RichText::new(&tv.message).weak());
+            status_label(ui, &tv.message);
         }
 
         if do_prev {
@@ -3021,8 +3199,8 @@ impl Station {
                 to: to_id,
             };
             let msg = submit_action(&rpc, seed, &signer, action)
-                .map(|id| format!("issued token (tx {})", &id[..id.len().min(14)]))
-                .unwrap_or_else(|e| format!("issue failed: {e}"));
+                .map(|id| format!("✓ issued token (tx {})", &id[..id.len().min(14)]))
+                .unwrap_or_else(|e| format!("✗ issue failed: {e}"));
             record(&activity, &msg);
             set_token_view_msg(&view, &ctx, &msg);
         });
@@ -3059,8 +3237,8 @@ impl Station {
                 amount: Balance::from_grains(grains),
             };
             let msg = submit_action(&rpc, seed, &signer, action)
-                .map(|id| format!("sent token (tx {})", &id[..id.len().min(14)]))
-                .unwrap_or_else(|e| format!("token send failed: {e}"));
+                .map(|id| format!("✓ sent token (tx {})", &id[..id.len().min(14)]))
+                .unwrap_or_else(|e| format!("✗ token send failed: {e}"));
             record(&activity, &msg);
             set_token_view_msg(&view, &ctx, &msg);
         });
@@ -3217,7 +3395,7 @@ impl Station {
                         kv(ui, "Timeout height", &timeout.to_string());
                     });
             } else if !sv.message.is_empty() {
-                ui.label(egui::RichText::new(&sv.message).weak());
+                status_label(ui, &sv.message);
             }
         }
         ui.horizontal(|ui| {
@@ -3284,8 +3462,8 @@ impl Station {
                 timeout_height: timeout,
             };
             let msg = submit_action(&rpc, seed, &signer, action)
-                .map(|id| format!("HTLC opened — id = {id}"))
-                .unwrap_or_else(|e| format!("lock failed: {e}"));
+                .map(|id| format!("✓ HTLC opened — id = {id}"))
+                .unwrap_or_else(|e| format!("✗ lock failed: {e}"));
             record(&activity, &msg);
             set_swap_view_msg(&view, &ctx, &msg);
         });
@@ -3359,8 +3537,8 @@ impl Station {
                 preimage: secret.into_bytes(),
             };
             let msg = submit_action(&rpc, seed, &signer, action)
-                .map(|id| format!("HTLC claimed (tx {})", &id[..id.len().min(14)]))
-                .unwrap_or_else(|e| format!("claim failed: {e}"));
+                .map(|id| format!("✓ HTLC claimed (tx {})", &id[..id.len().min(14)]))
+                .unwrap_or_else(|e| format!("✗ claim failed: {e}"));
             record(&activity, &msg);
             set_swap_view_msg(&view, &ctx, &msg);
         });
@@ -3383,8 +3561,8 @@ impl Station {
             };
             let action = Action::HtlcRefund { htlc_id };
             let msg = submit_action(&rpc, seed, &signer, action)
-                .map(|id| format!("HTLC refunded (tx {})", &id[..id.len().min(14)]))
-                .unwrap_or_else(|e| format!("refund failed: {e}"));
+                .map(|id| format!("✓ HTLC refunded (tx {})", &id[..id.len().min(14)]))
+                .unwrap_or_else(|e| format!("✗ refund failed: {e}"));
             record(&activity, &msg);
             set_swap_view_msg(&view, &ctx, &msg);
         });
@@ -3579,7 +3757,7 @@ impl Station {
             }
             if !self.keystore_msg.is_empty() {
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new(&self.keystore_msg).weak());
+                status_label(ui, &self.keystore_msg);
             }
             if do_generate {
                 self.generate_wallet();
@@ -4197,7 +4375,7 @@ impl Station {
                     );
                 }
                 if !self.operate_msg.is_empty() {
-                    ui.label(egui::RichText::new(&self.operate_msg).weak());
+                    status_label(ui, &self.operate_msg);
                 }
             });
 
@@ -4664,7 +4842,7 @@ impl Station {
                     do_broadcast = true;
                 }
                 if !self.ofl_msg.is_empty() {
-                    ui.label(egui::RichText::new(&self.ofl_msg).weak());
+                    status_label(ui, &self.ofl_msg);
                 }
             });
         }
@@ -4735,35 +4913,55 @@ impl Station {
                 });
         }
 
-        // Action status.
+        // Action status — a spinner while broadcasting, then a green (success) or red
+        // (failure) banner so the result of a sent transaction is unmistakable.
         ui.add_space(8.0);
         let (busy, msg) = self
             .action
             .lock()
             .map(|a| (a.busy, a.message.clone()))
             .unwrap_or((false, String::new()));
-        ui.horizontal(|ui| {
-            if busy {
+        if busy {
+            ui.horizontal(|ui| {
                 ui.spinner();
-            }
-            if !msg.is_empty() {
-                ui.label(&msg);
-            }
-        });
+                if !msg.is_empty() {
+                    ui.label(egui::RichText::new(&msg).color(palette::TEXT_DIM));
+                }
+            });
+        } else {
+            status_banner(ui, &msg);
+        }
 
-        // Activity log — a running history of submitted actions with their txids.
+        // Activity feed — a running history of submitted actions, each line timestamped
+        // and colored by outcome (green = succeeded, red = failed). Open by default so
+        // you can always see what just happened.
         let log = self.activity.lock().map(|l| l.clone()).unwrap_or_default();
         if !log.is_empty() {
             ui.add_space(4.0);
-            egui::CollapsingHeader::new(format!("Activity ({})", log.len()))
-                .default_open(false)
+            egui::CollapsingHeader::new(format!("Recent activity ({})", log.len()))
+                .default_open(true)
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("activity_log")
-                        .max_height(140.0)
+                        .max_height(160.0)
                         .show(ui, |ui| {
                             for line in &log {
-                                ui.label(egui::RichText::new(line).monospace().size(11.0));
+                                let (time, body) =
+                                    line.split_once('\t').unwrap_or(("", line.as_str()));
+                                let col = status_color(tx_status(body));
+                                ui.horizontal_wrapped(|ui| {
+                                    if !time.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(time)
+                                                .monospace()
+                                                .size(11.0)
+                                                .color(palette::TEXT_DIM),
+                                        );
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(body).monospace().size(11.0).color(col),
+                                    );
+                                });
                             }
                         });
                     if ui.button("Clear").clicked() {
@@ -4805,7 +5003,7 @@ impl Station {
             }
         });
         if !self.keystore_msg.is_empty() {
-            ui.label(egui::RichText::new(&self.keystore_msg).weak());
+            status_label(ui, &self.keystore_msg);
         }
 
         // Dispatch collected actions (after the UI borrows end).
@@ -5078,7 +5276,9 @@ fn finish(action: &Arc<Mutex<ActionState>>, msg: &str) {
 /// Append a line to the activity log (newest first), capped so it stays bounded.
 fn record(activity: &Arc<Mutex<Vec<String>>>, msg: &str) {
     if let Ok(mut log) = activity.lock() {
-        log.insert(0, msg.to_string());
+        // `time\tmessage` — the feed renders the time dim and colors the message by
+        // outcome (see `tx_status`); the tab keeps the two cleanly separable.
+        log.insert(0, format!("{}\t{}", clock_hms(), msg));
         log.truncate(100);
     }
 }
@@ -6395,6 +6595,7 @@ pub fn run(rpc: String) -> Result<(), String> {
         "SOV Station",
         options,
         Box::new(move |cc| {
+            install_theme(&cc.egui_ctx);
             spawn_poller(poll_snap, poll_cfg, cc.egui_ctx.clone());
             Ok(Box::new(Station::new(snapshot, config)))
         }),
@@ -6469,6 +6670,35 @@ mod tests {
             assert!(!s.contains(','), "{s} must be parseable by parse_xus");
             assert_eq!(parse_xus(&s), Some(g), "round-trip {g}");
         }
+    }
+
+    #[test]
+    fn tx_status_colors_success_green_and_any_failure_red() {
+        // Success: the ✓ convention.
+        assert!(matches!(
+            tx_status("✓ sent 5 XUS to alice.sov (tx ab12cd34)"),
+            TxStatus::Ok
+        ));
+        assert!(matches!(tx_status("✓ HTLC opened — id = ff00"), TxStatus::Ok));
+        // Failure with the ✗ marker.
+        assert!(matches!(
+            tx_status("✗ send failed: insufficient balance"),
+            TxStatus::Err
+        ));
+        // Failure WITHOUT a marker still goes red — the "for any reason" guarantee.
+        assert!(matches!(
+            tx_status("send failed: node unreachable"),
+            TxStatus::Err
+        ));
+        assert!(matches!(tx_status("issue failed: bad symbol"), TxStatus::Err));
+        assert!(matches!(
+            tx_status("insufficient balance for shielded value"),
+            TxStatus::Err
+        ));
+        assert!(matches!(tx_status("invalid recipient: …"), TxStatus::Err));
+        // Neutral / in-progress stays dim (not green, not red).
+        assert!(matches!(tx_status("broadcasting signed tx…"), TxStatus::Info));
+        assert!(matches!(tx_status("scanning the shielded pool…"), TxStatus::Info));
     }
 
     #[test]
