@@ -1,103 +1,190 @@
-# SOV testnet runbook
+# SOV node runbook
 
-A real, multi-node SOV network you operate with the **`sov-testnet`** tool. It
-mints real keys, writes the genesis + per-node configs, and launches, monitors,
-funds, and stops nodes — cross-platform (macOS, Windows, Linux) from one binary.
+A real, multi-node SOV network you operate with the **`sov-testnet`** tool and the
+headless **`sov-rpcd`** daemon. `sov-testnet` mints real keys, writes the genesis +
+per-node configs, and can launch/monitor/fund/stop nodes; `sov-rpcd` is the single
+long-running node process you put under `systemd` on a server. Both are the SAME
+node the desktop app (`sov-station`) embeds — identical consensus, mining, sync,
+and difficulty.
 
-The protocol is N-validator and permissionless: a block finalizes only once **more
-than two-thirds of stake** approves it, and any peer that presents the right
-chain-id + genesis hash handshakes in and is discovered gossip-style. The default
-two equal-stake validators are *true 2-of-2 BFT* — both must be online to finalize.
+The protocol is **pure Nakamoto proof-of-work** and permissionless:
 
-> **No keys are shipped in this repo.** You generate them locally with `gen`; the
-> output directory (keys, configs, block logs) is yours and secret. Regenerate any
+- Fork choice is **heaviest cumulative work**; ties break deterministically (smaller
+  block hash), so independent miners converge on one chain.
+- There is **no stake, no committee, no approvals, no quorum**. Finality is
+  probabilistic: a block is reported **final at 6-confirmation depth** (`FINALITY_DEPTH`).
+- Any peer presenting the right **chain-id + genesis hash** authenticates into the
+  network (transport is **Noise + X25519 + ML-KEM-768**, ChaCha20-Poly1305 — encrypted
+  and post-quantum hybrid), then discovers the rest gossip-style.
+- A joining node **downloads to the network tip before it mines** (sync-gated), so it
+  never mines its own fork. Mining is a continuous grind on the live tip; rewards are
+  proportional to hashpower. Per-block **LWMA-1** difficulty tracks the live hashrate
+  and converges to the target block time without oscillation.
+
+> **No keys are shipped in this repo.** You generate them locally with `gen`/`join`;
+> the output directory (keys, configs, block logs) is yours and secret. Regenerate any
 > time — nothing here is pre-baked.
 
 ## Build
 
 ```sh
-# from chain/ — produces sov-testnet, sov-rpcd, sov-wallet, sov-rpc-miner
+# from chain/ — produces sov-testnet, sov-rpcd, sov-wallet, sov-rpc-miner, sov-katgen
 cargo build --release -p sov-rpc --bins
-export PATH="$PWD/target/release:$PATH"   # so `sov-testnet` is on PATH (Windows: add to Path)
+export PATH="$PWD/target/release:$PATH"   # so the tools are on PATH (Windows: add to Path)
 ```
 
-The CI matrix builds + tests on Linux, macOS, and Windows, so the Windows binary is
-the same code. On Windows use the MSVC toolchain (`rustup default stable-msvc`).
+The CI matrix builds + tests on Linux, macOS, and Windows, so the Windows binary is the
+same code. On Windows use the MSVC toolchain (`rustup default stable-msvc`).
 
-## A. Local loopback testnet (one machine — e.g. this laptop)
+## A. Local network on one machine
 
-Both validators on `127.0.0.1`, ideal for intermittent testing on a single box:
+Both nodes on `127.0.0.1`, ideal for development on a single box:
 
 ```sh
-sov-testnet gen --validators 2 --out ./tn   # mint real keys + genesis + configs
-sov-testnet up   --out ./tn                  # launch node-1 (seed) and node-2 (peer)
-sov-testnet status --out ./tn                # height / finality / mempool / balances
-
-# Fund and watch it finalize on BOTH nodes:
-sov-testnet faucet val01.node.sov 100 --out ./tn
-sov-testnet status --out ./tn                # head shows `final` on node-1 AND node-2
-
-sov-testnet down --out ./tn                  # stop both nodes
+sov-testnet gen    --miners 2 --out ./tn   # mint real keys + genesis + per-node configs
+sov-testnet up     --out ./tn              # launch node-1 (seed) and node-2 (peer), real sov-rpcd
+sov-testnet status --out ./tn              # height / head / final-depth / mempool / balances
+sov-testnet down   --out ./tn              # stop both nodes
 ```
 
-`gen` writes to `--out`: `chain-spec.json` (identical on every node; its hash gates
-the handshake), `node-K/node-config.json` + `node-K/keystore.json` per validator,
-and `testnet.json` (the operator manifest). It prints each validator's seed once —
-record them; they control real signing keys.
+`gen` writes to `--out`: `chain-spec.json` (identical on every node; its hash gates the
+handshake), `node-K/node-config.json` + `node-K/keystore.json` per miner, and
+`testnet.json` (the operator manifest). It prints each miner's seed once — record them;
+they control real signing keys.
 
-## B. Real two-machine LAN testnet (Mac seed + Windows peer)
+Useful `gen` flags:
 
-1. **Generate once, on the seed machine:** `sov-testnet gen --validators 2 --out ./tn`.
-2. **Copy `./tn` to the second machine** (byte-for-byte — a mismatched genesis hash
-   is rejected at the handshake, by design).
-3. **Point the peer at the seed.** On the Windows box, edit
-   `tn/node-2/node-config.json` → `"bootstrap_peers": ["<MAC_LAN_IP>:9645"]`
-   (find the Mac IP with `ipconfig getifaddr en0`). Leave node-1 (`bootstrap_peers: []`)
-   as the seed.
-4. **Firewall:** allow inbound TCP on the P2P port (9645 on the seed, 9646 on the
-   peer if both run locally; on the LAN each machine runs one node, so 9645). Keep
-   `rpc_addr` on `127.0.0.1` so JSON-RPC stays local; only the P2P port crosses the LAN.
-5. **Clocks:** enable automatic time (NTP) on both. SOV enforces a median-time-past
-   lower bound and a 2-hour future-drift upper bound on block timestamps, so a badly
-   skewed clock will have its blocks rejected.
-6. **Do not expose the P2P port to the open internet.** The handshake is authenticated
-   (same-chain + key proof) but the transport is not yet encrypted; for remote peers
-   use a private overlay (Tailscale/WireGuard), not port-forwarding.
+- `--miners N` — number of local miner nodes (default 2).
+- `--policy mainnet-like` (default) — **no pre-mine**: the whole 21M cap is mined via the
+  coinbase (12.5 XUS/block, 5%/2% founder/dev tax). `--policy test` is the plumbing-only
+  shortcut whose preset has no emission, so it pre-funds a faucet for spendable coins.
+- `--block-time-ms 60000` (default) — consensus target + daemon cadence. Use `150000`
+  for the exact mainnet cadence (~2.5-min blocks).
+- `--pow sha256d` (default; single-box friendly) or `--pow randomx` (the mainnet-fidelity,
+  ASIC-resistant seal — a full dress rehearsal).
 
-Start the seed (Mac): `sov-testnet up --out ./tn --node node-1`. Start the peer
-(Windows): `sov-testnet up --out ./tn --node node-2`. The peer dials the seed,
-handshakes, and syncs; from then on blocks and approvals gossip both ways.
+## B. Public seed node on a VPS (headless, systemd)
 
-## Intermittent operation (machines not on 24/7)
+This is the reliable way to "become a network": a always-on node with a **public IP and
+an open P2P port** is the bootstrap anchor every other node (home machines behind NAT or
+host firewalls, other VPSes) dials into. The P2P transport is authenticated + encrypted,
+so the port is safe to expose.
 
-This network is built to be turned off and on:
+**1. Generate the network once (anywhere) and copy it to the VPS.**
 
-- **Finality needs a quorum.** With 2-of-2, a block produced while one machine is
-  offline is **`pending`** until the other comes back, approves it, and the
-  finality evidence propagates — then both report `final`. (`status` shows this.)
-- **Restart safety.** Each node replays its persisted block + approval logs on
-  start, so ledger state *and* finality survive a restart.
-- **Catch-up + evidence sync.** A node that was offline pulls the blocks it missed
-  *and* the approvals that finalized them, so its view converges on finality — it
-  does not merely re-derive balances.
-- **Sleep/wake.** Blocks are timestamped at production with the real wall clock and
-  there are no empty blocks, so long idle gaps are fine as long as clocks stay on NTP.
-- **Start clean:** `sov-testnet reset --out ./tn` wipes block/approval logs (keeping
-  keys + genesis) to restart from height 0.
+```sh
+sov-testnet gen --miners 1 --policy mainnet-like --out ./net
+# copy ./net to the VPS, e.g.:
+scp -r ./net  user@SEED_PUBLIC_IP:/opt/sov/net
+scp target/release/sov-rpcd  user@SEED_PUBLIC_IP:/usr/local/bin/sov-rpcd
+```
+
+**2. On the VPS, bind P2P to all interfaces and keep RPC local.** Edit
+`/opt/sov/net/node-1/node-config.json`:
+
+```json
+{
+  "rpc_addr":  "127.0.0.1:8645",
+  "p2p_addr":  "0.0.0.0:9645",
+  "data_dir":  "/opt/sov/net/node-1/data",
+  "block_time_ms": 60000,
+  "bootstrap_peers": []
+}
+```
+
+Use an **absolute** `data_dir` so the unit doesn't depend on the working directory. Leave
+`bootstrap_peers` empty on the seed. The JSON-RPC API is **unauthenticated** — keep
+`rpc_addr` on `127.0.0.1` (reach it over an SSH tunnel) or firewall it; only the P2P port
+faces the internet.
+
+**3. Open the P2P port** (cloud security group + host firewall), e.g.:
+
+```sh
+sudo ufw allow 9645/tcp           # P2P only; do NOT open 8645 (RPC)
+```
+
+**4. Install the systemd unit** (`chain/testnet/sov-rpcd.service` in this repo). Edit the
+paths/`User`, then:
+
+```sh
+sudo cp chain/testnet/sov-rpcd.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now sov-rpcd
+journalctl -u sov-rpcd -f          # the SAME live log the desktop app shows
+```
+
+You'll see the node resume from `blocks.log`, the P2P + RPC listeners bind, and the mining
+loop: `⏳ connecting to peers…` → `▶ mining…` / `⏸ mining PAUSED — downloading…` →
+`⛏ mined block N`.
+
+**Restart safety:** every block is `fsync`'d to `data_dir/blocks.log` before it's
+acknowledged, so a SIGTERM (systemd stop/restart) or crash loses nothing committed — the
+node replays the log on boot. `Restart=always` is therefore safe.
+
+**Encrypted keystore (recommended on a server):**
+
+```sh
+sov-testnet encrypt-keystore --out /opt/sov/net   # seals keystore.json at rest
+# then set SOV_KEYSTORE_PASSPHRASE in the unit's environment (see the .service file)
+```
+
+## C. Join an existing network (another VPS, or your laptop)
+
+On any new machine, point it at the seed's **public** P2P address. `join` copies the frozen
+spec byte-for-byte and mints this machine's own post-quantum miner key:
+
+```sh
+sov-testnet join \
+  --spec  ./net/chain-spec.json \
+  --seed-peer SEED_PUBLIC_IP:9645 \
+  --name  miner.node.sov \
+  --rpc   127.0.0.1:8645 \
+  --p2p   0.0.0.0:9645 \
+  --out   ./join
+# then run it the same way (systemd on a server, or `sov-testnet up --out ./join`)
+```
+
+The node dials the seed, authenticates, **syncs to the tip, and only then mines** — so it
+joins the one chain and earns blocks in proportion to its hashpower. Add as many as you
+like; one good link to a seed is enough to join (discovery spreads the rest).
+
+> **Home machine behind a firewall/NAT:** outbound dials to the seed work even when inbound
+> is blocked, so a laptop/desktop can fully participate by dialing a VPS seed — it just
+> won't accept inbound peers itself. This is why a public seed node is the anchor.
+
+## Operating notes
+
+- **Restart safety.** `down`/stop then `up`/start (or a reboot) resumes height + ledger from
+  the fsync'd `blocks.log`. No state is re-derived from scratch beyond replay.
+- **Sleep/wake & idle.** Blocks carry the real wall clock; long idle gaps are fine as long as
+  clocks stay on NTP. Consensus enforces a median-time-past lower bound and a 2-hour
+  future-drift upper bound — a badly skewed clock has its blocks rejected. Enable NTP.
+- **Difficulty.** Per-block LWMA converges to the target block time; the first
+  `DIFFICULTY_WINDOW` (60) blocks mine at the genesis difficulty (warmup), then it tracks the
+  live hashrate. No epoch boundaries, no oscillation.
+- **Start clean:** `sov-testnet reset --out ./net` wipes the block log (keeping keys +
+  genesis) to restart from height 0. On a server, `systemctl stop sov-rpcd`, delete
+  `data_dir`, `systemctl start sov-rpcd`.
 
 ## Verify
 
-- **Handshake / propagation:** `sov-testnet faucet …` on either node; `status` shows
-  both nodes' height and balances track within a block interval.
-- **Quorum finality:** stop one node, `faucet` again → `status` shows the new head
-  `pending`; restart the node → it becomes `final` on both.
-- **Restart safety:** `down` then `up` → height and finality are unchanged.
+- **Mining + RPC:** `curl` the node (over an SSH tunnel for a server):
+  ```sh
+  curl -s -X POST http://127.0.0.1:8645 -H 'content-type: application/json' \
+    --data '{"jsonrpc":"2.0","id":1,"method":"sov_health","params":[]}'
+  # {"result":{"chainId":"sov-...","height":N,"mempool":0,"ok":true}}
+  ```
+  Useful methods: `sov_getHeight`, `sov_getDifficulty`, `sov_getSupply`, `sov_getMiners`,
+  `sov_getHead`, `sov_isFinal`.
+- **Propagation:** `sov-testnet status --out ./net` shows every node's height tracking within
+  a block interval; a head buried 6 deep reports `final`.
+- **No pre-mine:** `sov_getSupply` returns `mined == circulating == total` and grows only by
+  the block reward — genesis supply is zero on `mainnet-like`.
 
-## Exercise the real protocol
+## Exercise the protocol
 
 - Transfer / balance / nonce: `sov-wallet <rpc> …` (and `sov-wallet keygen <seed>`).
-- Mine (PoW): `sov-rpc-miner` against a node's RPC; `--shielded` mints into the
-  shielded pool.
+- Mine against a node's RPC with `sov-rpc-miner`; `--shielded` mints into the shielded pool.
 - HTLC atomic-swap claim/refund — the same actions the chain validates in consensus.
 - Point the explorer at a node's `rpc_addr` for live monitoring.
 

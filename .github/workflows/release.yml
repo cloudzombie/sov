@@ -100,8 +100,36 @@ jobs:
           name: macos
           path: dist/*.dmg
 
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: chain
+          cache-on-failure: true
+      - name: Build headless node daemon + chain helper (release)
+        run: |
+          cargo build --release --manifest-path chain/Cargo.toml --bin sov-rpcd --bin sov-testnet
+      - name: Stage Linux node bundle (for VPS / server deployment)
+        shell: bash
+        run: |
+          STAGE="dist/SOV-Node-Testnet"
+          mkdir -p "$STAGE"
+          cp chain/target/release/sov-rpcd "$STAGE/"
+          cp chain/target/release/sov-testnet "$STAGE/"
+          cp chain/testnet/sov-rpcd.service "$STAGE/"
+          cp chain/testnet/RUNBOOK.md "$STAGE/"
+          chmod +x "$STAGE/sov-rpcd" "$STAGE/sov-testnet"
+          cd dist && tar czf "SOV-Node-Testnet-${GITHUB_REF_NAME}-linux-x64.tar.gz" "SOV-Node-Testnet"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*.tar.gz
+
   release:
-    needs: [windows, macos]
+    needs: [windows, macos, linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -122,5 +150,11 @@ jobs:
               right-click → Open the first time (Gatekeeper).
             - **Windows:** `SOV-Station-Testnet-*-windows-x64.zip` — unzip and run
               `sov-station.exe`. Unsigned — SmartScreen → More info → Run anyway.
+            - **Linux (server / VPS):** `SOV-Node-Testnet-*-linux-x64.tar.gz` — the
+              headless `sov-rpcd` daemon + `sov-testnet` helper + a `systemd` unit and
+              runbook. Run a public **seed node** with `journalctl -u sov-rpcd -f`; see
+              `RUNBOOK.md` in the tarball.
 
-            The node runs **in-process** inside the app; closing the app stops it.
+            The desktop app runs the node **in-process**; closing the app stops it. The
+            Linux daemon runs standalone under systemd (`Restart=always`, resumes from
+            its fsync'd block log).

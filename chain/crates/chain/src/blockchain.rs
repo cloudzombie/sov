@@ -257,17 +257,16 @@ pub struct MinerStats {
     pub last_seen_height: u64,
 }
 
-/// Difficulty retarget WINDOW, in blocks: the trailing span the **per-block** retarget
-/// averages over. This is the Monero/Zcash model (Monero's LWMA uses ~60, Zcash's
-/// DigiShield ~17), NOT Bitcoin's 2016-block epoch. A short, per-block window lets
-/// difficulty track the LIVE hashrate within a handful of blocks, so the network
-/// self-regulates to `target_block_ms` for ANY number of miners joining or leaving at
-/// once — the property a continuous-grind chain needs to support many miners and a fair
-/// reward lottery. (Bitcoin's 2016-epoch can't follow a fast-changing miner set, which
-/// is why the old "sleep then mine" daemon had to throttle by hand and could not share
-/// blocks fairly between miners.) Genesis (height 0) and the first `DIFFICULTY_WINDOW`
-/// blocks carry the genesis difficulty, so the frozen genesis hash is unchanged.
-const DIFFICULTY_WINDOW: u64 = 17;
+/// LWMA difficulty window, in blocks — the trailing span the per-block **LWMA-1**
+/// retarget ([`Difficulty::lwma`]) averages over. This is Monero's value (60). LWMA is a
+/// linearly-weighted moving average: it tracks the live hashrate and converges smoothly
+/// to `target_block_ms`, WITHOUT the overshoot-and-oscillate failure of a naive per-block
+/// ratio retarget (which ramped difficulty 4×/block on a cold start, then produced
+/// minutes-long blocks, then crashed back — never settling). It lets the network
+/// self-regulate for any number of miners joining/leaving. Genesis (height 0) and the
+/// first `DIFFICULTY_WINDOW` blocks carry the genesis difficulty (warmup), so the frozen
+/// genesis hash is unchanged.
+const DIFFICULTY_WINDOW: u64 = 60;
 
 /// Snap a difficulty target to the value representable in Bitcoin's compact
 /// "nBits" form — the canonical on-chain target. Difficulty arithmetic produces
@@ -459,9 +458,10 @@ impl Blockchain {
 
     /// The proof-of-work target a block extending `parent` must use, derived
     /// purely from the parent's branch — so the rule holds on *any* branch, not
-    /// just the active chain. Difficulty is constant within an epoch and
-    /// recomputed at each [`RETARGET_INTERVAL`] boundary from that branch's
-    /// actual-vs-expected timespan (Bitcoin's model). The result is canonical
+    /// just the active chain. Difficulty is retargeted **every block** by
+    /// **LWMA-1** ([`Difficulty::lwma`]) over the trailing [`DIFFICULTY_WINDOW`],
+    /// so the value tracks the live hashrate and converges smoothly to
+    /// `target_block_ms` without overshoot/oscillation. The result is canonical
     /// (snapped to the compact `nBits` grid).
     fn expected_target(&self, parent: &BlockIndexEntry) -> Target {
         let height = parent.height + 1;
@@ -471,49 +471,35 @@ impl Blockchain {
         if height <= DIFFICULTY_WINDOW {
             return parent.sha_target;
         }
-        // PER-BLOCK retarget (Zcash DigiShield / Monero LWMA family): set the next
-        // target from the ACTUAL time the last `DIFFICULTY_WINDOW` blocks took versus the
-        // time they SHOULD have taken. Faster-than-target ⇒ harder; slower ⇒ easier. The
-        // trailing-window average damps single-block jitter and the retarget's 4× clamp
-        // bounds any one step, so difficulty tracks the live hashrate smoothly and
-        // responsively — converging to `target_block_ms` within a few blocks no matter
-        // how many miners are grinding.
-        let window_start = self.ancestor_at_height(parent, height - 1 - DIFFICULTY_WINDOW);
-        let actual = parent
-            .block
-            .header
-            .timestamp_ms
-            .saturating_sub(window_start.block.header.timestamp_ms)
-            .max(1);
-        let expected = self
-            .mining
-            .target_block_ms
-            .saturating_mul(DIFFICULTY_WINDOW)
-            .max(1);
-        canonical_target(
-            Difficulty::from_target(parent.sha_target)
-                .retarget(actual, expected)
-                .to_target(),
-        )
-    }
-
-    /// Walk `from`'s ancestry (via parent links in the index) down to the block at
-    /// `target_height`. Used by the per-block retarget to reach the start of the
-    /// difficulty window; the ancestor is always within `DIFFICULTY_WINDOW` of `from`
-    /// and therefore indexed.
-    fn ancestor_at_height<'a>(
-        &'a self,
-        from: &'a BlockIndexEntry,
-        target_height: u64,
-    ) -> &'a BlockIndexEntry {
-        let mut entry = from;
-        while entry.height > target_height {
-            entry = self
+        // PER-BLOCK retarget by LWMA-1 (Monero/Zcash-family). Collect the last
+        // `DIFFICULTY_WINDOW` blocks' difficulties and their solve times (oldest first),
+        // walking parent links — all are within the window and therefore indexed. The
+        // block just *before* the window supplies the oldest in-window block's solve time.
+        let n = DIFFICULTY_WINDOW as usize;
+        let mut entries: Vec<&BlockIndexEntry> = Vec::with_capacity(n);
+        let mut cur = parent;
+        for _ in 0..n {
+            entries.push(cur);
+            cur = self
                 .index
-                .get(&entry.block.header.prev_hash)
+                .get(&cur.block.header.prev_hash)
                 .expect("ancestor within the difficulty window is always indexed");
         }
-        entry
+        // `entries` is newest-first and `cur` is now the pre-window block; flip to
+        // oldest-first so the LWMA weights line up (recent solve times weigh most).
+        entries.reverse();
+        let mut diffs: Vec<u128> = Vec::with_capacity(n);
+        let mut solvetimes: Vec<u64> = Vec::with_capacity(n);
+        let mut prev_ts = cur.block.header.timestamp_ms;
+        for e in &entries {
+            let ts = e.block.header.timestamp_ms;
+            solvetimes.push(ts.saturating_sub(prev_ts));
+            diffs.push(Difficulty::from_target(e.sha_target).0);
+            prev_ts = ts;
+        }
+        canonical_target(
+            Difficulty::lwma(&diffs, &solvetimes, self.mining.target_block_ms).to_target(),
+        )
     }
 
     /// Recompute the active head's *next-block* difficulty and cache it in the
@@ -2075,6 +2061,61 @@ mod tests {
                 "difficulty is constant within an epoch"
             );
         }
+    }
+
+    #[test]
+    fn lwma_retargets_past_the_warmup_window() {
+        // End-to-end proof that the per-block LWMA retarget is WIRED into consensus
+        // (not just the standalone Difficulty::lwma unit test): mine through the
+        // DIFFICULTY_WINDOW warmup at the target cadence, then feed FAST blocks and
+        // confirm difficulty RISES above genesis and stays BOUNDED (no 4×/block
+        // explosion), then feed SLOW blocks and confirm it comes back DOWN. This is
+        // the exact behavior whose absence let block 167 grind for 24 minutes.
+        let mut chain = fresh_chain();
+        let genesis_difficulty = chain.sha256d_difficulty().0;
+        let target_ms = MiningPolicy::test().target_block_ms; // 1000
+
+        // Warmup: mine a full window at exactly the target cadence. Difficulty is
+        // pinned to genesis throughout (the `height <= DIFFICULTY_WINDOW` branch).
+        let mut ts = 1_000u64;
+        for _ in 0..DIFFICULTY_WINDOW {
+            ts += target_ms;
+            let b = chain.produce_block(vec![], ts).unwrap();
+            chain.import_block(b).unwrap();
+            assert_eq!(
+                chain.sha256d_difficulty().0,
+                genesis_difficulty,
+                "difficulty pinned to genesis during warmup"
+            );
+        }
+
+        // Fast blocks: 2× faster than target ⇒ LWMA must raise difficulty toward ~2×.
+        for _ in 0..DIFFICULTY_WINDOW {
+            ts += target_ms / 2;
+            let b = chain.produce_block(vec![], ts).unwrap();
+            chain.import_block(b).unwrap();
+        }
+        let fast_difficulty = chain.sha256d_difficulty().0;
+        assert!(
+            fast_difficulty > genesis_difficulty,
+            "fast blocks must RAISE difficulty: {fast_difficulty} vs genesis {genesis_difficulty}"
+        );
+        assert!(
+            fast_difficulty < genesis_difficulty.saturating_mul(8),
+            "difficulty must stay BOUNDED (no per-block explosion): {fast_difficulty}"
+        );
+
+        // Slow blocks: 4× slower than target ⇒ difficulty must fall back down.
+        for _ in 0..DIFFICULTY_WINDOW {
+            ts += target_ms * 4;
+            let b = chain.produce_block(vec![], ts).unwrap();
+            chain.import_block(b).unwrap();
+        }
+        let slow_difficulty = chain.sha256d_difficulty().0;
+        assert!(
+            slow_difficulty < fast_difficulty,
+            "slow blocks must LOWER difficulty: {slow_difficulty} vs fast {fast_difficulty}"
+        );
     }
 
     #[test]
