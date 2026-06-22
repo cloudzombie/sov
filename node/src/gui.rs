@@ -67,6 +67,9 @@ struct BlockRow {
     height: u64,
     /// The block header's wall-clock timestamp (Unix ms), surfaced in the Blocks tab.
     timestamp_ms: u64,
+    /// The proof-of-work nonce that sealed this block — the literal "work"
+    /// surfaced in the Mining tab's recent-proofs list.
+    nonce: u64,
     miner: String,
     reward: String,
     miner_amount: String,
@@ -85,6 +88,13 @@ struct Snapshot {
     supply_mined: String,
     supply_total: String,
     difficulty: String,
+    /// Proof-of-work seal in force ("Sha256d" / "RandomX"), the consensus target
+    /// block interval, and the head block's winning nonce + compact target — the
+    /// raw "how work is proven" facts surfaced in the Mining tab.
+    pow_algo: String,
+    target_block_ms: u64,
+    head_nonce: Option<u64>,
+    head_bits: Option<u32>,
     mempool: Option<usize>,
     reward: String,
     miners: Vec<MinerRow>,
@@ -364,6 +374,37 @@ fn status_label(ui: &mut egui::Ui, msg: &str) {
     ui.label(egui::RichText::new(msg).color(status_color(tx_status(msg))));
 }
 
+/// A small colored pill identifying the network (e.g. `● TESTNET · SHA-256d`),
+/// tinted amber for testnet / green for mainnet — the at-a-glance "where am I".
+fn network_badge(ui: &mut egui::Ui, net: Network) {
+    let col = net.color();
+    egui::Frame::none()
+        .fill(palette::tint(col, 30))
+        .stroke(egui::Stroke::new(1.0, palette::tint(col, 150)))
+        .rounding(egui::Rounding::same(10.0))
+        .inner_margin(egui::Margin::symmetric(9.0, 3.0))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!("● {} · {}", net.label(), net.pow_algo()))
+                    .small()
+                    .strong()
+                    .color(col),
+            );
+        });
+}
+
+/// A small tinted status pill (e.g. `PRIVATE`, `PUBLIC`) in the given signal color.
+fn pill(ui: &mut egui::Ui, text: &str, col: egui::Color32) {
+    egui::Frame::none()
+        .fill(palette::tint(col, 30))
+        .stroke(egui::Stroke::new(1.0, palette::tint(col, 150)))
+        .rounding(egui::Rounding::same(10.0))
+        .inner_margin(egui::Margin::symmetric(9.0, 3.0))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).small().strong().color(col));
+        });
+}
+
 /// Green for a named account, amber for an unnamed (implicit) one — the colors
 /// the wallet UI uses everywhere to delineate the two at a glance.
 fn named_color(named: bool) -> egui::Color32 {
@@ -470,6 +511,10 @@ fn poll(client: &RpcClient, cfg: &Config) -> Snapshot {
     s.height = client.height().ok();
     if let Ok(head) = client.head() {
         s.head_hash = head.hash().to_hex();
+        // The head block's proof of work: the nonce a miner found and the compact
+        // target it had to beat. These are the literal "work" of Nakamoto consensus.
+        s.head_nonce = Some(head.header.nonce);
+        s.head_bits = Some(head.header.bits);
     }
     if let Ok(v) = client.call("sov_getStateRoot", json!({})) {
         s.state_root = v.as_str().unwrap_or_default().to_string();
@@ -488,6 +533,8 @@ fn poll(client: &RpcClient, cfg: &Config) -> Snapshot {
     }
     if let Ok(v) = client.call("sov_getDifficulty", json!({})) {
         s.difficulty = field(&v, "sha256d");
+        s.pow_algo = field(&v, "algo");
+        s.target_block_ms = v.get("targetBlockMs").and_then(Value::as_u64).unwrap_or(0);
     }
     s.mempool = client.mempool_size().ok();
     if let Ok(r) = client.mint_reward() {
@@ -563,6 +610,7 @@ fn block_row(height: u64, digest: &Value) -> BlockRow {
             .get("timestampMs")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        nonce: digest.get("nonce").and_then(Value::as_u64).unwrap_or(0),
         ..Default::default()
     };
     let cb = digest.get("coinbase");
@@ -1087,6 +1135,7 @@ enum Tab {
     Tokens,
     Swaps,
     Blocks,
+    Activity,
 }
 
 /// The network the app is pointed at. Wallets are key material and work on ANY
@@ -2529,6 +2578,7 @@ impl eframe::App for Station {
                 ui.selectable_value(&mut self.tab, Tab::Tokens, "Tokens");
                 ui.selectable_value(&mut self.tab, Tab::Swaps, "Swaps");
                 ui.selectable_value(&mut self.tab, Tab::Blocks, "Blocks");
+                ui.selectable_value(&mut self.tab, Tab::Activity, "Activity");
             });
             ui.add_space(4.0);
         });
@@ -2605,6 +2655,11 @@ impl eframe::App for Station {
                         .show(ui, |ui| self.swaps_panel(ui));
                 }
                 Tab::Blocks => blocks_panel(ui, &snap),
+                Tab::Activity => {
+                    egui::ScrollArea::vertical()
+                        .id_salt("scroll_activity")
+                        .show(ui, |ui| self.activity_panel(ui));
+                }
             }
         });
 
@@ -2812,21 +2867,204 @@ fn node_panel(ui: &mut egui::Ui, s: &Snapshot) {
     }
 }
 
+/// "1.23 MH/s" — a human hashrate from hashes-per-second.
+fn fmt_hashrate(hps: f64) -> String {
+    if hps >= 1e9 {
+        format!("{:.2} GH/s", hps / 1e9)
+    } else if hps >= 1e6 {
+        format!("{:.2} MH/s", hps / 1e6)
+    } else if hps >= 1e3 {
+        format!("{:.2} kH/s", hps / 1e3)
+    } else {
+        format!("{hps:.0} H/s")
+    }
+}
+
+/// Friendly name for the raw PoW algo string the node reports.
+fn pow_algo_display(raw: &str) -> &str {
+    match raw {
+        "Sha256d" => "SHA-256d",
+        "RandomX" => "RandomX",
+        "" => "—",
+        other => other,
+    }
+}
+
+/// Average gap (ms) between recent blocks' timestamps (newest-first) — the observed
+/// block time, for the cadence + hashrate estimate. `None` with fewer than two blocks.
+fn avg_block_interval_ms(blocks: &[BlockRow]) -> Option<u64> {
+    let mut total = 0u64;
+    let mut n = 0u64;
+    for w in blocks.windows(2) {
+        if w[0].timestamp_ms > w[1].timestamp_ms {
+            total += w[0].timestamp_ms - w[1].timestamp_ms;
+            n += 1;
+        }
+    }
+    (n > 0).then(|| total / n)
+}
+
+/// A bordered section card (the cohesive container used across the richer panels).
+fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::group(ui.style())
+        .fill(palette::PANEL)
+        .stroke(egui::Stroke::new(1.0, palette::BORDER))
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin::same(12.0))
+        .show(ui, add)
+        .inner
+}
+
 fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
     ui.heading("Mining");
-    ui.add_space(6.0);
-    egui::Grid::new("mining-kv")
-        .num_columns(2)
-        .spacing([24.0, 6.0])
-        .show(ui, |ui| {
-            kv(ui, "Block reward", &format!("{} XUS", xus(&s.reward)));
-            kv(ui, "Difficulty", &s.difficulty);
-            kv(
-                ui,
-                "Mempool",
-                &s.mempool.map(|m| m.to_string()).unwrap_or_default(),
+    ui.label(
+        egui::RichText::new(
+            "Proof of work: a miner hashes the block header with a changing nonce until the seal \
+             falls below the target. The winning nonce is the block's proof — one hash to verify, \
+             the whole network's effort to find.",
+        )
+        .weak()
+        .small(),
+    );
+    ui.add_space(8.0);
+
+    let diff = s.difficulty.parse::<f64>().ok();
+    let obs = avg_block_interval_ms(&s.blocks);
+
+    // ── Proof-of-Work card — the algorithm, difficulty, target, and the live proof ──
+    card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("PROOF OF WORK")
+                    .small()
+                    .color(palette::TEXT_DIM),
             );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(format!("⛏ {}", pow_algo_display(&s.pow_algo)))
+                        .strong()
+                        .color(palette::ACCENT_HI),
+                );
+            });
         });
+        ui.add_space(6.0);
+        egui::Grid::new("pow-kv")
+            .num_columns(2)
+            .spacing([24.0, 6.0])
+            .show(ui, |ui| {
+                kv(ui, "Difficulty", &s.difficulty);
+                if let Some(d) = diff {
+                    if d > 1.0 {
+                        kv(
+                            ui,
+                            "≈ work per block",
+                            &format!("{:.1} leading zero bits", d.log2()),
+                        );
+                    }
+                }
+                if let Some(nb) = s.head_bits {
+                    kv(ui, "Target (nBits)", &format!("0x{nb:08x}"));
+                }
+                if let Some(n) = s.head_nonce {
+                    kv(ui, "Head nonce (the proof)", &n.to_string());
+                }
+                if let Some(ms) = obs {
+                    kv(ui, "Observed block time", &format!("{:.1}s", ms as f64 / 1000.0));
+                }
+                if s.target_block_ms > 0 {
+                    kv(
+                        ui,
+                        "Target block time",
+                        &format!("{:.0}s", s.target_block_ms as f64 / 1000.0),
+                    );
+                }
+                if let (Some(d), Some(ms)) = (diff, obs) {
+                    if ms > 0 {
+                        kv(
+                            ui,
+                            "Est. network hashrate",
+                            &format!("≈ {}", fmt_hashrate(d / (ms as f64 / 1000.0))),
+                        );
+                    }
+                }
+                kv(
+                    ui,
+                    "Height",
+                    &s.height.map(|h| h.to_string()).unwrap_or_default(),
+                );
+                kv(ui, "Block reward", &format!("{} XUS", xus(&s.reward)));
+                kv(
+                    ui,
+                    "Mempool",
+                    &s.mempool.map(|m| m.to_string()).unwrap_or_default(),
+                );
+            });
+    });
+
+    // ── Latest block solved ──
+    if let Some(b) = s.blocks.first() {
+        ui.add_space(8.0);
+        card(ui, |ui| {
+            ui.label(
+                egui::RichText::new("LATEST BLOCK SOLVED")
+                    .small()
+                    .color(palette::TEXT_DIM),
+            );
+            ui.add_space(4.0);
+            egui::Grid::new("latest-block-kv")
+                .num_columns(2)
+                .spacing([24.0, 6.0])
+                .show(ui, |ui| {
+                    kv(ui, "Height", &b.height.to_string());
+                    kv(ui, "Nonce", &b.nonce.to_string());
+                    kv(ui, "Solved", &block_time(b.timestamp_ms));
+                    kv(ui, "Miner", &short_id(&b.miner));
+                    if !s.head_hash.is_empty() {
+                        kv(ui, "Block hash", &short_id(&s.head_hash));
+                    }
+                    kv(ui, "Coinbase", &format!("{} XUS", xus(&b.reward)));
+                });
+        });
+    }
+
+    // ── Recent proofs of work — per-block nonces + solve cadence ──
+    if s.blocks.len() > 1 {
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("Recent proofs of work").strong());
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical()
+            .id_salt("recent-pow")
+            .max_height(180.0)
+            .show(ui, |ui| {
+                egui::Grid::new("recent-pow-grid")
+                    .num_columns(4)
+                    .striped(true)
+                    .spacing([18.0, 4.0])
+                    .show(ui, |ui| {
+                        for h in ["Height", "Interval", "Nonce", "Miner"] {
+                            ui.label(egui::RichText::new(h).weak());
+                        }
+                        ui.end_row();
+                        for (i, b) in s.blocks.iter().enumerate() {
+                            ui.monospace(b.height.to_string());
+                            let interval = s
+                                .blocks
+                                .get(i + 1)
+                                .and_then(|older| b.timestamp_ms.checked_sub(older.timestamp_ms));
+                            ui.monospace(
+                                interval
+                                    .map(|ms| format!("{:.1}s", ms as f64 / 1000.0))
+                                    .unwrap_or_else(|| "—".to_string()),
+                            );
+                            ui.monospace(b.nonce.to_string());
+                            ui.monospace(short_id(&b.miner));
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+
+    // ── Miner registry ──
     ui.add_space(10.0);
     ui.label(egui::RichText::new("Miner registry").strong());
     ui.add_space(4.0);
@@ -2844,7 +3082,7 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
                 ui.end_row();
             }
             for m in &s.miners {
-                ui.monospace(&m.account);
+                ui.monospace(short_id(&m.account));
                 ui.monospace(m.blocks.to_string());
                 ui.monospace(m.first.to_string());
                 ui.monospace(m.last.to_string());
@@ -3682,6 +3920,155 @@ impl Station {
         });
     }
 
+    /// The hero balance card — the first thing the Wallet tab shows: the selected
+    /// wallet's spendable balance in large type, its label + account, the network
+    /// badge, and live miner / watch-only / shielded-pool context. The at-a-glance
+    /// "how much do I have, and where" that a bank app leads with.
+    fn balance_card(&self, ui: &mut egui::Ui, s: &Snapshot) {
+        let Some(w) = self.wallets.get(self.selected) else {
+            return;
+        };
+        let label = w.label.clone();
+        let effective = w.effective_account();
+        let watch_only = w.watch_only;
+        let account = w.account.clone();
+        let bal = s
+            .accounts
+            .iter()
+            .find(|a| a.account == effective)
+            .map(|a| xus(&a.balance))
+            .unwrap_or_else(|| "—".to_string());
+        let named = is_named_account(&effective);
+        let is_miner = self.mining_account.as_deref() == Some(account.as_str());
+        // Shielded (private) balance for this wallet, if it has been scanned.
+        let shielded = self
+            .shielded
+            .lock()
+            .ok()
+            .filter(|v| v.account == effective && v.balance > 0)
+            .map(|v| grains_to_xus_plain(u128::from(v.balance)));
+
+        egui::Frame::group(ui.style())
+            .fill(palette::PANEL)
+            .stroke(egui::Stroke::new(1.0, palette::BORDER))
+            .rounding(egui::Rounding::same(10.0))
+            .inner_margin(egui::Margin::same(16.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("ACTIVE WALLET")
+                            .small()
+                            .color(palette::TEXT_DIM),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        network_badge(ui, self.network);
+                        if is_miner {
+                            ui.label(
+                                egui::RichText::new("⛏ mining")
+                                    .small()
+                                    .color(palette::SUCCESS),
+                            );
+                        }
+                        if watch_only {
+                            ui.label(
+                                egui::RichText::new("👁 watch-only")
+                                    .small()
+                                    .color(palette::TEXT_DIM),
+                            );
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(&bal)
+                            .size(34.0)
+                            .strong()
+                            .color(palette::TEXT),
+                    );
+                    ui.label(
+                        egui::RichText::new("XUS")
+                            .size(15.0)
+                            .color(palette::TEXT_DIM),
+                    );
+                    if let Some(sh) = &shielded {
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(format!("🛡 {sh} private"))
+                                .color(palette::ACCENT_HI),
+                        );
+                    }
+                });
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&label).strong().color(palette::LINK));
+                    ui.label(egui::RichText::new("·").color(palette::TEXT_DIM));
+                    ui.label(
+                        egui::RichText::new(short_id(&effective))
+                            .monospace()
+                            .color(palette::TEXT_DIM),
+                    );
+                    if named {
+                        ui.label(
+                            egui::RichText::new("✓ named")
+                                .small()
+                                .color(palette::SUCCESS),
+                        );
+                    }
+                });
+            });
+        ui.add_space(10.0);
+    }
+
+    /// The dedicated Activity tab — the full session history of submitted actions,
+    /// newest first, each line timestamped and colored by outcome (green succeeded /
+    /// red failed). The same feed the wallet shows, given room to breathe.
+    fn activity_panel(&self, ui: &mut egui::Ui) {
+        ui.heading("Activity");
+        ui.label(
+            egui::RichText::new(
+                "Every action you've submitted this session — newest first. Green where it \
+                 succeeded, red where it failed.",
+            )
+            .weak()
+            .small(),
+        );
+        ui.add_space(8.0);
+        let log = self.activity.lock().map(|l| l.clone()).unwrap_or_default();
+        if log.is_empty() {
+            ui.label(
+                egui::RichText::new(
+                    "No activity yet — send, shield, register a name, or open a swap and it shows here.",
+                )
+                .weak(),
+            );
+            return;
+        }
+        if ui.button("Clear").clicked() {
+            if let Ok(mut l) = self.activity.lock() {
+                l.clear();
+            }
+        }
+        ui.add_space(6.0);
+        card(ui, |ui| {
+            for line in &log {
+                let (time, body) = line.split_once('\t').unwrap_or(("", line.as_str()));
+                let col = status_color(tx_status(body));
+                ui.horizontal_wrapped(|ui| {
+                    if !time.is_empty() {
+                        ui.label(
+                            egui::RichText::new(time)
+                                .monospace()
+                                .size(11.0)
+                                .color(palette::TEXT_DIM),
+                        );
+                    }
+                    ui.label(egui::RichText::new(body).monospace().size(12.0).color(col));
+                });
+            }
+        });
+    }
+
     fn wallet_panel(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
         let ctx = ui.ctx().clone();
         ui.heading("Wallet");
@@ -3843,6 +4230,9 @@ impl Station {
                 w.operate_as = Some(named.account.clone());
             }
         }
+
+        // The hero balance card — prominent spendable balance + network badge, up top.
+        self.balance_card(ui, s);
 
         // ── Unsaved-wallets banner — nudge to persist before they can be lost ──
         if self.wallets_dirty && !self.wallets.is_empty() {
@@ -4854,47 +5244,90 @@ impl Station {
         // ── Send confirmation modal (review before broadcast) ──
         if let Some(p) = self.pending_send.clone() {
             let ctx = ui.ctx().clone();
-            egui::Window::new("Confirm send")
+            let network = self.network;
+            egui::Window::new(egui::RichText::new("Review transaction").strong())
                 .collapsible(false)
                 .resizable(false)
+                .default_width(450.0)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(&ctx, |ui| {
+                    ui.set_max_width(450.0);
+                    // Hero amount + privacy state — the two things that matter most.
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(xus(&p.amount_grains.to_string()))
+                                .size(28.0)
+                                .strong()
+                                .color(palette::TEXT),
+                        );
+                        ui.label(egui::RichText::new("XUS").size(14.0).color(palette::TEXT_DIM));
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if p.links_public {
+                                    pill(ui, "PUBLIC", palette::WARNING);
+                                } else {
+                                    pill(ui, "PRIVATE", palette::SUCCESS);
+                                }
+                            },
+                        );
+                    });
+                    ui.add_space(10.0);
                     egui::Grid::new("confirm_grid")
                         .num_columns(2)
-                        .spacing([14.0, 6.0])
+                        .spacing([16.0, 8.0])
                         .show(ui, |ui| {
                             kv(
                                 ui,
                                 "From",
                                 &format!("{} · {}", p.from_label, short_id(&p.from_account)),
                             );
-                            kv(ui, "To", &p.to);
-                            kv(
-                                ui,
-                                "Amount",
-                                &format!("{} XUS", xus(&p.amount_grains.to_string())),
+                            // Full recipient address, monospace + wrapped so it never overflows.
+                            ui.label(egui::RichText::new("To").weak());
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&p.to).monospace().size(11.0),
+                                )
+                                .wrap(),
                             );
+                            ui.end_row();
                             kv(ui, "Route", &p.route_label);
+                            kv(ui, "Network", &format!("{} · {}", network.label(), network.pow_algo()));
                         });
-                    if p.self_send {
-                        ui.colored_label(named_color(true), "This is one of your own addresses.");
-                    }
+                    ui.add_space(8.0);
+                    // Privacy + self-send context.
                     if p.links_public {
                         ui.colored_label(
-                            egui::Color32::from_rgb(230, 170, 60),
-                            "⚠ Public transfer — sender, recipient, and amount are visible \
-                             on-chain. Send to a xus1…/uxus1… address to keep it private.",
+                            palette::WARNING,
+                            "⚠ Public — sender, recipient, and amount are visible on-chain. Send \
+                             to a xus1…/uxus1… address to keep it private.",
                         );
                     } else {
                         ui.colored_label(
-                            named_color(true),
-                            "Private — recipient and amount are shielded.",
+                            palette::SUCCESS,
+                            "🛡 Private — recipient and amount are shielded on-chain.",
                         );
                     }
+                    if p.self_send {
+                        ui.colored_label(
+                            palette::TEXT_DIM,
+                            "↩ This is one of your own addresses.",
+                        );
+                    }
+                    ui.add_space(10.0);
                     ui.separator();
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .button(egui::RichText::new("Confirm & send").strong())
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("✓ Confirm & send")
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(palette::ACCENT),
+                            )
                             .clicked()
                         {
                             // A pool spend (sender hidden) goes through shielded_send;

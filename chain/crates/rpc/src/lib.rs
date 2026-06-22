@@ -588,6 +588,8 @@ fn call(node: &Arc<Mutex<Node>>, method: &str, params: &Value) -> Result<Value, 
                 json!({
                     "hash": to_value(b.hash()),
                     "timestampMs": b.header.timestamp_ms,
+                    "nonce": b.header.nonce,
+                    "bits": b.header.bits,
                     "txIds": b
                         .transactions
                         .iter()
@@ -601,8 +603,13 @@ fn call(node: &Arc<Mutex<Node>>, method: &str, params: &Value) -> Result<Value, 
         "sov_getStateRoot" => Ok(json!(node.chain().ledger().state_root().to_hex())),
         "sov_getDifficulty" => {
             let c = node.chain();
+            // The proof-of-work seal in force (SHA-256d on dev/test, RandomX on
+            // mainnet) and the next-block difficulty, so a client can show exactly
+            // how work is being proven without guessing from the chain id.
             Ok(json!({
                 "sha256d": c.sha256d_difficulty().0.to_string(),
+                "algo": format!("{:?}", c.mining_policy().pow_algo),
+                "targetBlockMs": c.mining_policy().target_block_ms,
             }))
         }
         "sov_getMintReward" => Ok(to_value(node.chain().mint_reward())),
