@@ -2079,8 +2079,8 @@ impl Station {
             }
             Some(_) => {
                 ui.colored_label(
-                    egui::Color32::from_rgb(230, 170, 60),
-                    "● 0 peers (solo) — mining still works; set a seed peer to join another machine",
+                    egui::Color32::from_rgb(225, 75, 75),
+                    "● 0 peers — NOT connected. Set the other machine's address above + Connect.",
                 );
             }
             None => {
@@ -2496,7 +2496,9 @@ impl eframe::App for Station {
         }
 
         // Keep the live view ticking even without input events.
-        ctx.request_repaint_after(Duration::from_millis(1000));
+        // Repaint frequently so the connection/sync status, peer count, height, and
+        // logs update LIVE (not stale) — the operator sees peers connect in real time.
+        ctx.request_repaint_after(Duration::from_millis(300));
     }
 }
 
@@ -2579,42 +2581,49 @@ fn node_panel(ui: &mut egui::Ui, s: &Snapshot) {
             );
         });
     ui.add_space(8.0);
-    // Sync status: the join-progress line the operator watches. While catching up it
-    // shows a concrete target (our height → the peer chain height); once level it
-    // confirms the node is on the network tip and mining.
+    // Connection/sync status — color-coded and LIVE (the UI repaints continuously):
+    //   GREEN  = solid peer connection(s), at the tip, mining
+    //   ORANGE = connected but catching up (syncing)
+    //   RED    = NOT connected (0 peers) or offline/error
+    const GREEN: egui::Color32 = egui::Color32::from_rgb(70, 200, 110);
+    const ORANGE: egui::Color32 = egui::Color32::from_rgb(235, 165, 55);
+    const RED: egui::Color32 = egui::Color32::from_rgb(225, 75, 75);
     if s.online {
         let local_h = s.height.unwrap_or(0);
         let best = s.best_peer_height.unwrap_or(0);
+        let peers = s.peers.unwrap_or(0);
         if s.syncing {
             let behind = best.saturating_sub(local_h);
             ui.label(
                 egui::RichText::new(format!(
-                    "⟳ Syncing — downloading the existing chain: {local_h} / {best}  ({behind} behind, mining paused)"
+                    "⟳ SYNCING — {local_h} / {best}  ({behind} behind) — downloading from {peers} peer(s)"
                 ))
-                .color(egui::Color32::from_rgb(230, 170, 60))
+                .color(ORANGE)
                 .strong(),
             );
-        } else if s.peers.unwrap_or(0) > 0 {
+        } else if peers > 0 {
             ui.label(
-                egui::RichText::new(format!("✓ Synced — on the network tip at height {local_h}, mining"))
-                    .color(egui::Color32::from_rgb(90, 200, 130))
-                    .strong(),
+                egui::RichText::new(format!(
+                    "● CONNECTED — {peers} peer(s), synced at height {local_h}, mining"
+                ))
+                .color(GREEN)
+                .strong(),
             );
         } else {
             ui.label(
                 egui::RichText::new(format!(
-                    "● Solo — no peers yet; mining at height {local_h}. Add a seed peer below to join others."
+                    "● NOT CONNECTED — 0 peers (height {local_h}). Set the OTHER machine's address \
+                     in the Seed peer field below and click Connect."
                 ))
-                .weak(),
+                .color(RED)
+                .strong(),
             );
         }
-    }
-    if !s.online {
+    } else {
         ui.label(
-            egui::RichText::new(
-                "No node reachable. Start a local node above, or point RPC at a running one.",
-            )
-            .weak(),
+            egui::RichText::new("● OFFLINE — no node running. Start a local node above.")
+                .color(RED)
+                .strong(),
         );
     }
 }
