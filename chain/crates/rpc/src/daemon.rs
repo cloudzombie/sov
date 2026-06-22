@@ -1056,13 +1056,12 @@ impl Daemon {
             // boot — making the very NEXT restart a tier-1 instant resume even if THIS
             // boot had to replay (no snapshot existed yet, or it was stale).
             let _ = block_time_ms; // block cadence now comes from difficulty, not a sleep
-            // Drop the mining thread to the LOWEST OS priority — mirroring Zcash's
-            // `THREAD_PRIORITY_LOWEST` miner. The scheduler then runs networking,
-            // handshakes, RPC, and the UI ABOVE proof-of-work, so mining consumes idle
-            // CPU but instantly yields and never starves the node's connectivity. Best
-            // effort: a platform that refuses leaves the duty-cycle throttle (below) as
-            // the safety net.
-            let _ = thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Min);
+            // NOTE: we deliberately do NOT lower this thread's OS priority. Doing so
+            // (v0.1.25) risked a PRIORITY INVERSION — the low-priority miner briefly holds
+            // the node lock (build/commit/snapshot) and a normal-priority networking thread
+            // waiting on that lock would be blocked by a thread the scheduler won't run,
+            // stalling peer connections. The duty-cycle THROTTLE below (a normal-priority
+            // thread that sleeps OFF the lock) frees CPU for networking without that risk.
             let mut last_snap_height = 0u64;
             // Track the mining phase so each transition (connecting → syncing → mining) is
             // logged once. `start_at` bounds the connect-before-mining grace window.

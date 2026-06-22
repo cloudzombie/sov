@@ -5907,33 +5907,32 @@ fn local_node_dir() -> PathBuf {
     std::env::temp_dir().join("sov-station-node")
 }
 
-/// The seed/bootstrap peer saved in the local node config (if any), so the Peer
-/// field is pre-filled and the node auto-dials it on every launch (Bitcoin-style:
-/// configure a seed once, then it is automatic).
+/// Where the seed/bootstrap peer address is persisted. CRITICAL: this lives OUTSIDE the
+/// node data dir, in the user's home directory, so that "Reset local chain" (which wipes
+/// the data dir) and a fresh install NEVER lose the configured peer — peer connection
+/// must survive a reset. Falls back to the temp dir if no home is available.
+fn peer_config_path() -> PathBuf {
+    let base = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(".sov-station-peer")
+}
+
+/// The seed/bootstrap peer the operator configured (if any), so the Peer field is
+/// pre-filled and the node auto-dials it on every launch (Bitcoin-style: configure a
+/// seed once, then it is automatic) — and, crucially, it persists across a chain reset.
 fn read_saved_peer() -> String {
-    std::fs::read_to_string(local_node_dir().join("node-1/node-config.json"))
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| {
-            v.get("bootstrap_peers")
-                .and_then(|b| b.as_array())
-                .and_then(|a| a.first())
-                .and_then(|s| s.as_str())
-                .map(String::from)
-        })
+    std::fs::read_to_string(peer_config_path())
+        .map(|s| s.trim().to_string())
         .unwrap_or_default()
 }
 
-/// Persist the seed/bootstrap peer into the local node config so a running node's
-/// choice survives restarts and is auto-dialed on every launch.
+/// Persist the seed/bootstrap peer outside the data dir so the operator's choice survives
+/// restarts, fresh installs, AND a "Reset local chain". (The per-launch node config still
+/// gets it via `build_and_run_node`, for the node process to dial.)
 fn save_peer(peer: &str) {
-    let cfg_path = local_node_dir().join("node-1/node-config.json");
-    if let Ok(text) = std::fs::read_to_string(&cfg_path) {
-        if let Ok(mut v) = serde_json::from_str::<Value>(&text) {
-            v["bootstrap_peers"] = if peer.is_empty() { json!([]) } else { json!([peer]) };
-            let _ = std::fs::write(&cfg_path, v.to_string());
-        }
-    }
+    let _ = std::fs::write(peer_config_path(), peer.trim());
 }
 
 /// Add an inbound Windows Defender Firewall allow-rule for this executable, so LAN
