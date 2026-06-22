@@ -199,6 +199,31 @@ impl MiningCandidate {
         }
         Err(ChainError::PowNotFound)
     }
+
+    /// Grind a BOUNDED batch of `count` nonces starting at `start`, returning the sealed
+    /// block if one meets the target within the batch, else `None`. This is the
+    /// continuous-mining primitive (the Monero/Zcash model): a node grinds batch after
+    /// batch on a template built on the CURRENT tip, and between batches it can cheaply
+    /// check for a new tip (a peer's block) or shutdown and abandon a stale template —
+    /// instead of committing to one expensive grind-to-completion. Block discovery is
+    /// thus a memoryless lottery at the chain's live difficulty: every miner has an equal
+    /// per-hash chance each instant, so many miners SHARE blocks fairly rather than the
+    /// node that got ahead lapping the others (the failure of fixed-interval mining).
+    pub fn try_seal_batch(&mut self, start: u64, count: u64) -> Option<Block> {
+        let end = start.saturating_add(count);
+        for nonce in start..end {
+            self.block.header.nonce = nonce;
+            let seal = Hash::from_bytes(sov_pow::pow_seal(
+                self.pow_algo,
+                self.pow_key.as_bytes(),
+                &self.block.header.pow_preimage(),
+            ));
+            if self.target.is_met_by(&seal) {
+                return Some(self.block.clone());
+            }
+        }
+        None
+    }
 }
 
 /// Configuration of the miner-signaled post-quantum sunset: the BIP-9/8
@@ -232,12 +257,17 @@ pub struct MinerStats {
     pub last_seen_height: u64,
 }
 
-/// Difficulty retargeting epoch, in blocks (Bitcoin's value). Difficulty is
-/// recomputed once per epoch from the epoch's actual vs expected timespan, not
-/// per block — so a short chain (or any sequence under one epoch) mines at the
-/// genesis difficulty, and difficulty can never swing more than the per-epoch
-/// 4× clamp.
-const RETARGET_INTERVAL: u64 = 2016;
+/// Difficulty retarget WINDOW, in blocks: the trailing span the **per-block** retarget
+/// averages over. This is the Monero/Zcash model (Monero's LWMA uses ~60, Zcash's
+/// DigiShield ~17), NOT Bitcoin's 2016-block epoch. A short, per-block window lets
+/// difficulty track the LIVE hashrate within a handful of blocks, so the network
+/// self-regulates to `target_block_ms` for ANY number of miners joining or leaving at
+/// once — the property a continuous-grind chain needs to support many miners and a fair
+/// reward lottery. (Bitcoin's 2016-epoch can't follow a fast-changing miner set, which
+/// is why the old "sleep then mine" daemon had to throttle by hand and could not share
+/// blocks fairly between miners.) Genesis (height 0) and the first `DIFFICULTY_WINDOW`
+/// blocks carry the genesis difficulty, so the frozen genesis hash is unchanged.
+const DIFFICULTY_WINDOW: u64 = 17;
 
 /// Snap a difficulty target to the value representable in Bitcoin's compact
 /// "nBits" form — the canonical on-chain target. Difficulty arithmetic produces
@@ -435,32 +465,42 @@ impl Blockchain {
     /// (snapped to the compact `nBits` grid).
     fn expected_target(&self, parent: &BlockIndexEntry) -> Target {
         let height = parent.height + 1;
-        if height >= RETARGET_INTERVAL && height % RETARGET_INTERVAL == 0 {
-            let epoch_start = self.ancestor_at_height(parent, height - RETARGET_INTERVAL);
-            let actual = parent
-                .block
-                .header
-                .timestamp_ms
-                .saturating_sub(epoch_start.block.header.timestamp_ms)
-                .max(1);
-            let expected = self
-                .mining
-                .target_block_ms
-                .saturating_mul(RETARGET_INTERVAL)
-                .max(1);
-            canonical_target(
-                Difficulty::from_target(parent.sha_target)
-                    .retarget(actual, expected)
-                    .to_target(),
-            )
-        } else {
-            parent.sha_target
+        // Warmup: until a full window of history exists, carry the parent's (ultimately
+        // the genesis) difficulty forward. Genesis (height 0) is therefore unaffected, so
+        // the frozen genesis hash is unchanged.
+        if height <= DIFFICULTY_WINDOW {
+            return parent.sha_target;
         }
+        // PER-BLOCK retarget (Zcash DigiShield / Monero LWMA family): set the next
+        // target from the ACTUAL time the last `DIFFICULTY_WINDOW` blocks took versus the
+        // time they SHOULD have taken. Faster-than-target ⇒ harder; slower ⇒ easier. The
+        // trailing-window average damps single-block jitter and the retarget's 4× clamp
+        // bounds any one step, so difficulty tracks the live hashrate smoothly and
+        // responsively — converging to `target_block_ms` within a few blocks no matter
+        // how many miners are grinding.
+        let window_start = self.ancestor_at_height(parent, height - 1 - DIFFICULTY_WINDOW);
+        let actual = parent
+            .block
+            .header
+            .timestamp_ms
+            .saturating_sub(window_start.block.header.timestamp_ms)
+            .max(1);
+        let expected = self
+            .mining
+            .target_block_ms
+            .saturating_mul(DIFFICULTY_WINDOW)
+            .max(1);
+        canonical_target(
+            Difficulty::from_target(parent.sha_target)
+                .retarget(actual, expected)
+                .to_target(),
+        )
     }
 
-    /// Walk `from`'s ancestry (via parent links in the index) down to the block
-    /// at `target_height`. Only reached at epoch boundaries, where the ancestor
-    /// is guaranteed present.
+    /// Walk `from`'s ancestry (via parent links in the index) down to the block at
+    /// `target_height`. Used by the per-block retarget to reach the start of the
+    /// difficulty window; the ancestor is always within `DIFFICULTY_WINDOW` of `from`
+    /// and therefore indexed.
     fn ancestor_at_height<'a>(
         &'a self,
         from: &'a BlockIndexEntry,
@@ -471,7 +511,7 @@ impl Blockchain {
             entry = self
                 .index
                 .get(&entry.block.header.prev_hash)
-                .expect("ancestor within an epoch is always indexed");
+                .expect("ancestor within the difficulty window is always indexed");
         }
         entry
     }

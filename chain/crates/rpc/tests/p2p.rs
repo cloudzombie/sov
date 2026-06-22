@@ -526,18 +526,28 @@ fn node_that_mined_its_own_multiblock_fork_recovers_by_deep_reorg() {
 
 #[test]
 fn two_miners_share_one_chain_and_both_earn_blocks() {
-    // THE end-to-end guarantee the operator is betting on: two nodes BOTH mining (each
-    // its own miner identity), connected as peers, must converge on ONE chain and each
-    // win blocks — rewards distributed between them — instead of fork-warring into two
-    // divergent chains ("the chain was lost as soon as both were mining"). This exercises
-    // the real production paths together: daemon mining (jittered cadence), P2P gossip +
-    // sync, the mining gate (don't extend while behind), and the deterministic fork-choice
+    // THE end-to-end guarantee: two nodes BOTH mining (each its own identity), peered,
+    // must converge on ONE chain and EACH win blocks — rewards shared — not fork-war or
+    // have one miner lap the other forever. This exercises the real production paths
+    // together: CONTINUOUS-GRIND mining (the Monero/Zcash model — a memoryless PoW lottery
+    // at the chain's live difficulty), the PER-BLOCK difficulty retarget (which regulates
+    // the rate to `target_block_ms` for any number of miners), P2P gossip + sync, the IBD
+    // gate (download first only when far behind), and the deterministic fork-choice
     // tie-break (equal-work competitors converge on the smaller hash).
-    let g = genesis_2op();
+    //
+    // Fairness here comes from the memoryless grind, NOT a timer: whoever's hashing finds
+    // the next block first wins, ~50/50 between equal miners — so over enough blocks BOTH
+    // appear as proposers regardless of who started first.
+    let g = {
+        let mut g = genesis_2op();
+        // Fast blocks so the difficulty converges and the test runs in seconds; far above
+        // loopback propagation, so both miners always race the same tip.
+        g.mining.target_block_ms = 250;
+        g
+    };
 
-    // Build a fully-live mining node: a daemon producing blocks via `run`, plus a P2P
-    // engine sharing ONE `SyncShared` so the miner is gated on sync. 100 ms blocks keep
-    // the test quick while leaving room for gossip to land between blocks.
+    // Build a fully-live mining node: a daemon CONTINUOUSLY grinding via `run`, plus a P2P
+    // engine sharing ONE `SyncShared` so the miner is gated only during a real download.
     let build_miner = |tag: &str, miner: &str, miner_seed: [u8; 32], p2p_seed: [u8; 32]| {
         let sync = Arc::new(SyncShared::new());
         let d = Daemon::new(
@@ -563,7 +573,7 @@ fn two_miners_share_one_chain_and_both_earn_blocks() {
         .with_sync_status(Arc::clone(&sync));
         let d = d.with_gossip(p2p.tcp()).with_sync_status(Arc::clone(&sync));
         let net = p2p.start();
-        let dae = d.run("127.0.0.1:0", 1, 100).unwrap();
+        let dae = d.run("127.0.0.1:0", 1, 0).unwrap(); // block_time_ms unused (difficulty governs)
         (dae, net)
     };
 
@@ -571,49 +581,44 @@ fn two_miners_share_one_chain_and_both_earn_blocks() {
     let (b_dae, b_net) = build_miner("two-b", "val02.node.sov", VAL02_SEED, [52; 32]);
     b_net.connect(&a_net.local_addr().to_string()).unwrap();
 
-    // Converge while BOTH mine: agree on a BURIED block (5 deep), which is robust against
-    // the live tip differing by a block mid-propagation. If they diverged into competing
-    // forks, this buried block would differ and the wait would time out.
-    let converged = wait_until(60, || {
+    // Wait until BOTH conditions hold: (1) the nodes are CONVERGED on one chain (they
+    // agree on a buried block), and (2) BOTH miners have earned blocks on it. Polling for
+    // fairness to MANIFEST is robust to the early difficulty-ramp blocks (won by whoever
+    // started first) — once difficulty converges, the memoryless grind shares blocks, so
+    // both proposers appear. If one miner could never win (the old bug), this times out.
+    let (val01, val02) = (id("val01.node.sov"), id("val02.node.sov"));
+    let fair = wait_until(90, || {
         let an = a_dae.node();
         let an = an.lock().unwrap();
         let bn = b_dae.node();
         let bn = bn.lock().unwrap();
         let (ah, bh) = (an.chain().height(), bn.chain().height());
-        if ah < 30 || bh < 30 {
+        if ah < 25 || bh < 25 {
             return false;
         }
-        let common = ah.min(bh).saturating_sub(5).max(1);
-        an.chain().block_by_height(common).map(|b| b.hash())
-            == bn.chain().block_by_height(common).map(|b| b.hash())
-    });
-    assert!(
-        converged,
-        "two miners converged on a single shared chain while both mining"
-    );
-
-    // Rewards are distributed between them: the agreed chain contains blocks proposed by
-    // BOTH miners. Over 25+ jittered blocks at ~50/50 odds, both appear (one winning all
-    // is ~1e-7). Scan the buried, agreed prefix on A.
-    let (val01, val02) = (id("val01.node.sov"), id("val02.node.sov"));
-    let (mut a_blocks, mut b_blocks) = (0u32, 0u32);
-    {
-        let an = a_dae.node();
-        let an = an.lock().unwrap();
-        let scan_to = an.chain().height().saturating_sub(5).max(1);
-        for height in 1..=scan_to {
-            if let Some(b) = an.chain().block_by_height(height) {
-                if b.header.proposer == val01 {
-                    a_blocks += 1;
-                } else if b.header.proposer == val02 {
-                    b_blocks += 1;
+        // Converged on one chain (agree on a buried block).
+        let common = ah.min(bh).saturating_sub(3).max(1);
+        let converged = an.chain().block_by_height(common).map(|b| b.hash())
+            == bn.chain().block_by_height(common).map(|b| b.hash());
+        if !converged {
+            return false;
+        }
+        // Both miners appear as proposers on the agreed chain (rewards shared).
+        let (mut a_won, mut b_won) = (false, false);
+        for height in 1..=ah {
+            if let Some(blk) = an.chain().block_by_height(height) {
+                if blk.header.proposer == val01 {
+                    a_won = true;
+                } else if blk.header.proposer == val02 {
+                    b_won = true;
                 }
             }
         }
-    }
+        a_won && b_won
+    });
     assert!(
-        a_blocks > 0 && b_blocks > 0,
-        "both miners earned blocks on the shared chain (val01={a_blocks}, val02={b_blocks})"
+        fair,
+        "two miners converged on one chain AND both earned blocks (fair shared mining)"
     );
 
     a_net.shutdown();

@@ -4,20 +4,41 @@
 //! network" that three parties touch:
 //!
 //! * the **P2P engine** ([`crate::p2p::P2p`]) is the sole *writer* — each tick it
-//!   records whether any authenticated peer advertises a heavier chain than ours,
-//!   the highest peer height it has seen, and how many peers are authenticated;
-//! * the **block-production loop** ([`crate::Daemon::run`]) *reads* it to GATE
-//!   mining: a node must not extend its own chain while it is still catching up to
-//!   a heavier peer chain — otherwise a freshly-joined node mines a competing fork
-//!   instead of joining the existing one, and only converges after a deep reorg.
-//!   This is the Nakamoto "don't mine during initial block download" rule;
+//!   records HOW MANY BLOCKS behind the best authenticated peer we are, the highest
+//!   peer height it has seen, and how many peers are authenticated;
+//! * the **block-production loop** ([`crate::Daemon::run`]) *reads* it to GATE mining
+//!   ONLY during a real initial download (far behind), via [`should_gate_mining`];
 //! * a co-located **UI** (the desktop app) *reads* it for a rolling status display
 //!   ("syncing 1208/8400" → "synced").
 //!
 //! Every field is an atomic, so a reader never blocks the node — the UI can poll it
 //! every frame and the miner can check it between blocks at zero contention.
+//!
+//! ## Why a *threshold*, not "behind at all"
+//!
+//! An earlier version gated mining whenever we were behind by ANY amount. With two
+//! miners that is fatal: the instant one wins a block the other is "1 behind", so it
+//! stops mining and only syncs — by the time it catches up the leader has mined again,
+//! so the follower NEVER gets to mine and the leader wins every block. A node that is a
+//! block or two behind is in a normal Nakamoto *race*, not an initial download; it must
+//! keep mining (fork choice + the deterministic tie-break converge the race). Only a
+//! node that is genuinely far behind (a fresh/rejoining node) should pause and download.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+/// How many blocks behind the best peer we tolerate before *pausing* mining to download.
+///
+/// This is **1**, and the value is load-bearing for fair multi-miner rewards. A node
+/// mines a block at `its_tip + 1`. For that block to COMPETE (and so have a ~50% chance
+/// to win via the fork-choice tie-break) it must land at the network tip height — i.e.
+/// the miner must be at most ONE block behind the tip when it mines. A node 2+ blocks
+/// behind would mine *below* the tip, on a shorter fork that is always orphaned, so it
+/// would burn work and never earn — exactly "fell behind almost instantly and never
+/// mines again". So: 0–1 behind ⇒ keep racing (blocks compete at the tip); 2+ behind ⇒
+/// pause and download until back within one. (The OLD rule "mine only when exactly level"
+/// was unreachable on a real network with any latency, which is why the follower never
+/// mined; "within one" is reachable as long as block time exceeds gossip propagation.)
+pub const MINING_GATE_LAG: u64 = 1;
 
 /// A lock-free view of this node's sync position relative to its authenticated peers.
 /// Cloneable behind an [`Arc`](std::sync::Arc); construct one, hand a clone to the
@@ -26,9 +47,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 /// [`with_sync_status`](crate::p2p::P2p::with_sync_status)), and read it anywhere.
 #[derive(Debug, Default)]
 pub struct SyncShared {
-    /// Some authenticated peer advertises strictly more cumulative work than our
-    /// local chain — i.e. we are still catching up and must NOT mine yet.
-    behind: AtomicBool,
+    /// How many blocks behind the best authenticated peer we are (0 if at/ahead of the
+    /// tip). Block production pauses only when this exceeds [`MINING_GATE_LAG`].
+    behind_blocks: AtomicU64,
     /// Highest block height advertised by any authenticated peer (0 if none).
     best_peer_height: AtomicU64,
     /// Number of peers that have completed the authenticated handshake.
@@ -36,25 +57,36 @@ pub struct SyncShared {
 }
 
 impl SyncShared {
-    /// A fresh telemetry handle: not behind, no peers known yet.
+    /// A fresh telemetry handle: at the tip, no peers known yet.
     pub fn new() -> Self {
         Self::default()
     }
 
     /// **(writer — P2P engine.)** Publish the latest peer view in one shot.
-    pub fn update(&self, behind: bool, best_peer_height: u64, authed_peers: usize) {
-        self.behind.store(behind, Ordering::Relaxed);
+    pub fn update(&self, behind_blocks: u64, best_peer_height: u64, authed_peers: usize) {
+        self.behind_blocks.store(behind_blocks, Ordering::Relaxed);
         self.best_peer_height
             .store(best_peer_height, Ordering::Relaxed);
         self.authed_peers.store(authed_peers, Ordering::Relaxed);
     }
 
-    /// Whether we are still catching up to a heavier peer chain. Block production is
-    /// gated on this being `false`, so a node syncs the existing chain before it
-    /// mines instead of extending a competing fork. A solo node (no heavier peer)
-    /// is never "behind", so it mines normally and bootstraps the network.
+    /// How many blocks behind the best authenticated peer we are (0 = at/ahead of tip).
+    pub fn behind_blocks(&self) -> u64 {
+        self.behind_blocks.load(Ordering::Relaxed)
+    }
+
+    /// Whether block production should PAUSE to download (a real initial sync), i.e. we
+    /// are more than [`MINING_GATE_LAG`] blocks behind the tip. A node racing at the tip
+    /// (0–`LAG` behind) keeps mining, so two miners share blocks instead of one lapping
+    /// the other; a far-behind joiner pauses and catches up instead of forking.
+    pub fn should_gate_mining(&self) -> bool {
+        self.behind_blocks() > MINING_GATE_LAG
+    }
+
+    /// Whether we are strictly behind the tip at all (any amount). For UI nuance only —
+    /// the *gate* uses [`should_gate_mining`].
     pub fn is_behind(&self) -> bool {
-        self.behind.load(Ordering::Relaxed)
+        self.behind_blocks() > 0
     }
 
     /// Highest block height advertised by any authenticated peer (0 if none).
@@ -73,24 +105,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_to_not_behind_with_no_peers() {
-        // A node with no peers (a fresh seed) must be free to mine — `is_behind`
-        // is false by default, so block production is never gated on having peers.
+    fn defaults_to_at_tip_with_no_peers() {
+        // A node with no peers (a fresh seed) must be free to mine — never gated.
         let s = SyncShared::new();
+        assert!(!s.should_gate_mining());
         assert!(!s.is_behind());
         assert_eq!(s.best_peer_height(), 0);
         assert_eq!(s.authed_peers(), 0);
     }
 
     #[test]
-    fn update_is_readable() {
+    fn a_one_block_race_does_not_pause_mining() {
+        // THE fairness guarantee: a node a block or two behind is racing, not doing an
+        // initial download — it must keep mining so two miners share blocks instead of
+        // the leader lapping the follower.
         let s = SyncShared::new();
-        s.update(true, 8_400, 2);
-        assert!(s.is_behind());
-        assert_eq!(s.best_peer_height(), 8_400);
-        assert_eq!(s.authed_peers(), 2);
-        // Catching up clears the gate.
-        s.update(false, 8_405, 2);
-        assert!(!s.is_behind());
+        s.update(1, 100, 1);
+        assert!(s.is_behind(), "it is strictly behind by one");
+        assert!(
+            !s.should_gate_mining(),
+            "but a 1-block deficit is a race, not an initial download — keep mining"
+        );
+        s.update(MINING_GATE_LAG, 100, 1);
+        assert!(!s.should_gate_mining(), "exactly at the lag is still racing");
+    }
+
+    #[test]
+    fn a_far_behind_joiner_pauses_to_download() {
+        let s = SyncShared::new();
+        s.update(MINING_GATE_LAG + 1, 5_000, 1);
+        assert!(
+            s.should_gate_mining(),
+            "more than the lag behind = initial download, pause mining"
+        );
+        // Caught up to within the race window: mining resumes.
+        s.update(0, 5_000, 1);
+        assert!(!s.should_gate_mining());
     }
 }

@@ -258,13 +258,14 @@ impl P2p {
                     state.handle(&tcp, &node, &config, peer, msg);
                 }
                 state.request_missing(&tcp, &node);
-                // Publish live telemetry every poll: are we behind a heavier peer (gates
-                // the miner), the best peer height, and the DISTINCT authenticated-peer
-                // count (so the UI never shows a redundant link as a ghost). Cheap — a few
-                // map scans + atomic stores, no extra locks.
-                let (behind, best, peers) = state.telemetry(&node);
+                // Publish live telemetry every poll: how many blocks behind the tip we are
+                // (gates the miner only during a real download, not a 1-block race), the
+                // best peer height, and the DISTINCT authenticated-peer count (so the UI
+                // never shows a redundant link as a ghost). Cheap — map scans + atomic
+                // stores, no extra locks.
+                let (behind_blocks, best, peers) = state.telemetry(&node);
                 if let Some(s) = &sync_status {
-                    s.update(behind, best, peers);
+                    s.update(behind_blocks, best, peers);
                 }
                 // Reclaim slots from peers that connected but never authenticated
                 // (zombie-eclipse defense), and reap dead half-open connections to a
@@ -1035,18 +1036,22 @@ impl SyncState {
         self.inflight.is_some()
     }
 
-    /// Snapshot the node's sync position for [`SyncShared`]: `(behind, best_peer_height,
-    /// distinct_peers)`.
+    /// Snapshot the node's sync position for [`SyncShared`]: `(behind_blocks,
+    /// best_peer_height, distinct_peers)`.
     ///
-    /// * `behind` — some authenticated peer advertises strictly more cumulative work
-    ///   than our chain, so the miner must wait (we are catching up).
+    /// * `behind_blocks` — how many blocks below the tallest authenticated peer our head
+    ///   is (0 if at/ahead of the tip). The miner pauses only when this exceeds
+    ///   [`MINING_GATE_LAG`](crate::sync_status::MINING_GATE_LAG) — so a node racing at
+    ///   the tip (a block or two behind) keeps mining, while a far-behind joiner pauses
+    ///   to download. Height-based, so a sideways fork at the same height reads as 0
+    ///   behind (a race the fork-choice tie-break resolves), not a sync.
     /// * `best_peer_height` — the tallest authenticated peer chain we have heard of.
     /// * `distinct_peers` — the number of distinct authenticated node IDENTITIES, NOT
     ///   raw socket connections. A redundant inbound+outbound link to the same node
     ///   (briefly present before [`dedup_identity`](Self::dedup_identity) collapses it)
     ///   therefore never shows up as an extra "ghost" peer — the count the operator
     ///   sees is simply how many real remote nodes we are talking to.
-    fn telemetry(&self, node: &Mutex<Node>) -> (bool, u64, usize) {
+    fn telemetry(&self, node: &Mutex<Node>) -> (u64, u64, usize) {
         let distinct: HashSet<&AccountId> = self
             .identity
             .iter()
@@ -1060,15 +1065,9 @@ impl SyncState {
             .map(|(_, s)| s.height)
             .max()
             .unwrap_or(0);
-        let behind = match local_status(node) {
-            Some(local) => self
-                .peer_status
-                .iter()
-                .filter(|(p, _)| self.authenticated.contains(p))
-                .any(|(_, s)| s.chain_work > local.chain_work),
-            None => false,
-        };
-        (behind, best, distinct.len())
+        let local_height = local_status(node).map(|l| l.height).unwrap_or(0);
+        let behind_blocks = best.saturating_sub(local_height);
+        (behind_blocks, best, distinct.len())
     }
 }
 

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use argon2::Argon2;
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -645,18 +645,23 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// A randomized block-production wait around `base` ms: uniform in `[base/2, 3·base/2)`.
-/// De-correlates independent miners' phases so they do not emit competing equal-work
-/// blocks in lockstep (the cause of a reorg every round). The mean stays `~base`, so the
-/// difficulty retarget — which targets the mean block time — is unaffected. Models the
-/// memoryless (Poisson) nature of real proof-of-work discovery.
-fn jittered_wait_ms(base: u64) -> u64 {
-    if base <= 1 {
-        return base;
-    }
+/// How many nonces the continuous miner grinds per batch before pausing to check for a
+/// new tip or shutdown. Big enough that the per-batch bookkeeping (a non-blocking
+/// `try_lock`) is negligible, small enough that a peer's block is noticed within a few
+/// milliseconds (Sha256d) so no work is wasted on a stale template.
+const GRIND_BATCH: u64 = 16_384;
+
+/// How often the miner logs a "still searching" heartbeat while grinding a block, so the
+/// Node log shows live activity between blocks (which are ~`target_block_ms` apart)
+/// instead of going silent and looking hung.
+const MINING_HEARTBEAT: Duration = Duration::from_secs(10);
+
+/// A random 64-bit nonce start, so independent miners search different regions of the
+/// space rather than racing the same nonces (Monero/Bitcoin practice).
+fn random_nonce_start() -> u64 {
     let mut b = [0u8; 8];
     let _ = getrandom::getrandom(&mut b);
-    base / 2 + (u64::from_le_bytes(b) % base)
+    u64::from_le_bytes(b)
 }
 
 /// Append a timestamped mining diagnostic to the optional Node-log sink (the desktop
@@ -1016,122 +1021,31 @@ impl Daemon {
         let sync_status = self.sync_status.clone();
         let log = self.log.clone();
         let sd = Arc::clone(&shutdown);
-        let interval = block_time_ms.max(1);
 
         let produce = thread::spawn(move || {
             // Refresh the chainstate snapshot when the head advances by this many
             // blocks. Start at 0 so the just-loaded state is snapshotted soon after
             // boot — making the very NEXT restart a tier-1 instant resume even if THIS
             // boot had to replay (no snapshot existed yet, or it was stale).
+            let _ = block_time_ms; // block cadence now comes from difficulty, not a sleep
             let mut last_snap_height = 0u64;
             // Track the mining-gate state so a pause/resume is logged on TRANSITION (not
-            // every interval) — the operator sees exactly when/why mining stops & starts.
+            // every iteration) — the operator sees exactly when/why mining stops & starts.
             let mut was_behind = false;
+            // CONTINUOUS MINING (the Monero/Zcash/Bitcoin model, not "sleep then mine"):
+            // the node grinds proof of work on a template built on the CURRENT tip,
+            // batch after batch, abandoning the template the instant a better tip arrives.
+            // Block discovery is therefore a memoryless lottery at the chain's live
+            // difficulty — every miner has an equal per-hash chance each instant — so any
+            // number of miners SHARE blocks fairly instead of whoever-got-ahead lapping
+            // the rest (the fatal flaw of fixed-interval mining). The per-block difficulty
+            // retarget keeps the whole network at `target_block_ms` no matter how many
+            // miners join. Mining runs only when at the tip; a far-behind node downloads
+            // first (the IBD gate).
             while !sd.load(Ordering::SeqCst) {
-                // Wait a JITTERED interval (not a fixed one) so independent miners do not
-                // produce in lockstep. Two miners firing on the same fixed cadence emit
-                // competing equal-work blocks every round, which — even with a
-                // deterministic fork-choice tie-break — forces a reorg every round; with
-                // de-correlated phases one miner leads each round and the others adopt its
-                // block via the O(1) extend path, so reorgs become rare. The mean stays
-                // ~`interval`, so difficulty retargeting (which targets the mean) is
-                // unchanged. This models real PoW, where block discovery is a memoryless
-                // (Poisson) process, not a metronome. Sleep in small steps so shutdown is
-                // prompt.
-                let target = jittered_wait_ms(interval);
-                let mut waited = 0u64;
-                while waited < target && !sd.load(Ordering::SeqCst) {
-                    let step = target.saturating_sub(waited).min(50);
-                    thread::sleep(Duration::from_millis(step));
-                    waited += step;
-                }
-                if sd.load(Ordering::SeqCst) {
-                    break;
-                }
-                // Nakamoto cadence: EVERY mining node attempts a block each
-                // interval, empty or not — there is no proposer schedule; proof
-                // of work is the only authorization, and when two miners find
-                // competing blocks the heaviest-work fork choice resolves the
-                // race exactly as in Bitcoin.
-                //
-                // SYNC GATE (Nakamoto "no mining during initial block download"): while a
-                // heavier peer chain exists that we have not caught up to, do NOT mine —
-                // a joining node must download the existing chain, not extend its own
-                // competing fork from its local height (which only reconverges after a
-                // deep reorg, the "two chains / not indexing" failure). A solo node, or
-                // one already at the network's tip, is not behind and mines normally, so
-                // the network still bootstraps and never stalls. Re-checked every tick,
-                // so mining resumes the instant catch-up completes.
-                let behind = sync_status.as_ref().map(|s| s.is_behind()).unwrap_or(false);
-                // Log the gate transition so "not mining" is never a mystery: paused =>
-                // we are catching up to a heavier peer; resumed => caught up to the tip.
-                if behind != was_behind {
-                    if behind {
-                        let (h, peer) = {
-                            let local = node.lock().map(|n| n.chain().height()).unwrap_or(0);
-                            let best = sync_status
-                                .as_ref()
-                                .map(|s| s.best_peer_height())
-                                .unwrap_or(0);
-                            (local, best)
-                        };
-                        daemon_log(
-                            &log,
-                            format!(
-                                "⏸ mining PAUSED — catching up to a heavier peer (we're at {h}, peer at {peer})"
-                            ),
-                        );
-                    } else {
-                        let h = node.lock().map(|n| n.chain().height()).unwrap_or(0);
-                        daemon_log(&log, format!("▶ caught up — mining RESUMED at height {h}"));
-                    }
-                    was_behind = behind;
-                }
-                if !behind {
-                    // Build the candidate under a BRIEF lock, then grind the proof of
-                    // work OFF the lock so RPC and block import stay responsive while
-                    // this node mines — essential at mainnet/RandomX difficulty. Commit
-                    // the sealed block under another brief lock.
-                    let candidate = {
-                        let Ok(n) = node.lock() else { break };
-                        n.build_candidate(now_ms())
-                    };
-                    match candidate {
-                        Ok(candidate) => {
-                            if let Ok(sealed) = candidate.into_sealed_block() {
-                                if sd.load(Ordering::SeqCst) {
-                                    break;
-                                }
-                                let Ok(mut n) = node.lock() else { break };
-                                match n.commit_mined(sealed) {
-                                    Ok(produced) => {
-                                        let height = produced.block.header.height.get();
-                                        // Persist under the node lock (order == commit order).
-                                        let _ = block_log.append(&produced.block);
-                                        drop(n);
-                                        daemon_log(&log, format!("⛏ mined block {height}"));
-                                        if let Some(tcp) = &gossip {
-                                            tcp.broadcast(&NetMessage::NewBlock(
-                                                produced.block.clone(),
-                                            ));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        drop(n);
-                                        daemon_log(&log, format!("commit rejected: {e}"));
-                                    }
-                                }
-                            }
-                        }
-                        // A candidate that won't build (e.g. coinbase/emission edge) is the
-                        // silent "won't mine" case — surface it so it is never a mystery.
-                        Err(e) => daemon_log(&log, format!("could not build a block candidate: {e}")),
-                    }
-                }
                 // Periodic chainstate snapshot — keyed off the ACTIVE-head height, so it
-                // captures blocks this node IMPORTED from peers as well as ones it mined.
-                // Serialize under a brief lock, then fsync OFF the lock so mining, RPC,
-                // and block import aren't stalled by disk.
+                // captures blocks IMPORTED from peers as well as ones we mined. Serialize
+                // under a brief lock; the fsync happens off the lock.
                 let pending = {
                     let Ok(n) = node.lock() else { break };
                     let h = n.chain().height();
@@ -1141,6 +1055,118 @@ impl Daemon {
                 if let Some((h, bytes)) = pending {
                     if write_snapshot_bytes(&snap_path, &bytes).is_ok() {
                         last_snap_height = h;
+                    }
+                }
+
+                // IBD GATE: pause mining ONLY during a real initial download (many blocks
+                // behind), never during a 1-block race — otherwise the moment a peer wins
+                // a block we'd stop and only sync, and the leader would lap us forever.
+                // Within a block of the tip we keep grinding so our blocks compete at the
+                // tip height and rewards are shared.
+                let behind = sync_status
+                    .as_ref()
+                    .map(|s| s.should_gate_mining())
+                    .unwrap_or(false);
+                if behind != was_behind {
+                    if behind {
+                        let local = node.lock().map(|n| n.chain().height()).unwrap_or(0);
+                        let best = sync_status
+                            .as_ref()
+                            .map(|s| s.best_peer_height())
+                            .unwrap_or(0);
+                        daemon_log(
+                            &log,
+                            format!(
+                                "⏸ mining PAUSED — downloading the existing chain (we're at {local}, peer at {best})"
+                            ),
+                        );
+                    } else {
+                        let h = node.lock().map(|n| n.chain().height()).unwrap_or(0);
+                        daemon_log(&log, format!("▶ caught up — mining RESUMED at height {h}"));
+                    }
+                    was_behind = behind;
+                }
+                if behind {
+                    // Let the P2P engine download; don't grind a fork. Re-check shortly.
+                    let mut waited = 0u64;
+                    while waited < 200 && !sd.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(50));
+                        waited += 50;
+                    }
+                    continue;
+                }
+
+                // Build a template on the CURRENT tip (brief lock); grind OFF the lock.
+                let (mut candidate, tip) = {
+                    let Ok(n) = node.lock() else { break };
+                    let tip = n.chain().head().hash();
+                    match n.build_candidate(now_ms()) {
+                        Ok(c) => (c, tip),
+                        Err(e) => {
+                            drop(n);
+                            daemon_log(&log, format!("could not build a block candidate: {e}"));
+                            thread::sleep(Duration::from_millis(200));
+                            continue;
+                        }
+                    }
+                };
+
+                // Grind in bounded batches; between batches, abandon the template if
+                // shutdown is requested or the tip moved (we adopted a peer's block), so
+                // no work is wasted on a stale tip.
+                let mining_height = candidate.block().header.height.get();
+                let grind_started = Instant::now();
+                let mut last_beat = grind_started;
+                let mut nonce = random_nonce_start();
+                let mut sealed = None;
+                loop {
+                    if sd.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if let Some(block) = candidate.try_seal_batch(nonce, GRIND_BATCH) {
+                        sealed = Some(block);
+                        break;
+                    }
+                    nonce = nonce.wrapping_add(GRIND_BATCH);
+                    // Liveness heartbeat so the operator sees active mining between blocks.
+                    if last_beat.elapsed() >= MINING_HEARTBEAT {
+                        daemon_log(
+                            &log,
+                            format!(
+                                "⛏ mining block {mining_height} — searching for proof of work ({}s)",
+                                grind_started.elapsed().as_secs()
+                            ),
+                        );
+                        last_beat = Instant::now();
+                    }
+                    // A new tip? `try_lock` so a momentarily-busy node never stalls the grind.
+                    if let Ok(n) = node.try_lock() {
+                        if n.chain().head().hash() != tip {
+                            break; // rebuild on the new tip
+                        }
+                    }
+                }
+                let Some(sealed) = sealed else { continue }; // shutdown or new tip → rebuild
+                if sd.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                // Commit + persist under a brief lock (order == commit order); gossip off it.
+                {
+                    let Ok(mut n) = node.lock() else { break };
+                    match n.commit_mined(sealed) {
+                        Ok(produced) => {
+                            let height = produced.block.header.height.get();
+                            let _ = block_log.append(&produced.block);
+                            drop(n);
+                            daemon_log(&log, format!("⛏ mined block {height}"));
+                            if let Some(tcp) = &gossip {
+                                tcp.broadcast(&NetMessage::NewBlock(produced.block.clone()));
+                            }
+                        }
+                        // The tip moved between grind and commit (our block no longer
+                        // extends the head): not an error — rebuild next iteration.
+                        Err(_) => drop(n),
                     }
                 }
             }
@@ -1183,7 +1209,7 @@ mod tests {
         let spec = ChainSpec::from_json(TESTNET_1_SPEC).expect("frozen spec parses");
         assert_eq!(spec.chain_id, "sov-testnet-1");
         assert_eq!(spec.pow.as_deref(), Some("sha256d"));
-        assert_eq!(spec.block_time_ms, Some(60_000));
+        assert_eq!(spec.block_time_ms, Some(30_000));
         let genesis = spec
             .to_genesis_config()
             .expect("spec -> genesis config")
@@ -1404,8 +1430,8 @@ mod tests {
                 .as_nanos()
         ));
         let sync = Arc::new(SyncShared::new());
-        // Start gated: pretend an authenticated peer advertises a heavier chain.
-        sync.update(true, 100, 1);
+        // Start gated: pretend a peer is far ahead (100 blocks behind ⇒ initial download).
+        sync.update(100, 100, 1);
         let daemon = Daemon::new(
             &genesis,
             &dir,
@@ -1429,8 +1455,8 @@ mod tests {
             "a node behind a heavier peer must not mine its own fork"
         );
 
-        // Catch up: the gate clears and mining resumes.
-        sync.update(false, 100, 1);
+        // Catch up to the tip (0 behind): the gate clears and mining resumes.
+        sync.update(0, 100, 1);
         let mut resumed = false;
         for _ in 0..200 {
             if handle.node().lock().unwrap().chain().height() > 0 {

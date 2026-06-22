@@ -765,7 +765,10 @@ impl EmbeddedNode {
         SyncView {
             peers: self.sync.authed_peers(),
             best_peer_height: self.sync.best_peer_height(),
-            syncing: self.sync.is_behind(),
+            // "Syncing" = a real initial download (many blocks behind), not a 1-block
+            // race — so a node racing at the tip reads as "Synced", not perpetually
+            // "Syncing". Matches the mining gate exactly.
+            syncing: self.sync.should_gate_mining(),
         }
     }
 }
@@ -6136,14 +6139,11 @@ fn build_and_run_node(
         if !status.success() {
             return Err("`sov-testnet join` failed".to_string());
         }
-        // Watchable solo cadence (the genesis hash is unaffected by block time).
-        let cfg_path = node_dir.join("node-1/node-config.json");
-        if let Ok(text) = std::fs::read_to_string(&cfg_path) {
-            if let Ok(mut v) = serde_json::from_str::<Value>(&text) {
-                v["block_time_ms"] = json!(2000);
-                let _ = std::fs::write(&cfg_path, v.to_string());
-            }
-        }
+        // NOTE: block cadence is no longer a fixed sleep — the node mines CONTINUOUSLY
+        // and the per-block difficulty retarget regulates the rate to the genesis
+        // `block_time_ms` (30 s for testnet-1) for any number of miners, so the
+        // node-config `block_time_ms` is intentionally left untouched (unused by the
+        // continuous miner).
     }
 
     // Point the node's keystore at this wallet's account+seed, so the coinbase
