@@ -964,6 +964,17 @@ impl Network {
             Network::Mainnet => egui::Color32::from_rgb(80, 200, 120),
         }
     }
+
+    /// The proof-of-work algorithm a node on this network mines with — shown next to
+    /// the network selector. Fixed per network by the chain-spec's `pow` (not an
+    /// independent choice): testnet runs **SHA-256d** (fast, single-box friendly);
+    /// mainnet runs **RandomX** (Monero's memory-hard, ASIC-resistant CPU PoW).
+    fn pow_algo(self) -> &'static str {
+        match self {
+            Network::Testnet => "SHA-256d",
+            Network::Mainnet => "RandomX",
+        }
+    }
 }
 
 impl Station {
@@ -2201,6 +2212,19 @@ impl eframe::App for Station {
                         Network::Testnet => self.switch_network(Network::Testnet),
                     }
                 }
+                // PoW algorithm for the selected network (fixed by its chain-spec, not a
+                // separate choice): SHA-256d on testnet, RandomX on mainnet. Shown so the
+                // operator always knows exactly what their CPU is mining.
+                ui.label(
+                    egui::RichText::new(format!("⛏ {}", self.network.pow_algo()))
+                        .strong()
+                        .color(egui::Color32::from_rgb(150, 190, 255)),
+                )
+                .on_hover_text(
+                    "Proof-of-work algorithm for this network. Testnet: SHA-256d (fast). \
+                     Mainnet: RandomX (Monero's memory-hard, ASIC-resistant CPU PoW). \
+                     Reward rate is proportional to your hashpower.",
+                );
                 ui.separator();
                 let (dot, label) = if snap.online {
                     (egui::Color32::from_rgb(60, 200, 90), "online")
