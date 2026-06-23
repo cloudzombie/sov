@@ -7548,6 +7548,16 @@ fn build_and_run_node(
             }
         }
     }
+    // Always refresh chain-spec.json from the EMBEDDED spec, so a new build's spec
+    // changes take effect on an EXISTING chain instead of being frozen at first-run.
+    // testnet-1's genesis is frozen (hash 5e9f3cc5…) and the de-shield limiter params
+    // are NOT genesis-header fields, so this never alters the genesis ⇒ the persisted
+    // chain still resumes, no reset. (`sov-testnet join` writes chain-spec.json as a
+    // verbatim passthrough of the spec, so the embedded spec IS the on-disk content —
+    // this just keeps the two consistent across upgrades.)
+    let spec_text = embedded_spec(spec_filename)?;
+    std::fs::write(node_dir.join("chain-spec.json"), spec_text)
+        .map_err(|e| format!("refresh chain-spec: {e}"))?;
     let spec = ChainSpec::from_json(&read(&node_dir.join("chain-spec.json"))?)
         .map_err(|e| format!("chain-spec: {e}"))?;
     let keystore = Keystore::from_encrypted_or_plain(&read(&node_dir.join("node-1/keystore.json"))?, None)

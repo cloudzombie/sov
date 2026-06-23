@@ -1338,7 +1338,7 @@ mod tests {
         let spec = ChainSpec::from_json(TESTNET_1_SPEC).expect("frozen spec parses");
         assert_eq!(spec.chain_id, "sov-testnet-1");
         assert_eq!(spec.pow.as_deref(), Some("sha256d"));
-        assert_eq!(spec.block_time_ms, Some(5_000));
+        assert_eq!(spec.block_time_ms, Some(30_000));
         assert_eq!(spec.difficulty_leading_zeros, Some(8));
         let genesis = spec
             .to_genesis_config()

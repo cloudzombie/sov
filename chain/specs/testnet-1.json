@@ -2,7 +2,7 @@
   "chain_id": "sov-testnet-1",
   "timestamp_ms": 1750000000000,
   "policy": "mainnet_like",
-  "block_time_ms": 5000,
+  "block_time_ms": 30000,
   "pow": "sha256d",
   "difficulty_leading_zeros": 8,
   "deshield_limit_sov": 1000000,

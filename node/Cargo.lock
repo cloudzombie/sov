@@ -4237,7 +4237,7 @@ dependencies = [
 
 [[package]]
 name = "sov-station"
-version = "0.1.39"
+version = "0.1.40"
 dependencies = [
  "chacha20poly1305",
  "eframe",
