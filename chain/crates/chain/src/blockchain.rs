@@ -675,6 +675,7 @@ impl Blockchain {
         // its RPC stays responsive while mining; this convenience method keeps
         // the one-shot build+grind path for tests and simple callers.
         self.build_candidate(transactions, timestamp_ms)?
+            .0
             .into_sealed_block()
     }
 
@@ -694,7 +695,7 @@ impl Blockchain {
         &self,
         transactions: Vec<SignedTransaction>,
         timestamp_ms: u64,
-    ) -> Result<MiningCandidate, ChainError> {
+    ) -> Result<(MiningCandidate, Vec<(SignedTransaction, String)>), ChainError> {
         let next_height = self.height() + 1;
         // The coinbase recipient this block credits: this node's configured
         // miner account if one is set, else the genesis default (a deterministic
@@ -734,9 +735,16 @@ impl Blockchain {
         };
         apply_coinbase(&mut probe, &selection_ctx)?;
         let mut included = Vec::new();
+        // Transactions that CANNOT be executed against the current state (e.g. a
+        // sender who cannot afford amount + fee). They are kept out of the block AND
+        // their reasons captured so the caller can EVICT them from the mempool + log
+        // why — otherwise a permanently-failing tx is silently re-tried every block,
+        // clogging the mempool and producing empty blocks.
+        let mut excluded: Vec<(SignedTransaction, String)> = Vec::new();
         for stx in transactions {
-            if apply_transaction(&mut probe, &stx, &selection_ctx).is_ok() {
-                included.push(stx);
+            match apply_transaction(&mut probe, &stx, &selection_ctx) {
+                Ok(_) => included.push(stx),
+                Err(e) => excluded.push((stx, e.to_string())),
             }
         }
 
@@ -771,12 +779,15 @@ impl Blockchain {
         // required value and decodes the same target.
         block.header.bits = sha_target.to_compact();
 
-        Ok(MiningCandidate {
-            block,
-            target: policy.sha256d_target,
-            pow_algo: self.mining.pow_algo,
-            pow_key: self.genesis_hash,
-        })
+        Ok((
+            MiningCandidate {
+                block,
+                target: policy.sha256d_target,
+                pow_algo: self.mining.pow_algo,
+                pow_key: self.genesis_hash,
+            },
+            excluded,
+        ))
     }
 
     /// Validate `block` and fold it into the chain under **Nakamoto fork choice**:

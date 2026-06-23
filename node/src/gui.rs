@@ -5409,7 +5409,16 @@ impl Station {
                         .weak(),
                 );
             }
-            // Amount + Max + live validation against the spendable balance.
+            // Amount + Max + live validation. The network fee is RESERVED: a send must
+            // leave room for it (amount + fee ≤ balance), or the tx would fail execution
+            // ("cannot afford fee") and clog the mempool while blocks come up empty.
+            let fee = if route.private() {
+                s.fee_shielded_grains
+            } else {
+                s.fee_transfer_grains
+            };
+            // The most you can send while still covering the fee.
+            let sendable = spendable.saturating_sub(fee);
             let amount_grains = parse_xus(&self.send_amount);
             let amount_resp = ui
                 .horizontal(|ui| {
@@ -5419,27 +5428,37 @@ impl Station {
                     );
                     if ui
                         .button("Max")
-                        .on_hover_text("send the full spendable balance")
+                        .on_hover_text("send the most that still leaves room for the network fee")
                         .clicked()
                     {
-                        self.send_amount = grains_to_xus_plain(spendable);
+                        self.send_amount = grains_to_xus_plain(sendable);
                     }
-                    ui.label(
-                        egui::RichText::new(format!("balance {} XUS", xus(&spendable.to_string())))
-                            .weak(),
-                    );
+                    let note = if fee > 0 {
+                        format!(
+                            "balance {} XUS · fee ~{} XUS",
+                            xus(&spendable.to_string()),
+                            xus(&fee.to_string())
+                        )
+                    } else {
+                        format!("balance {} XUS", xus(&spendable.to_string()))
+                    };
+                    ui.label(egui::RichText::new(note).weak());
                     r
                 })
                 .inner;
-            let amount_err = match amount_grains {
+            let amount_err: Option<String> = match amount_grains {
                 None if !self.send_amount.trim().is_empty() => {
-                    Some("amount must be a number (e.g. 1.5)")
+                    Some("amount must be a number (e.g. 1.5)".to_string())
                 }
-                Some(0) => Some("amount must be greater than zero"),
-                Some(g) if g > spendable => Some("amount exceeds the spendable balance"),
+                Some(0) => Some("amount must be greater than zero".to_string()),
+                Some(g) if g > spendable => Some("amount exceeds your balance".to_string()),
+                Some(g) if g > sendable => Some(format!(
+                    "amount + network fee (~{} XUS) exceeds your balance — lower it or use Max",
+                    xus(&fee.to_string())
+                )),
                 _ => None,
             };
-            if let Some(e) = amount_err {
+            if let Some(e) = &amount_err {
                 ui.label(
                     egui::RichText::new(format!("✗ {e}"))
                         .small()
@@ -5448,7 +5467,7 @@ impl Station {
             }
             let busy = self.action.lock().map(|a| a.busy).unwrap_or(false);
             let can_send = route.is_valid()
-                && matches!(amount_grains, Some(g) if g > 0 && g <= spendable)
+                && matches!(amount_grains, Some(g) if g > 0 && g <= sendable)
                 && !busy;
             // Pressing Enter in the amount field reviews the send (same as the button).
             let submit_enter =

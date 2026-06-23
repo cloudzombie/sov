@@ -122,6 +122,7 @@ impl Node {
         // `commit_mined` (brief lock) — so RPC stays responsive while it mines.
         let block = self
             .build_candidate(timestamp_ms)?
+            .0
             .into_sealed_block()
             .map_err(NodeError::Chain)?;
         self.commit_mined(block)
@@ -132,7 +133,10 @@ impl Node {
     /// it touches no node state) and commits the result with
     /// [`commit_mined`](Self::commit_mined). This is the path the mining daemon
     /// uses to keep its JSON-RPC responsive while mining.
-    pub fn build_candidate(&self, timestamp_ms: u64) -> Result<MiningCandidate, NodeError> {
+    pub fn build_candidate(
+        &self,
+        timestamp_ms: u64,
+    ) -> Result<(MiningCandidate, Vec<(SignedTransaction, String)>), NodeError> {
         let batch = {
             let ledger = self.chain.ledger();
             self.mempool
@@ -141,6 +145,22 @@ impl Node {
         self.chain
             .build_candidate(batch, timestamp_ms)
             .map_err(NodeError::Chain)
+    }
+
+    /// Drop a transaction from the mempool by id. Used to EVICT a transaction the
+    /// block-builder found unminable (it failed execution against current state, so
+    /// it would be silently excluded from every block) — together with the reason
+    /// logged by the caller, this stops a permanently-failing tx from clogging the
+    /// mempool and producing empty blocks.
+    pub fn drop_tx(&mut self, id: &Hash) {
+        self.mempool.remove(id);
+    }
+
+    /// The current (confirmed) nonce of `account` — used to tell a FRONT-OF-LINE
+    /// unminable tx (its turn has come; it permanently fails) from one merely
+    /// blocked behind it (a nonce gap), so only the former is evicted.
+    pub fn account_nonce(&self, account: &AccountId) -> u64 {
+        self.chain.ledger().account(account).nonce
     }
 
     /// Commit a freshly-sealed block: import it through the same validated path as
@@ -368,6 +388,72 @@ mod tests {
             node.submit(bad),
             Err(NodeError::Unauthorized { .. })
         ));
+    }
+
+    #[test]
+    fn build_candidate_reports_a_tx_that_cannot_afford_the_fee_so_it_can_be_evicted() {
+        // The real "tx stuck while blocks are empty" case: with fees ON, a sender whose
+        // balance is below the intrinsic FEE produces a tx that is authorized (so it is
+        // admitted) but can never execute — `CannotAffordFee`. It must be kept OUT of the
+        // block AND reported with a reason, so the producer evicts it instead of silently
+        // re-trying it every block. (An *insufficient-balance* transfer, by contrast, is
+        // included as a failed receipt — fee + nonce consumed — so it does NOT clog.)
+        let poor_kp = Keypair::from_seed([7; 32]);
+        let mut mining = sov_mining::MiningPolicy::test();
+        mining.gas_price = Balance::from_grains(1); // fees ON ⇒ a transfer costs ~21,000 grains
+        let config = GenesisConfig {
+            chain_id: "sov-devnet".into(),
+            timestamp_ms: 0,
+            accounts: vec![
+                GenesisAccount {
+                    account: id("val01.node.sov"),
+                    key: Keypair::from_seed([1; 32]).public_key(),
+                    balance: Balance::ZERO,
+                },
+                GenesisAccount {
+                    account: id("poor.sov"),
+                    key: poor_kp.public_key(),
+                    balance: Balance::from_grains(100), // far below the fee
+                },
+            ],
+            mining,
+            vesting: vec![],
+        };
+        let chain = Blockchain::new(&config).unwrap();
+        let mut node = Node::new(chain, 1024, 256);
+        node.set_coinbase(id("val01.node.sov"));
+
+        let tx = SignedTransaction::sign(
+            Transaction {
+                signer: id("poor.sov"),
+                public_key: poor_kp.public_key(),
+                nonce: 0,
+                action: Action::Transfer {
+                    to: id("val01.node.sov"),
+                    amount: Balance::from_grains(1),
+                },
+            },
+            &poor_kp,
+        )
+        .unwrap();
+        let tx_id = tx.id();
+        node.submit(tx).expect("admitted: authorized + correct nonce");
+        assert_eq!(node.mempool_len(), 1);
+
+        let (candidate, excluded) = node.build_candidate(1).expect("build candidate");
+        assert!(
+            candidate.block().transactions.is_empty(),
+            "the unminable tx is kept out of the block"
+        );
+        assert_eq!(excluded.len(), 1, "it is reported as excluded");
+        assert_eq!(excluded[0].0.id(), tx_id);
+        assert!(!excluded[0].1.is_empty(), "with a non-empty reason");
+
+        // FRONT-OF-LINE (its nonce is the account's current nonce) ⇒ the producer evicts
+        // it; a tx merely blocked behind a gap would not be.
+        assert_eq!(node.account_nonce(&id("poor.sov")), 0);
+        node.drop_tx(&tx_id);
+        assert_eq!(node.mempool_len(), 0, "evicted → no longer clogs the mempool");
     }
 
     #[test]

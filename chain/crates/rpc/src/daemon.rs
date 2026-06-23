@@ -1205,10 +1205,35 @@ impl Daemon {
 
                 // Build a template on the CURRENT tip (brief lock); grind OFF the lock.
                 let (mut candidate, tip_height) = {
-                    let Ok(n) = node.lock() else { break };
+                    let Ok(mut n) = node.lock() else { break };
                     let h = n.chain().height();
                     match n.build_candidate(now_ms()) {
-                        Ok(c) => (c, h),
+                        Ok((c, excluded)) => {
+                            // EVICT front-of-line unminable txs (their turn has come and
+                            // they permanently fail — e.g. a sender who cannot afford
+                            // amount + fee), so they stop clogging the mempool and
+                            // producing empty blocks; log the reason so it is never
+                            // silent. A tx merely blocked behind such a gap is left
+                            // alone (select won't pick it until the gap is filled).
+                            for (stx, reason) in excluded {
+                                if n.account_nonce(&stx.transaction.signer)
+                                    == stx.transaction.nonce
+                                {
+                                    let id = stx.id();
+                                    n.drop_tx(&id);
+                                    let hex = id.to_hex();
+                                    daemon_log(
+                                        &log,
+                                        format!(
+                                            "⚠ dropped unminable tx {}… (nonce {}): {reason}",
+                                            &hex[..hex.len().min(12)],
+                                            stx.transaction.nonce
+                                        ),
+                                    );
+                                }
+                            }
+                            (c, h)
+                        }
                         Err(e) => {
                             drop(n);
                             daemon_log(&log, format!("could not build a block candidate: {e}"));
