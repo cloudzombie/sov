@@ -325,6 +325,13 @@ impl SignalLog {
         Some(prev)
     }
 
+    /// Forget the recorded mask at `height` (used when a reorg DISCONNECTS that
+    /// block — its signal leaves the active history). Returns the removed mask, if
+    /// any. The inverse of [`record`](SignalLog::record).
+    pub fn remove(&mut self, height: BlockHeight) -> Option<u32> {
+        self.masks.remove(&height.get())
+    }
+
     /// The number of recorded blocks.
     pub fn len(&self) -> usize {
         self.masks.len()
@@ -841,6 +848,22 @@ mod tests {
         log.record_bit(BlockHeight::new(11), d.bit + 1);
         assert_eq!(signaling_count_in_window(&d, 10, &log), 8);
         assert_eq!(signaling_count_in_window(&d, 20, &log), 1);
+    }
+
+    #[test]
+    fn signal_log_remove_is_the_exact_inverse_of_record() {
+        // A reorg disconnecting a block must remove its signal so the log returns to
+        // exactly its prior state — record then remove is a no-op.
+        let mut log = SignalLog::new();
+        log.record(BlockHeight::new(10), 0b11);
+        let before_len = log.len();
+        log.record(BlockHeight::new(11), 0b1);
+        assert_eq!(log.remove(BlockHeight::new(11)), Some(0b1));
+        assert_eq!(log.len(), before_len, "removed exactly the added height");
+        assert!(!log.signals(BlockHeight::new(11), 0), "height 11 is gone");
+        assert!(log.signals(BlockHeight::new(10), 0), "untouched height remains");
+        // Removing an absent height is a harmless None.
+        assert_eq!(log.remove(BlockHeight::new(99)), None);
     }
 
     #[test]

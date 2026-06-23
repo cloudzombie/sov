@@ -22,6 +22,6 @@ pub mod smt;
 pub use account::Account;
 pub use ledger::{
     nft_class_id, sns_class, token_asset_id, Htlc, Ledger, Multisig, NameRecord, NftClass,
-    NftToken, TokenInfo,
+    NftToken, TokenInfo, UndoLog,
 };
 pub use smt::{MerkleProof, SparseMerkleTree, TREE_HEIGHT};

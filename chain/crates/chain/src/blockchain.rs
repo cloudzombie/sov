@@ -14,14 +14,14 @@
 //! no finality gadget, no validator votes, and no proposer schedule; proof of
 //! work is the only authority.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use sov_mining::{Difficulty, MiningPolicy, Target, Work};
 use sov_primitives::{AccountId, Balance, BlockHeight, Hash};
 use sov_runtime::{
     apply_coinbase, apply_transaction, apply_transactions, BlockContext, BlockExecutionError,
 };
-use sov_state::Ledger;
+use sov_state::{Ledger, UndoLog};
 use sov_types::{receipts_root, Block, Receipt, SignedTransaction};
 
 use crate::genesis::{GenesisConfig, GenesisError};
@@ -91,6 +91,13 @@ pub struct Blockchain {
     /// Maps a transaction id to the active height whose block contains it, so a
     /// receipt can be found by transaction id in one lookup. Rebuilt on reorg.
     tx_height: HashMap<Hash, u64>,
+    /// A bounded ring of recent active-chain blocks' undo logs (`(height, hash, log)`,
+    /// newest at the back). A reorg DISCONNECTS through these in O(reorg depth) instead
+    /// of replaying the chain from genesis; a reorg whose fork point is older than the
+    /// window (an extraordinarily deep partition heal) falls back to the full genesis
+    /// replay. In-memory, transient, and derived from execution — it changes no block
+    /// hash, state root, or wire encoding, so the genesis KAT is unaffected.
+    undo_ring: VecDeque<(u64, Hash, UndoLog)>,
 }
 
 /// A block known to the node, with the metadata fork choice needs: its
@@ -288,6 +295,13 @@ fn canonical_target(target: Target) -> Target {
 /// this constant is where the protocol draws the operational line.
 pub const FINALITY_DEPTH: u64 = 6;
 
+/// How many recent active blocks keep an undo log for O(reorg-depth) disconnects.
+/// Far deeper than any honest reorg (and than [`FINALITY_DEPTH`]), so in practice a
+/// reorg never exceeds the window; one that did (a massive partition heal) simply
+/// falls back to the from-genesis replay. The ring holds small per-block deltas, so
+/// the window is cheap — its memory is bounded and independent of chain length.
+const REORG_UNDO_WINDOW: usize = 256;
+
 /// Producer-side nonce budget for sealing one block. Generous: at any sane
 /// difficulty a solution is found in a vanishing fraction of this; it exists
 /// only so a misconfigured (absurdly hard) target fails loudly instead of
@@ -344,6 +358,7 @@ impl Blockchain {
             pq_deployment: None,
             active_receipts: HashMap::new(),
             tx_height: HashMap::new(),
+            undo_ring: VecDeque::new(),
         })
     }
 
@@ -829,9 +844,17 @@ impl Blockchain {
             // literally means more proof of work was found), so both nodes pick the
             // SAME head each round and stay on one chain. `heaviest_chain` (boot
             // reconstruction) applies the identical rule, so live and restart agree.
-            // Re-validate and re-execute the whole branch from genesis; adopt it only
-            // if it is valid end-to-end (so an invalid heavier branch can never
-            // displace a valid lighter one).
+            // FAST PATH: an incremental reorg — disconnect the active chain to the fork
+            // point via undo logs, then connect the new branch — O(reorg depth), no
+            // genesis replay. Atomic: if the new branch is invalid it restores the
+            // original chain and returns the error. `None` only when the fork predates
+            // the undo window (a deep partition heal), which falls through to the replay.
+            if let Some(result) = self.try_incremental_reorg(&block, &cand) {
+                return result;
+            }
+            // FALLBACK: re-validate and re-execute the whole branch from genesis; adopt
+            // it only if valid end-to-end (so an invalid heavier branch can never
+            // displace a valid lighter one). Rare — only for very deep reorgs.
             let rebuilt = self.rebuild_branch(&block, &cand)?;
             // Capture transactions orphaned by the reorg: those in the OLD active
             // chain whose block is not on the NEW active chain. They return to the
@@ -851,6 +874,9 @@ impl Blockchain {
             self.head = block_hash;
             self.sync_active_difficulty();
             self.rebuild_receipt_index(rebuilt.branch_receipts);
+            // The active chain was rebuilt wholesale, so the undo ring no longer matches
+            // it — drop it; it refills as subsequent blocks connect.
+            self.undo_ring.clear();
             Ok(Imported {
                 receipts: rebuilt.tip_receipts,
                 reverted_txs,
@@ -957,6 +983,9 @@ impl Blockchain {
         sha_target: Target,
     ) -> Result<Vec<Receipt>, ChainError> {
         let mut scratch = self.ledger.clone();
+        // Record this block's writes so it can be DISCONNECTED later (a reorg) in
+        // O(1), instead of replaying the chain from genesis to undo it.
+        scratch.begin_undo();
         let receipts = self.execute_block_on(&mut scratch, block, sha_target, &self.signals)?;
         if scratch.state_root() != block.header.state_root {
             return Err(ChainError::StateRootMismatch);
@@ -969,11 +998,23 @@ impl Blockchain {
         // rejected. `self.ledger` is the pre-state, `scratch` the post-state, so this
         // is free — no extra clone — and runs on every committed block, every network.
         self.verify_invariants(&self.ledger, &scratch, sha_target)?;
+        let undo = scratch.take_undo();
         self.ledger = scratch;
         self.signals
             .record(block.header.height, block.header.version_bits);
         self.blocks.push(block.clone());
+        self.remember_undo(block.header.height.get(), block.hash(), undo);
         Ok(receipts)
+    }
+
+    /// Record a freshly-connected active block's undo log in the bounded ring (newest
+    /// at the back), evicting the oldest past [`REORG_UNDO_WINDOW`]. This is what lets
+    /// [`disconnect_to`](Self::disconnect_to) roll the active chain back in O(depth).
+    fn remember_undo(&mut self, height: u64, hash: Hash, undo: UndoLog) {
+        self.undo_ring.push_back((height, hash, undo));
+        while self.undo_ring.len() > REORG_UNDO_WINDOW {
+            self.undo_ring.pop_front();
+        }
     }
 
     /// **Trusted fast-replay** of a block from this node's OWN persisted, checksummed
@@ -1301,6 +1342,154 @@ impl Blockchain {
         };
         apply_coinbase(ledger, &ctx)?;
         Ok(apply_transactions(ledger, &block.transactions, &ctx)?)
+    }
+
+    /// Find where `tip`'s branch forks from the active chain, returning the common
+    /// ancestor's height and the new branch's blocks ABOVE it, oldest-first and
+    /// ending with `tip`. `None` if a parent link is missing (never, post-validation).
+    fn locate_fork(&self, tip: &Block) -> Option<(u64, Vec<Block>)> {
+        let mut new_blocks = vec![tip.clone()];
+        let mut hash = tip.header.prev_hash;
+        loop {
+            let entry = self.index.get(&hash)?;
+            let h = entry.height;
+            // The first ancestor that is the active block at its own height is the
+            // fork point (common ancestor) — everything above it on `tip`'s branch is new.
+            if self.blocks.get(h as usize).map(Block::hash) == Some(hash) {
+                new_blocks.reverse();
+                return Some((h, new_blocks));
+            }
+            new_blocks.push(entry.block.clone());
+            hash = entry.block.header.prev_hash;
+        }
+    }
+
+    /// **Disconnect** active blocks down to (not including) `target_height`, reversing
+    /// each via its undo log — O(depth), no genesis replay. Returns the disconnected
+    /// blocks newest-first. Requires the undo ring to cover the depth (caller checks).
+    fn disconnect_to(&mut self, target_height: u64) -> Vec<Block> {
+        let mut disconnected = Vec::new();
+        while self.height() > target_height {
+            let (rh, rhash, undo) = self
+                .undo_ring
+                .pop_back()
+                .expect("undo ring covers the disconnect depth");
+            let block = self.blocks.pop().expect("an active block above genesis");
+            debug_assert_eq!(rh, block.header.height.get());
+            debug_assert_eq!(rhash, block.hash());
+            self.ledger.apply_undo(undo);
+            self.signals.remove(block.header.height);
+            if let Some(rs) = self.active_receipts.remove(&rh) {
+                for r in &rs {
+                    self.tx_height.remove(&r.tx_id);
+                }
+            }
+            disconnected.push(block);
+        }
+        self.head = self.blocks.last().expect("chain always has genesis").hash();
+        disconnected
+    }
+
+    /// **Reconnect** previously-active blocks (given newest-first, as
+    /// [`disconnect_to`](Self::disconnect_to) returns them) — the rollback half when a
+    /// reorg's new branch turns out invalid. Re-executing previously-valid blocks is
+    /// deterministic, so it cannot fail; a failure here would be a determinism bug.
+    fn reconnect(&mut self, mut blocks: Vec<Block>) {
+        blocks.reverse(); // oldest-first
+        for b in &blocks {
+            let target = self
+                .index
+                .get(&b.hash())
+                .expect("a reconnected block is indexed")
+                .sha_target;
+            let receipts = self
+                .connect_to_active(b, target)
+                .expect("re-connecting a previously-valid block is deterministic");
+            self.index_block_receipts(b.header.height.get(), &receipts);
+        }
+        self.head = self.blocks.last().expect("chain always has genesis").hash();
+    }
+
+    /// **Incremental reorg** (the network-grade path): switch to `tip`'s heavier branch
+    /// by DISCONNECTING the active chain to the fork point via undo logs, then
+    /// CONNECTING the new branch — O(reorg depth), independent of chain length. If the
+    /// new branch is invalid, the original chain is restored exactly (atomic) and the
+    /// error returned. Returns `None` when the fork is older than the undo window, so
+    /// the caller falls back to the from-genesis replay (a rare, deep partition heal).
+    fn try_incremental_reorg(
+        &mut self,
+        tip: &Block,
+        cand: &Candidate,
+    ) -> Option<Result<Imported, ChainError>> {
+        let (fork_height, new_blocks) = self.locate_fork(tip)?;
+        // The undo ring must cover every active block above the fork point; if the fork
+        // is deeper than the window, defer to the full replay.
+        let depth = self.height().saturating_sub(fork_height);
+        if depth == 0 || (self.undo_ring.len() as u64) < depth {
+            return None;
+        }
+
+        // Disconnect the old active tail (O(depth), via undo).
+        let old = self.disconnect_to(fork_height);
+
+        // Connect the new branch. Each block is validated end-to-end (roots +
+        // invariants) by `connect_to_active`; a failure rolls everything back.
+        let mut tip_receipts = Vec::new();
+        for (i, b) in new_blocks.iter().enumerate() {
+            let is_tip = i + 1 == new_blocks.len();
+            let target = if is_tip {
+                cand.sha_target
+            } else {
+                match self.index.get(&b.hash()) {
+                    Some(e) => e.sha_target,
+                    None => {
+                        // An unindexed interior block (cannot normally happen) — restore
+                        // and defer to the full replay rather than risk a partial state.
+                        self.disconnect_to(fork_height);
+                        self.reconnect(old);
+                        return None;
+                    }
+                }
+            };
+            match self.connect_to_active(b, target) {
+                Ok(receipts) => {
+                    self.index_block_receipts(b.header.height.get(), &receipts);
+                    if is_tip {
+                        tip_receipts = receipts;
+                    }
+                }
+                Err(e) => {
+                    // The new branch is invalid: undo the blocks connected so far, then
+                    // re-attach the original chain. State returns to exactly where it was.
+                    self.disconnect_to(fork_height);
+                    self.reconnect(old);
+                    self.sync_active_difficulty();
+                    return Some(Err(e));
+                }
+            }
+        }
+
+        // Success: the tip joins the index, becomes the head, and difficulty refreshes.
+        self.insert_entry(tip.clone(), cand);
+        self.head = tip.hash();
+        self.sync_active_difficulty();
+
+        // Transactions on the dropped branch return to the mempool — unless they also
+        // appear on the new branch — so a reorg never silently loses a transaction.
+        let new_tx_ids: std::collections::HashSet<Hash> = new_blocks
+            .iter()
+            .flat_map(|b| b.transactions.iter().map(|t| t.id()))
+            .collect();
+        let reverted_txs: Vec<SignedTransaction> = old
+            .iter()
+            .flat_map(|b| b.transactions.iter())
+            .filter(|t| !new_tx_ids.contains(&t.id()))
+            .cloned()
+            .collect();
+        Some(Ok(Imported {
+            receipts: tip_receipts,
+            reverted_txs,
+        }))
     }
 
     /// Replay the entire branch tipped by `tip` from the genesis ledger,
@@ -2594,6 +2783,117 @@ mod tests {
         assert_eq!(
             node1.ledger().account(&id("ecb.reserve.sov")).balance,
             Balance::from_sov(251).unwrap()
+        );
+    }
+
+    /// Corrupt a block's committed state root and re-grind a valid nonce for the lie,
+    /// so it carries VALID proof of work but FAILS execution — an execution-invalid
+    /// block a miner with hashpower could actually produce. Test-only.
+    fn reseal_with_bad_state_root(chain: &Blockchain, mut block: Block) -> Block {
+        block.header.state_root = Hash::from_bytes([0xAB; 32]);
+        let target = Target::from_compact(block.header.bits).expect("valid committed bits");
+        block.header.nonce = 0;
+        loop {
+            if target.is_met_by(&chain.seal(&block.header)) {
+                return block;
+            }
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+    }
+
+    #[test]
+    fn incremental_reorg_matches_a_linear_build_at_depth() {
+        // A multi-block reorg (B's 4 blocks over A's 2, forking at genesis) must land
+        // on EXACTLY the state a node that built B linearly holds — proving the
+        // disconnect-via-undo / connect path reproduces a full replay, byte for byte,
+        // at depth (not just the 1-block case).
+        let mut node1 = fresh_chain();
+        let mut node2 = fresh_chain();
+
+        let a1 = node1
+            .produce_block(vec![usa_transfer("ecb.reserve.sov", 10, 0)], 2_000)
+            .unwrap();
+        node1.import_block(a1).unwrap();
+        let a2 = node1
+            .produce_block(vec![usa_transfer("ecb.reserve.sov", 20, 1)], 3_000)
+            .unwrap();
+        node1.import_block(a2).unwrap();
+        assert_eq!(node1.height(), 2);
+
+        // Branch B on node2: 4 blocks, different transfers — strictly heavier than A.
+        let mut bs = Vec::new();
+        let mut ts = 2_500;
+        for (i, amt) in [5u128, 7, 9, 11].into_iter().enumerate() {
+            let b = node2
+                .produce_block(vec![usa_transfer("ecb.reserve.sov", amt, i as u64)], ts)
+                .unwrap();
+            node2.import_block(b.clone()).unwrap();
+            bs.push(b);
+            ts += 1_000;
+        }
+        assert_eq!(node2.height(), 4);
+
+        // Feed B to node1: side branches until B outweighs A (its 3rd block), which
+        // triggers the incremental reorg; the 4th then extends the new active chain.
+        for b in &bs {
+            node1.import_block(b.clone()).unwrap();
+        }
+        assert_eq!(node1.height(), 4);
+        assert_eq!(node1.head().hash(), bs[3].hash(), "node1 adopted branch B's tip");
+        assert_eq!(
+            node1.ledger().state_root(),
+            node2.ledger().state_root(),
+            "incremental reorg == linear build, byte for byte"
+        );
+        assert_eq!(
+            node1.ledger().account(&id("ecb.reserve.sov")).balance,
+            Balance::from_sov(5 + 7 + 9 + 11).unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_heavier_branch_is_rejected_and_the_chain_is_restored() {
+        // The atomic-rollback guarantee: a HEAVIER branch whose block fails execution
+        // (a lie about its state root, carrying valid PoW) must be rejected and leave
+        // the active chain EXACTLY as it was — a reorg never half-applies.
+        let mut node1 = fresh_chain();
+        let mut node2 = fresh_chain();
+
+        let a1 = node1
+            .produce_block(vec![usa_transfer("ecb.reserve.sov", 100, 0)], 2_000)
+            .unwrap();
+        node1.import_block(a1).unwrap();
+        let (head_a, root_a, height_a) =
+            (node1.head().hash(), node1.ledger().state_root(), node1.height());
+
+        // Branch B (2 blocks, heavier): b1 valid, the tip tampered + re-sealed.
+        let b1 = node2
+            .produce_block(vec![usa_transfer("ecb.reserve.sov", 7, 0)], 3_000)
+            .unwrap();
+        node2.import_block(b1.clone()).unwrap();
+        let b2 = node2
+            .produce_block(vec![usa_transfer("ecb.reserve.sov", 9, 1)], 4_000)
+            .unwrap();
+        let b2_bad = reseal_with_bad_state_root(&node2, b2);
+
+        node1.import_block(b1).unwrap(); // equal-work side branch — no reorg
+        assert_eq!(node1.height(), height_a);
+        // The heavier-but-invalid tip is rejected; the incremental reorg rolls back.
+        assert!(
+            matches!(
+                node1.import_block(b2_bad),
+                Err(ChainError::StateRootMismatch)
+            ),
+            "an execution-invalid heavier branch must be rejected"
+        );
+        // ATOMIC: node1 is exactly where it started — still on branch A.
+        assert_eq!(node1.head().hash(), head_a, "head unchanged after a failed reorg");
+        assert_eq!(node1.height(), height_a);
+        assert_eq!(node1.ledger().state_root(), root_a, "state unchanged after a failed reorg");
+        assert_eq!(
+            node1.ledger().account(&id("ecb.reserve.sov")).balance,
+            Balance::from_sov(100).unwrap(),
+            "branch A's effect stands; the invalid branch never applied"
         );
     }
 

@@ -196,9 +196,58 @@ pub struct Htlc {
     pub timeout_height: u64,
 }
 
+/// A single reversible state change captured while the ledger is recording an undo
+/// log (see [`Ledger::begin_undo`]). Each variant holds the **pre-image** of one
+/// field write — enough to restore that field exactly. Applying a block's ops in
+/// reverse order returns the ledger to its pre-block state bit-for-bit (same
+/// `state_root`), which is what lets a reorg DISCONNECT blocks in O(reorg depth)
+/// instead of replaying the whole chain from genesis. The log is in-memory and
+/// transient (never serialized, never part of the state root).
+#[derive(Clone)]
+enum UndoOp {
+    // `Account` is boxed because it carries the ~2 KB hybrid post-quantum public key;
+    // keeping it off the inline enum keeps every journal entry small.
+    Account(AccountId, Option<Box<Account>>),
+    Contract(AccountId, Vec<u8>, Option<Vec<u8>>),
+    Token(Hash, Option<TokenInfo>),
+    TokenBalance(Hash, AccountId, Option<Balance>),
+    TokenPolicy(Hash, Option<CompliancePolicy>),
+    TokenWindow(Hash, AccountId, Option<SpendWindow>),
+    Htlc(Hash, Option<Htlc>),
+    NftClass(Hash, Option<NftClass>),
+    Nft(Hash, Vec<u8>, Option<NftToken>),
+    Multisig(AccountId, Option<Multisig>),
+    /// `intent_id` was absent before being consumed ⇒ undo removes it.
+    Intent(Hash),
+    /// The whole shielded sub-state, captured before a bundle was applied.
+    Shielded(Box<ShieldedState>),
+    MinedEmitted(Balance),
+    ShieldedValue(Balance),
+    HtlcLocked(Balance),
+    DeshieldWindow(u64, Balance),
+}
+
+/// A captured undo log for one block — replay it with [`Ledger::apply_undo`] to
+/// disconnect that block. Ordered as the writes happened; applied in reverse.
+#[derive(Clone, Default)]
+pub struct UndoLog(Vec<UndoOp>);
+
+impl UndoLog {
+    /// Whether the block changed no state (e.g. an empty block's coinbase that
+    /// minted nothing) — nothing to undo.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// The world state: all accounts and their Merkle commitment.
 #[derive(Clone, Default)]
 pub struct Ledger {
+    /// In-memory undo journal: when `Some`, every state write records its pre-image
+    /// here so the block can be disconnected (reorg) without a genesis replay. Never
+    /// serialized; not part of the state root; cleared between blocks. `None` = off
+    /// (the default — boot replay, query-only ledgers, and tests pay nothing).
+    undo: Option<Vec<UndoOp>>,
     accounts: BTreeMap<AccountId, Account>,
     /// Per-contract key/value storage, keyed by `(contract account, key)`. Each
     /// entry is also committed to the Merkle tree, so contract state is part of
@@ -477,11 +526,223 @@ impl Ledger {
         self.accounts.contains_key(id)
     }
 
+    /// Start recording an undo log for the block about to be applied: every state
+    /// write now captures its pre-image. Pair with [`take_undo`](Ledger::take_undo)
+    /// once the block has executed. Off by default, so boot replay and query-only
+    /// ledgers pay nothing.
+    pub fn begin_undo(&mut self) {
+        self.undo = Some(Vec::new());
+    }
+
+    /// Stop recording and take the block's captured undo log (its reverse patch).
+    /// Empty if recording was never started.
+    pub fn take_undo(&mut self) -> UndoLog {
+        UndoLog(self.undo.take().unwrap_or_default())
+    }
+
+    /// Whether undo recording is currently on.
+    pub fn is_recording_undo(&self) -> bool {
+        self.undo.is_some()
+    }
+
+    /// Record one pre-image (the single choke point every mutator calls before it
+    /// writes). No-op when recording is off.
+    fn record(&mut self, op: UndoOp) {
+        if let Some(j) = self.undo.as_mut() {
+            j.push(op);
+        }
+    }
+
+    /// **Disconnect a block:** reverse its writes in LIFO order, restoring the exact
+    /// pre-block state — same `state_root`, bit-for-bit. Recording is suspended
+    /// during the restore (the undo itself is never journaled). This is what lets a
+    /// reorg roll back in O(reorg depth) instead of replaying the chain from genesis.
+    pub fn apply_undo(&mut self, log: UndoLog) {
+        let saved = self.undo.take();
+        for op in log.0.into_iter().rev() {
+            self.undo_one(op);
+        }
+        self.undo = saved;
+    }
+
+    /// Restore one field write's pre-image, manipulating the store + commitment
+    /// directly — mirroring each setter's own commit logic exactly so the resulting
+    /// `state_root` is identical to "the write never happened".
+    fn undo_one(&mut self, op: UndoOp) {
+        match op {
+            UndoOp::Account(id, prev) => {
+                let slot = Self::slot(&id);
+                match prev.map(|b| *b) {
+                    Some(a) if !a.is_empty() => {
+                        let encoded =
+                            borsh::to_vec(&a).expect("Account serialization is infallible");
+                        self.commitment.insert(slot, encoded);
+                        self.accounts.insert(id, a);
+                    }
+                    _ => {
+                        self.accounts.remove(&id);
+                        self.commitment.remove(&slot);
+                    }
+                }
+            }
+            UndoOp::Contract(contract, key, prev) => {
+                let slot = Self::contract_slot(&contract, &key);
+                let map_key = (contract, key);
+                match prev {
+                    Some(v) if !v.is_empty() => {
+                        self.commitment.insert(slot, v.clone());
+                        self.contract_storage.insert(map_key, v);
+                    }
+                    _ => {
+                        self.contract_storage.remove(&map_key);
+                        self.commitment.remove(&slot);
+                    }
+                }
+            }
+            UndoOp::Token(asset, prev) => match prev {
+                Some(info) => {
+                    let encoded =
+                        borsh::to_vec(&info).expect("TokenInfo serialization is infallible");
+                    self.commitment.insert(Self::token_slot(&asset), encoded);
+                    self.tokens.insert(asset, info);
+                }
+                None => {
+                    self.tokens.remove(&asset);
+                    self.commitment.remove(&Self::token_slot(&asset));
+                }
+            },
+            UndoOp::TokenBalance(asset, holder, prev) => {
+                let slot = Self::token_balance_slot(&asset, &holder);
+                let key = (asset, holder);
+                match prev {
+                    Some(b) if b != Balance::ZERO => {
+                        let encoded =
+                            borsh::to_vec(&b).expect("Balance serialization is infallible");
+                        self.commitment.insert(slot, encoded);
+                        self.token_balances.insert(key, b);
+                    }
+                    _ => {
+                        self.token_balances.remove(&key);
+                        self.commitment.remove(&slot);
+                    }
+                }
+            }
+            UndoOp::TokenPolicy(asset, prev) => match prev {
+                Some(p) => {
+                    let encoded =
+                        borsh::to_vec(&p).expect("CompliancePolicy serialization is infallible");
+                    self.commitment.insert(Self::token_policy_slot(&asset), encoded);
+                    self.token_policies.insert(asset, p);
+                }
+                None => {
+                    self.token_policies.remove(&asset);
+                    self.commitment.remove(&Self::token_policy_slot(&asset));
+                }
+            },
+            UndoOp::TokenWindow(asset, holder, prev) => {
+                let slot = Self::token_window_slot(&asset, &holder);
+                let key = (asset, holder);
+                match prev {
+                    Some(w) if w != SpendWindow::default() => {
+                        let encoded =
+                            borsh::to_vec(&w).expect("SpendWindow serialization is infallible");
+                        self.commitment.insert(slot, encoded);
+                        self.token_windows.insert(key, w);
+                    }
+                    _ => {
+                        self.token_windows.remove(&key);
+                        self.commitment.remove(&slot);
+                    }
+                }
+            }
+            UndoOp::Htlc(id, prev) => {
+                match prev {
+                    Some(h) => {
+                        self.htlcs.insert(id, h);
+                    }
+                    None => {
+                        self.htlcs.remove(&id);
+                    }
+                }
+                self.recommit_htlcs();
+            }
+            UndoOp::NftClass(id, prev) => {
+                match prev {
+                    Some(c) => {
+                        self.nft_classes.insert(id, c);
+                    }
+                    None => {
+                        self.nft_classes.remove(&id);
+                    }
+                }
+                self.recommit_nft_classes();
+            }
+            UndoOp::Nft(collection, token_id, prev) => {
+                let key = (collection, token_id);
+                match prev {
+                    Some(t) => {
+                        self.nfts.insert(key, t);
+                    }
+                    None => {
+                        self.nfts.remove(&key);
+                    }
+                }
+                self.recommit_nfts();
+            }
+            UndoOp::Multisig(account, prev) => {
+                match prev {
+                    Some(m) => {
+                        self.multisig.insert(account, m);
+                    }
+                    None => {
+                        self.multisig.remove(&account);
+                    }
+                }
+                self.recommit_multisig();
+            }
+            UndoOp::Intent(intent_id) => {
+                self.consumed_intents.remove(&intent_id);
+                self.commitment.remove(&Self::intent_slot(&intent_id));
+            }
+            UndoOp::Shielded(prev) => {
+                self.shielded = *prev;
+                self.recommit_shielded();
+            }
+            UndoOp::MinedEmitted(prev) => {
+                self.mined_emitted = prev;
+                self.commit_counter(Self::MINED_SLOT, prev);
+            }
+            UndoOp::ShieldedValue(prev) => {
+                self.shielded_value = prev;
+                self.commit_counter(Self::SHIELDED_VALUE_SLOT, prev);
+            }
+            UndoOp::HtlcLocked(prev) => {
+                self.htlc_locked = prev;
+                self.commit_counter(Self::HTLC_LOCKED_SLOT, prev);
+            }
+            UndoOp::DeshieldWindow(start, spent) => {
+                self.deshield_window = (start, spent);
+                let slot = Self::reserved_slot(Self::DESHIELD_WINDOW_SLOT);
+                if start == 0 && spent == Balance::ZERO {
+                    self.commitment.remove(&slot);
+                } else {
+                    let encoded = borsh::to_vec(&self.deshield_window)
+                        .expect("window serialization is infallible");
+                    self.commitment.insert(slot, encoded);
+                }
+            }
+        }
+    }
+
     /// Write `account` to `id`, updating both the store and the commitment. An
     /// account equal to the default empty state is removed, keeping the root
     /// canonical (an explicitly-zeroed account commits identically to an absent
     /// one).
     pub fn set_account(&mut self, id: &AccountId, account: Account) {
+        if self.undo.is_some() {
+            let prev = self.accounts.get(id).cloned().map(Box::new);
+            self.record(UndoOp::Account(id.clone(), prev));
+        }
         let slot = Self::slot(id);
         if account.is_empty() {
             self.accounts.remove(id);
@@ -503,6 +764,10 @@ impl Ledger {
     /// Write (or, with an empty value, clear) a contract storage entry, updating
     /// both the store and the commitment.
     pub fn set_contract_value(&mut self, contract: &AccountId, key: Vec<u8>, value: Vec<u8>) {
+        if self.undo.is_some() {
+            let prev = self.contract_value(contract, &key).map(<[u8]>::to_vec);
+            self.record(UndoOp::Contract(contract.clone(), key.clone(), prev));
+        }
         let slot = Self::contract_slot(contract, &key);
         let map_key = (contract.clone(), key);
         if value.is_empty() {
@@ -576,7 +841,13 @@ impl Ledger {
     /// re-commit the pool digest into the state root. The caller must already
     /// have verified the bundle's proof and that its anchor is known.
     pub fn apply_shielded_bundle(&mut self, bundle: &ShieldedBundle) -> Result<(), ShieldedError> {
+        // Snapshot the pool ONLY if recording, and record it ONLY after the apply
+        // succeeds — a rejected bundle must not leave a spurious undo entry.
+        let prev = self.undo.is_some().then(|| self.shielded.clone());
         self.shielded.apply_bundle(bundle)?;
+        if let Some(p) = prev {
+            self.record(UndoOp::Shielded(Box::new(p)));
+        }
         self.recommit_shielded();
         Ok(())
     }
@@ -584,7 +855,9 @@ impl Ledger {
     /// Increase the net shielded-pool value (a shield moves transparent value in).
     /// `None` on overflow. Commits the counter to the state root.
     pub fn add_shielded_value(&mut self, amount: Balance) -> Option<()> {
-        self.shielded_value = self.shielded_value.checked_add(amount)?;
+        let next = self.shielded_value.checked_add(amount)?;
+        self.record(UndoOp::ShieldedValue(self.shielded_value));
+        self.shielded_value = next;
         self.commit_counter(Self::SHIELDED_VALUE_SLOT, self.shielded_value);
         Some(())
     }
@@ -592,7 +865,9 @@ impl Ledger {
     /// Decrease the net shielded-pool value (a de-shield moves value back out).
     /// `None` if the pool holds less than `amount`. Commits the counter.
     pub fn sub_shielded_value(&mut self, amount: Balance) -> Option<()> {
-        self.shielded_value = self.shielded_value.checked_sub(amount)?;
+        let next = self.shielded_value.checked_sub(amount)?;
+        self.record(UndoOp::ShieldedValue(self.shielded_value));
+        self.shielded_value = next;
         self.commit_counter(Self::SHIELDED_VALUE_SLOT, self.shielded_value);
         Some(())
     }
@@ -614,7 +889,10 @@ impl Ledger {
         if self.htlcs.contains_key(&id) {
             return None;
         }
-        self.htlc_locked = self.htlc_locked.checked_add(htlc.amount)?;
+        let next_locked = self.htlc_locked.checked_add(htlc.amount)?;
+        self.record(UndoOp::HtlcLocked(self.htlc_locked));
+        self.record(UndoOp::Htlc(id, None)); // id was absent (checked above)
+        self.htlc_locked = next_locked;
         self.commit_counter(Self::HTLC_LOCKED_SLOT, self.htlc_locked);
         self.htlcs.insert(id, htlc);
         self.recommit_htlcs();
@@ -626,6 +904,10 @@ impl Ledger {
     /// `htlc.amount`. `None` if no such HTLC is open.
     pub fn settle_htlc(&mut self, id: &Hash) -> Option<Htlc> {
         let htlc = self.htlcs.remove(id)?;
+        if self.undo.is_some() {
+            self.record(UndoOp::HtlcLocked(self.htlc_locked));
+            self.record(UndoOp::Htlc(*id, Some(htlc.clone())));
+        }
         self.htlc_locked = self
             .htlc_locked
             .checked_sub(htlc.amount)
@@ -738,6 +1020,10 @@ impl Ledger {
 
     /// Set (or replace) `account`'s multisig policy, committing it to the root.
     pub fn set_multisig(&mut self, account: AccountId, policy: Multisig) {
+        if self.undo.is_some() {
+            let prev = self.multisig.get(&account).cloned();
+            self.record(UndoOp::Multisig(account.clone(), prev));
+        }
         self.multisig.insert(account, policy);
         self.recommit_multisig();
     }
@@ -754,6 +1040,10 @@ impl Ledger {
 
     /// Record (insert/replace) an NFT collection, committing it to the root.
     pub fn set_nft_class(&mut self, id: Hash, class: NftClass) {
+        if self.undo.is_some() {
+            let prev = self.nft_classes.get(&id).cloned();
+            self.record(UndoOp::NftClass(id, prev));
+        }
         self.nft_classes.insert(id, class);
         self.recommit_nft_classes();
     }
@@ -784,6 +1074,9 @@ impl Ledger {
         if self.nfts.contains_key(&key) {
             return None;
         }
+        if self.undo.is_some() {
+            self.record(UndoOp::Nft(key.0, key.1.clone(), None));
+        }
         self.nfts.insert(
             key,
             NftToken {
@@ -803,7 +1096,15 @@ impl Ledger {
         token_id: &[u8],
         new_owner: AccountId,
     ) -> Option<()> {
-        let token = self.nfts.get_mut(&(collection, token_id.to_vec()))?;
+        let key = (collection, token_id.to_vec());
+        if !self.nfts.contains_key(&key) {
+            return None;
+        }
+        if self.undo.is_some() {
+            let prev = self.nfts.get(&key).cloned();
+            self.record(UndoOp::Nft(collection, token_id.to_vec(), prev));
+        }
+        let token = self.nfts.get_mut(&key).expect("present");
         token.owner = new_owner;
         self.recommit_nfts();
         Some(())
@@ -816,7 +1117,15 @@ impl Ledger {
         token_id: &[u8],
         metadata: Vec<u8>,
     ) -> Option<()> {
-        let token = self.nfts.get_mut(&(collection, token_id.to_vec()))?;
+        let key = (collection, token_id.to_vec());
+        if !self.nfts.contains_key(&key) {
+            return None;
+        }
+        if self.undo.is_some() {
+            let prev = self.nfts.get(&key).cloned();
+            self.record(UndoOp::Nft(collection, token_id.to_vec(), prev));
+        }
+        let token = self.nfts.get_mut(&key).expect("present");
         token.metadata = metadata;
         self.recommit_nfts();
         Some(())
@@ -845,6 +1154,10 @@ impl Ledger {
     /// commitment. Assets are never deleted (their burn history is part of the
     /// chain's accounting), so this only inserts or overwrites.
     pub fn set_token(&mut self, asset: Hash, info: TokenInfo) {
+        if self.undo.is_some() {
+            let prev = self.tokens.get(&asset).cloned();
+            self.record(UndoOp::Token(asset, prev));
+        }
         let encoded = borsh::to_vec(&info).expect("TokenInfo serialization is infallible");
         self.commitment.insert(Self::token_slot(&asset), encoded);
         self.tokens.insert(asset, info);
@@ -863,6 +1176,10 @@ impl Ledger {
     /// commitment. A zero balance is removed, keeping the root canonical (an
     /// explicitly-zeroed holding commits identically to an absent one).
     pub fn set_token_balance(&mut self, asset: &Hash, holder: &AccountId, balance: Balance) {
+        if self.undo.is_some() {
+            let prev = self.token_balances.get(&(*asset, holder.clone())).copied();
+            self.record(UndoOp::TokenBalance(*asset, holder.clone(), prev));
+        }
         let slot = Self::token_balance_slot(asset, holder);
         let key = (*asset, holder.clone());
         if balance == Balance::ZERO {
@@ -886,6 +1203,19 @@ impl Ledger {
     /// windows** — a new policy starts with fresh accounting, and stale windows
     /// never linger in the committed state.
     pub fn set_token_policy(&mut self, asset: Hash, policy: CompliancePolicy) {
+        if self.undo.is_some() {
+            // The policy itself, plus every spend window this call is about to clear.
+            self.record(UndoOp::TokenPolicy(asset, self.token_policies.get(&asset).cloned()));
+            let cleared: Vec<((Hash, AccountId), SpendWindow)> = self
+                .token_windows
+                .iter()
+                .filter(|((a, _), _)| *a == asset)
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+            for ((a, holder), w) in cleared {
+                self.record(UndoOp::TokenWindow(a, holder, Some(w)));
+            }
+        }
         let encoded = borsh::to_vec(&policy).expect("CompliancePolicy serialization is infallible");
         self.commitment
             .insert(Self::token_policy_slot(&asset), encoded);
@@ -917,6 +1247,10 @@ impl Ledger {
     /// and the commitment. A default (zero) window is removed, keeping the
     /// root canonical.
     pub fn set_token_window(&mut self, asset: &Hash, holder: &AccountId, window: SpendWindow) {
+        if self.undo.is_some() {
+            let prev = self.token_windows.get(&(*asset, holder.clone())).copied();
+            self.record(UndoOp::TokenWindow(*asset, holder.clone(), prev));
+        }
         let slot = Self::token_window_slot(asset, holder);
         let key = (*asset, holder.clone());
         if window == SpendWindow::default() {
@@ -938,6 +1272,10 @@ impl Ledger {
     /// Write the rolling de-shield window, committing it to the state root.
     /// The default `(0, 0)` window is removed, keeping the root canonical.
     pub fn set_deshield_window(&mut self, window_start: u64, spent: Balance) {
+        if self.undo.is_some() {
+            let (s, sp) = self.deshield_window;
+            self.record(UndoOp::DeshieldWindow(s, sp));
+        }
         self.deshield_window = (window_start, spent);
         let slot = Self::reserved_slot(Self::DESHIELD_WINDOW_SLOT);
         if window_start == 0 && spent == Balance::ZERO {
@@ -958,6 +1296,9 @@ impl Ledger {
     /// to the state root. Idempotent; the runtime checks
     /// [`intent_consumed`](Ledger::intent_consumed) first and rejects reuse.
     pub fn consume_intent(&mut self, intent_id: Hash) {
+        if self.undo.is_some() && !self.consumed_intents.contains(&intent_id) {
+            self.record(UndoOp::Intent(intent_id));
+        }
         self.commitment
             .insert(Self::intent_slot(&intent_id), vec![1u8]);
         self.consumed_intents.insert(intent_id);
@@ -996,7 +1337,9 @@ impl Ledger {
     /// Record `amount` of freshly mined SOV against the committed counter.
     /// `None` on overflow (unreachable under the mining budget, but checked).
     pub fn add_mined_emitted(&mut self, amount: Balance) -> Option<()> {
-        self.mined_emitted = self.mined_emitted.checked_add(amount)?;
+        let next = self.mined_emitted.checked_add(amount)?;
+        self.record(UndoOp::MinedEmitted(self.mined_emitted));
+        self.mined_emitted = next;
         self.commit_counter(Self::MINED_SLOT, self.mined_emitted);
         Some(())
     }
@@ -1248,6 +1591,75 @@ mod tests {
         ledger.set_account(&id("x.sov"), Account::default());
         assert_eq!(ledger.state_root(), empty_root);
         assert_eq!(ledger.account_count(), 0);
+    }
+
+    #[test]
+    fn undo_restores_exact_state_for_every_mutation_kind() {
+        use sov_compliance::{SpendLimit, TransferControl};
+        // The reorg-correctness linchpin: after recording a block's writes, applying
+        // the undo log must restore the ledger BIT-FOR-BIT (same state root AND same
+        // serialized state). This exercises overwrite / create / remove across every
+        // one of the ~16 mutation kinds, so a missed pre-image anywhere fails here.
+        let issuer = id("usa.reserve.sov");
+        let asset = token_asset_id(&issuer, "USD1");
+        let coll = nft_class_id(&issuer, "ART");
+        let deny = || TransferControl::DenyList([id("bad.sov")].into_iter().collect());
+        let pk = |s: u8| sov_crypto::Keypair::from_seed([s; 32]).public_key();
+
+        // ── Baseline state, so undos restore PRIOR values, not just absence ──
+        let mut l = Ledger::new();
+        l.set_account(&id("alice.sov"), Account::with_balance(Balance::from_sov(100).unwrap()));
+        l.set_contract_value(&id("c.sov"), b"k".to_vec(), b"v0".to_vec());
+        l.set_token(asset, TokenInfo { issuer: issuer.clone(), symbol: "USD1".into(), issued: Balance::from_sov(50).unwrap(), burned: Balance::ZERO });
+        l.set_token_balance(&asset, &id("alice.sov"), Balance::from_sov(20).unwrap());
+        l.set_token_policy(asset, CompliancePolicy { frozen: false, transfer_control: deny(), spend_limit: Some(SpendLimit { max_per_window: Balance::from_sov(9).unwrap(), window_blocks: 5 }) });
+        l.set_token_window(&asset, &id("alice.sov"), SpendWindow { window_start: 3, spent: Balance::from_sov(2).unwrap() });
+        l.set_nft_class(coll, NftClass { issuer: issuer.clone(), symbol: "ART".into(), minted: 1 });
+        l.mint_nft(coll, b"item1".to_vec(), id("alice.sov"), b"meta0".to_vec(), 1).unwrap();
+        l.lock_htlc(Hash::digest(b"h0"), Htlc { locker: id("alice.sov"), recipient: id("bob.sov"), amount: Balance::from_sov(5).unwrap(), hashlock: [0u8; 32], timeout_height: 100 }).unwrap();
+        l.set_multisig(id("alice.sov"), Multisig { signers: vec![pk(1)], threshold: 1 });
+        l.add_mined_emitted(Balance::from_sov(12).unwrap()).unwrap();
+        l.add_shielded_value(Balance::from_sov(7).unwrap()).unwrap();
+        l.set_deshield_window(2, Balance::from_sov(1).unwrap());
+        l.consume_intent(Hash::digest(b"intent0"));
+
+        let root0 = l.state_root();
+        let snap0 = l.to_snapshot_bytes();
+
+        // ── A recorded "block": overwrite, create, AND remove across every kind ──
+        l.begin_undo();
+        l.set_account(&id("alice.sov"), Account::with_balance(Balance::from_sov(999).unwrap())); // overwrite
+        l.set_account(&id("carol.sov"), Account::with_balance(Balance::from_sov(1).unwrap()));   // create
+        l.set_contract_value(&id("c.sov"), b"k".to_vec(), b"v1".to_vec()); // overwrite
+        l.set_contract_value(&id("c.sov"), b"k".to_vec(), Vec::new());     // clear
+        let asset2 = token_asset_id(&id("ecb.reserve.sov"), "EUR1");
+        l.set_token(asset2, TokenInfo { issuer: id("ecb.reserve.sov"), symbol: "EUR1".into(), issued: Balance::from_sov(1).unwrap(), burned: Balance::ZERO }); // create
+        l.set_token_balance(&asset, &id("alice.sov"), Balance::ZERO);     // remove
+        l.set_token_balance(&asset, &id("bob.sov"), Balance::from_sov(8).unwrap()); // create
+        l.set_token_policy(asset, CompliancePolicy { frozen: true, transfer_control: deny(), spend_limit: None }); // overwrite + cascades (clears alice's window)
+        l.set_token_window(&asset, &id("bob.sov"), SpendWindow { window_start: 9, spent: Balance::from_sov(4).unwrap() }); // create
+        l.mint_nft(coll, b"item2".to_vec(), id("bob.sov"), Vec::new(), 2).unwrap(); // create
+        l.transfer_nft(coll, b"item1", id("carol.sov")).unwrap();         // transfer
+        l.set_nft_meta(coll, b"item1", b"meta1".to_vec()).unwrap();       // meta
+        l.set_nft_class(coll, NftClass { issuer: issuer.clone(), symbol: "ART".into(), minted: 2 }); // overwrite
+        l.settle_htlc(&Hash::digest(b"h0")).unwrap();                     // remove htlc
+        l.lock_htlc(Hash::digest(b"h1"), Htlc { locker: id("carol.sov"), recipient: id("alice.sov"), amount: Balance::from_sov(3).unwrap(), hashlock: [1u8; 32], timeout_height: 200 }).unwrap(); // create
+        l.set_multisig(id("alice.sov"), Multisig { signers: vec![pk(1), pk(2)], threshold: 2 }); // overwrite
+        l.set_multisig(id("dave.sov"), Multisig { signers: vec![pk(3)], threshold: 1 });          // create
+        l.add_mined_emitted(Balance::from_sov(1).unwrap()).unwrap();
+        l.add_shielded_value(Balance::from_sov(2).unwrap()).unwrap();
+        l.sub_shielded_value(Balance::from_sov(1).unwrap()).unwrap();
+        l.set_deshield_window(5, Balance::from_sov(3).unwrap());
+        l.consume_intent(Hash::digest(b"intent1"));
+
+        let undo = l.take_undo();
+        assert!(!undo.is_empty());
+        assert_ne!(l.state_root(), root0, "the recorded block must have changed state");
+
+        // ── Disconnect: undo must restore the pre-block state EXACTLY ──
+        l.apply_undo(undo);
+        assert_eq!(l.state_root(), root0, "undo restores the exact state root");
+        assert_eq!(l.to_snapshot_bytes(), snap0, "undo restores the exact serialized state");
     }
 
     #[test]
