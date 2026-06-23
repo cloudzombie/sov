@@ -328,28 +328,34 @@ pub fn apply_transaction(
         ExecutionStatus::Failed { reason }
     } else {
         match effective_action {
-            Action::Transfer { to, amount } => match signer.balance.checked_sub(*amount) {
-                None => ExecutionStatus::Failed {
-                    reason: "insufficient balance".into(),
-                },
-                Some(remaining) => {
-                    if to == &tx.signer {
-                        // Self-transfer: funds stay put; only the nonce advanced.
-                        ExecutionStatus::Success
-                    } else {
-                        let mut recipient = ledger.account(to);
-                        match recipient.balance.checked_add(*amount) {
-                            None => return Err(ExecutionError::Overflow),
-                            Some(credited) => {
-                                signer.balance = remaining;
-                                recipient.balance = credited;
-                                ledger.set_account(to, recipient);
-                                ExecutionStatus::Success
+            Action::Transfer { to, amount } => {
+                // Resolve a `.sov` name to the owner's safe account (an SNS alias); an
+                // implicit id / existing / fresh account passes through unchanged.
+                let dest = resolve_recipient(ledger, to);
+                let to = &dest;
+                match signer.balance.checked_sub(*amount) {
+                    None => ExecutionStatus::Failed {
+                        reason: "insufficient balance".into(),
+                    },
+                    Some(remaining) => {
+                        if to == &tx.signer {
+                            // Self-transfer: funds stay put; only the nonce advanced.
+                            ExecutionStatus::Success
+                        } else {
+                            let mut recipient = ledger.account(to);
+                            match recipient.balance.checked_add(*amount) {
+                                None => return Err(ExecutionError::Overflow),
+                                Some(credited) => {
+                                    signer.balance = remaining;
+                                    recipient.balance = credited;
+                                    ledger.set_account(to, recipient);
+                                    ExecutionStatus::Success
+                                }
                             }
                         }
                     }
                 }
-            },
+            }
             Action::ClaimVesting => {
                 if !signer.can_claim_vesting(ctx.height) {
                     ExecutionStatus::Failed {
@@ -720,6 +726,10 @@ pub fn apply_transaction(
                 }
             }
             Action::TokenTransfer { asset, to, amount } => {
+                // Resolve a `.sov` name to the owner's safe account (an SNS alias); an
+                // implicit id / existing / fresh account passes through unchanged.
+                let dest = resolve_recipient(ledger, to);
+                let to = &dest;
                 // Token transfers obey the exact discipline of native transfers:
                 // validate fully (compliance gate first, then funds), then apply
                 // atomically with checked arithmetic. The velocity window is
@@ -1468,6 +1478,21 @@ const NAME_REGISTRATION_FEE_GRAINS: u128 = 100_000_000;
 /// `MultisigExec` and the policy's committed size. Generous for institutional
 /// M-of-N (e.g. a reserve board) while keeping verification cost predictable.
 const MAX_MULTISIG_SIGNERS: usize = 32;
+
+/// Resolve a transfer recipient to the account that should actually be credited: a
+/// **registered SNS name** resolves to its target account — an `*.sov` alias points at
+/// the owner — so a transfer to a name reaches the owner's real (key-bound) account
+/// instead of a bare, keyless, squattable name account. An **implicit** id, an
+/// already-**existing** account, or a fresh account being created is used unchanged.
+/// (This makes "send to alice.sov" land on alice safely, the SNS-handled-better fix.)
+fn resolve_recipient(ledger: &Ledger, to: &AccountId) -> AccountId {
+    if !to.is_implicit() {
+        if let Some(target) = ledger.resolve_name(to.as_str()) {
+            return target;
+        }
+    }
+    to.clone()
+}
 
 /// Gate an **outgoing** movement of `asset` (a transfer or a burn) against the
 /// asset's compliance policy. `counterparty` is the recipient for a transfer
@@ -4469,6 +4494,53 @@ mod tests {
         assert!(ledger.account(&miner_id()).balance > Balance::ZERO);
         use sov_verify::check_transition;
         check_transition(&before, &ledger).expect("fee earned, not burned — value conserved");
+    }
+
+    #[test]
+    fn transfer_to_an_sns_name_resolves_to_the_owner_not_a_squattable_name() {
+        // The SNS-handled-better fix: a transfer to a registered `.sov` name credits the
+        // name's OWNER (its resolved account), and NEVER creates a bare keyless `shop.sov`
+        // account that a stranger could claim first-come. Native + token transfers both.
+        let mut ledger = ledger_with_usa(1_000);
+        let p = policy();
+
+        // usa registers "shop.sov" → it resolves to usa.
+        let reg = signed(
+            [1; 32],
+            "usa.reserve.sov",
+            0,
+            Action::RegisterName {
+                name: "shop.sov".into(),
+            },
+        );
+        assert!(apply_transaction(&mut ledger, &reg, &ctx(&p))
+            .unwrap()
+            .succeeded());
+        assert_eq!(ledger.resolve_name("shop.sov"), Some(id("usa.reserve.sov")));
+
+        // Fund a separate implicit sender B, then B sends 50 to the NAME "shop.sov".
+        let b_id = Keypair::from_seed([2; 32]).public_key().implicit_account_id();
+        let fund = transfer([1; 32], "usa.reserve.sov", b_id.as_str(), 200, 1);
+        assert!(apply_transaction(&mut ledger, &fund, &ctx(&p))
+            .unwrap()
+            .succeeded());
+        let usa_before = ledger.account(&id("usa.reserve.sov")).balance;
+
+        let pay = transfer([2; 32], b_id.as_str(), "shop.sov", 50, 0);
+        assert!(apply_transaction(&mut ledger, &pay, &ctx(&p))
+            .unwrap()
+            .succeeded());
+
+        // The 50 landed on usa (the resolved owner)…
+        assert_eq!(
+            ledger.account(&id("usa.reserve.sov")).balance,
+            usa_before
+                .checked_add(Balance::from_sov(50).unwrap())
+                .unwrap()
+        );
+        // …and NO literal "shop.sov" account was ever created — the squat footgun is closed.
+        assert!(!ledger.exists(&id("shop.sov")));
+        assert_eq!(ledger.account(&id("shop.sov")).balance, Balance::ZERO);
     }
 
     #[test]

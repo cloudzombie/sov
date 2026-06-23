@@ -1130,6 +1130,11 @@ pub struct Station {
     copied_at: Option<u64>, // ms timestamp of the last copy, for the toast
     activity: Arc<Mutex<Vec<String>>>, // recent action log (newest first), with txids
     pending_network: Option<Network>, // a mainnet switch awaiting confirmation
+    /// The most recent action result surfaced as a transient toast (`message`,
+    /// `shown_at_ms`), visible from ANY tab, and the message already toasted (so each
+    /// result toasts once). Green on success, red on failure (`tx_status`).
+    toast: Option<(String, u64)>,
+    toast_seen: String,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -1293,6 +1298,8 @@ impl Station {
             copied_at: None,
             activity: Arc::new(Mutex::new(Vec::new())),
             pending_network: None,
+            toast: None,
+            toast_seen: String::new(),
             passphrase: String::new(),
             keystore_msg: String::new(),
         };
@@ -2126,6 +2133,52 @@ impl Station {
     /// count (in-process), RPC online/offline, and head height — so the Node log shows
     /// peering churn and sync progress as they happen instead of a frozen number. Only
     /// transitions are logged (most frames change nothing), so the log stays readable.
+    /// Render the current transaction toast (if any): a floating, auto-dismissing
+    /// banner in the top-right — green on success, red on failure — shown OVER every
+    /// tab, so a result is never missed when you're not on the Wallet tab.
+    fn show_toast(&mut self, ctx: &egui::Context) {
+        const TOAST_MS: u64 = 5_000;
+        let Some((msg, at)) = self.toast.clone() else {
+            return;
+        };
+        if now_ms().saturating_sub(at) >= TOAST_MS {
+            self.toast = None;
+            return;
+        }
+        let st = tx_status(&msg);
+        let col = status_color(st);
+        let glyph = match st {
+            TxStatus::Ok => "✓",
+            TxStatus::Err => "✗",
+            TxStatus::Info => "•",
+        };
+        let body = msg
+            .trim_start_matches('✓')
+            .trim_start_matches('✗')
+            .trim_start_matches('•')
+            .trim_start();
+        egui::Area::new(egui::Id::new("tx_toast"))
+            .anchor(egui::Align2::RIGHT_TOP, [-12.0, 48.0])
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(palette::tint(col, 38))
+                    .stroke(egui::Stroke::new(1.0, palette::tint(col, 165)))
+                    .rounding(egui::Rounding::same(8.0))
+                    .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+                    .show(ui, |ui| {
+                        ui.set_max_width(360.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new(glyph).color(col).strong());
+                            ui.label(egui::RichText::new(body).color(col).strong());
+                        });
+                    });
+            });
+        // Keep repainting so the toast dismisses on time even if nothing else changes.
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+    }
+
     fn log_node_changes(&mut self, snap: &Snapshot) {
         let peers = match &*self.node_run.lock().unwrap() {
             NodeRun::Running(node) => Some(node.peer_count()),
@@ -2415,6 +2468,22 @@ impl eframe::App for Station {
         // the node log the moment they happen, so the operator sees peering churn and
         // sync progress as it occurs (not just a frozen number).
         self.log_node_changes(&snap);
+
+        // Surface each new action RESULT as a transient toast — visible from ANY tab,
+        // not just Wallet — so you always see the moment a send lands (green) or fails
+        // (red). Detected once per distinct result message.
+        {
+            let (busy, msg) = self
+                .action
+                .lock()
+                .map(|a| (a.busy, a.message.clone()))
+                .unwrap_or((false, String::new()));
+            if !busy && !msg.is_empty() && msg != self.toast_seen {
+                self.toast = Some((msg.clone(), now_ms()));
+                self.toast_seen = msg;
+            }
+        }
+        self.show_toast(ctx);
 
         // Keep the window title in sync with the selected network.
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
@@ -2921,6 +2990,54 @@ fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
         .inner
 }
 
+/// Draw a small bar sparkline of recent block intervals (oldest→newest, left→right),
+/// each bar colored by how close it is to the target cadence (green ≤2×, amber ≤4×,
+/// red beyond), with a dashed target reference line — block cadence at a glance.
+fn interval_sparkline(ui: &mut egui::Ui, blocks: &[BlockRow], target_ms: u64) {
+    let mut intervals: Vec<f32> = Vec::new();
+    for w in blocks.windows(2) {
+        if w[0].timestamp_ms > w[1].timestamp_ms {
+            intervals.push((w[0].timestamp_ms - w[1].timestamp_ms) as f32 / 1000.0);
+        }
+    }
+    intervals.reverse(); // oldest first, so the newest block is on the right
+    if intervals.is_empty() {
+        return;
+    }
+    let target_s = (target_ms as f32 / 1000.0).max(0.001);
+    let max = intervals.iter().copied().fold(target_s, f32::max).max(0.001);
+    let (w, h) = (240.0_f32, 38.0_f32);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let n = intervals.len() as f32;
+    let slot = w / n;
+    for (i, &v) in intervals.iter().enumerate() {
+        let x = rect.left() + i as f32 * slot;
+        let bar_h = (v / max) * h;
+        let col = if v <= target_s * 2.0 {
+            palette::SUCCESS
+        } else if v <= target_s * 4.0 {
+            palette::WARNING
+        } else {
+            palette::ERROR
+        };
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x, rect.bottom() - bar_h),
+                egui::pos2(x + (slot * 0.7).max(1.0), rect.bottom()),
+            ),
+            egui::Rounding::same(1.0),
+            col,
+        );
+    }
+    // The target cadence as a reference line.
+    let ty = rect.bottom() - (target_s / max) * h;
+    painter.line_segment(
+        [egui::pos2(rect.left(), ty), egui::pos2(rect.right(), ty)],
+        egui::Stroke::new(1.0, palette::tint(palette::TEXT_DIM, 170)),
+    );
+}
+
 fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
     ui.heading("Mining");
     ui.label(
@@ -2978,6 +3095,17 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
         });
     });
     ui.add_space(8.0);
+
+    // ── Block cadence sparkline — recent intervals at a glance ──
+    if s.blocks.len() > 2 {
+        ui.label(
+            egui::RichText::new("Block cadence — recent intervals (newest →)")
+                .small()
+                .color(palette::TEXT_DIM),
+        );
+        interval_sparkline(ui, &s.blocks, s.target_block_ms);
+        ui.add_space(8.0);
+    }
 
     // ── Proof-of-Work card — the algorithm, difficulty, target, and the live proof ──
     card(ui, |ui| {
