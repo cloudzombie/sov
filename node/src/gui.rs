@@ -334,6 +334,31 @@ fn status_color(s: TxStatus) -> egui::Color32 {
     }
 }
 
+/// Strip the leading status glyph (✓/✗/•) the action layer prepends, leaving the
+/// human message. Shared by the result banner and the status-bar toast.
+fn strip_status_glyph(msg: &str) -> &str {
+    msg.trim_start_matches('✓')
+        .trim_start_matches('✗')
+        .trim_start_matches('•')
+        .trim_start()
+}
+
+/// The text for the single-line status-bar toast: the message with its glyph stripped
+/// and capped to `max_chars` (char-safe, ellipsis on overflow) so a long error can
+/// never blow out the bottom-bar layout. The full text still shows in the Wallet
+/// status banner.
+fn toast_chip_text(msg: &str, max_chars: usize) -> String {
+    let body = strip_status_glyph(msg);
+    if body.chars().count() > max_chars {
+        let keep = max_chars.saturating_sub(1);
+        let mut s: String = body.chars().take(keep).collect();
+        s.push('…');
+        s
+    } else {
+        body.to_string()
+    }
+}
+
 /// A highlighted result banner — a faint status-tinted card with the message in the
 /// success (green) or failure (red) color. This is the at-a-glance "did my
 /// transaction land?" signal the wallet shows after every action.
@@ -348,11 +373,7 @@ fn status_banner(ui: &mut egui::Ui, msg: &str) {
         TxStatus::Err => "✗",
         TxStatus::Info => "•",
     };
-    let body = msg
-        .trim_start_matches('✓')
-        .trim_start_matches('✗')
-        .trim_start_matches('•')
-        .trim_start();
+    let body = strip_status_glyph(msg);
     egui::Frame::none()
         .fill(palette::tint(col, 28))
         .stroke(egui::Stroke::new(1.0, palette::tint(col, 130)))
@@ -2129,21 +2150,19 @@ impl Station {
         }
     }
 
-    /// Append a node-log line whenever a watched observable changes — the live peer
-    /// count (in-process), RPC online/offline, and head height — so the Node log shows
-    /// peering churn and sync progress as they happen instead of a frozen number. Only
-    /// transitions are logged (most frames change nothing), so the log stays readable.
-    /// Render the current transaction toast (if any): a floating, auto-dismissing
-    /// banner in the top-right — green on success, red on failure — shown OVER every
-    /// tab, so a result is never missed when you're not on the Wallet tab.
-    fn show_toast(&mut self, ctx: &egui::Context) {
+    /// Render the current transaction toast (if any) INLINE in the status bar — a
+    /// colored, auto-dismissing chip (green on success, red on failure) drawn at the
+    /// left of the bottom bar so a result is never missed from any tab, and never
+    /// floats over the top-bar node-status line. Returns `true` while a toast is live
+    /// (the caller then suppresses the staleness indicator for its brief lifetime).
+    fn show_bottom_toast(&mut self, ui: &mut egui::Ui) -> bool {
         const TOAST_MS: u64 = 5_000;
         let Some((msg, at)) = self.toast.clone() else {
-            return;
+            return false;
         };
         if now_ms().saturating_sub(at) >= TOAST_MS {
             self.toast = None;
-            return;
+            return false;
         }
         let st = tx_status(&msg);
         let col = status_color(st);
@@ -2152,33 +2171,24 @@ impl Station {
             TxStatus::Err => "✗",
             TxStatus::Info => "•",
         };
-        let body = msg
-            .trim_start_matches('✓')
-            .trim_start_matches('✗')
-            .trim_start_matches('•')
-            .trim_start();
-        egui::Area::new(egui::Id::new("tx_toast"))
-            .anchor(egui::Align2::RIGHT_TOP, [-12.0, 48.0])
-            .order(egui::Order::Foreground)
-            .interactable(false)
-            .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(palette::tint(col, 38))
-                    .stroke(egui::Stroke::new(1.0, palette::tint(col, 165)))
-                    .rounding(egui::Rounding::same(8.0))
-                    .inner_margin(egui::Margin::symmetric(12.0, 9.0))
-                    .show(ui, |ui| {
-                        ui.set_max_width(360.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(egui::RichText::new(glyph).color(col).strong());
-                            ui.label(egui::RichText::new(body).color(col).strong());
-                        });
-                    });
-            });
+        // The status bar is a single line shared with the version label — cap the
+        // message so a long error can never blow out the layout.
+        let shown = toast_chip_text(&msg, 96);
+        ui.label(
+            egui::RichText::new(format!("{glyph}  {shown}"))
+                .color(col)
+                .strong(),
+        );
         // Keep repainting so the toast dismisses on time even if nothing else changes.
-        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(200));
+        true
     }
 
+    /// Append a node-log line whenever a watched observable changes — the live peer
+    /// count (in-process), RPC online/offline, and head height — so the Node log shows
+    /// peering churn and sync progress as they happen instead of a frozen number. Only
+    /// transitions are logged (most frames change nothing), so the log stays readable.
     fn log_node_changes(&mut self, snap: &Snapshot) {
         let peers = match &*self.node_run.lock().unwrap() {
             NodeRun::Running(node) => Some(node.peer_count()),
@@ -2471,7 +2481,8 @@ impl eframe::App for Station {
 
         // Surface each new action RESULT as a transient toast — visible from ANY tab,
         // not just Wallet — so you always see the moment a send lands (green) or fails
-        // (red). Detected once per distinct result message.
+        // (red). Detected once per distinct result message; rendered in the bottom bar
+        // (see `show_bottom_toast`) so it never floats over the top-bar node status.
         {
             let (busy, msg) = self
                 .action
@@ -2483,7 +2494,6 @@ impl eframe::App for Station {
                 self.toast_seen = msg;
             }
         }
-        self.show_toast(ctx);
 
         // Keep the window title in sync with the selected network.
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
@@ -2661,11 +2671,19 @@ impl eframe::App for Station {
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
             ui.add_space(3.0);
             ui.horizontal(|ui| {
-                if let Some(err) = &snap.error {
-                    ui.colored_label(egui::Color32::from_rgb(220, 120, 120), format!("⚠ {err}"));
-                } else if snap.updated_ms > 0 {
-                    let age = now_ms().saturating_sub(snap.updated_ms);
-                    ui.label(egui::RichText::new(format!("updated {age} ms ago")).weak());
+                // A live transaction toast owns the left of the status bar for its brief
+                // lifetime (green/red) — more important in that moment than staleness or a
+                // node error, and it can never collide with the top-bar node status here.
+                if !self.show_bottom_toast(ui) {
+                    if let Some(err) = &snap.error {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 120, 120),
+                            format!("⚠ {err}"),
+                        );
+                    } else if snap.updated_ms > 0 {
+                        let age = now_ms().saturating_sub(snap.updated_ms);
+                        ui.label(egui::RichText::new(format!("updated {age} ms ago")).weak());
+                    }
                 }
                 // Right-aligned: the app version (always visible) + a "copied ✓" toast.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -7299,6 +7317,35 @@ mod tests {
         // Neutral / in-progress stays dim (not green, not red).
         assert!(matches!(tx_status("broadcasting signed tx…"), TxStatus::Info));
         assert!(matches!(tx_status("scanning the shielded pool…"), TxStatus::Info));
+    }
+
+    #[test]
+    fn toast_chip_text_strips_the_glyph_and_caps_length() {
+        // The leading status glyph (added by the action layer) is stripped — the
+        // bottom-bar toast supplies its own colored glyph.
+        assert_eq!(
+            toast_chip_text("✓ sent 5 XUS to alice.sov", 96),
+            "sent 5 XUS to alice.sov"
+        );
+        assert_eq!(
+            toast_chip_text("✗ send failed: insufficient balance", 96),
+            "send failed: insufficient balance"
+        );
+        assert_eq!(toast_chip_text("• broadcasting…", 96), "broadcasting…");
+        // A short message is returned verbatim (no ellipsis).
+        assert_eq!(toast_chip_text("ok", 96), "ok");
+        // An over-long message is capped to exactly `max_chars` with a trailing ellipsis
+        // so it can never blow out the single-line status bar.
+        let long = "x".repeat(200);
+        let capped = toast_chip_text(&long, 96);
+        assert_eq!(capped.chars().count(), 96);
+        assert!(capped.ends_with('…'));
+        assert!(capped.starts_with(&"x".repeat(95)));
+        // Char-safe truncation: a multi-byte boundary must never panic or split a glyph.
+        let wide = "✓ ".to_string() + &"é".repeat(200);
+        let capped = toast_chip_text(&wide, 10);
+        assert_eq!(capped.chars().count(), 10);
+        assert!(capped.ends_with('…'));
     }
 
     #[test]
