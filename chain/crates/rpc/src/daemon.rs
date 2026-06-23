@@ -1079,6 +1079,11 @@ impl Daemon {
             // logged once. `start_at` bounds the connect-before-mining grace window.
             let mut last_phase: Option<MinePhase> = None;
             let start_at = Instant::now();
+            // Hashrate meter: hashes attempted since the last publish, and when. Published
+            // to the shared telemetry ~1×/s so the UI can show this node's H/s (and an
+            // operator can confirm that multi-miner block shares track hashpower).
+            let mut hashes_acc = 0u64;
+            let mut rate_clock = Instant::now();
             // CONTINUOUS MINING (the Monero/Zcash/Bitcoin model, not "sleep then mine"):
             // the node grinds proof of work on a template built on the CURRENT tip,
             // batch after batch, abandoning the template the instant a better tip arrives.
@@ -1158,6 +1163,13 @@ impl Daemon {
                     last_phase = Some(phase);
                 }
                 if phase != MinePhase::Mining {
+                    // Not mining right now (connecting/downloading): report 0 H/s so the UI
+                    // shows this node is paused, not silently stalled.
+                    if let Some(ss) = sync_status.as_ref() {
+                        ss.set_local_hashrate(0);
+                    }
+                    hashes_acc = 0;
+                    rate_clock = Instant::now();
                     // Connecting or syncing: don't grind. Re-check shortly.
                     let mut waited = 0u64;
                     while waited < 200 && !sd.load(Ordering::SeqCst) {
@@ -1204,6 +1216,7 @@ impl Daemon {
                             break 'grind;
                         }
                         nonce = nonce.wrapping_add(GRIND_MICRO_BATCH);
+                        hashes_acc = hashes_acc.saturating_add(GRIND_MICRO_BATCH);
                         if sd.load(Ordering::SeqCst) {
                             break 'grind;
                         }
@@ -1211,6 +1224,15 @@ impl Daemon {
                     // YIELD: sleep ~the slice's own grind time (≈50% duty), capped, so the
                     // miner never starves the rest of the node. THE peer-drop fix.
                     thread::sleep(slice_start.elapsed().min(Duration::from_millis(250)));
+                    // Publish the measured hashrate ~1×/s (H/s = hashes / elapsed).
+                    if rate_clock.elapsed() >= Duration::from_secs(1) {
+                        let ms = rate_clock.elapsed().as_millis().max(1) as u64;
+                        if let Some(ss) = sync_status.as_ref() {
+                            ss.set_local_hashrate(hashes_acc.saturating_mul(1000) / ms);
+                        }
+                        hashes_acc = 0;
+                        rate_clock = Instant::now();
+                    }
                     // Liveness heartbeat so the operator sees active mining between blocks.
                     if last_beat.elapsed() >= MINING_HEARTBEAT {
                         daemon_log(

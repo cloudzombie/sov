@@ -121,6 +121,8 @@ struct Snapshot {
     peers: Option<usize>,
     best_peer_height: Option<u64>,
     syncing: bool,
+    /// This node's measured proof-of-work rate (H/s); 0 when not actively mining.
+    local_hashrate: u64,
 }
 
 /// UI-editable polling config, shared with the poller thread.
@@ -940,6 +942,8 @@ struct SyncView {
     best_peer_height: u64,
     /// Still catching up to a heavier peer chain — downloading, not mining.
     syncing: bool,
+    /// This node's measured proof-of-work rate (H/s); 0 when not actively mining.
+    local_hashrate: u64,
 }
 
 impl EmbeddedNode {
@@ -1001,6 +1005,7 @@ impl EmbeddedNode {
             // race — so a node racing at the tip reads as "Synced", not perpetually
             // "Syncing". Matches the mining gate exactly.
             syncing: self.sync.should_gate_mining(),
+            local_hashrate: self.sync.local_hashrate(),
         }
     }
 }
@@ -2100,6 +2105,7 @@ impl Station {
             snap.peers = Some(sv.peers);
             snap.best_peer_height = Some(sv.best_peer_height);
             snap.syncing = sv.syncing;
+            snap.local_hashrate = sv.local_hashrate;
             // Live chain state, read in-process every frame so height + supply + head
             // ROLL in real time (no dependency on the loopback RPC poller, which blips
             // on Windows). Skipped silently if the node is busy this instant.
@@ -2921,7 +2927,9 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
         egui::RichText::new(
             "Proof of work: a miner hashes the block header with a changing nonce until the seal \
              falls below the target. The winning nonce is the block's proof — one hash to verify, \
-             the whole network's effort to find.",
+             the whole network's effort to find. Block rewards track HASHPOWER, not machine count: \
+             a node with N× the hashrate earns ~N× the blocks. Compare \"Your hashrate\" across \
+             machines to see the split is fair.",
         )
         .weak()
         .small(),
@@ -2978,6 +2986,14 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
                         &format!("{:.0}s", s.target_block_ms as f64 / 1000.0),
                     );
                 }
+                let yours = if s.local_hashrate > 0 {
+                    fmt_hashrate(s.local_hashrate as f64)
+                } else if s.syncing {
+                    "paused — downloading".to_string()
+                } else {
+                    "—".to_string()
+                };
+                kv(ui, "Your hashrate (this machine)", &yours);
                 if let (Some(d), Some(ms)) = (diff, obs) {
                     if ms > 0 {
                         kv(

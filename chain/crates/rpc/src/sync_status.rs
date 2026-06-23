@@ -54,6 +54,11 @@ pub struct SyncShared {
     best_peer_height: AtomicU64,
     /// Number of peers that have completed the authenticated handshake.
     authed_peers: AtomicUsize,
+    /// This node's most recently measured proof-of-work rate, in hashes per second
+    /// (0 while not actively mining / gated). Published by the production loop and read
+    /// by the UI so an operator can compare machines — block rewards track THIS
+    /// (hashpower), not the number of machines, so a 10×-faster node earns ~10× the blocks.
+    local_hashrate: AtomicU64,
 }
 
 impl SyncShared {
@@ -97,6 +102,16 @@ impl SyncShared {
     /// Number of authenticated (handshake-complete) peers.
     pub fn authed_peers(&self) -> usize {
         self.authed_peers.load(Ordering::Relaxed)
+    }
+
+    /// **(writer — production loop.)** Publish the latest measured local hashrate (H/s).
+    pub fn set_local_hashrate(&self, hps: u64) {
+        self.local_hashrate.store(hps, Ordering::Relaxed);
+    }
+
+    /// This node's most recent measured proof-of-work rate (H/s); 0 when not mining.
+    pub fn local_hashrate(&self) -> u64 {
+        self.local_hashrate.load(Ordering::Relaxed)
     }
 }
 
