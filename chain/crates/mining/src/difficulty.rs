@@ -107,8 +107,24 @@ impl Difficulty {
             u128::MAX
         } else {
             next.as_u128()
-        };
-        Difficulty(next.max(1))
+        }
+        .max(1);
+        // Clamp the per-block CHANGE relative to the parent (most-recent) difficulty.
+        // The weighted average alone still lets a single anomalous window — most acutely a
+        // fresh chain's COLD START, where the warmup blocks were mined at the trivial
+        // genesis difficulty and rate-limited by commit overhead (not hashing), so their
+        // solve times don't reflect the real hashrate — overshoot into a multi-minute
+        // block (the live "130s first block on a 30s testnet"). Bounding the step to
+        // ≤ MAX_STEP× per block makes difficulty RAMP smoothly to equilibrium (a handful
+        // of progressively-slower blocks instead of one long stall) and keeps adaptation
+        // orderly as miners join or leave — the damping Bitcoin/Zcash-DigiShield apply for
+        // the same reason. At equilibrium the estimate sits inside the band, so the clamp
+        // does not bind (no steady-state bias).
+        const MAX_STEP: u128 = 2;
+        let parent = diffs[n - 1].max(1);
+        let lo = (parent / MAX_STEP).max(1);
+        let hi = parent.saturating_mul(MAX_STEP);
+        Difficulty(next.clamp(lo, hi))
     }
 }
 
@@ -190,6 +206,45 @@ mod tests {
         assert!(
             min_recent >= target_ms / 2,
             "block time must not collapse: min {min_recent}ms vs target {target_ms}ms"
+        );
+    }
+
+    #[test]
+    fn lwma_cold_start_from_trivial_difficulty_never_overshoots_into_slow_blocks() {
+        // The live failure: a fresh chain's warmup blocks are mined at the TRIVIAL genesis
+        // difficulty, rate-limited by commit overhead (not hashing), so their solve times
+        // don't reflect the real hashrate. Without the per-block clamp the LWMA overshoots
+        // and a block runs many times the target (the observed 130s block on a 30s
+        // testnet). With the clamp the difficulty ramps smoothly and, once past the brief
+        // ramp, NO block exceeds ~2x the target.
+        let target_ms = 30_000u64;
+        let hashrate = 2_000u128; // hashes/ms (~2 MH/s throttled CPU) ⇒ equilibrium D = 6e7
+        let n = 60usize;
+        // Warmup window: trivial difficulty, commit-limited ~30ms solve times (NOT D/H).
+        let mut diffs = vec![256u128; n];
+        let mut solvetimes = vec![30u64; n];
+        let mut worst_after_ramp = 0u64;
+        for i in 0..400 {
+            let next = Difficulty::lwma(&diffs, &solvetimes, target_ms);
+            // Per-block clamp must hold: never more than 2x the parent difficulty.
+            assert!(
+                next.0 <= diffs[n - 1].saturating_mul(2),
+                "step {i}: {} exceeds 2x parent {}",
+                next.0,
+                diffs[n - 1]
+            );
+            let solve = (next.0 / hashrate).max(1) as u64; // real grind time at this difficulty
+            diffs.remove(0);
+            diffs.push(next.0);
+            solvetimes.remove(0);
+            solvetimes.push(solve);
+            if i >= 60 {
+                worst_after_ramp = worst_after_ramp.max(solve);
+            }
+        }
+        assert!(
+            worst_after_ramp <= target_ms * 2,
+            "no block may run far past target: worst {worst_after_ramp}ms vs target {target_ms}ms"
         );
     }
 
