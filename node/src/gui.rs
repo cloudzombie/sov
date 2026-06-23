@@ -1862,7 +1862,7 @@ impl Station {
             let msg = send_payment(&rpc, seed, &from, &to, grains, &params, &action)
                 .map(|id| {
                     format!(
-                        "✓ sent {} XUS to {to} (tx {})",
+                        "✓ submitted {} XUS → {to} — in the mempool, confirms next block (tx {})",
                         xus(&grains.to_string()),
                         &id[..id.len().min(14)]
                     )
@@ -4445,6 +4445,21 @@ impl Station {
                         );
                     }
                 });
+                // In-flight transactions: anything in the node's mempool is waiting to be
+                // mined into the next block. The big number above is the CONFIRMED on-chain
+                // balance, so a just-sent tx shows here as pending until that block lands
+                // (the funds aren't "still in your wallet" — they're committed to the
+                // pending tx, which confirms in ~one block).
+                if let Some(n) = s.mempool.filter(|n| *n > 0) {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "⏳ {n} transaction(s) in the mempool — confirming in the next block"
+                        ))
+                        .small()
+                        .color(palette::warning()),
+                    );
+                }
             });
         ui.add_space(10.0);
     }
