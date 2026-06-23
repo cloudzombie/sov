@@ -166,6 +166,46 @@ fn rpc_server_serves_real_chain_state_and_accepts_transactions() {
         "no miners until someone mines"
     );
 
+    // --- block digest carries the new prevHash / stateRoot (for the block-detail view) ---
+    let digest = rpc(addr, "sov_getBlockDigest", json!({"height": 0}));
+    assert!(digest["result"]["prevHash"].is_string(), "digest has prevHash");
+    assert!(
+        digest["result"]["stateRoot"].is_string(),
+        "digest has stateRoot"
+    );
+
+    // --- fee estimate is the REAL gas × price (single source of truth) ---
+    // With a V1 (Ed25519) signer the envelope surcharge is zero, so a transfer's gas
+    // is exactly the 21,000 intrinsic; a shielded send costs strictly more (proof
+    // verification). The fee itself is gas × the node's live gas price.
+    let v1_pk = serde_json::to_value(kp.public_key()).unwrap();
+    let est = rpc(
+        addr,
+        "sov_estimateFee",
+        json!({"kind": "transfer", "publicKey": v1_pk}),
+    );
+    assert_eq!(est["result"]["gasUsed"], 21_000, "V1 transfer = intrinsic only");
+    assert!(
+        est["result"]["feeGrains"].is_string(),
+        "feeGrains is a JS-safe string"
+    );
+    let shielded = rpc(
+        addr,
+        "sov_estimateFee",
+        json!({"kind": "shielded", "publicKey": v1_pk}),
+    );
+    assert!(
+        shielded["result"]["gasUsed"].as_u64().unwrap() > 21_000,
+        "a shielded send costs more than a bare transfer"
+    );
+    // Default (no key) prices the hybrid post-quantum envelope every station wallet
+    // uses, so it costs strictly more than the V1 transfer.
+    let hybrid = rpc(addr, "sov_estimateFee", json!({"kind": "transfer"}));
+    assert!(hybrid["result"]["gasUsed"].as_u64().unwrap() > 21_000, "hybrid envelope > V1");
+    // An unknown route is a parameter error, not a silent default.
+    let bad_kind = rpc(addr, "sov_estimateFee", json!({"kind": "frobnicate"}));
+    assert_eq!(bad_kind["error"]["code"], -32602);
+
     // --- errors are well-formed JSON-RPC ---
     let unknown = rpc(addr, "sov_nope", json!({}));
     assert_eq!(unknown["error"]["code"], -32601);

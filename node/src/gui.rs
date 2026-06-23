@@ -75,6 +75,15 @@ struct BlockRow {
     miner_amount: String,
     founder_amount: String,
     dev_amount: String,
+    /// Header identity + seal, for the in-app block-detail view (click a block in the
+    /// Blocks tab). All from `sov_getBlockDigest`.
+    hash: String,
+    prev_hash: String,
+    state_root: String,
+    /// The compact PoW target (`nBits`) the nonce satisfied.
+    bits: u32,
+    /// Number of transactions in the block (a coinbase-only block has 0).
+    tx_count: usize,
 }
 
 /// The live state the poller writes and the UI reads.
@@ -123,6 +132,11 @@ struct Snapshot {
     syncing: bool,
     /// This node's measured proof-of-work rate (H/s); 0 when not actively mining.
     local_hashrate: u64,
+    /// The exact network fee (grains) a wallet send would pay right now, per route,
+    /// straight from `sov_estimateFee` (0 on a fee-free testnet, the real cost on
+    /// mainnet). Shown in the send-review modal so the spender sees the full cost.
+    fee_transfer_grains: u128,
+    fee_shielded_grains: u128,
 }
 
 /// UI-editable polling config, shared with the poller thread.
@@ -198,79 +212,150 @@ fn is_named_account(account: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// SOV Station palette — one cohesive, bank-grade dark theme (a GitHub-dark family):
-/// a deep slate base, restrained hairline borders, a confident SOV-green accent, and
-/// unambiguous success / error / warning signal colors. All new UI color flows from
-/// here so the app reads as one designed surface instead of ad-hoc tints.
+/// SOV Station palette — one cohesive, bank-grade theme in two MODES (a GitHub dark
+/// family and a clean "retail bank" light family): a slate/white base, restrained
+/// hairline borders, a confident SOV-green accent, and unambiguous success / error /
+/// warning signal colors. All UI color flows from here through mode-aware accessors,
+/// so flipping [`set_dark`] re-skins every panel, card, banner, pill and badge at once
+/// (not just egui's base visuals) — no dark islands on a light background.
 mod palette {
     use eframe::egui::Color32;
-    pub const BG: Color32 = Color32::from_rgb(13, 17, 23); // app background (deepest)
-    pub const PANEL: Color32 = Color32::from_rgb(22, 27, 34); // raised panels / cards / windows
-    pub const SURFACE: Color32 = Color32::from_rgb(33, 38, 45); // buttons / inputs at rest
-    pub const SURFACE_HI: Color32 = Color32::from_rgb(48, 54, 61); // hovered
-    pub const FIELD: Color32 = Color32::from_rgb(9, 12, 17); // recessed text-input wells
-    pub const BORDER: Color32 = Color32::from_rgb(48, 54, 61); // subtle hairline borders
-    pub const TEXT: Color32 = Color32::from_rgb(230, 237, 243); // primary text
-    pub const TEXT_DIM: Color32 = Color32::from_rgb(139, 148, 158); // secondary / neutral text
-    pub const ACCENT: Color32 = Color32::from_rgb(46, 160, 67); // SOV green — primary action
-    pub const ACCENT_HI: Color32 = Color32::from_rgb(63, 185, 80);
-    pub const SUCCESS: Color32 = Color32::from_rgb(63, 185, 80); // a transaction landed
-    pub const ERROR: Color32 = Color32::from_rgb(248, 81, 73); // a transaction failed
-    pub const WARNING: Color32 = Color32::from_rgb(210, 153, 34);
-    pub const LINK: Color32 = Color32::from_rgb(88, 166, 255);
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The active mode (dark by default). A process-wide atomic so every free-function
+    /// panel can read it without threading state through; flipped by the ☀/🌙 toggle.
+    static DARK: AtomicBool = AtomicBool::new(true);
+    pub fn set_dark(dark: bool) {
+        DARK.store(dark, Ordering::Relaxed);
+    }
+    pub fn is_dark() -> bool {
+        DARK.load(Ordering::Relaxed)
+    }
+    /// Pick the dark or light value for the current mode.
+    fn pick(dark: Color32, light: Color32) -> Color32 {
+        if is_dark() {
+            dark
+        } else {
+            light
+        }
+    }
+
+    const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
+        Color32::from_rgb(r, g, b)
+    }
+
+    // Each accessor returns the dark value / the calibrated light value.
+    pub fn bg() -> Color32 {
+        pick(rgb(13, 17, 23), rgb(246, 248, 250))
+    } // app background
+    pub fn panel() -> Color32 {
+        pick(rgb(22, 27, 34), rgb(255, 255, 255))
+    } // cards / windows
+    pub fn surface() -> Color32 {
+        pick(rgb(33, 38, 45), rgb(240, 242, 245))
+    } // buttons / inputs at rest
+    pub fn surface_hi() -> Color32 {
+        pick(rgb(48, 54, 61), rgb(225, 228, 232))
+    } // hovered
+    pub fn field() -> Color32 {
+        pick(rgb(9, 12, 17), rgb(255, 255, 255))
+    } // recessed input wells
+    pub fn border() -> Color32 {
+        pick(rgb(48, 54, 61), rgb(208, 215, 222))
+    } // hairline borders
+    pub fn text() -> Color32 {
+        pick(rgb(230, 237, 243), rgb(31, 35, 40))
+    } // primary text
+    pub fn text_dim() -> Color32 {
+        pick(rgb(139, 148, 158), rgb(101, 109, 118))
+    } // secondary text
+    pub fn accent() -> Color32 {
+        pick(rgb(46, 160, 67), rgb(31, 136, 61))
+    } // SOV green — primary action
+    pub fn accent_hi() -> Color32 {
+        pick(rgb(63, 185, 80), rgb(46, 160, 67))
+    }
+    pub fn success() -> Color32 {
+        pick(rgb(63, 185, 80), rgb(26, 127, 55))
+    } // a transaction landed
+    pub fn error() -> Color32 {
+        pick(rgb(248, 81, 73), rgb(207, 34, 46))
+    } // a transaction failed
+    pub fn warning() -> Color32 {
+        pick(rgb(210, 153, 34), rgb(154, 103, 0))
+    }
+    pub fn link() -> Color32 {
+        pick(rgb(88, 166, 255), rgb(9, 105, 218))
+    }
     /// A faint translucent tint of `c` (for status-banner fills/strokes).
     pub fn tint(c: Color32, alpha: u8) -> Color32 {
         Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
     }
 }
 
-/// Install the cohesive dark theme once, at startup. Sets the whole widget palette
-/// (rest / hover / press), recessed input wells, accent selection, link color, and a
-/// little more breathing room — so every panel inherits one consistent look.
-fn install_theme(ctx: &egui::Context) {
+/// Install the cohesive theme in the requested mode (dark or light). Sets the active
+/// `palette` mode FIRST (so every accessor returns the right family), then the whole
+/// widget palette (rest / hover / press), recessed input wells, accent selection, link
+/// color, and a little more breathing room — so every panel inherits one consistent
+/// look. Called at startup and again whenever the ☀/🌙 toggle flips the mode.
+fn install_theme(ctx: &egui::Context, dark: bool) {
     use egui::{Rounding, Stroke};
+    palette::set_dark(dark);
     let mut style = (*ctx.style()).clone();
-    let mut v = egui::Visuals::dark();
+    let mut v = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
     let r = Rounding::same(6.0);
 
-    v.widgets.noninteractive.bg_fill = palette::PANEL;
-    v.widgets.noninteractive.weak_bg_fill = palette::PANEL;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette::BORDER);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, palette::TEXT);
+    v.widgets.noninteractive.bg_fill = palette::panel();
+    v.widgets.noninteractive.weak_bg_fill = palette::panel();
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette::border());
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, palette::text());
     v.widgets.noninteractive.rounding = r;
 
-    v.widgets.inactive.bg_fill = palette::SURFACE;
-    v.widgets.inactive.weak_bg_fill = palette::SURFACE;
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, palette::BORDER);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, palette::TEXT);
+    v.widgets.inactive.bg_fill = palette::surface();
+    v.widgets.inactive.weak_bg_fill = palette::surface();
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, palette::border());
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0, palette::text());
     v.widgets.inactive.rounding = r;
 
-    v.widgets.hovered.bg_fill = palette::SURFACE_HI;
-    v.widgets.hovered.weak_bg_fill = palette::SURFACE_HI;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, palette::ACCENT);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, palette::TEXT);
+    v.widgets.hovered.bg_fill = palette::surface_hi();
+    v.widgets.hovered.weak_bg_fill = palette::surface_hi();
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, palette::accent());
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0, palette::text());
     v.widgets.hovered.rounding = r;
 
-    v.widgets.active.bg_fill = palette::ACCENT;
-    v.widgets.active.weak_bg_fill = palette::ACCENT;
-    v.widgets.active.bg_stroke = Stroke::new(1.0, palette::ACCENT_HI);
+    v.widgets.active.bg_fill = palette::accent();
+    v.widgets.active.weak_bg_fill = palette::accent();
+    v.widgets.active.bg_stroke = Stroke::new(1.0, palette::accent_hi());
     v.widgets.active.fg_stroke = Stroke::new(1.0, egui::Color32::WHITE);
     v.widgets.active.rounding = r;
 
     v.widgets.open = v.widgets.inactive;
 
-    v.selection.bg_fill = palette::tint(palette::ACCENT, 90);
-    v.selection.stroke = Stroke::new(1.0, palette::ACCENT_HI);
-    v.hyperlink_color = palette::LINK;
-    v.warn_fg_color = palette::WARNING;
-    v.error_fg_color = palette::ERROR;
-    v.window_fill = palette::PANEL;
-    v.window_stroke = Stroke::new(1.0, palette::BORDER);
+    v.selection.bg_fill = palette::tint(palette::accent(), 90);
+    v.selection.stroke = Stroke::new(1.0, palette::accent_hi());
+    v.hyperlink_color = palette::link();
+    v.warn_fg_color = palette::warning();
+    v.error_fg_color = palette::error();
+    v.window_fill = palette::panel();
+    v.window_stroke = Stroke::new(1.0, palette::border());
     v.window_rounding = Rounding::same(10.0);
-    v.panel_fill = palette::BG;
-    v.extreme_bg_color = palette::FIELD; // text-edit / code wells
-    v.faint_bg_color = egui::Color32::from_rgb(26, 31, 38); // striped rows
-    v.code_bg_color = egui::Color32::from_rgb(28, 33, 40);
+    v.panel_fill = palette::bg();
+    v.extreme_bg_color = palette::field(); // text-edit / code wells
+    // Striped rows + code wells, mode-aware (a faint stripe on whichever base).
+    v.faint_bg_color = if dark {
+        egui::Color32::from_rgb(26, 31, 38)
+    } else {
+        egui::Color32::from_rgb(244, 246, 249)
+    };
+    v.code_bg_color = if dark {
+        egui::Color32::from_rgb(28, 33, 40)
+    } else {
+        egui::Color32::from_rgb(235, 238, 242)
+    };
 
     style.visuals = v;
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
@@ -328,9 +413,9 @@ fn tx_status(msg: &str) -> TxStatus {
 /// The signal color for a status (green / red / neutral).
 fn status_color(s: TxStatus) -> egui::Color32 {
     match s {
-        TxStatus::Ok => palette::SUCCESS,
-        TxStatus::Err => palette::ERROR,
-        TxStatus::Info => palette::TEXT_DIM,
+        TxStatus::Ok => palette::success(),
+        TxStatus::Err => palette::error(),
+        TxStatus::Info => palette::text_dim(),
     }
 }
 
@@ -432,9 +517,9 @@ fn pill(ui: &mut egui::Ui, text: &str, col: egui::Color32) {
 /// the wallet UI uses everywhere to delineate the two at a glance.
 fn named_color(named: bool) -> egui::Color32 {
     if named {
-        palette::SUCCESS
+        palette::success()
     } else {
-        palette::WARNING
+        palette::warning()
     }
 }
 
@@ -559,6 +644,22 @@ fn poll(client: &RpcClient, cfg: &Config) -> Snapshot {
         s.pow_algo = field(&v, "algo");
         s.target_block_ms = v.get("targetBlockMs").and_then(Value::as_u64).unwrap_or(0);
     }
+    // The live per-route network fee, straight from consensus (0 on a fee-free
+    // testnet, the real cost on mainnet) — surfaced in the send-review modal. A node
+    // without the method just reports no fee (graceful on older peers).
+    let fee_of = |kind: &str| -> u128 {
+        client
+            .call("sov_estimateFee", json!({ "kind": kind }))
+            .ok()
+            .and_then(|v| {
+                v.get("feeGrains")
+                    .and_then(Value::as_str)
+                    .and_then(|g| g.parse::<u128>().ok())
+            })
+            .unwrap_or(0)
+    };
+    s.fee_transfer_grains = fee_of("transfer");
+    s.fee_shielded_grains = fee_of("shielded");
     s.mempool = client.mempool_size().ok();
     if let Ok(r) = client.mint_reward() {
         s.reward = r.grains().to_string();
@@ -634,6 +735,27 @@ fn block_row(height: u64, digest: &Value) -> BlockRow {
             .and_then(Value::as_u64)
             .unwrap_or(0),
         nonce: digest.get("nonce").and_then(Value::as_u64).unwrap_or(0),
+        hash: digest
+            .get("hash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        prev_hash: digest
+            .get("prevHash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        state_root: digest
+            .get("stateRoot")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        bits: digest.get("bits").and_then(Value::as_u64).unwrap_or(0) as u32,
+        tx_count: digest
+            .get("txIds")
+            .and_then(Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0),
         ..Default::default()
     };
     let cb = digest.get("coinbase");
@@ -915,6 +1037,10 @@ struct PendingSend {
     from_account: String,
     to: String,
     amount_grains: u128,
+    /// The spendable balance (grains) of the source the amount is drawn from — the
+    /// transparent account for a normal send, the shielded pool for a pool spend —
+    /// so the review modal can show the resulting balance after amount + fee.
+    from_balance_grains: u128,
     route_label: String,
     self_send: bool,
     /// True when BOTH ends are public (transparent→transparent): the amount and
@@ -1080,6 +1206,9 @@ pub struct Station {
     // A peer to bootstrap the local node to (`host:port`), so two machines join the
     // SAME testnet (same genesis + a P2P link). Persisted in the node config.
     peer_addr: String,
+    // UI theme mode (dark by default). Persisted across launches; flipped by the ☀/🌙
+    // toggle, which re-installs the theme live.
+    dark_mode: bool,
     // This machine's LAN address to hand to the OTHER machine (cached at launch).
     lan_addr: Option<String>,
     network: Network,
@@ -1093,6 +1222,7 @@ pub struct Station {
     reveal_phrase: bool,            // show the active wallet's recovery phrase (export)
     receive_kind: ReceiveKind,      // which address the Receive view shows
     pending_send: Option<PendingSend>, // a send awaiting confirmation (review modal)
+    block_detail: Option<u64>,         // height of the block open in the detail view
     wallets_dirty: bool,            // wallets exist that aren't saved to the keystore
     confirm_quit: bool,             // quit requested with unsaved wallets — show guard
     gen_name: String,
@@ -1259,6 +1389,7 @@ impl Station {
             log_prev_syncing: None,
             log_prev_best: None,
             peer_addr: read_saved_peer(),
+            dark_mode: read_saved_theme(),
             lan_addr: lan_ipv4(),
             network: Network::Testnet,
             wallets: Vec::new(),
@@ -1270,6 +1401,7 @@ impl Station {
             reveal_phrase: false,
             receive_kind: ReceiveKind::Shielded,
             pending_send: None,
+            block_detail: None,
             wallets_dirty: false,
             confirm_quit: false,
             gen_name: "my-wallet".to_string(),
@@ -2185,6 +2317,22 @@ impl Station {
         true
     }
 
+    /// One tab in the top toolbar: a leading glyph + label, a clear active state
+    /// (accent-filled pill via the selectable's selection styling), and built-in hover
+    /// feedback. Replaces the plain text `selectable_value` row.
+    fn tab_button(&mut self, ui: &mut egui::Ui, tab: Tab, glyph: &str, label: &str) {
+        let selected = self.tab == tab;
+        let text = egui::RichText::new(format!("{glyph}  {label}"));
+        let text = if selected {
+            text.strong().color(palette::text())
+        } else {
+            text.color(palette::text_dim())
+        };
+        if ui.selectable_label(selected, text).clicked() {
+            self.tab = tab;
+        }
+    }
+
     /// Append a node-log line whenever a watched observable changes — the live peer
     /// count (in-process), RPC online/offline, and head height — so the Node log shows
     /// peering churn and sync progress as they happen instead of a frozen number. Only
@@ -2506,18 +2654,17 @@ impl eframe::App for Station {
             ui.horizontal(|ui| {
                 ui.heading("SOV Station");
                 ui.separator();
-                // Network chip + selector — you ALWAYS know which network you're
-                // on, and switching keeps every wallet (keys are network-agnostic).
-                ui.label(
-                    egui::RichText::new(format!(" {} ", self.network.label()))
-                        .strong()
-                        .color(egui::Color32::BLACK)
-                        .background_color(self.network.color()),
-                );
+                // Network selector — one colored chip that IS the switcher (no more
+                // redundant "TESTNET TESTNET"); you ALWAYS know which network you're on,
+                // and switching keeps every wallet (keys are network-agnostic).
                 let mut chosen = self.network;
                 egui::ComboBox::from_id_salt("network")
-                    .selected_text(self.network.label())
-                    .width(110.0)
+                    .selected_text(
+                        egui::RichText::new(format!("● {}", self.network.label()))
+                            .strong()
+                            .color(self.network.color()),
+                    )
+                    .width(120.0)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut chosen, Network::Testnet, "Testnet");
                         ui.selectable_value(&mut chosen, Network::Mainnet, "Mainnet");
@@ -2568,6 +2715,19 @@ impl eframe::App for Station {
                         );
                     }
                 }
+                // Theme toggle (right-aligned): flip dark/light live + persist the choice.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (glyph, hint) = if self.dark_mode {
+                        ("☀", "Switch to light mode")
+                    } else {
+                        ("🌙", "Switch to dark mode")
+                    };
+                    if ui.button(glyph).on_hover_text(hint).clicked() {
+                        self.dark_mode = !self.dark_mode;
+                        install_theme(ui.ctx(), self.dark_mode);
+                        save_theme(self.dark_mode);
+                    }
+                });
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -2656,16 +2816,19 @@ impl eframe::App for Station {
                 }
             });
             ui.add_space(6.0);
+            // A real toolbar: a glyph per tab, a clear active state, and a hairline
+            // separating it from the content below.
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Node, "Node");
-                ui.selectable_value(&mut self.tab, Tab::Mining, "Mining");
-                ui.selectable_value(&mut self.tab, Tab::Wallet, "Wallet");
-                ui.selectable_value(&mut self.tab, Tab::Tokens, "Tokens");
-                ui.selectable_value(&mut self.tab, Tab::Swaps, "Swaps");
-                ui.selectable_value(&mut self.tab, Tab::Blocks, "Blocks");
-                ui.selectable_value(&mut self.tab, Tab::Activity, "Activity");
+                self.tab_button(ui, Tab::Node, "◧", "Node");
+                self.tab_button(ui, Tab::Mining, "⛏", "Mining");
+                self.tab_button(ui, Tab::Wallet, "👛", "Wallet");
+                self.tab_button(ui, Tab::Tokens, "⬡", "Tokens");
+                self.tab_button(ui, Tab::Swaps, "⇄", "Swaps");
+                self.tab_button(ui, Tab::Blocks, "▦", "Blocks");
+                self.tab_button(ui, Tab::Activity, "◷", "Activity");
             });
             ui.add_space(4.0);
+            ui.separator();
         });
 
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
@@ -2696,7 +2859,10 @@ impl eframe::App for Station {
                         .weak()
                         .monospace(),
                     );
-                    if let Some(t) = self.copied_at {
+                    // A copy from an explicit button (`self.copied_at`) OR from any
+                    // `copy_glyph` affordance (egui memory) shows the same confirmation.
+                    let last_copy = self.copied_at.into_iter().chain(copied_recent(ctx)).max();
+                    if let Some(t) = last_copy {
                         if now_ms().saturating_sub(t) < 1500 {
                             ui.separator();
                             ui.colored_label(egui::Color32::from_rgb(120, 200, 120), "copied ✓");
@@ -2747,7 +2913,7 @@ impl eframe::App for Station {
                         .id_salt("scroll_swaps")
                         .show(ui, |ui| self.swaps_panel(ui));
                 }
-                Tab::Blocks => blocks_panel(ui, &snap),
+                Tab::Blocks => blocks_panel(ui, &snap, &mut self.block_detail),
                 Tab::Activity => {
                     egui::ScrollArea::vertical()
                         .id_salt("scroll_activity")
@@ -2840,6 +3006,72 @@ fn kv(ui: &mut egui::Ui, k: &str, v: &str) {
     ui.end_row();
 }
 
+/// Stable egui-memory key for "something was just copied", set by [`copy_glyph`] from
+/// any panel (free functions can't touch `self.copied_at`) and read by the bottom bar,
+/// so a copy from anywhere shows the same "copied ✓" confirmation.
+fn copied_memory_id() -> egui::Id {
+    egui::Id::new("sov_copied_at")
+}
+
+/// The most recent copy timestamp recorded in egui memory by [`copy_glyph`], if any.
+fn copied_recent(ctx: &egui::Context) -> Option<u64> {
+    ctx.data(|d| d.get_temp::<u64>(copied_memory_id()))
+}
+
+/// A compact copy-to-clipboard affordance — a small 📋 button that copies `value`.
+/// A free function (no `&self`) so it works from every panel; confirmation is the
+/// shared bottom-bar "copied ✓" (signalled through egui memory), so there is no
+/// per-row layout shift. No-op for an empty / placeholder value.
+fn copy_glyph(ui: &mut egui::Ui, value: &str) {
+    if value.is_empty() || value == "—" {
+        return;
+    }
+    let resp = ui
+        .add(
+            egui::Button::new(egui::RichText::new("📋").size(11.0).color(palette::text_dim()))
+                .frame(false),
+        )
+        .on_hover_text("Copy");
+    if resp.clicked() {
+        ui.output_mut(|o| o.copied_text = value.to_owned());
+        let now = now_ms();
+        ui.ctx().data_mut(|d| d.insert_temp(copied_memory_id(), now));
+    }
+}
+
+/// A key/value grid row whose value is a hash or address: a shortened, monospace
+/// display with a copy affordance that puts the FULL value on the clipboard.
+fn kv_copy(ui: &mut egui::Ui, k: &str, full: &str) {
+    ui.label(egui::RichText::new(k).weak());
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(if full.is_empty() {
+                "—".to_string()
+            } else {
+                short(full)
+            })
+            .monospace(),
+        );
+        copy_glyph(ui, full);
+    });
+    ui.end_row();
+}
+
+/// A friendly empty-state block — a large glyph "illustration" + a title and a hint —
+/// shown where a list or feed has nothing yet, so a panel never reads as broken or
+/// blank but instead tells the user what will appear and how to make it happen.
+fn empty_state(ui: &mut egui::Ui, glyph: &str, title: &str, hint: &str) {
+    ui.add_space(28.0);
+    ui.vertical_centered(|ui| {
+        ui.label(egui::RichText::new(glyph).size(40.0).color(palette::text_dim()));
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(title).strong().size(15.0));
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new(hint).weak());
+    });
+    ui.add_space(28.0);
+}
+
 /// Real node logs — the embedded node's startup, replay timing, RPC/P2P bring-up,
 /// and errors — in a monospace, newest-last view so the user can see exactly what
 /// the node is doing (and why a start was slow or failed).
@@ -2888,8 +3120,8 @@ fn node_panel(ui: &mut egui::Ui, s: &Snapshot) {
                 "Height",
                 &s.height.map(|h| h.to_string()).unwrap_or_default(),
             );
-            kv(ui, "Head", &short(&s.head_hash));
-            kv(ui, "State root", &short(&s.state_root));
+            kv_copy(ui, "Head", &s.head_hash);
+            kv_copy(ui, "State root", &s.state_root);
             kv(
                 ui,
                 "Supply (mined)",
@@ -3000,8 +3232,8 @@ fn avg_block_interval_ms(blocks: &[BlockRow]) -> Option<u64> {
 /// A bordered section card (the cohesive container used across the richer panels).
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::group(ui.style())
-        .fill(palette::PANEL)
-        .stroke(egui::Stroke::new(1.0, palette::BORDER))
+        .fill(palette::panel())
+        .stroke(egui::Stroke::new(1.0, palette::border()))
         .rounding(egui::Rounding::same(8.0))
         .inner_margin(egui::Margin::same(12.0))
         .show(ui, add)
@@ -3033,11 +3265,11 @@ fn interval_sparkline(ui: &mut egui::Ui, blocks: &[BlockRow], target_ms: u64) {
         let x = rect.left() + i as f32 * slot;
         let bar_h = (v / max) * h;
         let col = if v <= target_s * 2.0 {
-            palette::SUCCESS
+            palette::success()
         } else if v <= target_s * 4.0 {
-            palette::WARNING
+            palette::warning()
         } else {
-            palette::ERROR
+            palette::error()
         };
         painter.rect_filled(
             egui::Rect::from_min_max(
@@ -3052,7 +3284,7 @@ fn interval_sparkline(ui: &mut egui::Ui, blocks: &[BlockRow], target_ms: u64) {
     let ty = rect.bottom() - (target_s / max) * h;
     painter.line_segment(
         [egui::pos2(rect.left(), ty), egui::pos2(rect.right(), ty)],
-        egui::Stroke::new(1.0, palette::tint(palette::TEXT_DIM, 170)),
+        egui::Stroke::new(1.0, palette::tint(palette::text_dim(), 170)),
     );
 }
 
@@ -3084,7 +3316,7 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
             c[0].label(
                 egui::RichText::new("YOUR HASHPOWER")
                     .small()
-                    .color(palette::TEXT_DIM),
+                    .color(palette::text_dim()),
             );
             let yours = if s.local_hashrate > 0 {
                 fmt_hashrate(s.local_hashrate as f64)
@@ -3097,18 +3329,18 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
                 egui::RichText::new(yours)
                     .size(26.0)
                     .strong()
-                    .color(palette::ACCENT_HI),
+                    .color(palette::accent_hi()),
             );
             c[1].label(
                 egui::RichText::new("NETWORK HASHPOWER (est)")
                     .small()
-                    .color(palette::TEXT_DIM),
+                    .color(palette::text_dim()),
             );
             c[1].label(
                 egui::RichText::new(net_hps.map(fmt_hashrate).unwrap_or_else(|| "—".to_string()))
                     .size(26.0)
                     .strong()
-                    .color(palette::TEXT),
+                    .color(palette::text()),
             );
         });
     });
@@ -3119,7 +3351,7 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
         ui.label(
             egui::RichText::new("Block cadence — recent intervals (newest →)")
                 .small()
-                .color(palette::TEXT_DIM),
+                .color(palette::text_dim()),
         );
         interval_sparkline(ui, &s.blocks, s.target_block_ms);
         ui.add_space(8.0);
@@ -3131,13 +3363,13 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
             ui.label(
                 egui::RichText::new("PROOF OF WORK")
                     .small()
-                    .color(palette::TEXT_DIM),
+                    .color(palette::text_dim()),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     egui::RichText::new(format!("⛏ {}", pow_algo_display(&s.pow_algo)))
                         .strong()
-                        .color(palette::ACCENT_HI),
+                        .color(palette::accent_hi()),
                 );
             });
         });
@@ -3193,7 +3425,7 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
             ui.label(
                 egui::RichText::new("LATEST BLOCK SOLVED")
                     .small()
-                    .color(palette::TEXT_DIM),
+                    .color(palette::text_dim()),
             );
             ui.add_space(4.0);
             egui::Grid::new("latest-block-kv")
@@ -3201,11 +3433,16 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
                 .spacing([24.0, 6.0])
                 .show(ui, |ui| {
                     kv(ui, "Height", &b.height.to_string());
-                    kv(ui, "Nonce", &b.nonce.to_string());
+                    ui.label(egui::RichText::new("Nonce").weak());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(b.nonce.to_string()).monospace());
+                        copy_glyph(ui, &b.nonce.to_string());
+                    });
+                    ui.end_row();
                     kv(ui, "Solved", &block_time(b.timestamp_ms));
-                    kv(ui, "Miner", &short_id(&b.miner));
+                    kv_copy(ui, "Miner", &b.miner);
                     if !s.head_hash.is_empty() {
-                        kv(ui, "Block hash", &short_id(&s.head_hash));
+                        kv_copy(ui, "Block hash", &s.head_hash);
                     }
                     kv(ui, "Coinbase", &format!("{} XUS", xus(&b.reward)));
                 });
@@ -4134,8 +4371,8 @@ impl Station {
             .map(|v| grains_to_xus_plain(u128::from(v.balance)));
 
         egui::Frame::group(ui.style())
-            .fill(palette::PANEL)
-            .stroke(egui::Stroke::new(1.0, palette::BORDER))
+            .fill(palette::panel())
+            .stroke(egui::Stroke::new(1.0, palette::border()))
             .rounding(egui::Rounding::same(10.0))
             .inner_margin(egui::Margin::same(16.0))
             .show(ui, |ui| {
@@ -4143,7 +4380,7 @@ impl Station {
                     ui.label(
                         egui::RichText::new("ACTIVE WALLET")
                             .small()
-                            .color(palette::TEXT_DIM),
+                            .color(palette::text_dim()),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         network_badge(ui, self.network);
@@ -4151,14 +4388,14 @@ impl Station {
                             ui.label(
                                 egui::RichText::new("⛏ mining")
                                     .small()
-                                    .color(palette::SUCCESS),
+                                    .color(palette::success()),
                             );
                         }
                         if watch_only {
                             ui.label(
                                 egui::RichText::new("👁 watch-only")
                                     .small()
-                                    .color(palette::TEXT_DIM),
+                                    .color(palette::text_dim()),
                             );
                         }
                     });
@@ -4169,35 +4406,35 @@ impl Station {
                         egui::RichText::new(&bal)
                             .size(34.0)
                             .strong()
-                            .color(palette::TEXT),
+                            .color(palette::text()),
                     );
                     ui.label(
                         egui::RichText::new("XUS")
                             .size(15.0)
-                            .color(palette::TEXT_DIM),
+                            .color(palette::text_dim()),
                     );
                     if let Some(sh) = &shielded {
                         ui.add_space(10.0);
                         ui.label(
                             egui::RichText::new(format!("🛡 {sh} private"))
-                                .color(palette::ACCENT_HI),
+                                .color(palette::accent_hi()),
                         );
                     }
                 });
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(&label).strong().color(palette::LINK));
-                    ui.label(egui::RichText::new("·").color(palette::TEXT_DIM));
+                    ui.label(egui::RichText::new(&label).strong().color(palette::link()));
+                    ui.label(egui::RichText::new("·").color(palette::text_dim()));
                     ui.label(
                         egui::RichText::new(short_id(&effective))
                             .monospace()
-                            .color(palette::TEXT_DIM),
+                            .color(palette::text_dim()),
                     );
                     if named {
                         ui.label(
                             egui::RichText::new("✓ named")
                                 .small()
-                                .color(palette::SUCCESS),
+                                .color(palette::success()),
                         );
                     }
                 });
@@ -4221,11 +4458,11 @@ impl Station {
         ui.add_space(8.0);
         let log = self.activity.lock().map(|l| l.clone()).unwrap_or_default();
         if log.is_empty() {
-            ui.label(
-                egui::RichText::new(
-                    "No activity yet — send, shield, register a name, or open a swap and it shows here.",
-                )
-                .weak(),
+            empty_state(
+                ui,
+                "◷",
+                "No activity yet",
+                "Send, shield, register a name, or open a swap — it shows up here.",
             );
             return;
         }
@@ -4245,7 +4482,7 @@ impl Station {
                             egui::RichText::new(time)
                                 .monospace()
                                 .size(11.0)
-                                .color(palette::TEXT_DIM),
+                                .color(palette::text_dim()),
                         );
                     }
                     ui.label(egui::RichText::new(body).monospace().size(12.0).color(col));
@@ -4254,9 +4491,83 @@ impl Station {
         });
     }
 
+    /// A compact onboarding checklist — the create-wallet → start-node → mine → send
+    /// journey — shown atop the Wallet tab until the user is up and running, so a
+    /// first-time user always knows the next step. Auto-hides once fully set up.
+    fn first_run_checklist(&self, ui: &mut egui::Ui, s: &Snapshot) {
+        let has_wallet = !self.wallets.is_empty();
+        let node_running = matches!(&*self.node_run.lock().unwrap(), NodeRun::Running(_));
+        let acct = self.wallets.get(self.selected).map(|w| w.effective_account());
+        let row = acct
+            .as_ref()
+            .and_then(|a| s.accounts.iter().find(|r| &r.account == a));
+        let has_funds = row
+            .and_then(|a| a.balance.parse::<u128>().ok())
+            .map(|b| b > 0)
+            .unwrap_or(false);
+        let has_sent = row
+            .and_then(|a| a.nonce.parse::<u64>().ok())
+            .map(|n| n > 0)
+            .unwrap_or(false);
+        // Fully set up — the checklist has served its purpose, so get out of the way.
+        if has_wallet && node_running && has_funds && has_sent {
+            return;
+        }
+        fn step(ui: &mut egui::Ui, done: bool, current: bool, text: &str) {
+            ui.horizontal(|ui| {
+                let (glyph, col) = if done {
+                    ("✓", palette::success())
+                } else if current {
+                    ("▸", palette::accent_hi())
+                } else {
+                    ("○", palette::text_dim())
+                };
+                ui.label(egui::RichText::new(glyph).color(col).strong());
+                let t = egui::RichText::new(text);
+                ui.label(if done {
+                    t.color(palette::text_dim()).strikethrough()
+                } else if current {
+                    t.strong()
+                } else {
+                    t.color(palette::text_dim())
+                });
+            });
+        }
+        card(ui, |ui| {
+            ui.label(
+                egui::RichText::new("GET STARTED")
+                    .small()
+                    .color(palette::text_dim()),
+            );
+            ui.add_space(4.0);
+            // "current" highlights the first not-yet-done step.
+            step(ui, has_wallet, !has_wallet, "Create or restore a wallet");
+            step(
+                ui,
+                node_running,
+                has_wallet && !node_running,
+                "Start the local node (it mines to your wallet)",
+            );
+            step(
+                ui,
+                has_funds,
+                node_running && !has_funds,
+                "Mine your first block (wait for a coinbase)",
+            );
+            step(
+                ui,
+                has_sent,
+                has_funds && !has_sent,
+                "Send your first transaction",
+            );
+        });
+        ui.add_space(8.0);
+    }
+
     fn wallet_panel(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
         let ctx = ui.ctx().clone();
         ui.heading("Wallet");
+        self.first_run_checklist(ui, s);
 
         // ── STATE 1 — Onboarding ──
         // Like every real wallet, you must create or restore a recovery phrase
@@ -5133,6 +5444,7 @@ impl Station {
                         from_account: effective.clone(),
                         to: to_trim.to_string(),
                         amount_grains: g,
+                        from_balance_grains: spendable,
                         route_label: route.label().0,
                         self_send,
                         // Any transparent route puts sender, recipient, and amount
@@ -5328,6 +5640,7 @@ impl Station {
                             from_account: effective.clone(),
                             to,
                             amount_grains: g,
+                            from_balance_grains: sv.balance as u128,
                             route_label: "shielded → shielded (fully private)".to_string(),
                             self_send,
                             links_public: false,
@@ -5444,16 +5757,16 @@ impl Station {
                             egui::RichText::new(xus(&p.amount_grains.to_string()))
                                 .size(28.0)
                                 .strong()
-                                .color(palette::TEXT),
+                                .color(palette::text()),
                         );
-                        ui.label(egui::RichText::new("XUS").size(14.0).color(palette::TEXT_DIM));
+                        ui.label(egui::RichText::new("XUS").size(14.0).color(palette::text_dim()));
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 if p.links_public {
-                                    pill(ui, "PUBLIC", palette::WARNING);
+                                    pill(ui, "PUBLIC", palette::warning());
                                 } else {
-                                    pill(ui, "PRIVATE", palette::SUCCESS);
+                                    pill(ui, "PRIVATE", palette::success());
                                 }
                             },
                         );
@@ -5479,24 +5792,43 @@ impl Station {
                             ui.end_row();
                             kv(ui, "Route", &p.route_label);
                             kv(ui, "Network", &format!("{} · {}", network.label(), network.pow_algo()));
+                            // The EXACT network fee for this route (from consensus via
+                            // `sov_estimateFee`) and the resulting balance after amount +
+                            // fee, so the full cost is visible before broadcast.
+                            let fee = if p.links_public {
+                                s.fee_transfer_grains
+                            } else {
+                                s.fee_shielded_grains
+                            };
+                            let fee_str = if fee == 0 {
+                                "0 XUS  ·  no network fee on testnet".to_string()
+                            } else {
+                                format!("{} XUS", xus(&fee.to_string()))
+                            };
+                            kv(ui, "Network fee", &fee_str);
+                            let after = p
+                                .from_balance_grains
+                                .saturating_sub(p.amount_grains)
+                                .saturating_sub(fee);
+                            kv(ui, "Balance after", &format!("{} XUS", xus(&after.to_string())));
                         });
                     ui.add_space(8.0);
                     // Privacy + self-send context.
                     if p.links_public {
                         ui.colored_label(
-                            palette::WARNING,
+                            palette::warning(),
                             "⚠ Public — sender, recipient, and amount are visible on-chain. Send \
                              to a xus1…/uxus1… address to keep it private.",
                         );
                     } else {
                         ui.colored_label(
-                            palette::SUCCESS,
+                            palette::success(),
                             "🛡 Private — recipient and amount are shielded on-chain.",
                         );
                     }
                     if p.self_send {
                         ui.colored_label(
-                            palette::TEXT_DIM,
+                            palette::text_dim(),
                             "↩ This is one of your own addresses.",
                         );
                     }
@@ -5511,7 +5843,7 @@ impl Station {
                                         .strong()
                                         .color(egui::Color32::WHITE),
                                 )
-                                .fill(palette::ACCENT),
+                                .fill(palette::accent()),
                             )
                             .clicked()
                         {
@@ -5543,7 +5875,7 @@ impl Station {
             ui.horizontal(|ui| {
                 ui.spinner();
                 if !msg.is_empty() {
-                    ui.label(egui::RichText::new(&msg).color(palette::TEXT_DIM));
+                    ui.label(egui::RichText::new(&msg).color(palette::text_dim()));
                 }
             });
         } else {
@@ -5573,7 +5905,7 @@ impl Station {
                                             egui::RichText::new(time)
                                                 .monospace()
                                                 .size(11.0)
-                                                .color(palette::TEXT_DIM),
+                                                .color(palette::text_dim()),
                                         );
                                     }
                                     ui.label(
@@ -5825,14 +6157,23 @@ fn block_time(ts_ms: u64) -> String {
     }
 }
 
-fn blocks_panel(ui: &mut egui::Ui, s: &Snapshot) {
+fn blocks_panel(ui: &mut egui::Ui, s: &Snapshot, selected: &mut Option<u64>) {
     ui.heading("Blocks");
     ui.label(egui::RichText::new("each block's coinbase — newly minted issuance and its 93% / 5% / 2% miner / founder / dev split").weak());
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("click a height to inspect it in the explorer →").weak());
+        ui.label(egui::RichText::new("click a height to inspect the block →").weak());
         ui.hyperlink_to("open explorer ↗", EXPLORER_URL);
     });
     ui.add_space(8.0);
+    if s.blocks.is_empty() {
+        empty_state(
+            ui,
+            "▦",
+            "No blocks yet",
+            "Start the local node (Node tab) to begin mining — solved blocks appear here.",
+        );
+        return;
+    }
     egui::ScrollArea::vertical().show(ui, |ui| {
         egui::Grid::new("blocks")
             .num_columns(7)
@@ -5851,16 +6192,15 @@ fn blocks_panel(ui: &mut egui::Ui, s: &Snapshot) {
                     ui.label(egui::RichText::new(h).weak());
                 }
                 ui.end_row();
-                if s.blocks.is_empty() {
-                    ui.label("—");
-                    ui.end_row();
-                }
                 for b in &s.blocks {
-                    // Height links to the block's page in the running explorer.
-                    ui.hyperlink_to(
-                        b.height.to_string(),
-                        format!("{EXPLORER_URL}/#/block/{}", b.height),
-                    );
+                    // Height opens the in-app block-detail view (seal, nonce, hashes).
+                    if ui
+                        .link(egui::RichText::new(b.height.to_string()).monospace())
+                        .on_hover_text("Inspect this block")
+                        .clicked()
+                    {
+                        *selected = Some(b.height);
+                    }
                     ui.monospace(block_time(b.timestamp_ms));
                     ui.monospace(short(&b.miner));
                     ui.monospace(xus(&b.reward));
@@ -5871,6 +6211,79 @@ fn blocks_panel(ui: &mut egui::Ui, s: &Snapshot) {
                 }
             });
     });
+    // ── Block-detail view (click a height above) ──
+    if let Some(height) = *selected {
+        if let Some(b) = s.blocks.iter().find(|b| b.height == height) {
+            block_detail_window(ui.ctx(), b, selected);
+        } else {
+            // The block scrolled out of the recent window — nothing to show.
+            *selected = None;
+        }
+    }
+}
+
+/// The block-detail modal: full header identity (hash / prev / state root), the PoW
+/// seal (nonce + compact target), timestamp, tx count, and the coinbase split — each
+/// hash with a copy affordance, plus a deep link into the explorer.
+fn block_detail_window(ctx: &egui::Context, b: &BlockRow, selected: &mut Option<u64>) {
+    let mut open = true;
+    egui::Window::new(egui::RichText::new(format!("Block #{}", b.height)).strong())
+        .collapsible(false)
+        .resizable(false)
+        .default_width(460.0)
+        .open(&mut open)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.set_max_width(460.0);
+            ui.add_space(2.0);
+            egui::Grid::new("block_detail_grid")
+                .num_columns(2)
+                .spacing([16.0, 8.0])
+                .show(ui, |ui| {
+                    kv(ui, "Height", &b.height.to_string());
+                    kv(ui, "Time", &block_time(b.timestamp_ms));
+                    kv_copy(ui, "Hash", &b.hash);
+                    kv_copy(ui, "Prev hash", &b.prev_hash);
+                    kv_copy(ui, "State root", &b.state_root);
+                    // The PoW seal — the nonce that satisfied the compact target.
+                    ui.label(egui::RichText::new("Nonce (seal)").weak());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(b.nonce.to_string()).monospace());
+                        copy_glyph(ui, &b.nonce.to_string());
+                    });
+                    ui.end_row();
+                    kv(ui, "Target (nBits)", &format!("0x{:08x}", b.bits));
+                    kv(ui, "Transactions", &b.tx_count.to_string());
+                });
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Coinbase").strong());
+            egui::Grid::new("block_detail_coinbase")
+                .num_columns(2)
+                .spacing([16.0, 6.0])
+                .show(ui, |ui| {
+                    kv(ui, "Reward", &format!("{} XUS", xus(&b.reward)));
+                    kv_copy(ui, "Miner", &b.miner);
+                    kv(ui, "Miner 93%", &format!("{} XUS", xus(&b.miner_amount)));
+                    kv(ui, "Founder 5%", &format!("{} XUS", xus(&b.founder_amount)));
+                    kv(ui, "Dev 2%", &format!("{} XUS", xus(&b.dev_amount)));
+                });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Close").clicked() {
+                    *selected = None;
+                }
+                ui.hyperlink_to(
+                    "open in explorer ↗",
+                    format!("{EXPLORER_URL}/#/block/{}", b.height),
+                );
+            });
+        });
+    // The window's [x] close button.
+    if !open {
+        *selected = None;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6792,6 +7205,28 @@ fn save_peer(peer: &str) {
     let _ = std::fs::write(peer_config_path(), peer.trim());
 }
 
+/// Where the UI theme choice is persisted (next to the peer file, outside the data dir).
+fn theme_config_path() -> PathBuf {
+    let base = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(".sov-station-theme")
+}
+
+/// The saved theme mode — dark unless the operator chose light last time.
+fn read_saved_theme() -> bool {
+    match std::fs::read_to_string(theme_config_path()) {
+        Ok(s) => s.trim() != "light",
+        Err(_) => true,
+    }
+}
+
+/// Persist the theme choice so it survives restarts.
+fn save_theme(dark: bool) {
+    let _ = std::fs::write(theme_config_path(), if dark { "dark" } else { "light" });
+}
+
 /// Add an inbound Windows Defender Firewall allow-rule for this executable, so LAN
 /// peers can reach the P2P (9645/TCP) + discovery (9646/UDP) ports. Unsigned apps
 /// are inbound-blocked by default on Windows, which silently prevents peering; this
@@ -7213,7 +7648,7 @@ pub fn run(rpc: String) -> Result<(), String> {
         "SOV Station",
         options,
         Box::new(move |cc| {
-            install_theme(&cc.egui_ctx);
+            install_theme(&cc.egui_ctx, read_saved_theme());
             spawn_poller(poll_snap, poll_cfg, cc.egui_ctx.clone());
             Ok(Box::new(Station::new(snapshot, config)))
         }),
@@ -7388,5 +7823,60 @@ mod tests {
         assert_eq!(decrypt_blob(&key, &bad), None);
         // Truncated/short input is rejected, not panicked on.
         assert_eq!(decrypt_blob(&key, &blob[..8]), None);
+    }
+
+    #[test]
+    fn block_row_parses_header_identity_seal_and_coinbase() {
+        // A digest as `sov_getBlockDigest` returns it (incl. the new prevHash /
+        // stateRoot fields the block-detail view shows).
+        let digest = serde_json::json!({
+            "hash": "aa".repeat(32),
+            "prevHash": "bb".repeat(32),
+            "stateRoot": "cc".repeat(32),
+            "timestampMs": 1_700_000_000_000u64,
+            "nonce": 42u64,
+            "bits": 0x1d00ffffu64,
+            "txIds": ["dd".repeat(32), "ee".repeat(32)],
+            "coinbase": {
+                "reward": "1250000000000",
+                "recipients": [
+                    { "role": "miner", "account": "miner.acct", "amount": "1162500000000" },
+                    { "role": "founder-tax", "account": "f", "amount": "62500000000" },
+                    { "role": "dev-tax", "account": "d", "amount": "25000000000" },
+                ],
+            },
+        });
+        let row = block_row(7, &digest);
+        assert_eq!(row.height, 7);
+        assert_eq!(row.hash, "aa".repeat(32));
+        assert_eq!(row.prev_hash, "bb".repeat(32));
+        assert_eq!(row.state_root, "cc".repeat(32));
+        assert_eq!(row.nonce, 42);
+        assert_eq!(row.bits, 0x1d00ffff);
+        assert_eq!(row.tx_count, 2);
+        assert_eq!(row.miner, "miner.acct");
+        assert_eq!(row.reward, "1250000000000");
+        assert_eq!(row.miner_amount, "1162500000000");
+        // Missing optional fields degrade gracefully (no panic, sensible defaults).
+        let bare = block_row(0, &serde_json::json!({}));
+        assert_eq!(bare.height, 0);
+        assert_eq!(bare.tx_count, 0);
+        assert!(bare.hash.is_empty());
+    }
+
+    #[test]
+    fn palette_modes_differ_and_toggle() {
+        // The light/dark accessor must actually return different values per mode, so
+        // the toggle re-skins custom surfaces (not just egui's base visuals).
+        palette::set_dark(true);
+        assert!(palette::is_dark());
+        let dark_bg = palette::bg();
+        let dark_text = palette::text();
+        palette::set_dark(false);
+        assert!(!palette::is_dark());
+        assert_ne!(dark_bg, palette::bg(), "bg differs by mode");
+        assert_ne!(dark_text, palette::text(), "text differs by mode");
+        // Restore the process-wide default so nothing else observes light mode.
+        palette::set_dark(true);
     }
 }

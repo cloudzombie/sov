@@ -28,7 +28,7 @@
 //! Reads: `sov_health`, `sov_chainId`, `sov_getHeight`, `sov_getSupply`,
 //! `sov_getAccount`, `sov_getBalance`, `sov_getNonce`, `sov_getBlockByHeight`,
 //! `sov_getBlockByHash`, `sov_getBlockDigest`, `sov_getHead`,
-//! `sov_getStateRoot`, `sov_getDifficulty`,
+//! `sov_getStateRoot`, `sov_getDifficulty`, `sov_estimateFee`,
 //! `sov_getMempoolSize`, `sov_getConfirmations`, `sov_isFinal`,
 //! `sov_getMiners`, `sov_listTokens` (paged), `sov_getTokenInfo`,
 //! `sov_getTokenBalances`, `sov_getHtlc`. SNS (Sovereign Name Service):
@@ -587,6 +587,8 @@ fn call(node: &Arc<Mutex<Node>>, method: &str, params: &Value) -> Result<Value, 
                 };
                 json!({
                     "hash": to_value(b.hash()),
+                    "prevHash": to_value(b.header.prev_hash),
+                    "stateRoot": to_value(b.header.state_root),
                     "timestampMs": b.header.timestamp_ms,
                     "nonce": b.header.nonce,
                     "bits": b.header.bits,
@@ -610,6 +612,51 @@ fn call(node: &Arc<Mutex<Node>>, method: &str, params: &Value) -> Result<Value, 
                 "sha256d": c.sha256d_difficulty().0.to_string(),
                 "algo": format!("{:?}", c.mining_policy().pow_algo),
                 "targetBlockMs": c.mining_policy().target_block_ms,
+            }))
+        }
+        "sov_estimateFee" => {
+            // The EXACT fee the runtime would charge for one of the wallet's send
+            // routes, using the same gas schedule (`sov_runtime::gas`) and the node's
+            // live gas price — 0 on a fee-free testnet, the real cost once fees are on
+            // (mainnet). The station shows this (and the resulting balance) in the
+            // send-review modal so the spender sees the full cost before broadcast.
+            use sov_runtime::gas::{
+                envelope_gas, hybrid_envelope_gas, BOOKKEEPING_GAS, INTRINSIC_GAS,
+                SHIELDED_VERIFY_GAS,
+            };
+            let kind = params.get("kind").and_then(Value::as_str).unwrap_or("transfer");
+            // Payload-independent intrinsic gas per route — mirrors `gas_for` (pinned by
+            // `gas::tests::wallet_route_intrinsic_gas_is_stable`).
+            let action_gas = match kind {
+                "transfer" => INTRINSIC_GAS,
+                "tokenTransfer" => INTRINSIC_GAS + BOOKKEEPING_GAS,
+                "shielded" => INTRINSIC_GAS + SHIELDED_VERIFY_GAS,
+                other => {
+                    return Err(RpcError::invalid_params(format!(
+                        "unknown action kind `{other}` (transfer | tokenTransfer | shielded)"
+                    )))
+                }
+            };
+            // Signature-envelope surcharge: exact for the signer's key when supplied,
+            // else the hybrid (post-quantum) envelope every sov-station wallet uses.
+            let envelope = match params.get("publicKey").and_then(Value::as_str) {
+                Some(pk_hex) => {
+                    let pk: sov_crypto::PublicKey =
+                        serde_json::from_value(Value::String(pk_hex.to_string())).map_err(|e| {
+                            RpcError::invalid_params(format!("invalid publicKey: {e}"))
+                        })?;
+                    envelope_gas(&pk)
+                }
+                None => hybrid_envelope_gas(),
+            };
+            let gas_used = action_gas + envelope;
+            let gas_price = node.chain().mining_policy().gas_price.grains();
+            let fee = u128::from(gas_used).saturating_mul(gas_price);
+            Ok(json!({
+                "kind": kind,
+                "gasUsed": gas_used,
+                "gasPriceGrains": gas_price.to_string(),
+                "feeGrains": fee.to_string(),
             }))
         }
         "sov_getMintReward" => Ok(to_value(node.chain().mint_reward())),

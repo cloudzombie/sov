@@ -120,11 +120,17 @@ pub const INTENT_VERIFY_GAS: u64 = 30_000;
 pub fn envelope_gas(key: &sov_crypto::PublicKey) -> u64 {
     match key {
         sov_crypto::PublicKey::V1Ed25519(_) => 0,
-        sov_crypto::PublicKey::V2HybridMlDsa65 { .. } => {
-            let extra_bytes = (sov_crypto::ML_DSA_65_PK_LEN + sov_crypto::ML_DSA_65_SIG_LEN) as u64;
-            extra_bytes * CALLDATA_GAS_PER_BYTE + ML_DSA_VERIFY_GAS
-        }
+        sov_crypto::PublicKey::V2HybridMlDsa65 { .. } => hybrid_envelope_gas(),
     }
+}
+
+/// The envelope surcharge for a hybrid (Ed25519 + ML-DSA-65) signature, beyond the
+/// V1 baseline — the single source of truth for `envelope_gas`'s V2 arm, exposed so
+/// a fee estimator can price the station's post-quantum wallets without a key in
+/// hand (every sov-station wallet signs hybrid).
+pub fn hybrid_envelope_gas() -> u64 {
+    let extra_bytes = (sov_crypto::ML_DSA_65_PK_LEN + sov_crypto::ML_DSA_65_SIG_LEN) as u64;
+    extra_bytes * CALLDATA_GAS_PER_BYTE + ML_DSA_VERIFY_GAS
 }
 
 /// Extra gas for one ML-DSA-65 verification (lattice arithmetic — materially
@@ -141,5 +147,45 @@ pub fn policy_entries(policy: &sov_compliance::CompliancePolicy) -> u64 {
     match &policy.transfer_control {
         TransferControl::Unrestricted => 0,
         TransferControl::AllowList(set) | TransferControl::DenyList(set) => set.len() as u64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sov_crypto::Keypair;
+
+    #[test]
+    fn hybrid_envelope_gas_matches_envelope_gas_for_a_hybrid_key() {
+        // The exposed helper (used by the fee estimator without a key in hand) must
+        // equal what `envelope_gas` charges a real hybrid key — one source of truth.
+        let pk = Keypair::hybrid_from_seed([7u8; 32]).public_key();
+        assert_eq!(envelope_gas(&pk), hybrid_envelope_gas());
+        // A V1 (Ed25519) key pays no envelope surcharge.
+        let v1 = Keypair::from_seed([7u8; 32]).public_key();
+        assert_eq!(envelope_gas(&v1), 0);
+    }
+
+    #[test]
+    fn wallet_route_intrinsic_gas_is_stable() {
+        // These payload-independent sums are what the `sov_estimateFee` RPC reuses for
+        // the wallet's three send routes; pin them so the RPC can never drift.
+        use sov_primitives::{AccountId, Balance, Hash};
+        let to = AccountId::new("ab".repeat(32)).expect("64-hex implicit id");
+        assert_eq!(
+            gas_for(&Action::Transfer {
+                to: to.clone(),
+                amount: Balance::from_grains(1),
+            }),
+            INTRINSIC_GAS
+        );
+        assert_eq!(
+            gas_for(&Action::TokenTransfer {
+                asset: Hash::from_bytes([2u8; 32]),
+                to,
+                amount: Balance::from_grains(1),
+            }),
+            INTRINSIC_GAS + BOOKKEEPING_GAS
+        );
     }
 }
