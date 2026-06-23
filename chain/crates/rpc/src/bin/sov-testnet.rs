@@ -395,6 +395,10 @@ fn cmd_gen(flags: &Flags) -> Result<(), Box<dyn Error>> {
         block_time_ms: Some(block_time_ms),
         pow: pow.clone(),
         difficulty_leading_zeros: Some(difficulty_zeros),
+        // Use the selected policy's native de-shield limiter by default; the shipped
+        // testnet-1.json relaxes it via these optional overrides.
+        deshield_limit_sov: None,
+        deshield_window_blocks: None,
         accounts,
     };
     write_json(&out.join("chain-spec.json"), &spec)?;

@@ -126,6 +126,20 @@ pub struct ChainSpec {
     /// running chain. (Affects only the sha256d target the seal compares against.)
     #[serde(default)]
     pub difficulty_leading_zeros: Option<u32>,
+    /// Override the de-shield drain-limiter's per-window cap, in whole SOV. `None`
+    /// uses the policy's native limit. A testnet relaxes this (and/or
+    /// [`deshield_window_blocks`](Self::deshield_window_blocks)) so de-shielding is
+    /// freely testable, while mainnet keeps its native circuit breaker. The limiter
+    /// is NOT a genesis-header field, so changing it never alters the genesis hash
+    /// (no reset), and relaxing it is replay-compatible (past de-shields that fit the
+    /// stricter cap still fit the looser one).
+    #[serde(default)]
+    pub deshield_limit_sov: Option<u128>,
+    /// Override the de-shield drain-limiter's rolling window length, in blocks. `None`
+    /// uses the policy's native window; `0` disables the limiter entirely. Same
+    /// no-reset / replay-safe properties as [`deshield_limit_sov`](Self::deshield_limit_sov).
+    #[serde(default)]
+    pub deshield_window_blocks: Option<u64>,
     /// Funded accounts.
     pub accounts: Vec<SpecAccount>,
 }
@@ -172,6 +186,16 @@ impl ChainSpec {
         }
         if let Some(lz) = self.difficulty_leading_zeros {
             mining.sha256d_target = sov_mining::Target::from_leading_zero_bits(lz);
+        }
+        // De-shield drain-limiter overrides (relaxed on testnet; not a header field, so
+        // no reset). A `0` window disables the limiter outright.
+        if let Some(sov) = self.deshield_limit_sov {
+            mining.deshield_limit_grains = Balance::from_sov(sov)
+                .map_err(|e| DaemonError::config(format!("deshield_limit_sov: {e}")))?
+                .grains();
+        }
+        if let Some(blocks) = self.deshield_window_blocks {
+            mining.deshield_window_blocks = blocks;
         }
         Ok(GenesisConfig {
             chain_id: self.chain_id.clone(),
@@ -1336,6 +1360,37 @@ mod tests {
         );
         assert_eq!(
             genesis_hash,
+            "5e9f3cc54cc3f9e3fdb798019cec9aee8cf0c3881a7e4901e1840aff6f7aa2b1"
+        );
+    }
+
+    #[test]
+    fn deshield_limiter_override_applies_without_changing_the_genesis_hash() {
+        // Testnet relaxes the de-shield drain limiter. The override must reach the
+        // mining policy...
+        let spec = ChainSpec::from_json(TESTNET_1_SPEC).expect("frozen spec parses");
+        assert_eq!(spec.deshield_limit_sov, Some(1_000_000));
+        assert_eq!(spec.deshield_window_blocks, Some(12));
+        let cfg = spec.to_genesis_config().expect("spec -> genesis config");
+        assert_eq!(
+            cfg.mining.deshield_limit_grains,
+            sov_primitives::Balance::from_sov(1_000_000).unwrap().grains()
+        );
+        assert_eq!(cfg.mining.deshield_window_blocks, 12);
+        // ...but the limiter is NOT a genesis-header field, so the genesis hash is
+        // IDENTICAL with or without the override — proving relaxing it needs no reset
+        // (and a node resumes its existing chain under the looser rule).
+        let mut bare = spec.clone();
+        bare.deshield_limit_sov = None;
+        bare.deshield_window_blocks = None;
+        let with = spec.to_genesis_config().unwrap().build().unwrap().block.hash();
+        let without = bare.to_genesis_config().unwrap().build().unwrap().block.hash();
+        assert_eq!(
+            with, without,
+            "de-shield limiter override must not change the genesis hash"
+        );
+        assert_eq!(
+            with.to_hex(),
             "5e9f3cc54cc3f9e3fdb798019cec9aee8cf0c3881a7e4901e1840aff6f7aa2b1"
         );
     }

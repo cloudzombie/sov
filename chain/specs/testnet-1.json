@@ -5,6 +5,8 @@
   "block_time_ms": 5000,
   "pow": "sha256d",
   "difficulty_leading_zeros": 8,
+  "deshield_limit_sov": 1000000,
+  "deshield_window_blocks": 12,
   "accounts": [
     {
       "account": "genesis.node.sov",

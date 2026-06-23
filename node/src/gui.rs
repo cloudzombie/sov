@@ -116,6 +116,9 @@ struct Snapshot {
     shielded_pool: String,
     deshieldable_now: Option<u128>,
     deshield_resets_at: Option<u64>,
+    /// The de-shield drain-limiter's full per-window cap (grains), so the wallet can
+    /// show "X of LIMIT this window". `None`/0 when the limiter is disabled.
+    deshield_limit: Option<u128>,
     error: Option<String>,
     updated_ms: u64,
     /// LIVE peer/sync telemetry, read in-process from the embedded node every frame
@@ -638,6 +641,10 @@ fn poll(client: &RpcClient, cfg: &Config) -> Snapshot {
             .and_then(Value::as_str)
             .and_then(|x| x.parse::<u128>().ok());
         s.deshield_resets_at = v.get("windowResetsAtHeight").and_then(Value::as_u64);
+        s.deshield_limit = v
+            .get("deshieldLimitGrains")
+            .and_then(Value::as_str)
+            .and_then(|x| x.parse::<u128>().ok());
     }
     if let Ok(v) = client.call("sov_getDifficulty", json!({})) {
         s.difficulty = field(&v, "sha256d");
@@ -5503,13 +5510,15 @@ impl Station {
                         .hint_text("amount")
                         .desired_width(140.0),
                 );
-                if ui
-                    .button("Max")
-                    .on_hover_text("de-shield the most allowed right now (balance, capped by the window budget)")
-                    .clicked()
-                {
-                    self.deshield_amount = grains_to_xus_plain(deshield_cap);
-                }
+                ui.add_enabled_ui(deshield_cap > 0, |ui| {
+                    if ui
+                        .button("Max")
+                        .on_hover_text("de-shield the most allowed right now (balance, capped by the window budget)")
+                        .clicked()
+                    {
+                        self.deshield_amount = grains_to_xus_plain(deshield_cap);
+                    }
+                });
                 let ds_ok = for_this
                     && sv.notes > 0
                     && !sv.scanning
@@ -5521,31 +5530,73 @@ impl Station {
                     }
                 });
             });
-            // Show the live budget so the per-window drain limit is transparent.
+            // Show the live budget so the per-window drain limit is transparent — and,
+            // when the window cap (not the balance) is the binding constraint, say so
+            // LOUDLY with when it resets, so a limited/0 Max never reads as a broken
+            // wallet (this is the de-shield circuit breaker, working as designed).
             if for_this {
-                if budget_now.is_some() {
-                    let resets = snap
-                        .deshield_resets_at
-                        .map(|h| format!(", window resets at height {h}"))
-                        .unwrap_or_default();
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "de-shieldable now: up to {} XUS (balance {} XUS; per-window limit{})",
-                            grains_to_xus_plain(deshield_cap),
-                            xus(&sv.balance.to_string()),
-                            resets,
-                        ))
-                        .small()
-                        .weak(),
-                    );
-                } else {
-                    ui.label(
-                        egui::RichText::new(
-                            "de-shield moves a variable amount to this account (transparent); change stays shielded",
-                        )
-                        .small()
-                        .weak(),
-                    );
+                match budget_now {
+                    Some(b) => {
+                        // Reset as a time estimate (height delta × block time), not a raw height.
+                        let reset_str = match (snap.deshield_resets_at, snap.height) {
+                            (Some(r), Some(h)) if r > h && snap.target_block_ms > 0 => {
+                                let secs = (r - h) * snap.target_block_ms / 1000;
+                                if secs >= 60 {
+                                    format!(" — resets in ~{} min (block {r})", secs / 60)
+                                } else {
+                                    format!(" — resets in ~{secs}s (block {r})")
+                                }
+                            }
+                            (Some(r), _) => format!(" — resets at block {r}"),
+                            _ => String::new(),
+                        };
+                        if b < sv.balance as u128 {
+                            // The per-window cap, not the balance, is the limit right now.
+                            let of_limit = snap
+                                .deshield_limit
+                                .filter(|l| *l > 0)
+                                .map(|l| format!(" of {} XUS/window", grains_to_xus_plain(l)))
+                                .unwrap_or_default();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "⏳ De-shield rate-limited — up to {} XUS{} de-shieldable now{}. \
+                                     Your {} XUS pool balance exceeds the per-window cap, so de-shield \
+                                     in batches. (Private shielded → shielded sends are NOT limited.)",
+                                    grains_to_xus_plain(deshield_cap),
+                                    of_limit,
+                                    reset_str,
+                                    xus(&sv.balance.to_string()),
+                                ))
+                                .small()
+                                .color(palette::warning()),
+                            );
+                        } else {
+                            let cap_note = snap
+                                .deshield_limit
+                                .filter(|l| *l > 0)
+                                .map(|l| format!("; per-window cap {} XUS", grains_to_xus_plain(l)))
+                                .unwrap_or_default();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "de-shieldable now: up to {} XUS (balance {} XUS{})",
+                                    grains_to_xus_plain(deshield_cap),
+                                    xus(&sv.balance.to_string()),
+                                    cap_note,
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                        }
+                    }
+                    None => {
+                        ui.label(
+                            egui::RichText::new(
+                                "de-shield moves a variable amount to this account (transparent); change stays shielded",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    }
                 }
             }
 
