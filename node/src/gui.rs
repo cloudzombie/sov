@@ -2938,6 +2938,46 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
 
     let diff = s.difficulty.parse::<f64>().ok();
     let obs = avg_block_interval_ms(&s.blocks);
+    let net_hps = match (diff, obs) {
+        (Some(d), Some(ms)) if ms > 0 => Some(d / (ms as f64 / 1000.0)),
+        _ => None,
+    };
+
+    // ── Hashpower hero — your measured rate vs the estimated network rate, up front ──
+    card(ui, |ui| {
+        ui.columns(2, |c| {
+            c[0].label(
+                egui::RichText::new("YOUR HASHPOWER")
+                    .small()
+                    .color(palette::TEXT_DIM),
+            );
+            let yours = if s.local_hashrate > 0 {
+                fmt_hashrate(s.local_hashrate as f64)
+            } else if s.syncing {
+                "paused — syncing".to_string()
+            } else {
+                "—".to_string()
+            };
+            c[0].label(
+                egui::RichText::new(yours)
+                    .size(26.0)
+                    .strong()
+                    .color(palette::ACCENT_HI),
+            );
+            c[1].label(
+                egui::RichText::new("NETWORK HASHPOWER (est)")
+                    .small()
+                    .color(palette::TEXT_DIM),
+            );
+            c[1].label(
+                egui::RichText::new(net_hps.map(fmt_hashrate).unwrap_or_else(|| "—".to_string()))
+                    .size(26.0)
+                    .strong()
+                    .color(palette::TEXT),
+            );
+        });
+    });
+    ui.add_space(8.0);
 
     // ── Proof-of-Work card — the algorithm, difficulty, target, and the live proof ──
     card(ui, |ui| {
@@ -2985,23 +3025,6 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
                         "Target block time",
                         &format!("{:.0}s", s.target_block_ms as f64 / 1000.0),
                     );
-                }
-                let yours = if s.local_hashrate > 0 {
-                    fmt_hashrate(s.local_hashrate as f64)
-                } else if s.syncing {
-                    "paused — downloading".to_string()
-                } else {
-                    "—".to_string()
-                };
-                kv(ui, "Your hashrate (this machine)", &yours);
-                if let (Some(d), Some(ms)) = (diff, obs) {
-                    if ms > 0 {
-                        kv(
-                            ui,
-                            "Est. network hashrate",
-                            &format!("≈ {}", fmt_hashrate(d / (ms as f64 / 1000.0))),
-                        );
-                    }
                 }
                 kv(
                     ui,
