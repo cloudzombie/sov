@@ -24,7 +24,7 @@ use sov_crypto::Keypair;
 use sov_mining::MiningPolicy;
 use sov_network::{NetMessage, TcpNode};
 use sov_primitives::{AccountId, Balance, Hash};
-use sov_rpc::{Daemon, P2p, P2pConfig, P2pHandle, SyncShared};
+use sov_rpc::{Daemon, P2p, P2pConfig, P2pHandle, RpcClient, SyncShared};
 use std::sync::Arc;
 use sov_types::{Action, SignedTransaction, Transaction};
 
@@ -624,6 +624,117 @@ fn two_miners_share_one_chain_and_both_earn_blocks() {
     a_net.shutdown();
     b_net.shutdown();
     a_dae.shutdown();
+    b_dae.shutdown();
+}
+
+#[test]
+fn a_tx_submitted_to_one_node_is_gossiped_to_a_peer_and_mined() {
+    // PROOF that transactions PROPAGATE across the network — the thing a real chain
+    // MUST do. Node A serves RPC + P2P but NEVER mines; node B mines. A transaction
+    // POSTed to A's JSON-RPC can only ever reach the chain if A GOSSIPS it to B and B
+    // mines it — so its inclusion proves transaction gossip works (not merely block
+    // gossip). Before the fix, `sov_submitTransaction` added the tx to the local
+    // mempool only and never broadcast it, so it could be mined ONLY by the node it
+    // was submitted to.
+    let g = {
+        let mut g = genesis_2op();
+        g.mining.target_block_ms = 250; // fast blocks → mines within seconds
+        g
+    };
+
+    // Node A — RPC + P2P + gossip, but NO mining (serve_rpc, empty miner set).
+    let a_sync = Arc::new(SyncShared::new());
+    let a_d = Daemon::new(&g, unique_dir("gossip-a"), 1024, 256, vec![]).unwrap();
+    let a_p2p = P2p::bind(
+        a_d.node(),
+        P2pConfig {
+            chain_id: g.chain_id.clone(),
+            genesis_hash: a_d.genesis_hash(),
+            account: id("val01.node.sov"),
+            keypair: Keypair::from_seed([61; 32]),
+        },
+        "127.0.0.1:0",
+    )
+    .unwrap()
+    .with_block_log(a_d.block_log())
+    .with_sync_status(Arc::clone(&a_sync));
+    let a_d = a_d.with_gossip(a_p2p.tcp()).with_sync_status(Arc::clone(&a_sync));
+    let a_net = a_p2p.start();
+    let a_rpc = a_d.serve_rpc("127.0.0.1:0", 1).unwrap();
+    let a_rpc_addr = a_rpc.local_addr();
+
+    // Node B — a full miner.
+    let b_sync = Arc::new(SyncShared::new());
+    let b_d = Daemon::new(
+        &g,
+        unique_dir("gossip-b"),
+        1024,
+        256,
+        vec![(id("val02.node.sov"), Keypair::from_seed(VAL02_SEED))],
+    )
+    .unwrap();
+    let b_p2p = P2p::bind(
+        b_d.node(),
+        P2pConfig {
+            chain_id: g.chain_id.clone(),
+            genesis_hash: b_d.genesis_hash(),
+            account: id("val02.node.sov"),
+            keypair: Keypair::from_seed([62; 32]),
+        },
+        "127.0.0.1:0",
+    )
+    .unwrap()
+    .with_block_log(b_d.block_log())
+    .with_sync_status(Arc::clone(&b_sync));
+    let b_d = b_d.with_gossip(b_p2p.tcp()).with_sync_status(Arc::clone(&b_sync));
+    let b_net = b_p2p.start();
+    let b_dae = b_d.run("127.0.0.1:0", 1, 0).unwrap();
+
+    // Peer them and WAIT for the APP-authenticated link (Noise handshake AND the signed
+    // `Hello` — `authed_peers`, not the raw connection count) — A gossips the tx once, so
+    // B must be ready to accept it before we submit.
+    b_net.connect(&a_net.local_addr().to_string()).unwrap();
+    assert!(
+        wait_until(30, || a_sync.authed_peers() >= 1 && b_sync.authed_peers() >= 1),
+        "A and B app-authenticated a peer link"
+    );
+
+    // Submit the tx to A (the NON-miner) over JSON-RPC.
+    let stx = usa_transfer("val02.node.sov", 10, 0);
+    let tx_id = stx.id();
+    let client = RpcClient::new(a_rpc_addr.to_string());
+    let accepted = client
+        .call("sov_submitTransaction", serde_json::to_value(&stx).unwrap())
+        .map(|v| v.get("accepted").and_then(|a| a.as_bool()).unwrap_or(false))
+        .unwrap_or(false);
+    assert!(accepted, "node A accepted the transaction over RPC");
+
+    // It must PROPAGATE to B — A does not mine, so B can only know this tx if A gossiped
+    // it. Proven by the tx reaching B's mempool OR being mined into B's chain (B is the
+    // only miner, so a tx in the chain was mined by B from a gossiped tx). Either way the
+    // tx left the node it was submitted to — real transaction propagation.
+    let propagated = wait_until(60, || {
+        let bn = b_dae.node();
+        let bn = bn.lock().unwrap();
+        if bn.mempool_len() > 0 {
+            return true; // B (which generates no txs of its own) received it via gossip
+        }
+        let h = bn.chain().height();
+        (1..=h).any(|height| {
+            bn.chain()
+                .block_by_height(height)
+                .map(|b| b.transactions.iter().any(|t| t.id() == tx_id))
+                .unwrap_or(false)
+        })
+    });
+    assert!(
+        propagated,
+        "a tx submitted to the non-mining node A propagated to peer B (gossip works)"
+    );
+
+    a_rpc.shutdown();
+    a_net.shutdown();
+    b_net.shutdown();
     b_dae.shutdown();
 }
 

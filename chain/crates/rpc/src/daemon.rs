@@ -1035,9 +1035,14 @@ impl Daemon {
             .unwrap_or_default()
     }
 
-    /// Start the JSON-RPC server over this daemon's node.
+    /// Start the JSON-RPC server over this daemon's node. The P2P transport (if any)
+    /// is handed to it so a transaction accepted via `sov_submitTransaction` is
+    /// gossiped to peers — reaching every node's mempool so any miner can include it,
+    /// not just the node it was submitted to.
     pub fn serve_rpc(&self, addr: &str, workers: usize) -> io::Result<RpcHandle> {
-        RpcServer::new(self.node()).start(addr, workers)
+        RpcServer::new(self.node())
+            .with_gossip(self.gossip.clone())
+            .start(addr, workers)
     }
 
     /// Produce a single block now (timestamped `timestamp_ms`) if the mempool has

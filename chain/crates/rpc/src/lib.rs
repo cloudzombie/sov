@@ -115,6 +115,12 @@ impl RpcError {
 /// A JSON-RPC server bound to a shared [`Node`].
 pub struct RpcServer {
     node: Arc<Mutex<Node>>,
+    /// If set, a transaction accepted via `sov_submitTransaction` is GOSSIPED to
+    /// peers over this transport, so it reaches every node's mempool and any miner
+    /// can include it — not just the node it was submitted to. Without this a tx
+    /// would live only on the originating node (the "only mined by its own client"
+    /// bug); a real network must propagate transactions.
+    gossip: Option<Arc<sov_network::TcpNode>>,
 }
 
 /// A running server: its bound address and the means to stop it gracefully.
@@ -142,7 +148,17 @@ impl RpcHandle {
 impl RpcServer {
     /// Wrap a shared node.
     pub fn new(node: Arc<Mutex<Node>>) -> Self {
-        RpcServer { node }
+        RpcServer {
+            node,
+            gossip: None,
+        }
+    }
+
+    /// Attach a P2P transport so accepted transactions are gossiped to peers (so any
+    /// node can mine them, not just the one they were submitted to).
+    pub fn with_gossip(mut self, gossip: Option<Arc<sov_network::TcpNode>>) -> Self {
+        self.gossip = gossip;
+        self
     }
 
     /// Bind `addr` and start `workers` accept threads. Returns immediately with a
@@ -161,11 +177,12 @@ impl RpcServer {
             let listener = Arc::clone(&listener);
             let shutdown = Arc::clone(&shutdown);
             let node = Arc::clone(&self.node);
+            let gossip = self.gossip.clone();
             handles.push(thread::spawn(move || {
                 while !shutdown.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((stream, _peer)) => {
-                            let _ = handle_connection(stream, &node);
+                            let _ = handle_connection(stream, &node, &gossip);
                         }
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(2));
@@ -240,7 +257,11 @@ fn write_response(stream: &mut TcpStream, status: &str, body: &[u8]) -> io::Resu
 }
 
 /// Handle a single connection: one request, one response, then close.
-fn handle_connection(mut stream: TcpStream, node: &Arc<Mutex<Node>>) -> io::Result<()> {
+fn handle_connection(
+    mut stream: TcpStream,
+    node: &Arc<Mutex<Node>>,
+    gossip: &Option<Arc<sov_network::TcpNode>>,
+) -> io::Result<()> {
     // The listener is non-blocking; accepted sockets must be blocking for the
     // timeout-bounded reads/writes below to behave.
     stream.set_nonblocking(false)?;
@@ -257,7 +278,7 @@ fn handle_connection(mut stream: TcpStream, node: &Arc<Mutex<Node>>) -> io::Resu
             serde_json::to_vec(&health(node)).unwrap_or_default(),
         )
     } else if method == "POST" {
-        ("200 OK", dispatch(node, &body))
+        ("200 OK", dispatch(node, gossip, &body))
     } else {
         (
             "405 Method Not Allowed",
@@ -277,7 +298,11 @@ fn health(node: &Arc<Mutex<Node>>) -> Value {
 }
 
 /// Parse the request body and produce the JSON-RPC response bytes (single or batch).
-fn dispatch(node: &Arc<Mutex<Node>>, body: &[u8]) -> Vec<u8> {
+fn dispatch(
+    node: &Arc<Mutex<Node>>,
+    gossip: &Option<Arc<sov_network::TcpNode>>,
+    body: &[u8],
+) -> Vec<u8> {
     let parsed: Result<Value, _> = serde_json::from_slice(body);
     let value = match parsed {
         Ok(v) => v,
@@ -292,10 +317,10 @@ fn dispatch(node: &Arc<Mutex<Node>>, body: &[u8]) -> Vec<u8> {
             error_envelope(Value::Null, -32600, "Invalid Request (batch too large)")
         }
         Value::Array(reqs) if !reqs.is_empty() => {
-            Value::Array(reqs.iter().map(|r| handle_one(node, r)).collect())
+            Value::Array(reqs.iter().map(|r| handle_one(node, gossip, r)).collect())
         }
         Value::Array(_) => error_envelope(Value::Null, -32600, "Invalid Request (empty batch)"),
-        single => handle_one(node, &single),
+        single => handle_one(node, gossip, &single),
     };
     serde_json::to_vec(&response).unwrap_or_default()
 }
@@ -305,14 +330,18 @@ fn error_envelope(id: Value, code: i64, message: &str) -> Value {
 }
 
 /// Dispatch one JSON-RPC request object into a full response object.
-fn handle_one(node: &Arc<Mutex<Node>>, req: &Value) -> Value {
+fn handle_one(
+    node: &Arc<Mutex<Node>>,
+    gossip: &Option<Arc<sov_network::TcpNode>>,
+    req: &Value,
+) -> Value {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let Some(method) = req.get("method").and_then(Value::as_str) else {
         return error_envelope(id, -32600, "Invalid Request (missing method)");
     };
     let params = req.get("params").cloned().unwrap_or(Value::Null);
 
-    match call(node, method, &params) {
+    match call(node, gossip, method, &params) {
         Ok(result) => json!({"jsonrpc": "2.0", "result": result, "id": id}),
         Err(e) => {
             json!({"jsonrpc": "2.0", "error": {"code": e.code, "message": e.message}, "id": id})
@@ -409,7 +438,12 @@ fn to_value<T: serde::Serialize>(v: T) -> Value {
 
 // ---- method dispatch ------------------------------------------------------
 
-fn call(node: &Arc<Mutex<Node>>, method: &str, params: &Value) -> Result<Value, RpcError> {
+fn call(
+    node: &Arc<Mutex<Node>>,
+    gossip: &Option<Arc<sov_network::TcpNode>>,
+    method: &str,
+    params: &Value,
+) -> Result<Value, RpcError> {
     // A single lock serves the whole call: queries borrow the node immutably,
     // `sov_submitTransaction` mutably. Handlers are short, so contention is low.
     let mut node = node
@@ -691,8 +725,16 @@ fn call(node: &Arc<Mutex<Node>>, method: &str, params: &Value) -> Result<Value, 
             let stx: SignedTransaction = serde_json::from_value(params.clone())
                 .map_err(|e| RpcError::invalid_params(format!("invalid SignedTransaction: {e}")))?;
             let tx_id = stx.id();
-            node.submit(stx)
+            node.submit(stx.clone())
                 .map_err(|e| RpcError::server(format!("rejected: {e}")))?;
+            // GOSSIP the accepted tx to peers so it reaches EVERY node's mempool and any
+            // miner can include it — not just the node it was submitted to. Release the
+            // node lock first (mirror the block-gossip path: never do network I/O under
+            // the lock). A node that receives it adds it to its mempool and re-floods.
+            drop(node);
+            if let Some(g) = gossip {
+                g.broadcast(&sov_network::NetMessage::NewTransaction(stx));
+            }
             Ok(json!({"accepted": true, "txId": tx_id.to_hex()}))
         }
         // A PAGE of the token registry — never the whole set, so the response
