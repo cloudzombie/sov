@@ -362,6 +362,12 @@ const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 /// How often to sweep unauthenticated zombies and reap dead half-open connections.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Warn when a single block import holds the node lock at least this long. A plain
+/// extend is sub-millisecond; crossing this means the reorg replay (currently O(chain
+/// length) from genesis) is starting to block peer I/O — the signal that motivates the
+/// incremental-reorg work.
+const SLOW_IMPORT_MS: u128 = 50;
+
 /// Largest exponential backtrack step when walking back to a common ancestor on a
 /// fork: 1, 2, 4, … capped here, so even a deep divergence is located in O(log)
 /// requests instead of one height at a time.
@@ -510,6 +516,11 @@ impl SyncState {
         }
         let prev_head = n.chain().head().hash();
         let prev_height = n.chain().height();
+        // Time the import: this whole call holds the node lock (blocking peer I/O, RPC,
+        // mining), and a reorg currently replays its branch from genesis — an O(chain
+        // length) cost. Surfacing the lock-held time makes that cost visible so a deep
+        // replay can't masquerade as a silent stall / peer drop.
+        let started = Instant::now();
         match n.import_block(block.clone()) {
             Ok(_) => {}
             // "Does not extend a known parent" is the ordinary backtrack signal during
@@ -527,22 +538,31 @@ impl SyncState {
         if let Some(log) = &self.block_log {
             let _ = log.append(&block);
         }
+        let lock_ms = started.elapsed().as_millis();
         drop(n);
         // A head move to a block that does NOT simply extend the prior head is a REORG —
         // we abandoned our current tip for a competing branch. NEVER silent: log both
-        // heads + height, so an operator always knows EXACTLY what happened to the chain
-        // (this is the "lost where it is" event made explicit). With the deterministic
-        // fork-choice tie-break + jittered block timing, these are rare and convergent.
+        // heads + height (and how long it held the lock), so an operator always knows
+        // EXACTLY what happened to the chain (this is the "lost where it is" event made
+        // explicit). With the deterministic fork-choice tie-break + jittered block timing,
+        // these are rare and convergent.
         if new_head != prev_head && block.header.prev_hash != prev_head {
             p2p_log(
                 &self.log,
                 format!(
-                    "⚠ REORG: head {}@{} → {}@{} (adopted a heavier/smaller-hash competing block)",
+                    "⚠ REORG: head {}@{} → {}@{} in {lock_ms}ms (adopted a heavier/smaller-hash competing block)",
                     short_hash(&prev_head),
                     prev_height,
                     short_hash(&new_head),
                     new_height,
                 ),
+            );
+        } else if lock_ms >= SLOW_IMPORT_MS {
+            // A plain extend that nonetheless held the lock a long time — a warning that
+            // import cost is growing (the signal that motivates an incremental reorg).
+            p2p_log(
+                &self.log,
+                format!("⚠ slow block import: {lock_ms}ms (held the node lock) at height {new_height}"),
             );
         }
         ImportOutcome::New
