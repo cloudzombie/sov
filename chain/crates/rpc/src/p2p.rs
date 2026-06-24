@@ -225,6 +225,9 @@ impl P2p {
         let bootstrap = self.bootstrap.clone();
         let sync_status = self.sync_status.clone();
         let log_sink = self.log_sink.clone();
+        // A second handle to the same sink for bootstrap-dial diagnostics (the primary
+        // `log_sink` is moved into `SyncState`, which logs the app-layer sync events).
+        let boot_log = self.log_sink.clone();
         let stop = Arc::clone(&shutdown);
 
         let worker = thread::spawn(move || {
@@ -250,7 +253,14 @@ impl P2p {
                 // a seed that was asleep at startup or a link that dropped.
                 if last_reconnect.elapsed() >= RECONNECT_INTERVAL {
                     for addr in &bootstrap {
-                        tcp.request_reconnect(addr);
+                        // Tolerant resolve + non-blocking dial request. An unresolvable
+                        // bootstrap address is logged ONCE (on the first sweep) rather than
+                        // every interval, so a typo is visible without spamming the log.
+                        if let Err(e) = tcp.request_reconnect(addr) {
+                            if last_reconnect == past {
+                                p2p_log(&boot_log, format!("bootstrap peer '{addr}' unusable: {e}"));
+                            }
+                        }
                     }
                     last_reconnect = Instant::now();
                 }

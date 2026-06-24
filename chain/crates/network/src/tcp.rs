@@ -33,7 +33,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -85,6 +85,19 @@ type PeerWriter = Arc<Peer>;
 /// retry to an unreachable peer (e.g. a seed that is asleep) does not pin the dial
 /// thread for the OS default timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default P2P listen/dial port. When an operator enters a bare IP or hostname in
+/// the seed-peer box (no `:port`), this is appended — it matches the port the app
+/// advertises to the other machine ("enter THIS in the other node's Seed peer:
+/// `<ip>:9645`"). Centralised so the listener, the advertised hint, and the
+/// tolerant dial resolver can never drift apart.
+pub const DEFAULT_P2P_PORT: u16 = 9645;
+
+/// An optional shared, line-buffered log sink — the GUI's Node-tab log. `None` in
+/// headless/tests, where transport logging then costs nothing. Lets the transport
+/// surface dial attempts and link transitions to the operator, so a failed peering
+/// is a visible, actionable line instead of a silent "nothing happens".
+type LogSink = Option<Arc<Mutex<Vec<String>>>>;
 
 /// Maximum simultaneous INBOUND connections. Bounds resource use and raises the
 /// cost of an eclipse attempt (a flood of inbound peers cannot crowd out the
@@ -167,6 +180,10 @@ struct Shared {
     scores: Mutex<HashMap<IpAddr, PeerScore>>,
     /// Channel to request the manager thread dial an address (discovery + retry).
     dial_tx: Sender<SocketAddr>,
+    /// Optional Node-tab log sink for human-readable transport diagnostics (dial
+    /// attempts, connect success/failure, link up/down). `None` until a sink is
+    /// attached via [`TcpNode::set_log_sink`]; logging is then a cheap no-op.
+    log: Mutex<LogSink>,
     /// Set to stop the background threads and release the listen port, so the node
     /// can be cleanly shut down and its address rebound (e.g. an in-process restart).
     shutdown: AtomicBool,
@@ -254,6 +271,7 @@ impl TcpNode {
             inbound: Mutex::new(HashSet::new()),
             scores: Mutex::new(HashMap::new()),
             dial_tx,
+            log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
         });
 
@@ -389,22 +407,50 @@ impl TcpNode {
         self.shared.local_addr
     }
 
-    /// Dial a peer by `host:port` now (blocking up to [`CONNECT_TIMEOUT`]). A
-    /// no-op if already connected or a dial to it is already in flight.
+    /// Attach a Node-tab log sink so dial attempts and link transitions become
+    /// visible to the operator — the cure for "the seed-peer box does nothing":
+    /// every dial now logs `dialing X` → `tcp connected to X` / `dial to X failed`,
+    /// and each handshake logs `link up` / `handshake failed`. Idempotent; safe to
+    /// call after [`bind`](Self::bind) and before [`enable_lan_discovery`].
+    pub fn set_log_sink(&self, sink: Arc<Mutex<Vec<String>>>) {
+        *self.shared.log.lock().unwrap() = Some(sink);
+    }
+
+    /// Dial a peer now (blocking up to [`CONNECT_TIMEOUT`]). Tolerant of how the
+    /// address is written — `ip:port`, `host:port`, or a BARE ip / hostname (the
+    /// [`DEFAULT_P2P_PORT`] is appended) — and resolves hostnames via DNS, trying
+    /// each resolved target until one connects. A no-op if already connected or a
+    /// dial is already in flight. Returns an error (never silently nothing) when the
+    /// address cannot be parsed/resolved or no target is reachable.
     pub fn connect(&self, addr: &str) -> std::io::Result<()> {
-        let sa: SocketAddr = addr
-            .parse()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad address"))?;
-        attempt_dial(&self.shared, sa)
+        let targets = resolve_dial_targets(addr)?;
+        let mut last_err: Option<std::io::Error> = None;
+        for sa in targets {
+            match attempt_dial(&self.shared, sa) {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "no dial targets")))
     }
 
     /// Ask the background dial thread to (re)connect to `addr` if it is not already
-    /// connected — non-blocking. Used to keep bootstrap links up across peer
-    /// restarts and sleep/wake, without stalling the gossip loop.
-    pub fn request_reconnect(&self, addr: &str) {
-        if let Ok(sa) = addr.parse::<SocketAddr>() {
-            let _ = self.shared.dial_tx.send(sa);
+    /// connected — non-blocking, so a slow connect never stalls the gossip loop.
+    /// Used to keep bootstrap links up across peer restarts and sleep/wake, and by
+    /// the GUI "Connect" button. Tolerant of the address form (`ip:port`,
+    /// `host:port`, or a BARE ip / hostname → [`DEFAULT_P2P_PORT`] appended) and
+    /// resolves hostnames. Returns the concrete dial target(s) queued — so the
+    /// caller can show the operator exactly what it is dialing (with any
+    /// appended/resolved port) — or an error for an address it cannot resolve,
+    /// instead of silently dropping it (the old bug behind "putting an IP in the
+    /// seed-peer window does nothing").
+    pub fn request_reconnect(&self, addr: &str) -> std::io::Result<Vec<SocketAddr>> {
+        let targets = resolve_dial_targets(addr)?;
+        for sa in &targets {
+            let _ = self.shared.dial_tx.send(*sa);
         }
+        Ok(targets)
     }
 
     /// Broadcast `message` to every connected peer; returns how many writes
@@ -505,6 +551,82 @@ impl TcpNode {
     }
 }
 
+/// Resolve an operator-entered peer string into concrete dial targets, tolerantly.
+/// Accepts every form a human reasonably types:
+///   * `ip:port`         — e.g. `192.168.0.244:9645`
+///   * `host:port`       — e.g. `seed.example.com:9645` (DNS-resolved, may fan out)
+///   * a BARE ip         — e.g. `192.168.0.244` → [`DEFAULT_P2P_PORT`] appended
+///   * a BARE hostname   — e.g. `seed.example.com` → default port appended + resolved
+///
+/// Returns a clear error instead of silently dropping unparseable input — the bug
+/// behind "putting an IP in the seed-peer window does absolutely nothing", where a
+/// bare IP failed a strict `SocketAddr` parse and was discarded with no feedback.
+/// Never returns an empty vector on `Ok`.
+fn resolve_dial_targets(addr: &str) -> std::io::Result<Vec<SocketAddr>> {
+    let trimmed = addr.trim();
+    if trimmed.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty peer address",
+        ));
+    }
+    // 1) Exactly as entered — handles `ip:port` and `host:port` (with DNS).
+    if let Ok(iter) = trimmed.to_socket_addrs() {
+        let v: Vec<SocketAddr> = iter.collect();
+        if !v.is_empty() {
+            return Ok(v);
+        }
+    }
+    // 2) A bare IP (v4 or v6) with no port — pair it with the default port directly
+    //    (constructing the `SocketAddr` ourselves so a bare IPv6 like `::1` works
+    //    without the operator needing to bracket it).
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, DEFAULT_P2P_PORT)]);
+    }
+    // 3) A bare hostname with no port — append the default and resolve via DNS.
+    if let Ok(iter) = (trimmed, DEFAULT_P2P_PORT).to_socket_addrs() {
+        let v: Vec<SocketAddr> = iter.collect();
+        if !v.is_empty() {
+            return Ok(v);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("could not resolve peer '{trimmed}' — expected host:port, ip:port, or a bare ip/host"),
+    ))
+}
+
+/// Append one timestamped transport-diagnostic line to the (optional) Node-tab log.
+/// A no-op when no sink is attached (headless/tests), so it is free to call on the
+/// dial/handshake paths. Mirrors the GUI logger's format and cap.
+fn net_log(shared: &Shared, msg: impl AsRef<str>) {
+    let sink = match shared.log.lock().unwrap().clone() {
+        Some(s) => s,
+        None => return,
+    };
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        % 86_400;
+    let line = format!(
+        "{:02}:{:02}:{:02}  p2p: {}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+        msg.as_ref()
+    );
+    // Bind the guard to a named local (declared after `sink`) so it drops FIRST, before
+    // the cloned `sink` Arc — an `if let` scrutinee would keep the guard alive to the end
+    // of the function and conflict with that drop.
+    let Ok(mut v) = sink.lock() else { return };
+    v.push(line);
+    let n = v.len();
+    if n > 5_000 {
+        v.drain(0..n - 5_000);
+    }
+}
+
 /// Connect to `addr` and register the resulting stream. Idempotent and
 /// retry-safe: skips if already connected or a dial is in flight, and on failure
 /// leaves no trace, so a later retry (e.g. once a sleeping seed wakes) succeeds.
@@ -532,13 +654,19 @@ fn attempt_dial(shared: &Arc<Shared>, addr: SocketAddr) -> std::io::Result<()> {
     }
     shared.known.lock().unwrap().insert(addr);
 
+    // Past the dedup/in-flight guards: this is a genuine new dial, so make it visible
+    // (the guarded skips above stay quiet to avoid spamming the log every retry once a
+    // link is already up).
+    net_log(shared, format!("dialing {addr}…"));
     match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
         Ok(stream) => {
+            net_log(shared, format!("tcp connected to {addr} — handshaking"));
             // `setup_connection` clears the in-flight slot once the peer is live.
             register(shared, stream, true); // we dialed: we are the Noise initiator
             Ok(())
         }
         Err(e) => {
+            net_log(shared, format!("dial to {addr} failed: {e}"));
             // Unreachable: drop the in-flight slot AND forget the address, so a
             // later reconnect request can try again from scratch.
             shared.dialing.lock().unwrap().remove(&addr);
@@ -602,6 +730,7 @@ fn setup_connection(
     let (reader, transport, pq, handshake_hash) = match setup {
         Ok(v) => v,
         Err(e) => {
+            net_log(shared, format!("handshake with {key} failed: {e}"));
             shared.dialing.lock().unwrap().remove(&key);
             shared.inbound.lock().unwrap().remove(&key);
             return Err(e);
@@ -617,6 +746,16 @@ fn setup_connection(
     shared.peers.lock().unwrap().insert(key, Arc::clone(&peer));
     // Connection is live: stop treating this address as an in-flight dial.
     shared.dialing.lock().unwrap().remove(&key);
+    // The encrypted transport is up (Noise + ML-KEM). The app-layer signed `Hello`
+    // (chain/identity auth) is logged separately by the sync engine; this line is the
+    // honest "the pipe exists" milestone an operator watches for after a dial.
+    net_log(
+        shared,
+        format!(
+            "link up: {key} ({} · noise+ml-kem encrypted)",
+            if initiator { "outbound" } else { "inbound" }
+        ),
+    );
 
     // Announce ourselves + everyone we know, so the peer can discover the network.
     let mut addrs = vec![shared.local_addr.to_string()];
@@ -625,6 +764,8 @@ fn setup_connection(
 
     reader_loop(shared, key, reader, peer);
     shared.inbound.lock().unwrap().remove(&key);
+    // The read loop returned → the connection closed (peer gone, reaped, or banned).
+    net_log(shared, format!("link down: {key}"));
     Ok(())
 }
 
@@ -1467,6 +1608,7 @@ mod tests {
             inbound: Mutex::new(HashSet::new()),
             scores: Mutex::new(HashMap::new()),
             dial_tx: tx,
+            log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
         };
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
@@ -1502,6 +1644,7 @@ mod tests {
             inbound: Mutex::new(HashSet::new()),
             scores: Mutex::new(HashMap::new()),
             dial_tx: tx,
+            log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
         };
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
@@ -1608,6 +1751,7 @@ mod tests {
             inbound: Mutex::new(["192.168.1.5:54321".parse().unwrap()].into_iter().collect()),
             scores: Mutex::new(HashMap::new()),
             dial_tx: tx,
+            log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
         };
         // Same host, its advertised LISTEN port → duplicate (matched by IP).
@@ -1616,5 +1760,84 @@ mod tests {
         assert!(!dial_would_duplicate(&shared, "192.168.1.9:9645".parse().unwrap()));
         // Loopback is exempt so single-host / loopback multi-node tests still connect.
         assert!(!dial_would_duplicate(&shared, "127.0.0.1:9645".parse().unwrap()));
+    }
+
+    #[test]
+    fn resolve_dial_targets_accepts_every_address_form_an_operator_types() {
+        // `ip:port` — the canonical form.
+        assert_eq!(
+            resolve_dial_targets("192.168.0.244:9645").unwrap(),
+            vec!["192.168.0.244:9645".parse::<SocketAddr>().unwrap()]
+        );
+        // A BARE IPv4 — the exact input the user said "does absolutely nothing". The
+        // default P2P port MUST be appended (not silently dropped).
+        assert_eq!(
+            resolve_dial_targets("192.168.0.244").unwrap(),
+            vec![SocketAddr::new(
+                "192.168.0.244".parse().unwrap(),
+                DEFAULT_P2P_PORT
+            )]
+        );
+        // Surrounding whitespace (a pasted address) is tolerated.
+        assert_eq!(
+            resolve_dial_targets("  192.168.0.244  ").unwrap(),
+            vec![SocketAddr::new(
+                "192.168.0.244".parse().unwrap(),
+                DEFAULT_P2P_PORT
+            )]
+        );
+        // A BARE IPv6 — paired with the default port without the operator bracketing it.
+        assert_eq!(
+            resolve_dial_targets("::1").unwrap(),
+            vec![SocketAddr::new("::1".parse().unwrap(), DEFAULT_P2P_PORT)]
+        );
+        // Bracketed IPv6 with an explicit port.
+        assert_eq!(
+            resolve_dial_targets("[::1]:9645").unwrap(),
+            vec!["[::1]:9645".parse::<SocketAddr>().unwrap()]
+        );
+        // `localhost` resolves (it is in every hosts file) and lands on the default port.
+        let local = resolve_dial_targets("localhost").unwrap();
+        assert!(
+            local.iter().all(|a| a.port() == DEFAULT_P2P_PORT),
+            "bare hostname gets the default port: {local:?}"
+        );
+        // `localhost:port` resolves with the explicit port.
+        let local_port = resolve_dial_targets("localhost:9645").unwrap();
+        assert!(local_port.iter().all(|a| a.port() == 9645));
+
+        // Genuinely-unusable input is a CLEAR error — never a silent empty success.
+        assert!(resolve_dial_targets("").is_err());
+        assert!(resolve_dial_targets("   ").is_err());
+        assert!(resolve_dial_targets("not a valid address !!!").is_err());
+    }
+
+    #[test]
+    fn request_reconnect_actually_dials_and_connects_a_bare_address() {
+        // The EXACT path the GUI "Connect" button drives (`request_reconnect`), which
+        // previously no-op'd on anything that was not strictly `ip:port`. Two real
+        // loopback nodes: A asks to reconnect to B by address; the background dial
+        // thread must pick it up, open the TCP connection, run the encrypted handshake,
+        // and register the peer — proving the seed-peer box does something real.
+        let a = TcpNode::bind("127.0.0.1:0").unwrap();
+        let b = TcpNode::bind("127.0.0.1:0").unwrap();
+
+        // `request_reconnect` returns the concrete target it queued (no silent drop)...
+        let queued = a
+            .request_reconnect(&b.local_addr().to_string())
+            .expect("a valid loopback address resolves");
+        assert!(
+            queued.contains(&b.local_addr()),
+            "the queued dial target is B's address: {queued:?}"
+        );
+
+        // ...and the dial truly lands: A is connected to B within a few seconds.
+        assert!(
+            wait_until(5, || a.peer_count() >= 1),
+            "request_reconnect dialed and the link came up"
+        );
+
+        // An unresolvable address is reported as an error here, NOT swallowed.
+        assert!(a.request_reconnect("definitely not an address !!!").is_err());
     }
 }

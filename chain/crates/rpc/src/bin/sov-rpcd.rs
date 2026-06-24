@@ -159,6 +159,10 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
             .with_bootstrap(config.bootstrap_peers.clone())
             .with_sync_status(Arc::clone(&sync))
             .with_log_sink(Arc::clone(&logs));
+            // Surface transport-level dial/handshake diagnostics (dialing → tcp connected
+            // → link up, or the exact failure) on stdout/journald too, so a VPS operator
+            // can see peering happen instead of guessing.
+            p2p.tcp().set_log_sink(Arc::clone(&logs));
             log(&logs, format!("P2P gossip listening on {}", p2p.local_addr()));
             for peer in &config.bootstrap_peers {
                 // Best-effort first dial; if the seed isn't up yet, the engine keeps

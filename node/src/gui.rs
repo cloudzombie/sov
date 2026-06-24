@@ -1109,11 +1109,19 @@ impl EmbeddedNode {
         self.daemon.shutdown();
     }
 
-    /// Dial a peer (`host:port`) now — non-blocking; the engine keeps retrying so
-    /// the link forms once the peer is reachable. No-op if P2P is off.
-    fn dial(&self, addr: &str) {
-        if let Some(p2p) = &self.p2p {
-            p2p.tcp().request_reconnect(addr);
+    /// Dial a peer now — non-blocking; the engine keeps retrying so the link forms
+    /// once the peer is reachable. Tolerant of the address form (`ip:port`,
+    /// `host:port`, or a bare ip / hostname → default P2P port appended). Returns the
+    /// concrete target(s) queued (so the UI can show exactly what it is dialing), or
+    /// an error for an unresolvable address / a node that is not running — never a
+    /// silent no-op.
+    fn dial(&self, addr: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        match &self.p2p {
+            Some(p2p) => p2p.tcp().request_reconnect(addr),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "P2P is not running on this node",
+            )),
         }
     }
 
@@ -2481,7 +2489,7 @@ impl Station {
             ui.label("Seed peer");
             ui.add(
                 egui::TextEdit::singleline(&mut self.peer_addr)
-                    .hint_text("other machine — host:port (e.g. 192.168.0.244:9645)")
+                    .hint_text("other machine's IP — port optional (e.g. 192.168.0.244)")
                     .desired_width(320.0),
             );
             if ui
@@ -2492,22 +2500,48 @@ impl Station {
                 let p = self.peer_addr.trim().to_string();
                 self.peer_addr = p.clone();
                 save_peer(&p);
-                if let NodeRun::Running(node) = &*self.node_run.lock().unwrap() {
-                    node.dial(&p);
-                }
-                self.node_status = if p.is_empty() {
-                    "seed peer cleared".into()
+                if p.is_empty() {
+                    self.node_status = "seed peer cleared".into();
+                    push_log(&self.node_logs, "seed peer cleared".to_string());
                 } else {
-                    format!("seeding to {p} (auto-dial on)")
-                };
-                push_log(
-                    &self.node_logs,
-                    if p.is_empty() {
-                        "seed peer cleared".to_string()
-                    } else {
-                        format!("seed peer set to {p} — dialing")
-                    },
-                );
+                    // Dial NOW if the node is up; report the REAL outcome — the resolved
+                    // target (with any appended/looked-up port) or the actual error — so
+                    // the box never "appears to dial but does nothing".
+                    let outcome = match &*self.node_run.lock().unwrap() {
+                        NodeRun::Running(node) => Some(node.dial(&p)),
+                        _ => None,
+                    };
+                    match outcome {
+                        Some(Ok(addrs)) => {
+                            let list = addrs
+                                .iter()
+                                .map(|a| a.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            self.node_status = format!("dialing {list} (auto-dial on)");
+                            push_log(
+                                &self.node_logs,
+                                format!("seed peer {p} → dialing {list}"),
+                            );
+                        }
+                        Some(Err(e)) => {
+                            self.node_status = format!("seed peer '{p}' rejected: {e}");
+                            push_log(
+                                &self.node_logs,
+                                format!("seed peer '{p}' rejected: {e}"),
+                            );
+                        }
+                        None => {
+                            // Node not started yet: saved, and auto-dialed on next start.
+                            self.node_status =
+                                format!("seed peer saved ({p}) — start the node to dial");
+                            push_log(
+                                &self.node_logs,
+                                format!("seed peer saved: {p} (auto-dials when the node starts)"),
+                            );
+                        }
+                    }
+                }
             }
             // Windows only: a one-click firewall fix (re-request the inbound allow),
             // for the case where the first-run UAC prompt was dismissed.
@@ -7671,9 +7705,25 @@ fn build_and_run_node(
             .with_bootstrap(config.bootstrap_peers.clone())
             .with_sync_status(Arc::clone(&sync))
             .with_log_sink(logs.clone());
+            // Surface transport-level dial/handshake diagnostics in the Node tab too,
+            // so peering is never a silent black box (dialing → tcp connected → link up,
+            // or the exact failure).
+            p2p.tcp().set_log_sink(logs.clone());
+            // Kick an immediate, NON-BLOCKING dial of each saved seed peer and report
+            // the resolved target (or a clear error) right away — no 5s startup stall on
+            // a peer that is still down; the engine's reconnect loop keeps retrying.
             for peer in &config.bootstrap_peers {
-                let _ = p2p.connect(peer);
-                push_log(logs, format!("dialing seed peer {peer}…"));
+                match p2p.tcp().request_reconnect(peer) {
+                    Ok(addrs) => {
+                        let list = addrs
+                            .iter()
+                            .map(|a| a.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        push_log(logs, format!("seed peer {peer} → dialing {list}"));
+                    }
+                    Err(e) => push_log(logs, format!("seed peer '{peer}' is not a valid address: {e}")),
+                }
             }
             let bound = p2p.local_addr();
             // mDNS-style LAN auto-discovery: find + dial same-chain peers on the
