@@ -699,10 +699,29 @@ fn a_tx_submitted_to_one_node_is_gossiped_to_a_peer_and_mined() {
         "A and B app-authenticated a peer link"
     );
 
+    let client = RpcClient::new(a_rpc_addr.to_string());
+
+    // The live diagnostic RPC reports the REAL peering state over RPC (so an operator —
+    // or `curl` — can see exactly why two nodes do/don't see each other, no GUI logs).
+    let info = client
+        .call("sov_getPeerInfo", serde_json::json!({}))
+        .expect("sov_getPeerInfo");
+    assert!(
+        info["peers"].as_u64().unwrap_or(0) >= 1,
+        "peer info reports the authenticated peer: {info}"
+    );
+    assert!(
+        !info["connectedPeers"].as_array().unwrap().is_empty(),
+        "peer info lists the connected peer address"
+    );
+    assert!(
+        info["genesisHash"].as_str().is_some_and(|s| !s.is_empty()),
+        "peer info reports the genesis hash (the handshake identity)"
+    );
+
     // Submit the tx to A (the NON-miner) over JSON-RPC.
     let stx = usa_transfer("val02.node.sov", 10, 0);
     let tx_id = stx.id();
-    let client = RpcClient::new(a_rpc_addr.to_string());
     let accepted = client
         .call("sov_submitTransaction", serde_json::to_value(&stx).unwrap())
         .map(|v| v.get("accepted").and_then(|a| a.as_bool()).unwrap_or(false))

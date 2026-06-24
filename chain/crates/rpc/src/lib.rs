@@ -29,7 +29,8 @@
 //! `sov_getAccount`, `sov_getBalance`, `sov_getNonce`, `sov_getBlockByHeight`,
 //! `sov_getBlockByHash`, `sov_getBlockDigest`, `sov_getHead`,
 //! `sov_getStateRoot`, `sov_getDifficulty`, `sov_estimateFee`,
-//! `sov_getMempoolSize`, `sov_getConfirmations`, `sov_isFinal`,
+//! `sov_getMempoolSize`, `sov_getPeerInfo` (live P2P/sync state),
+//! `sov_getConfirmations`, `sov_isFinal`,
 //! `sov_getMiners`, `sov_listTokens` (paged), `sov_getTokenInfo`,
 //! `sov_getTokenBalances`, `sov_getHtlc`. SNS (Sovereign Name Service):
 //! `sov_resolveName`, `sov_getName`, `sov_namesOf`, `sov_listNames` (paged).
@@ -121,6 +122,19 @@ pub struct RpcServer {
     /// would live only on the originating node (the "only mined by its own client"
     /// bug); a real network must propagate transactions.
     gossip: Option<Arc<sov_network::TcpNode>>,
+    /// Live peering/sync telemetry, so `sov_getPeerInfo` can report the real-time
+    /// network picture (authenticated peers, best peer height, behind/IBD) over RPC.
+    sync: Option<Arc<crate::SyncShared>>,
+}
+
+/// The live network state the RPC handlers need beyond the node itself: the gossip
+/// transport (broadcast accepted txs AND list connected peers) and the sync
+/// telemetry. Threaded to the dispatch chain so `sov_submitTransaction` can gossip
+/// and `sov_getPeerInfo` can expose peering/sync in real time.
+#[derive(Clone, Default)]
+struct RpcCtx {
+    gossip: Option<Arc<sov_network::TcpNode>>,
+    sync: Option<Arc<crate::SyncShared>>,
 }
 
 /// A running server: its bound address and the means to stop it gracefully.
@@ -151,13 +165,22 @@ impl RpcServer {
         RpcServer {
             node,
             gossip: None,
+            sync: None,
         }
     }
 
     /// Attach a P2P transport so accepted transactions are gossiped to peers (so any
-    /// node can mine them, not just the one they were submitted to).
+    /// node can mine them, not just the one they were submitted to) and connected
+    /// peers can be reported via `sov_getPeerInfo`.
     pub fn with_gossip(mut self, gossip: Option<Arc<sov_network::TcpNode>>) -> Self {
         self.gossip = gossip;
+        self
+    }
+
+    /// Attach the sync telemetry so `sov_getPeerInfo` reports authenticated peers,
+    /// the best peer height, and IBD/behind status in real time.
+    pub fn with_sync_status(mut self, sync: Option<Arc<crate::SyncShared>>) -> Self {
+        self.sync = sync;
         self
     }
 
@@ -172,17 +195,21 @@ impl RpcServer {
         let listener = Arc::new(listener);
         let shutdown = Arc::new(AtomicBool::new(false));
 
+        let ctx = RpcCtx {
+            gossip: self.gossip.clone(),
+            sync: self.sync.clone(),
+        };
         let mut handles = Vec::new();
         for _ in 0..workers.max(1) {
             let listener = Arc::clone(&listener);
             let shutdown = Arc::clone(&shutdown);
             let node = Arc::clone(&self.node);
-            let gossip = self.gossip.clone();
+            let ctx = ctx.clone();
             handles.push(thread::spawn(move || {
                 while !shutdown.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((stream, _peer)) => {
-                            let _ = handle_connection(stream, &node, &gossip);
+                            let _ = handle_connection(stream, &node, &ctx);
                         }
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(2));
@@ -260,7 +287,7 @@ fn write_response(stream: &mut TcpStream, status: &str, body: &[u8]) -> io::Resu
 fn handle_connection(
     mut stream: TcpStream,
     node: &Arc<Mutex<Node>>,
-    gossip: &Option<Arc<sov_network::TcpNode>>,
+    ctx: &RpcCtx,
 ) -> io::Result<()> {
     // The listener is non-blocking; accepted sockets must be blocking for the
     // timeout-bounded reads/writes below to behave.
@@ -278,7 +305,7 @@ fn handle_connection(
             serde_json::to_vec(&health(node)).unwrap_or_default(),
         )
     } else if method == "POST" {
-        ("200 OK", dispatch(node, gossip, &body))
+        ("200 OK", dispatch(node, ctx, &body))
     } else {
         (
             "405 Method Not Allowed",
@@ -300,7 +327,7 @@ fn health(node: &Arc<Mutex<Node>>) -> Value {
 /// Parse the request body and produce the JSON-RPC response bytes (single or batch).
 fn dispatch(
     node: &Arc<Mutex<Node>>,
-    gossip: &Option<Arc<sov_network::TcpNode>>,
+    ctx: &RpcCtx,
     body: &[u8],
 ) -> Vec<u8> {
     let parsed: Result<Value, _> = serde_json::from_slice(body);
@@ -317,10 +344,10 @@ fn dispatch(
             error_envelope(Value::Null, -32600, "Invalid Request (batch too large)")
         }
         Value::Array(reqs) if !reqs.is_empty() => {
-            Value::Array(reqs.iter().map(|r| handle_one(node, gossip, r)).collect())
+            Value::Array(reqs.iter().map(|r| handle_one(node, ctx, r)).collect())
         }
         Value::Array(_) => error_envelope(Value::Null, -32600, "Invalid Request (empty batch)"),
-        single => handle_one(node, gossip, &single),
+        single => handle_one(node, ctx, &single),
     };
     serde_json::to_vec(&response).unwrap_or_default()
 }
@@ -332,7 +359,7 @@ fn error_envelope(id: Value, code: i64, message: &str) -> Value {
 /// Dispatch one JSON-RPC request object into a full response object.
 fn handle_one(
     node: &Arc<Mutex<Node>>,
-    gossip: &Option<Arc<sov_network::TcpNode>>,
+    ctx: &RpcCtx,
     req: &Value,
 ) -> Value {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
@@ -341,7 +368,7 @@ fn handle_one(
     };
     let params = req.get("params").cloned().unwrap_or(Value::Null);
 
-    match call(node, gossip, method, &params) {
+    match call(node, ctx, method, &params) {
         Ok(result) => json!({"jsonrpc": "2.0", "result": result, "id": id}),
         Err(e) => {
             json!({"jsonrpc": "2.0", "error": {"code": e.code, "message": e.message}, "id": id})
@@ -440,7 +467,7 @@ fn to_value<T: serde::Serialize>(v: T) -> Value {
 
 fn call(
     node: &Arc<Mutex<Node>>,
-    gossip: &Option<Arc<sov_network::TcpNode>>,
+    ctx: &RpcCtx,
     method: &str,
     params: &Value,
 ) -> Result<Value, RpcError> {
@@ -695,6 +722,43 @@ fn call(
         }
         "sov_getMintReward" => Ok(to_value(node.chain().mint_reward())),
         "sov_getMempoolSize" => Ok(json!(node.mempool_len())),
+        // LIVE networking state — so an operator (or `curl`) can see EXACTLY why two
+        // nodes do or don't see each other, without reading GUI logs. `chainId` +
+        // `genesisHash` are what peers handshake on (a mismatch ⇒ they can NEVER
+        // authenticate); `tcpLinks` is raw connections, `peers` is AUTHENTICATED peers,
+        // `connectedPeers` their addresses. peers 0 + connectedPeers [] ⇒ no link
+        // (check the seed peer / firewall); tcpLinks > 0 but peers 0 ⇒ handshake/
+        // genesis mismatch. `behindBlocks`/`syncing` show catch-up state.
+        "sov_getPeerInfo" => {
+            let c = node.chain();
+            let genesis = c
+                .block_by_height(0)
+                .map(|b| b.hash().to_hex())
+                .unwrap_or_default();
+            let (peers, best, behind) = ctx
+                .sync
+                .as_ref()
+                .map(|s| (s.authed_peers(), s.best_peer_height(), s.behind_blocks()))
+                .unwrap_or((0, 0, 0));
+            let connected: Vec<String> = ctx
+                .gossip
+                .as_ref()
+                .map(|g| g.connected_peers().iter().map(|a| a.to_string()).collect())
+                .unwrap_or_default();
+            Ok(json!({
+                "chainId": c.chain_id(),
+                "genesisHash": genesis,
+                "height": c.height(),
+                "p2pEnabled": ctx.gossip.is_some(),
+                "listenAddr": ctx.gossip.as_ref().map(|g| g.local_addr().to_string()),
+                "tcpLinks": ctx.gossip.as_ref().map(|g| g.peer_count()).unwrap_or(0),
+                "peers": peers,
+                "connectedPeers": connected,
+                "bestPeerHeight": best,
+                "behindBlocks": behind,
+                "syncing": behind > 0,
+            }))
+        }
         // Nakamoto finality: confirmation depth in the heaviest-work chain.
         "sov_getConfirmations" => {
             let hash = param_hash(params)?;
@@ -732,7 +796,7 @@ fn call(
             // node lock first (mirror the block-gossip path: never do network I/O under
             // the lock). A node that receives it adds it to its mempool and re-floods.
             drop(node);
-            if let Some(g) = gossip {
+            if let Some(g) = &ctx.gossip {
                 g.broadcast(&sov_network::NetMessage::NewTransaction(stx));
             }
             Ok(json!({"accepted": true, "txId": tx_id.to_hex()}))

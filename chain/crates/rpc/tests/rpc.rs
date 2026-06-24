@@ -206,6 +206,16 @@ fn rpc_server_serves_real_chain_state_and_accepts_transactions() {
     let bad_kind = rpc(addr, "sov_estimateFee", json!({"kind": "frobnicate"}));
     assert_eq!(bad_kind["error"]["code"], -32602);
 
+    // --- live network diagnostic: reports chain identity + (no) peers ---
+    // This server has no P2P attached, so it reports the chain it would handshake on
+    // plus an empty peer set — the shape an operator/`curl` reads to debug peering.
+    let peer = rpc(addr, "sov_getPeerInfo", json!({}));
+    assert_eq!(peer["result"]["chainId"], "sov-rpc-test");
+    assert!(peer["result"]["genesisHash"].is_string(), "reports genesis hash");
+    assert_eq!(peer["result"]["peers"], 0);
+    assert_eq!(peer["result"]["p2pEnabled"], false);
+    assert!(peer["result"]["connectedPeers"].as_array().unwrap().is_empty());
+
     // --- errors are well-formed JSON-RPC ---
     let unknown = rpc(addr, "sov_nope", json!({}));
     assert_eq!(unknown["error"]["code"], -32601);

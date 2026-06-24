@@ -1042,6 +1042,7 @@ impl Daemon {
     pub fn serve_rpc(&self, addr: &str, workers: usize) -> io::Result<RpcHandle> {
         RpcServer::new(self.node())
             .with_gossip(self.gossip.clone())
+            .with_sync_status(self.sync_status.clone())
             .start(addr, workers)
     }
 
