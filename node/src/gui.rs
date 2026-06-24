@@ -1006,22 +1006,22 @@ impl SendRoute {
     /// A short human label + color for inline display.
     fn label(&self) -> (String, egui::Color32) {
         match self {
-            SendRoute::Empty => (String::new(), egui::Color32::GRAY),
+            SendRoute::Empty => (String::new(), palette::text_dim()),
             SendRoute::Invalid => (
                 "✗ unrecognized address".into(),
-                egui::Color32::from_rgb(240, 90, 90),
+                palette::error(),
             ),
             SendRoute::Transparent(a) => (
                 format!("→ transparent · {a} (public)"),
-                egui::Color32::from_rgb(230, 170, 60),
+                palette::warning(),
             ),
             SendRoute::Shielded => (
                 "→ shielded (private)".into(),
-                egui::Color32::from_rgb(90, 200, 130),
+                palette::success(),
             ),
             SendRoute::Unified => (
                 "→ unified (routes shielded — private)".into(),
-                egui::Color32::from_rgb(90, 200, 130),
+                palette::success(),
             ),
         }
     }
@@ -1361,8 +1361,8 @@ impl Network {
     /// mainnet (live).
     fn color(self) -> egui::Color32 {
         match self {
-            Network::Testnet => egui::Color32::from_rgb(230, 170, 60),
-            Network::Mainnet => egui::Color32::from_rgb(80, 200, 120),
+            Network::Testnet => palette::warning(),
+            Network::Mainnet => palette::success(),
         }
     }
 
@@ -2530,13 +2530,13 @@ impl Station {
         match peers {
             Some(n) if n > 0 => {
                 ui.colored_label(
-                    egui::Color32::from_rgb(60, 200, 90),
+                    palette::success(),
                     format!("● {n} peer(s) connected — on the same testnet"),
                 );
             }
             Some(_) => {
                 ui.colored_label(
-                    egui::Color32::from_rgb(225, 75, 75),
+                    palette::error(),
                     "● 0 peers — NOT connected. Set the other machine's address above + Connect.",
                 );
             }
@@ -2690,7 +2690,7 @@ impl eframe::App for Station {
                 ui.label(
                     egui::RichText::new(format!("⛏ {}", self.network.pow_algo()))
                         .strong()
-                        .color(egui::Color32::from_rgb(150, 190, 255)),
+                        .color(palette::link()),
                 )
                 .on_hover_text(
                     "Proof-of-work algorithm for this network. Testnet: SHA-256d (fast). \
@@ -2699,9 +2699,9 @@ impl eframe::App for Station {
                 );
                 ui.separator();
                 let (dot, label) = if snap.online {
-                    (egui::Color32::from_rgb(60, 200, 90), "online")
+                    (palette::success(), "online")
                 } else {
-                    (egui::Color32::from_rgb(220, 80, 80), "offline")
+                    (palette::error(), "offline")
                 };
                 ui.colored_label(dot, "●");
                 ui.label(label);
@@ -2713,7 +2713,7 @@ impl eframe::App for Station {
                     // chosen) is flagged loudly so no action lands on the wrong chain.
                     if snap.online && snap.chain_id != self.network.chain_id() {
                         ui.colored_label(
-                            egui::Color32::from_rgb(240, 90, 90),
+                            palette::error(),
                             format!(
                                 "⚠ not {} — expected {}",
                                 self.network.label(),
@@ -2789,7 +2789,7 @@ impl eframe::App for Station {
                                     "← create or import a wallet in the Wallet tab first \
                                      (a node mines to a wallet you control)",
                                 )
-                                .color(egui::Color32::from_rgb(230, 170, 60)),
+                                .color(palette::warning()),
                             );
                         }
                     }
@@ -2847,7 +2847,7 @@ impl eframe::App for Station {
                 if !self.show_bottom_toast(ui) {
                     if let Some(err) = &snap.error {
                         ui.colored_label(
-                            egui::Color32::from_rgb(220, 120, 120),
+                            palette::error(),
                             format!("⚠ {err}"),
                         );
                     } else if snap.updated_ms > 0 {
@@ -2872,7 +2872,7 @@ impl eframe::App for Station {
                     if let Some(t) = last_copy {
                         if now_ms().saturating_sub(t) < 1500 {
                             ui.separator();
-                            ui.colored_label(egui::Color32::from_rgb(120, 200, 120), "copied ✓");
+                            ui.colored_label(palette::success(), "copied ✓");
                             ctx.request_repaint(); // keep ticking so it fades on time
                         } else {
                             self.copied_at = None;
@@ -2952,7 +2952,7 @@ impl eframe::App for Station {
                         if ui
                             .button(
                                 egui::RichText::new("Quit anyway")
-                                    .color(egui::Color32::from_rgb(255, 120, 120)),
+                                    .color(palette::error()),
                             )
                             .clicked()
                         {
@@ -3152,13 +3152,12 @@ fn node_panel(ui: &mut egui::Ui, s: &Snapshot) {
             );
         });
     ui.add_space(8.0);
-    // Connection/sync status — color-coded and LIVE (the UI repaints continuously):
-    //   GREEN  = solid peer connection(s), at the tip, mining
-    //   ORANGE = connected but catching up (syncing)
-    //   RED    = NOT connected (0 peers) or offline/error
-    const GREEN: egui::Color32 = egui::Color32::from_rgb(70, 200, 110);
-    const ORANGE: egui::Color32 = egui::Color32::from_rgb(235, 165, 55);
-    const RED: egui::Color32 = egui::Color32::from_rgb(225, 75, 75);
+    // Connection/sync status — color-coded and LIVE (the UI repaints continuously),
+    // through the mode-aware palette so it reads correctly in light AND dark:
+    //   green  = solid peer connection(s), at the tip, mining
+    //   amber  = connected but catching up (syncing)
+    //   red    = NOT connected (0 peers) or offline/error
+    let (green, orange, red) = (palette::success(), palette::warning(), palette::error());
     if s.online {
         let local_h = s.height.unwrap_or(0);
         let best = s.best_peer_height.unwrap_or(0);
@@ -3169,7 +3168,7 @@ fn node_panel(ui: &mut egui::Ui, s: &Snapshot) {
                 egui::RichText::new(format!(
                     "⟳ SYNCING — {local_h} / {best}  ({behind} behind) — downloading from {peers} peer(s)"
                 ))
-                .color(ORANGE)
+                .color(orange)
                 .strong(),
             );
         } else if peers > 0 {
@@ -3177,7 +3176,7 @@ fn node_panel(ui: &mut egui::Ui, s: &Snapshot) {
                 egui::RichText::new(format!(
                     "● CONNECTED — {peers} peer(s), synced at height {local_h}, mining"
                 ))
-                .color(GREEN)
+                .color(green)
                 .strong(),
             );
         } else {
@@ -3186,14 +3185,14 @@ fn node_panel(ui: &mut egui::Ui, s: &Snapshot) {
                     "● NOT CONNECTED — 0 peers (height {local_h}). Set the OTHER machine's address \
                      in the Seed peer field below and click Connect."
                 ))
-                .color(RED)
+                .color(red)
                 .strong(),
             );
         }
     } else {
         ui.label(
             egui::RichText::new("● OFFLINE — no node running. Start a local node above.")
-                .color(RED)
+                .color(red)
                 .strong(),
         );
     }
@@ -4252,7 +4251,7 @@ impl Station {
             return;
         }
         egui::Frame::group(ui.style())
-            .fill(egui::Color32::from_rgb(18, 30, 22))
+            .fill(palette::tint(palette::success(), 30))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("TOTAL EARNED").small().weak());
@@ -4260,7 +4259,7 @@ impl Station {
                         egui::RichText::new(format!("{} XUS", xus(&ev.total_grains.to_string())))
                             .strong()
                             .size(18.0)
-                            .color(egui::Color32::from_rgb(120, 200, 120)),
+                            .color(palette::success()),
                     );
                     if ev.scanned_height > 0 {
                         ui.label(
@@ -4690,10 +4689,10 @@ impl Station {
                 .map(|w| w.public_key.clone())
                 .unwrap_or_default();
             egui::Frame::group(ui.style())
-                .fill(egui::Color32::from_rgb(60, 50, 20))
+                .fill(palette::tint(palette::warning(), 30))
                 .show(ui, |ui| {
                     ui.colored_label(
-                        egui::Color32::from_rgb(240, 200, 90),
+                        palette::warning(),
                         "⚠ Write this recovery phrase down now — offline, in order. It is the ONLY \
                          way to restore this wallet, is shown once, and must never be shared.",
                     );
@@ -4755,10 +4754,10 @@ impl Station {
         // ── Unsaved-wallets banner — nudge to persist before they can be lost ──
         if self.wallets_dirty && !self.wallets.is_empty() {
             egui::Frame::group(ui.style())
-                .fill(egui::Color32::from_rgb(46, 38, 18))
+                .fill(palette::tint(palette::warning(), 30))
                 .stroke(egui::Stroke::new(
                     1.0,
-                    egui::Color32::from_rgb(230, 170, 60),
+                    palette::warning(),
                 ))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -4768,7 +4767,7 @@ impl Station {
                                  restart.",
                                 self.wallets.len()
                             ))
-                            .color(egui::Color32::from_rgb(240, 200, 90)),
+                            .color(palette::warning()),
                         );
                         if self.passphrase.is_empty() {
                             ui.label(
@@ -4867,7 +4866,7 @@ impl Station {
             // A green border for a named wallet (operate-as OR SNS), amber for an
             // unnamed (implicit) one — the name-state is unmistakable at a glance.
             egui::Frame::group(ui.style())
-                .fill(egui::Color32::from_rgb(22, 34, 48))
+                .fill(palette::tint(palette::link(), 30))
                 .stroke(egui::Stroke::new(1.5, named_color(named)))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -4876,14 +4875,14 @@ impl Station {
                             egui::RichText::new(&label)
                                 .strong()
                                 .size(16.0)
-                                .color(egui::Color32::from_rgb(120, 200, 255)),
+                                .color(palette::link()),
                         );
                         ui.label(egui::RichText::new(short_id(&account)).monospace().weak());
                         if is_miner {
                             ui.label(
                                 egui::RichText::new("⛏ mining")
                                     .small()
-                                    .color(egui::Color32::from_rgb(120, 200, 120)),
+                                    .color(palette::success()),
                             );
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4900,7 +4899,7 @@ impl Station {
                                 "👁 WATCH-ONLY  ·  no private key here — monitor only",
                             )
                             .strong()
-                            .color(egui::Color32::from_rgb(150, 180, 220)),
+                            .color(palette::link()),
                         );
                     } else if operating_named {
                         ui.label(
@@ -4960,7 +4959,7 @@ impl Station {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(&ctx, |ui| {
                     ui.colored_label(
-                        egui::Color32::from_rgb(240, 200, 90),
+                        palette::warning(),
                         "⚠ This removes the wallet from the app. It can ONLY be restored from its \
                          recovery phrase (or a saved backup). Export the phrase first if you need it.",
                     );
@@ -4977,7 +4976,7 @@ impl Station {
                             if ui
                                 .button(
                                     egui::RichText::new("Remove permanently")
-                                        .color(egui::Color32::from_rgb(255, 120, 120)),
+                                        .color(palette::error()),
                                 )
                                 .clicked()
                             {
@@ -4995,7 +4994,7 @@ impl Station {
                         ui.label(
                             egui::RichText::new("label doesn't match")
                                 .small()
-                                .color(egui::Color32::from_rgb(240, 90, 90)),
+                                .color(palette::error()),
                         );
                     }
                 });
@@ -5052,7 +5051,7 @@ impl Station {
                     ui.label(
                         egui::RichText::new("⛏")
                             .small()
-                            .color(egui::Color32::from_rgb(120, 200, 120)),
+                            .color(palette::success()),
                     );
                 }
             });
@@ -5195,10 +5194,10 @@ impl Station {
             if self.reveal_phrase {
                 if let Some(phrase) = &mnemonic {
                     egui::Frame::group(ui.style())
-                        .fill(egui::Color32::from_rgb(60, 50, 20))
+                        .fill(palette::tint(palette::warning(), 30))
                         .show(ui, |ui| {
                             ui.colored_label(
-                                egui::Color32::from_rgb(240, 200, 90),
+                                palette::warning(),
                                 "⚠ Anyone who sees these 24 words owns this wallet. Write them \
                                  down offline; never paste them online.",
                             );
@@ -5269,9 +5268,9 @@ impl Station {
                     ui.label(egui::RichText::new("checking the network…").weak());
                 } else if !name_msg.is_empty() {
                     let col = if name_ok {
-                        egui::Color32::from_rgb(120, 220, 150)
+                        palette::success()
                     } else {
-                        egui::Color32::from_rgb(230, 120, 120)
+                        palette::error()
                     };
                     ui.colored_label(col, &name_msg);
                 }
@@ -5462,7 +5461,7 @@ impl Station {
                 ui.label(
                     egui::RichText::new(format!("✗ {e}"))
                         .small()
-                        .color(egui::Color32::from_rgb(240, 90, 90)),
+                        .color(palette::error()),
                 );
             }
             let busy = self.action.lock().map(|a| a.busy).unwrap_or(false);
@@ -5661,7 +5660,7 @@ impl Station {
                         "✗ private send needs a shielded (xus1…) or unified address",
                     )
                     .small()
-                    .color(egui::Color32::from_rgb(240, 90, 90)),
+                    .color(palette::error()),
                 );
             }
             let priv_grains = parse_xus(&self.private_amount);
@@ -5712,7 +5711,7 @@ impl Station {
                 ui.label(
                     egui::RichText::new(format!("→ {priv_reason}"))
                         .small()
-                        .color(egui::Color32::from_rgb(230, 180, 90)),
+                        .color(palette::warning()),
                 );
             }
             ui.add_enabled_ui(priv_ok, |ui| {
@@ -7967,10 +7966,23 @@ mod tests {
         assert!(palette::is_dark());
         let dark_bg = palette::bg();
         let dark_text = palette::text();
+        // The SEMANTIC colors are mode-aware too — every status color, banner and
+        // card tint now flows through these (no hardcoded dark RGBs left as "islands"
+        // on a light background), so each must shift between modes.
+        let (ds, de, dw, dl) = (
+            palette::success(),
+            palette::error(),
+            palette::warning(),
+            palette::link(),
+        );
         palette::set_dark(false);
         assert!(!palette::is_dark());
         assert_ne!(dark_bg, palette::bg(), "bg differs by mode");
         assert_ne!(dark_text, palette::text(), "text differs by mode");
+        assert_ne!(ds, palette::success(), "success differs by mode");
+        assert_ne!(de, palette::error(), "error differs by mode");
+        assert_ne!(dw, palette::warning(), "warning differs by mode");
+        assert_ne!(dl, palette::link(), "link differs by mode");
         // Restore the process-wide default so nothing else observes light mode.
         palette::set_dark(true);
     }
