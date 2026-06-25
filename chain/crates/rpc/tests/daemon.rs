@@ -323,11 +323,19 @@ fn boot_streams_indexing_progress_on_replay() {
 
     // Restart with no snapshot present → the REPLAY tier, which streams progress.
     let mut updates: Vec<(u64, u64)> = Vec::new();
-    let d2 = Daemon::new_with_progress(&genesis, &dir, 1024, 256, miner_keys(), &mut |done, total| {
-        updates.push((done, total))
-    })
+    let d2 = Daemon::new_with_progress(
+        &genesis,
+        &dir,
+        1024,
+        256,
+        miner_keys(),
+        &mut |done, total| updates.push((done, total)),
+    )
     .unwrap();
-    assert!(!d2.resumed_from_snapshot(), "no snapshot existed — replay path");
+    assert!(
+        !d2.resumed_from_snapshot(),
+        "no snapshot existed — replay path"
+    );
     assert_eq!(d2.height(), 3);
     assert!(!updates.is_empty(), "the replay streamed indexing progress");
     assert_eq!(

@@ -1044,12 +1044,12 @@ impl Blockchain {
         let block_hash = block.hash();
         let height = block.header.height.get();
         // Trust the committed difficulty (validated when first accepted).
-        let sha_target = canonical_target(
-            Target::from_compact(block.header.bits).ok_or(ChainError::BadDifficultyBits {
+        let sha_target = canonical_target(Target::from_compact(block.header.bits).ok_or(
+            ChainError::BadDifficultyBits {
                 expected: block.header.bits,
                 got: block.header.bits,
-            })?,
-        );
+            },
+        )?);
         let parent_work = self
             .index
             .get(&self.head)
@@ -2850,7 +2850,11 @@ mod tests {
             node1.import_block(b.clone()).unwrap();
         }
         assert_eq!(node1.height(), 4);
-        assert_eq!(node1.head().hash(), bs[3].hash(), "node1 adopted branch B's tip");
+        assert_eq!(
+            node1.head().hash(),
+            bs[3].hash(),
+            "node1 adopted branch B's tip"
+        );
         assert_eq!(
             node1.ledger().state_root(),
             node2.ledger().state_root(),
@@ -2874,8 +2878,11 @@ mod tests {
             .produce_block(vec![usa_transfer("ecb.reserve.sov", 100, 0)], 2_000)
             .unwrap();
         node1.import_block(a1).unwrap();
-        let (head_a, root_a, height_a) =
-            (node1.head().hash(), node1.ledger().state_root(), node1.height());
+        let (head_a, root_a, height_a) = (
+            node1.head().hash(),
+            node1.ledger().state_root(),
+            node1.height(),
+        );
 
         // Branch B (2 blocks, heavier): b1 valid, the tip tampered + re-sealed.
         let b1 = node2
@@ -2898,9 +2905,17 @@ mod tests {
             "an execution-invalid heavier branch must be rejected"
         );
         // ATOMIC: node1 is exactly where it started — still on branch A.
-        assert_eq!(node1.head().hash(), head_a, "head unchanged after a failed reorg");
+        assert_eq!(
+            node1.head().hash(),
+            head_a,
+            "head unchanged after a failed reorg"
+        );
         assert_eq!(node1.height(), height_a);
-        assert_eq!(node1.ledger().state_root(), root_a, "state unchanged after a failed reorg");
+        assert_eq!(
+            node1.ledger().state_root(),
+            root_a,
+            "state unchanged after a failed reorg"
+        );
         assert_eq!(
             node1.ledger().account(&id("ecb.reserve.sov")).balance,
             Balance::from_sov(100).unwrap(),
@@ -3174,7 +3189,10 @@ mod tests {
         let ok = resumed
             .resume_from_snapshot(ledger, receipts, snap_head, 5, &short_log)
             .unwrap();
-        assert!(!ok, "a snapshot ahead of the log's heaviest tip is rejected");
+        assert!(
+            !ok,
+            "a snapshot ahead of the log's heaviest tip is rejected"
+        );
     }
 
     #[test]

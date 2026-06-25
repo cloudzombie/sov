@@ -325,11 +325,7 @@ fn health(node: &Arc<Mutex<Node>>) -> Value {
 }
 
 /// Parse the request body and produce the JSON-RPC response bytes (single or batch).
-fn dispatch(
-    node: &Arc<Mutex<Node>>,
-    ctx: &RpcCtx,
-    body: &[u8],
-) -> Vec<u8> {
+fn dispatch(node: &Arc<Mutex<Node>>, ctx: &RpcCtx, body: &[u8]) -> Vec<u8> {
     let parsed: Result<Value, _> = serde_json::from_slice(body);
     let value = match parsed {
         Ok(v) => v,
@@ -357,11 +353,7 @@ fn error_envelope(id: Value, code: i64, message: &str) -> Value {
 }
 
 /// Dispatch one JSON-RPC request object into a full response object.
-fn handle_one(
-    node: &Arc<Mutex<Node>>,
-    ctx: &RpcCtx,
-    req: &Value,
-) -> Value {
+fn handle_one(node: &Arc<Mutex<Node>>, ctx: &RpcCtx, req: &Value) -> Value {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let Some(method) = req.get("method").and_then(Value::as_str) else {
         return error_envelope(id, -32600, "Invalid Request (missing method)");
@@ -685,7 +677,10 @@ fn call(
                 envelope_gas, hybrid_envelope_gas, BOOKKEEPING_GAS, INTRINSIC_GAS,
                 SHIELDED_VERIFY_GAS,
             };
-            let kind = params.get("kind").and_then(Value::as_str).unwrap_or("transfer");
+            let kind = params
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("transfer");
             // Payload-independent intrinsic gas per route — mirrors `gas_for` (pinned by
             // `gas::tests::wallet_route_intrinsic_gas_is_stable`).
             let action_gas = match kind {

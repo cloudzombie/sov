@@ -631,7 +631,8 @@ impl Ledger {
                 Some(p) => {
                     let encoded =
                         borsh::to_vec(&p).expect("CompliancePolicy serialization is infallible");
-                    self.commitment.insert(Self::token_policy_slot(&asset), encoded);
+                    self.commitment
+                        .insert(Self::token_policy_slot(&asset), encoded);
                     self.token_policies.insert(asset, p);
                 }
                 None => {
@@ -1205,7 +1206,10 @@ impl Ledger {
     pub fn set_token_policy(&mut self, asset: Hash, policy: CompliancePolicy) {
         if self.undo.is_some() {
             // The policy itself, plus every spend window this call is about to clear.
-            self.record(UndoOp::TokenPolicy(asset, self.token_policies.get(&asset).cloned()));
+            self.record(UndoOp::TokenPolicy(
+                asset,
+                self.token_policies.get(&asset).cloned(),
+            ));
             let cleared: Vec<((Hash, AccountId), SpendWindow)> = self
                 .token_windows
                 .iter()
@@ -1608,16 +1612,74 @@ mod tests {
 
         // ── Baseline state, so undos restore PRIOR values, not just absence ──
         let mut l = Ledger::new();
-        l.set_account(&id("alice.sov"), Account::with_balance(Balance::from_sov(100).unwrap()));
+        l.set_account(
+            &id("alice.sov"),
+            Account::with_balance(Balance::from_sov(100).unwrap()),
+        );
         l.set_contract_value(&id("c.sov"), b"k".to_vec(), b"v0".to_vec());
-        l.set_token(asset, TokenInfo { issuer: issuer.clone(), symbol: "USD1".into(), issued: Balance::from_sov(50).unwrap(), burned: Balance::ZERO });
+        l.set_token(
+            asset,
+            TokenInfo {
+                issuer: issuer.clone(),
+                symbol: "USD1".into(),
+                issued: Balance::from_sov(50).unwrap(),
+                burned: Balance::ZERO,
+            },
+        );
         l.set_token_balance(&asset, &id("alice.sov"), Balance::from_sov(20).unwrap());
-        l.set_token_policy(asset, CompliancePolicy { frozen: false, transfer_control: deny(), spend_limit: Some(SpendLimit { max_per_window: Balance::from_sov(9).unwrap(), window_blocks: 5 }) });
-        l.set_token_window(&asset, &id("alice.sov"), SpendWindow { window_start: 3, spent: Balance::from_sov(2).unwrap() });
-        l.set_nft_class(coll, NftClass { issuer: issuer.clone(), symbol: "ART".into(), minted: 1 });
-        l.mint_nft(coll, b"item1".to_vec(), id("alice.sov"), b"meta0".to_vec(), 1).unwrap();
-        l.lock_htlc(Hash::digest(b"h0"), Htlc { locker: id("alice.sov"), recipient: id("bob.sov"), amount: Balance::from_sov(5).unwrap(), hashlock: [0u8; 32], timeout_height: 100 }).unwrap();
-        l.set_multisig(id("alice.sov"), Multisig { signers: vec![pk(1)], threshold: 1 });
+        l.set_token_policy(
+            asset,
+            CompliancePolicy {
+                frozen: false,
+                transfer_control: deny(),
+                spend_limit: Some(SpendLimit {
+                    max_per_window: Balance::from_sov(9).unwrap(),
+                    window_blocks: 5,
+                }),
+            },
+        );
+        l.set_token_window(
+            &asset,
+            &id("alice.sov"),
+            SpendWindow {
+                window_start: 3,
+                spent: Balance::from_sov(2).unwrap(),
+            },
+        );
+        l.set_nft_class(
+            coll,
+            NftClass {
+                issuer: issuer.clone(),
+                symbol: "ART".into(),
+                minted: 1,
+            },
+        );
+        l.mint_nft(
+            coll,
+            b"item1".to_vec(),
+            id("alice.sov"),
+            b"meta0".to_vec(),
+            1,
+        )
+        .unwrap();
+        l.lock_htlc(
+            Hash::digest(b"h0"),
+            Htlc {
+                locker: id("alice.sov"),
+                recipient: id("bob.sov"),
+                amount: Balance::from_sov(5).unwrap(),
+                hashlock: [0u8; 32],
+                timeout_height: 100,
+            },
+        )
+        .unwrap();
+        l.set_multisig(
+            id("alice.sov"),
+            Multisig {
+                signers: vec![pk(1)],
+                threshold: 1,
+            },
+        );
         l.add_mined_emitted(Balance::from_sov(12).unwrap()).unwrap();
         l.add_shielded_value(Balance::from_sov(7).unwrap()).unwrap();
         l.set_deshield_window(2, Balance::from_sov(1).unwrap());
@@ -1628,24 +1690,82 @@ mod tests {
 
         // ── A recorded "block": overwrite, create, AND remove across every kind ──
         l.begin_undo();
-        l.set_account(&id("alice.sov"), Account::with_balance(Balance::from_sov(999).unwrap())); // overwrite
-        l.set_account(&id("carol.sov"), Account::with_balance(Balance::from_sov(1).unwrap()));   // create
+        l.set_account(
+            &id("alice.sov"),
+            Account::with_balance(Balance::from_sov(999).unwrap()),
+        ); // overwrite
+        l.set_account(
+            &id("carol.sov"),
+            Account::with_balance(Balance::from_sov(1).unwrap()),
+        ); // create
         l.set_contract_value(&id("c.sov"), b"k".to_vec(), b"v1".to_vec()); // overwrite
-        l.set_contract_value(&id("c.sov"), b"k".to_vec(), Vec::new());     // clear
+        l.set_contract_value(&id("c.sov"), b"k".to_vec(), Vec::new()); // clear
         let asset2 = token_asset_id(&id("ecb.reserve.sov"), "EUR1");
-        l.set_token(asset2, TokenInfo { issuer: id("ecb.reserve.sov"), symbol: "EUR1".into(), issued: Balance::from_sov(1).unwrap(), burned: Balance::ZERO }); // create
-        l.set_token_balance(&asset, &id("alice.sov"), Balance::ZERO);     // remove
+        l.set_token(
+            asset2,
+            TokenInfo {
+                issuer: id("ecb.reserve.sov"),
+                symbol: "EUR1".into(),
+                issued: Balance::from_sov(1).unwrap(),
+                burned: Balance::ZERO,
+            },
+        ); // create
+        l.set_token_balance(&asset, &id("alice.sov"), Balance::ZERO); // remove
         l.set_token_balance(&asset, &id("bob.sov"), Balance::from_sov(8).unwrap()); // create
-        l.set_token_policy(asset, CompliancePolicy { frozen: true, transfer_control: deny(), spend_limit: None }); // overwrite + cascades (clears alice's window)
-        l.set_token_window(&asset, &id("bob.sov"), SpendWindow { window_start: 9, spent: Balance::from_sov(4).unwrap() }); // create
-        l.mint_nft(coll, b"item2".to_vec(), id("bob.sov"), Vec::new(), 2).unwrap(); // create
-        l.transfer_nft(coll, b"item1", id("carol.sov")).unwrap();         // transfer
-        l.set_nft_meta(coll, b"item1", b"meta1".to_vec()).unwrap();       // meta
-        l.set_nft_class(coll, NftClass { issuer: issuer.clone(), symbol: "ART".into(), minted: 2 }); // overwrite
-        l.settle_htlc(&Hash::digest(b"h0")).unwrap();                     // remove htlc
-        l.lock_htlc(Hash::digest(b"h1"), Htlc { locker: id("carol.sov"), recipient: id("alice.sov"), amount: Balance::from_sov(3).unwrap(), hashlock: [1u8; 32], timeout_height: 200 }).unwrap(); // create
-        l.set_multisig(id("alice.sov"), Multisig { signers: vec![pk(1), pk(2)], threshold: 2 }); // overwrite
-        l.set_multisig(id("dave.sov"), Multisig { signers: vec![pk(3)], threshold: 1 });          // create
+        l.set_token_policy(
+            asset,
+            CompliancePolicy {
+                frozen: true,
+                transfer_control: deny(),
+                spend_limit: None,
+            },
+        ); // overwrite + cascades (clears alice's window)
+        l.set_token_window(
+            &asset,
+            &id("bob.sov"),
+            SpendWindow {
+                window_start: 9,
+                spent: Balance::from_sov(4).unwrap(),
+            },
+        ); // create
+        l.mint_nft(coll, b"item2".to_vec(), id("bob.sov"), Vec::new(), 2)
+            .unwrap(); // create
+        l.transfer_nft(coll, b"item1", id("carol.sov")).unwrap(); // transfer
+        l.set_nft_meta(coll, b"item1", b"meta1".to_vec()).unwrap(); // meta
+        l.set_nft_class(
+            coll,
+            NftClass {
+                issuer: issuer.clone(),
+                symbol: "ART".into(),
+                minted: 2,
+            },
+        ); // overwrite
+        l.settle_htlc(&Hash::digest(b"h0")).unwrap(); // remove htlc
+        l.lock_htlc(
+            Hash::digest(b"h1"),
+            Htlc {
+                locker: id("carol.sov"),
+                recipient: id("alice.sov"),
+                amount: Balance::from_sov(3).unwrap(),
+                hashlock: [1u8; 32],
+                timeout_height: 200,
+            },
+        )
+        .unwrap(); // create
+        l.set_multisig(
+            id("alice.sov"),
+            Multisig {
+                signers: vec![pk(1), pk(2)],
+                threshold: 2,
+            },
+        ); // overwrite
+        l.set_multisig(
+            id("dave.sov"),
+            Multisig {
+                signers: vec![pk(3)],
+                threshold: 1,
+            },
+        ); // create
         l.add_mined_emitted(Balance::from_sov(1).unwrap()).unwrap();
         l.add_shielded_value(Balance::from_sov(2).unwrap()).unwrap();
         l.sub_shielded_value(Balance::from_sov(1).unwrap()).unwrap();
@@ -1654,12 +1774,20 @@ mod tests {
 
         let undo = l.take_undo();
         assert!(!undo.is_empty());
-        assert_ne!(l.state_root(), root0, "the recorded block must have changed state");
+        assert_ne!(
+            l.state_root(),
+            root0,
+            "the recorded block must have changed state"
+        );
 
         // ── Disconnect: undo must restore the pre-block state EXACTLY ──
         l.apply_undo(undo);
         assert_eq!(l.state_root(), root0, "undo restores the exact state root");
-        assert_eq!(l.to_snapshot_bytes(), snap0, "undo restores the exact serialized state");
+        assert_eq!(
+            l.to_snapshot_bytes(),
+            snap0,
+            "undo restores the exact serialized state"
+        );
     }
 
     #[test]

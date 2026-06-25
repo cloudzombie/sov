@@ -122,7 +122,10 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
     if !checkpoints.is_empty() {
         log(
             &logs,
-            format!("{} weak-subjectivity checkpoint(s) loaded", checkpoints.len()),
+            format!(
+                "{} weak-subjectivity checkpoint(s) loaded",
+                checkpoints.len()
+            ),
         );
         daemon = daemon.with_checkpoints(checkpoints);
     }
@@ -163,7 +166,10 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
             // → link up, or the exact failure) on stdout/journald too, so a VPS operator
             // can see peering happen instead of guessing.
             p2p.tcp().set_log_sink(Arc::clone(&logs));
-            log(&logs, format!("P2P gossip listening on {}", p2p.local_addr()));
+            log(
+                &logs,
+                format!("P2P gossip listening on {}", p2p.local_addr()),
+            );
             for peer in &config.bootstrap_peers {
                 // Best-effort first dial; if the seed isn't up yet, the engine keeps
                 // retrying in the background, so the link forms once it is.
@@ -171,7 +177,9 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
                     Ok(()) => log(&logs, format!("dialed bootstrap peer {peer}")),
                     Err(e) => log(
                         &logs,
-                        format!("bootstrap peer {peer} not reachable yet ({e}); will keep retrying"),
+                        format!(
+                            "bootstrap peer {peer} not reachable yet ({e}); will keep retrying"
+                        ),
                     ),
                 }
             }
@@ -191,7 +199,10 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
         .with_sync_status(Arc::clone(&sync))
         .with_log_sink(Arc::clone(&logs))
         .run(&config.rpc_addr, config.rpc_workers, config.block_time_ms)?;
-    log(&logs, format!("JSON-RPC listening on http://{}", handle.rpc_addr()));
+    log(
+        &logs,
+        format!("JSON-RPC listening on http://{}", handle.rpc_addr()),
+    );
     log(
         &logs,
         format!(

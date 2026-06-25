@@ -371,8 +371,15 @@ mod tests {
         // De-shield a VARIABLE amount (30 of 50): value balance is +30 (only 30
         // leaves the pool), and Alice keeps a 20 shielded change note.
         let bundle = unshield_amount(&params, &alice, &received[0], path, anchor, 30).unwrap();
-        assert!(bundle.verify(&params), "partial de-shield proof must verify");
-        assert_eq!(bundle.value_balance(), 30, "exactly the de-shielded amount leaves");
+        assert!(
+            bundle.verify(&params),
+            "partial de-shield proof must verify"
+        );
+        assert_eq!(
+            bundle.value_balance(),
+            30,
+            "exactly the de-shielded amount leaves"
+        );
         let change = recover_outputs(&alice, &bundle);
         assert_eq!(change.len(), 1, "the remainder stays shielded as change");
         assert_eq!(change[0].value(), 20);
@@ -381,7 +388,10 @@ mod tests {
         let (path2, anchor2) = tree.witness(pos).unwrap();
         let whole = unshield_amount(&params, &alice, &received[0], path2, anchor2, 50).unwrap();
         assert_eq!(whole.value_balance(), 50);
-        assert!(recover_outputs(&alice, &whole).is_empty(), "no change on a full de-shield");
+        assert!(
+            recover_outputs(&alice, &whole).is_empty(),
+            "no change on a full de-shield"
+        );
 
         // De-shielding more than the note holds is rejected.
         let (path3, anchor3) = tree.witness(pos).unwrap();

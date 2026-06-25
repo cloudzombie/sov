@@ -592,7 +592,9 @@ fn resolve_dial_targets(addr: &str) -> std::io::Result<Vec<SocketAddr>> {
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
-        format!("could not resolve peer '{trimmed}' — expected host:port, ip:port, or a bare ip/host"),
+        format!(
+            "could not resolve peer '{trimmed}' — expected host:port, ip:port, or a bare ip/host"
+        ),
     ))
 }
 
@@ -927,7 +929,12 @@ fn node_nonce() -> u64 {
 /// address — the packet's `src` IP plus the advertised port — only if the beacon is
 /// well-formed, for the SAME chain, and NOT our own (nonce differs). Nodes on a
 /// different chain are never dialed, and a node never dials itself.
-fn parse_beacon(data: &[u8], our_chain_id: &str, our_nonce: u64, src: IpAddr) -> Option<SocketAddr> {
+fn parse_beacon(
+    data: &[u8],
+    our_chain_id: &str,
+    our_nonce: u64,
+    src: IpAddr,
+) -> Option<SocketAddr> {
     let text = std::str::from_utf8(data).ok()?;
     let mut parts = text.split('|');
     if parts.next()? != LAN_DISCO_TAG {
@@ -1302,12 +1309,12 @@ mod tests {
         a.connect(&b.local_addr().to_string()).unwrap();
 
         assert!(
-            wait_until(3, || a.peer_count() >= 1 && b.peer_count() >= 1),
+            wait_until(15, || a.peer_count() >= 1 && b.peer_count() >= 1),
             "peers connected"
         );
 
         a.broadcast(&status(7));
-        let got = wait_until(3, || {
+        let got = wait_until(15, || {
             b.drain()
                 .iter()
                 .any(|(_, m)| matches!(m, NetMessage::Status { height: 7, .. }))
@@ -1340,7 +1347,10 @@ mod tests {
         let addr = server.local_addr().to_string();
         let client = TcpNode::bind("127.0.0.1:0").unwrap();
         client.connect(&addr).unwrap();
-        assert!(wait_until(3, || server.peer_count() >= 1), "peer connected");
+        assert!(
+            wait_until(15, || server.peer_count() >= 1),
+            "peer connected"
+        );
 
         // Blast well past the burst budget as fast as possible: this empties the
         // token bucket, then every further message accrues a rate-violation
@@ -1350,9 +1360,12 @@ mod tests {
             client.broadcast(&status(1));
         }
 
-        // The flooder is dropped...
+        // The flooder is dropped... (generous ceiling: under `cargo test --workspace`
+        // the CPU-bound Noise+ML-KEM handshakes across hundreds of parallel tests can
+        // starve this thread, so a tight 5s wait flaked on CI — the healthy path still
+        // drops in well under a second).
         assert!(
-            wait_until(5, || server.peer_count() == 0),
+            wait_until(30, || server.peer_count() == 0),
             "flooding peer was dropped"
         );
         // ...and its IP is banned, so it cannot immediately reconnect.
@@ -1429,7 +1442,7 @@ mod tests {
         // Noise channel is up — now violate the PQ exchange.
         noise_send(&mut stream, &mut transport, b"not-a-kem-key").unwrap();
 
-        let accepted = wait_until(2, || server.peer_count() > 0);
+        let accepted = wait_until(15, || server.peer_count() > 0);
         assert!(
             !accepted,
             "a connection without a completed ML-KEM exchange must be dropped"
@@ -1450,7 +1463,9 @@ mod tests {
             }
         }
         assert!(
-            wait_until(5, || server.peer_count() >= MAX_INBOUND_PEERS),
+            // 64+ Noise+ML-KEM handshakes is the heaviest test here; give it ample
+            // headroom under saturated CI parallelism (healthy: a couple of seconds).
+            wait_until(40, || server.peer_count() >= MAX_INBOUND_PEERS),
             "cap saturates (got {})",
             server.peer_count()
         );
@@ -1473,7 +1488,7 @@ mod tests {
         a.connect(&b.local_addr().to_string()).unwrap();
 
         let c_addr = c.local_addr();
-        let learned = wait_until(4, || a.known_peers().contains(&c_addr));
+        let learned = wait_until(15, || a.known_peers().contains(&c_addr));
         assert!(learned, "A discovered C transitively through B");
     }
 
@@ -1482,7 +1497,7 @@ mod tests {
         let src = IpAddr::V4(Ipv4Addr::new(192, 168, 0, 244));
         let me = 42u64; // our nonce
         let peer = 7u64; // a different node's nonce
-        // Well-formed, same chain, different node → dial src_ip:advertised_port.
+                         // Well-formed, same chain, different node → dial src_ip:advertised_port.
         let good = format!("{LAN_DISCO_TAG}|sov-testnet-1|9645|{peer}");
         assert_eq!(
             parse_beacon(good.as_bytes(), "sov-testnet-1", me, src),
@@ -1490,14 +1505,25 @@ mod tests {
         );
         // OUR OWN beacon looped back (same nonce) → ignored (no self-dial / ghost).
         let mine = format!("{LAN_DISCO_TAG}|sov-testnet-1|9645|{me}");
-        assert_eq!(parse_beacon(mine.as_bytes(), "sov-testnet-1", me, src), None);
+        assert_eq!(
+            parse_beacon(mine.as_bytes(), "sov-testnet-1", me, src),
+            None
+        );
         // Different chain → ignored.
         let other = format!("{LAN_DISCO_TAG}|sov-mainnet|9645|{peer}");
-        assert_eq!(parse_beacon(other.as_bytes(), "sov-testnet-1", me, src), None);
+        assert_eq!(
+            parse_beacon(other.as_bytes(), "sov-testnet-1", me, src),
+            None
+        );
         // Garbage / wrong tag / bad port → ignored.
         assert_eq!(parse_beacon(b"hello world", "sov-testnet-1", me, src), None);
         assert_eq!(
-            parse_beacon(b"sov-disco1|sov-testnet-1|notaport|7", "sov-testnet-1", me, src),
+            parse_beacon(
+                b"sov-disco1|sov-testnet-1|notaport|7",
+                "sov-testnet-1",
+                me,
+                src
+            ),
             None
         );
     }
@@ -1510,7 +1536,7 @@ mod tests {
         let node = TcpNode::bind("127.0.0.1:0").unwrap();
         let addr = node.local_addr();
         node.shutdown();
-        let freed = wait_until(3, || TcpListener::bind(addr).is_ok());
+        let freed = wait_until(10, || TcpListener::bind(addr).is_ok());
         assert!(freed, "listen port {addr} must be free after shutdown");
     }
 
@@ -1673,7 +1699,10 @@ mod tests {
         let addr = server.local_addr().to_string();
         let client = TcpNode::bind("127.0.0.1:0").unwrap();
         client.connect(&addr).unwrap();
-        assert!(wait_until(3, || server.peer_count() >= 1), "peer connected");
+        assert!(
+            wait_until(15, || server.peer_count() >= 1),
+            "peer connected"
+        );
         let peer = server.connected_peers()[0];
 
         let banned = server.penalize_peer(peer, MISBEHAVIOR_BAN);
@@ -1686,7 +1715,7 @@ mod tests {
         );
         // ...and the live connection is dropped immediately, not merely barred later.
         assert!(
-            wait_until(3, || server.peer_count() == 0),
+            wait_until(15, || server.peer_count() == 0),
             "the penalized peer is dropped immediately"
         );
     }
@@ -1699,13 +1728,19 @@ mod tests {
         let addr = server.local_addr().to_string();
         let client = TcpNode::bind("127.0.0.1:0").unwrap();
         client.connect(&addr).unwrap();
-        assert!(wait_until(3, || server.peer_count() >= 1), "peer connected");
+        assert!(
+            wait_until(15, || server.peer_count() >= 1),
+            "peer connected"
+        );
         let peer = server.connected_peers()[0];
 
         let banned = server.penalize_peer(peer, MISBEHAVIOR_BAN / 4.0);
         assert!(!banned, "one sub-threshold strike does not ban");
         // The peer stays connected.
-        assert!(server.peer_count() >= 1, "a forgiven peer keeps its connection");
+        assert!(
+            server.peer_count() >= 1,
+            "a forgiven peer keeps its connection"
+        );
     }
 
     #[test]
@@ -1716,19 +1751,22 @@ mod tests {
         let addr = server.local_addr().to_string();
         let client = TcpNode::bind("127.0.0.1:0").unwrap();
         client.connect(&addr).unwrap();
-        assert!(wait_until(3, || server.peer_count() >= 1), "peer connected");
+        assert!(
+            wait_until(15, || server.peer_count() >= 1),
+            "peer connected"
+        );
         let peer = server.connected_peers()[0];
 
         server.disconnect(&peer);
         assert!(
-            wait_until(3, || server.peer_count() == 0),
+            wait_until(15, || server.peer_count() == 0),
             "the peer is dropped"
         );
         // NOT banned: a fresh connection from the same host is admitted.
         let client2 = TcpNode::bind("127.0.0.1:0").unwrap();
         client2.connect(&addr).unwrap();
         assert!(
-            wait_until(3, || server.peer_count() >= 1),
+            wait_until(15, || server.peer_count() >= 1),
             "disconnect does not ban — the host can reconnect"
         );
     }
@@ -1755,11 +1793,20 @@ mod tests {
             shutdown: AtomicBool::new(false),
         };
         // Same host, its advertised LISTEN port → duplicate (matched by IP).
-        assert!(dial_would_duplicate(&shared, "192.168.1.5:9645".parse().unwrap()));
+        assert!(dial_would_duplicate(
+            &shared,
+            "192.168.1.5:9645".parse().unwrap()
+        ));
         // A different host → not a duplicate.
-        assert!(!dial_would_duplicate(&shared, "192.168.1.9:9645".parse().unwrap()));
+        assert!(!dial_would_duplicate(
+            &shared,
+            "192.168.1.9:9645".parse().unwrap()
+        ));
         // Loopback is exempt so single-host / loopback multi-node tests still connect.
-        assert!(!dial_would_duplicate(&shared, "127.0.0.1:9645".parse().unwrap()));
+        assert!(!dial_would_duplicate(
+            &shared,
+            "127.0.0.1:9645".parse().unwrap()
+        ));
     }
 
     #[test]
@@ -1833,11 +1880,13 @@ mod tests {
 
         // ...and the dial truly lands: A is connected to B within a few seconds.
         assert!(
-            wait_until(5, || a.peer_count() >= 1),
+            wait_until(15, || a.peer_count() >= 1),
             "request_reconnect dialed and the link came up"
         );
 
         // An unresolvable address is reported as an error here, NOT swallowed.
-        assert!(a.request_reconnect("definitely not an address !!!").is_err());
+        assert!(a
+            .request_reconnect("definitely not an address !!!")
+            .is_err());
     }
 }

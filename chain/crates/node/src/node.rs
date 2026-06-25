@@ -437,7 +437,8 @@ mod tests {
         )
         .unwrap();
         let tx_id = tx.id();
-        node.submit(tx).expect("admitted: authorized + correct nonce");
+        node.submit(tx)
+            .expect("admitted: authorized + correct nonce");
         assert_eq!(node.mempool_len(), 1);
 
         let (candidate, excluded) = node.build_candidate(1).expect("build candidate");
@@ -453,7 +454,11 @@ mod tests {
         // it; a tx merely blocked behind a gap would not be.
         assert_eq!(node.account_nonce(&id("poor.sov")), 0);
         node.drop_tx(&tx_id);
-        assert_eq!(node.mempool_len(), 0, "evicted → no longer clogs the mempool");
+        assert_eq!(
+            node.mempool_len(),
+            0,
+            "evicted → no longer clogs the mempool"
+        );
     }
 
     #[test]

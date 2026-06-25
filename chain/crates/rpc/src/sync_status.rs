@@ -142,7 +142,10 @@ mod tests {
             "but a 1-block deficit is a race, not an initial download — keep mining"
         );
         s.update(MINING_GATE_LAG, 100, 1);
-        assert!(!s.should_gate_mining(), "exactly at the lag is still racing");
+        assert!(
+            !s.should_gate_mining(),
+            "exactly at the lag is still racing"
+        );
     }
 
     #[test]

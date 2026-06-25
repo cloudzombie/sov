@@ -1098,12 +1098,12 @@ impl Daemon {
             // boot — making the very NEXT restart a tier-1 instant resume even if THIS
             // boot had to replay (no snapshot existed yet, or it was stale).
             let _ = block_time_ms; // block cadence now comes from difficulty, not a sleep
-            // NOTE: we deliberately do NOT lower this thread's OS priority. Doing so
-            // (v0.1.25) risked a PRIORITY INVERSION — the low-priority miner briefly holds
-            // the node lock (build/commit/snapshot) and a normal-priority networking thread
-            // waiting on that lock would be blocked by a thread the scheduler won't run,
-            // stalling peer connections. The duty-cycle THROTTLE below (a normal-priority
-            // thread that sleeps OFF the lock) frees CPU for networking without that risk.
+                                   // NOTE: we deliberately do NOT lower this thread's OS priority. Doing so
+                                   // (v0.1.25) risked a PRIORITY INVERSION — the low-priority miner briefly holds
+                                   // the node lock (build/commit/snapshot) and a normal-priority networking thread
+                                   // waiting on that lock would be blocked by a thread the scheduler won't run,
+                                   // stalling peer connections. The duty-cycle THROTTLE below (a normal-priority
+                                   // thread that sleeps OFF the lock) frees CPU for networking without that risk.
             let mut last_snap_height = 0u64;
             // Track the mining phase so each transition (connecting → syncing → mining) is
             // logged once. `start_at` bounds the connect-before-mining grace window.
@@ -1153,19 +1153,17 @@ impl Daemon {
                     .as_ref()
                     .map(|s| s.should_gate_mining())
                     .unwrap_or(false);
-                let phase = if sync_status.is_some()
-                    && peers == 0
-                    && start_at.elapsed() < CONNECT_GRACE
-                {
-                    // P2P is active but no peer has connected yet — wait (grace), so the
-                    // handshake gets full CPU and we don't mine ahead of the network. With
-                    // no P2P at all (standalone), there is nothing to wait for, so mine.
-                    MinePhase::Connecting
-                } else if behind {
-                    MinePhase::Syncing
-                } else {
-                    MinePhase::Mining
-                };
+                let phase =
+                    if sync_status.is_some() && peers == 0 && start_at.elapsed() < CONNECT_GRACE {
+                        // P2P is active but no peer has connected yet — wait (grace), so the
+                        // handshake gets full CPU and we don't mine ahead of the network. With
+                        // no P2P at all (standalone), there is nothing to wait for, so mine.
+                        MinePhase::Connecting
+                    } else if behind {
+                        MinePhase::Syncing
+                    } else {
+                        MinePhase::Mining
+                    };
                 if last_phase != Some(phase) {
                     match phase {
                         MinePhase::Connecting => {
@@ -1186,7 +1184,11 @@ impl Daemon {
                         }
                         MinePhase::Mining => {
                             let h = node.lock().map(|n| n.chain().height()).unwrap_or(0);
-                            let how = if peers > 0 { "at the network tip" } else { "solo" };
+                            let how = if peers > 0 {
+                                "at the network tip"
+                            } else {
+                                "solo"
+                            };
                             daemon_log(&log, format!("▶ mining {how} at height {h}"));
                         }
                     }
@@ -1222,8 +1224,7 @@ impl Daemon {
                             // silent. A tx merely blocked behind such a gap is left
                             // alone (select won't pick it until the gap is filled).
                             for (stx, reason) in excluded {
-                                if n.account_nonce(&stx.transaction.signer)
-                                    == stx.transaction.nonce
+                                if n.account_nonce(&stx.transaction.signer) == stx.transaction.nonce
                                 {
                                     let id = stx.id();
                                     n.drop_tx(&id);
@@ -1405,7 +1406,9 @@ mod tests {
         let cfg = spec.to_genesis_config().expect("spec -> genesis config");
         assert_eq!(
             cfg.mining.deshield_limit_grains,
-            sov_primitives::Balance::from_sov(1_000_000).unwrap().grains()
+            sov_primitives::Balance::from_sov(1_000_000)
+                .unwrap()
+                .grains()
         );
         assert_eq!(cfg.mining.deshield_window_blocks, 12);
         // ...but the limiter is NOT a genesis-header field, so the genesis hash is
@@ -1414,8 +1417,20 @@ mod tests {
         let mut bare = spec.clone();
         bare.deshield_limit_sov = None;
         bare.deshield_window_blocks = None;
-        let with = spec.to_genesis_config().unwrap().build().unwrap().block.hash();
-        let without = bare.to_genesis_config().unwrap().build().unwrap().block.hash();
+        let with = spec
+            .to_genesis_config()
+            .unwrap()
+            .build()
+            .unwrap()
+            .block
+            .hash();
+        let without = bare
+            .to_genesis_config()
+            .unwrap()
+            .build()
+            .unwrap()
+            .block
+            .hash();
         assert_eq!(
             with, without,
             "de-shield limiter override must not change the genesis hash"

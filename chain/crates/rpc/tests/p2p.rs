@@ -25,8 +25,8 @@ use sov_mining::MiningPolicy;
 use sov_network::{NetMessage, TcpNode};
 use sov_primitives::{AccountId, Balance, Hash};
 use sov_rpc::{Daemon, P2p, P2pConfig, P2pHandle, RpcClient, SyncShared};
-use std::sync::Arc;
 use sov_types::{Action, SignedTransaction, Transaction};
+use std::sync::Arc;
 
 const CHAIN_ID: &str = "sov-p2p-testnet";
 /// Seed for the founding operator `val01.node.sov` (node A's miner identity).
@@ -264,21 +264,22 @@ fn late_joiner_syncs_with_hybrid_pq_keys() {
         vesting: vec![],
     };
     // Node identities (the P2P `Hello` signing keys) are hybrid too.
-    let build_hybrid = |tag: &str, account: &str, seed: [u8; 32], ops: Vec<(AccountId, Keypair)>| {
-        let daemon = Daemon::new(&g, unique_dir(tag), 1024, 256, ops).unwrap();
-        let config = P2pConfig {
-            chain_id: g.chain_id.clone(),
-            genesis_hash: daemon.genesis_hash(),
-            account: id(account),
-            keypair: Keypair::hybrid_from_seed(seed),
+    let build_hybrid =
+        |tag: &str, account: &str, seed: [u8; 32], ops: Vec<(AccountId, Keypair)>| {
+            let daemon = Daemon::new(&g, unique_dir(tag), 1024, 256, ops).unwrap();
+            let config = P2pConfig {
+                chain_id: g.chain_id.clone(),
+                genesis_hash: daemon.genesis_hash(),
+                account: id(account),
+                keypair: Keypair::hybrid_from_seed(seed),
+            };
+            let p2p = P2p::bind(daemon.node(), config, "127.0.0.1:0")
+                .unwrap()
+                .with_block_log(daemon.block_log());
+            let daemon = daemon.with_gossip(p2p.tcp());
+            let handle = p2p.start();
+            (daemon, handle)
         };
-        let p2p = P2p::bind(daemon.node(), config, "127.0.0.1:0")
-            .unwrap()
-            .with_block_log(daemon.block_log());
-        let daemon = daemon.with_gossip(p2p.tcp());
-        let handle = p2p.start();
-        (daemon, handle)
-    };
 
     let (a, a_p2p) = build_hybrid(
         "hy-a",
@@ -300,7 +301,11 @@ fn late_joiner_syncs_with_hybrid_pq_keys() {
         };
         let stx = SignedTransaction::sign(tx, &kp).unwrap();
         a.node().lock().unwrap().submit(stx).unwrap();
-        a.node().lock().unwrap().produce(1_000 + nonce * 1_000).unwrap();
+        a.node()
+            .lock()
+            .unwrap()
+            .produce(1_000 + nonce * 1_000)
+            .unwrap();
     }
     assert_eq!(a.height(), 5);
 
@@ -461,7 +466,11 @@ fn node_that_mined_its_own_multiblock_fork_recovers_by_deep_reorg() {
             .unwrap()
             .submit(usa_transfer("ecb.reserve.sov", 1, nonce))
             .unwrap();
-        a.node().lock().unwrap().produce(1_000 + nonce * 1_000).unwrap();
+        a.node()
+            .lock()
+            .unwrap()
+            .produce(1_000 + nonce * 1_000)
+            .unwrap();
     }
     let a_head = a.node().lock().unwrap().chain().head().hash();
     assert_eq!(a.height(), 6);
@@ -473,10 +482,17 @@ fn node_that_mined_its_own_multiblock_fork_recovers_by_deep_reorg() {
             .unwrap()
             .submit(usa_transfer("ecb.reserve.sov", 7, nonce))
             .unwrap();
-        b.node().lock().unwrap().produce(1_500 + nonce * 1_000).unwrap();
+        b.node()
+            .lock()
+            .unwrap()
+            .produce(1_500 + nonce * 1_000)
+            .unwrap();
     }
     assert_eq!(b.height(), 3);
-    assert_eq!(b.balance(&id("ecb.reserve.sov")), Balance::from_sov(21).unwrap());
+    assert_eq!(
+        b.balance(&id("ecb.reserve.sov")),
+        Balance::from_sov(21).unwrap()
+    );
 
     let a_p2p = P2p::bind(
         a.node(),
@@ -658,7 +674,9 @@ fn a_tx_submitted_to_one_node_is_gossiped_to_a_peer_and_mined() {
     .unwrap()
     .with_block_log(a_d.block_log())
     .with_sync_status(Arc::clone(&a_sync));
-    let a_d = a_d.with_gossip(a_p2p.tcp()).with_sync_status(Arc::clone(&a_sync));
+    let a_d = a_d
+        .with_gossip(a_p2p.tcp())
+        .with_sync_status(Arc::clone(&a_sync));
     let a_net = a_p2p.start();
     let a_rpc = a_d.serve_rpc("127.0.0.1:0", 1).unwrap();
     let a_rpc_addr = a_rpc.local_addr();
@@ -686,7 +704,9 @@ fn a_tx_submitted_to_one_node_is_gossiped_to_a_peer_and_mined() {
     .unwrap()
     .with_block_log(b_d.block_log())
     .with_sync_status(Arc::clone(&b_sync));
-    let b_d = b_d.with_gossip(b_p2p.tcp()).with_sync_status(Arc::clone(&b_sync));
+    let b_d = b_d
+        .with_gossip(b_p2p.tcp())
+        .with_sync_status(Arc::clone(&b_sync));
     let b_net = b_p2p.start();
     let b_dae = b_d.run("127.0.0.1:0", 1, 0).unwrap();
 
@@ -695,7 +715,8 @@ fn a_tx_submitted_to_one_node_is_gossiped_to_a_peer_and_mined() {
     // B must be ready to accept it before we submit.
     b_net.connect(&a_net.local_addr().to_string()).unwrap();
     assert!(
-        wait_until(30, || a_sync.authed_peers() >= 1 && b_sync.authed_peers() >= 1),
+        wait_until(30, || a_sync.authed_peers() >= 1
+            && b_sync.authed_peers() >= 1),
         "A and B app-authenticated a peer link"
     );
 

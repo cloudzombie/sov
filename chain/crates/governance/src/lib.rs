@@ -861,7 +861,10 @@ mod tests {
         assert_eq!(log.remove(BlockHeight::new(11)), Some(0b1));
         assert_eq!(log.len(), before_len, "removed exactly the added height");
         assert!(!log.signals(BlockHeight::new(11), 0), "height 11 is gone");
-        assert!(log.signals(BlockHeight::new(10), 0), "untouched height remains");
+        assert!(
+            log.signals(BlockHeight::new(10), 0),
+            "untouched height remains"
+        );
         // Removing an absent height is a harmless None.
         assert_eq!(log.remove(BlockHeight::new(99)), None);
     }

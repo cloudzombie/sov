@@ -181,8 +181,10 @@ mod tests {
         let hashrate = 1_000u128; // ⇒ equilibrium D = target_ms * H = 30,000,000
         let n = 60usize;
         let mut diffs = vec![1_000u128; n]; // genesis-ish, ~300x too easy
-        let mut solvetimes: Vec<u64> =
-            diffs.iter().map(|&d| (d / hashrate).max(1) as u64).collect();
+        let mut solvetimes: Vec<u64> = diffs
+            .iter()
+            .map(|&d| (d / hashrate).max(1) as u64)
+            .collect();
         let (mut min_recent, mut max_recent) = (u64::MAX, 0u64);
         for iter in 0..500 {
             let next = Difficulty::lwma(&diffs, &solvetimes, target_ms);

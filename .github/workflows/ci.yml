@@ -93,7 +93,12 @@ jobs:
         with:
           workspaces: chain/contracts
       - name: Clippy (deny warnings)
-        run: cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
+        # Lint the real guest targets (lib + any bins), NOT --all-targets: a `no_std`
+        # crate that defines a `#[panic_handler]` (the SDK does) cannot link into the
+        # std test harness `--all-targets` would build (duplicate `panic_impl` lang
+        # item), and wasm32-unknown-unknown has no test runner anyway — so those test
+        # targets are both unbuildable and un-runnable. The lib IS the deliverable.
+        run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
       - name: Build (release wasm)
         run: cargo build --target wasm32-unknown-unknown --release
 

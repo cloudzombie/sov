@@ -9,6 +9,18 @@
 # Fail the build if any dependency is using a yanked release.
 yanked = "deny"
 # (Security vulnerabilities from the RustSec database are always denied.)
+# Narrowly waive specific UNMAINTAINED advisories that have no fix and no runtime
+# exposure. These are NOT vulnerabilities — a new security advisory (or a yanked
+# crate) still breaks CI. Each entry is justified; revisit if a maintained
+# replacement lands upstream.
+ignore = [
+    # proc-macro-error (original) and its fork proc-macro-error2 are both now
+    # unmaintained. They are TRANSITIVE, BUILD-TIME proc-macro helpers (pulled by
+    # derive macros); their code runs only at compile time and ships in NO node
+    # binary — zero runtime/consensus surface. Nothing to patch (upstream is dead).
+    "RUSTSEC-2024-0370", # proc-macro-error  — unmaintained
+    "RUSTSEC-2026-0173", # proc-macro-error2 — unmaintained
+]
 
 [bans]
 multiple-versions = "allow"

@@ -168,7 +168,10 @@ fn rpc_server_serves_real_chain_state_and_accepts_transactions() {
 
     // --- block digest carries the new prevHash / stateRoot (for the block-detail view) ---
     let digest = rpc(addr, "sov_getBlockDigest", json!({"height": 0}));
-    assert!(digest["result"]["prevHash"].is_string(), "digest has prevHash");
+    assert!(
+        digest["result"]["prevHash"].is_string(),
+        "digest has prevHash"
+    );
     assert!(
         digest["result"]["stateRoot"].is_string(),
         "digest has stateRoot"
@@ -184,7 +187,10 @@ fn rpc_server_serves_real_chain_state_and_accepts_transactions() {
         "sov_estimateFee",
         json!({"kind": "transfer", "publicKey": v1_pk}),
     );
-    assert_eq!(est["result"]["gasUsed"], 21_000, "V1 transfer = intrinsic only");
+    assert_eq!(
+        est["result"]["gasUsed"], 21_000,
+        "V1 transfer = intrinsic only"
+    );
     assert!(
         est["result"]["feeGrains"].is_string(),
         "feeGrains is a JS-safe string"
@@ -201,7 +207,10 @@ fn rpc_server_serves_real_chain_state_and_accepts_transactions() {
     // Default (no key) prices the hybrid post-quantum envelope every station wallet
     // uses, so it costs strictly more than the V1 transfer.
     let hybrid = rpc(addr, "sov_estimateFee", json!({"kind": "transfer"}));
-    assert!(hybrid["result"]["gasUsed"].as_u64().unwrap() > 21_000, "hybrid envelope > V1");
+    assert!(
+        hybrid["result"]["gasUsed"].as_u64().unwrap() > 21_000,
+        "hybrid envelope > V1"
+    );
     // An unknown route is a parameter error, not a silent default.
     let bad_kind = rpc(addr, "sov_estimateFee", json!({"kind": "frobnicate"}));
     assert_eq!(bad_kind["error"]["code"], -32602);
@@ -211,10 +220,16 @@ fn rpc_server_serves_real_chain_state_and_accepts_transactions() {
     // plus an empty peer set — the shape an operator/`curl` reads to debug peering.
     let peer = rpc(addr, "sov_getPeerInfo", json!({}));
     assert_eq!(peer["result"]["chainId"], "sov-rpc-test");
-    assert!(peer["result"]["genesisHash"].is_string(), "reports genesis hash");
+    assert!(
+        peer["result"]["genesisHash"].is_string(),
+        "reports genesis hash"
+    );
     assert_eq!(peer["result"]["peers"], 0);
     assert_eq!(peer["result"]["p2pEnabled"], false);
-    assert!(peer["result"]["connectedPeers"].as_array().unwrap().is_empty());
+    assert!(peer["result"]["connectedPeers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 
     // --- errors are well-formed JSON-RPC ---
     let unknown = rpc(addr, "sov_nope", json!({}));

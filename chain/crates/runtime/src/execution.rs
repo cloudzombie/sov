@@ -4519,7 +4519,9 @@ mod tests {
         assert_eq!(ledger.resolve_name("shop.sov"), Some(id("usa.reserve.sov")));
 
         // Fund a separate implicit sender B, then B sends 50 to the NAME "shop.sov".
-        let b_id = Keypair::from_seed([2; 32]).public_key().implicit_account_id();
+        let b_id = Keypair::from_seed([2; 32])
+            .public_key()
+            .implicit_account_id();
         let fund = transfer([1; 32], "usa.reserve.sov", b_id.as_str(), 200, 1);
         assert!(apply_transaction(&mut ledger, &fund, &ctx(&p))
             .unwrap()

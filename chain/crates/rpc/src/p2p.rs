@@ -258,7 +258,10 @@ impl P2p {
                         // every interval, so a typo is visible without spamming the log.
                         if let Err(e) = tcp.request_reconnect(addr) {
                             if last_reconnect == past {
-                                p2p_log(&boot_log, format!("bootstrap peer '{addr}' unusable: {e}"));
+                                p2p_log(
+                                    &boot_log,
+                                    format!("bootstrap peer '{addr}' unusable: {e}"),
+                                );
                             }
                         }
                     }
@@ -572,7 +575,9 @@ impl SyncState {
             // import cost is growing (the signal that motivates an incremental reorg).
             p2p_log(
                 &self.log,
-                format!("⚠ slow block import: {lock_ms}ms (held the node lock) at height {new_height}"),
+                format!(
+                    "⚠ slow block import: {lock_ms}ms (held the node lock) at height {new_height}"
+                ),
             );
         }
         ImportOutcome::New
@@ -784,8 +789,8 @@ impl SyncState {
                 // its parent isn't ours (a fork), which flips us into backtrack.
                 self.inflight = None;
                 self.stalled_logged = false; // a reply arrived — clear the stall latch
-                // A peer must never return more than we ask for ([`SYNC_BATCH`]); a
-                // larger batch is a memory/CPU amplification — penalize and ignore it.
+                                             // A peer must never return more than we ask for ([`SYNC_BATCH`]); a
+                                             // larger batch is a memory/CPU amplification — penalize and ignore it.
                 if blocks.len() > SYNC_BATCH as usize {
                     tcp.penalize_peer(peer, OVERSIZE_RESPONSE_PENALTY);
                     return;
@@ -936,9 +941,7 @@ impl SyncState {
         let now = Instant::now();
         for peer in tcp.connected_peers() {
             let first = *self.first_seen.entry(peer).or_insert(now);
-            if !self.authenticated.contains(&peer)
-                && now.duration_since(first) >= HELLO_TIMEOUT
-            {
+            if !self.authenticated.contains(&peer) && now.duration_since(first) >= HELLO_TIMEOUT {
                 tcp.disconnect(&peer);
             }
         }
@@ -1249,7 +1252,10 @@ mod tests {
         let client = TcpNode::bind("127.0.0.1:0").unwrap();
         client.connect(&server.local_addr().to_string()).unwrap();
         let mut connected = false;
-        for _ in 0..400 {
+        // Generous ceiling (~30s): under `cargo test --workspace` the CPU-bound
+        // Noise+ML-KEM handshake competes with hundreds of parallel tests, so a tight
+        // wait flaked on CI. The healthy path connects in well under a second.
+        for _ in 0..1500 {
             if server.peer_count() >= 1 {
                 connected = true;
                 break;
@@ -1260,7 +1266,11 @@ mod tests {
 
         let mut state = SyncState::new(None, None);
         state.sweep_unauthenticated(&server);
-        assert_eq!(state.first_seen.len(), 1, "the new peer's first-seen time is recorded");
+        assert_eq!(
+            state.first_seen.len(),
+            1,
+            "the new peer's first-seen time is recorded"
+        );
         assert!(
             server.peer_count() >= 1,
             "a just-connected peer is given time to authenticate, not dropped on sight"
@@ -1277,7 +1287,10 @@ mod tests {
         let client = TcpNode::bind("127.0.0.1:0").unwrap();
         client.connect(&server.local_addr().to_string()).unwrap();
         let mut connected = false;
-        for _ in 0..400 {
+        // Generous ceiling (~30s): under `cargo test --workspace` the CPU-bound
+        // Noise+ML-KEM handshake competes with hundreds of parallel tests, so a tight
+        // wait flaked on CI. The healthy path connects in well under a second.
+        for _ in 0..1500 {
             if server.peer_count() >= 1 {
                 connected = true;
                 break;
@@ -1291,7 +1304,10 @@ mod tests {
         // Fresh activity → spared.
         state.last_recv.insert(peer, Instant::now());
         state.reap_dead_peers(&server);
-        assert!(server.peer_count() >= 1, "an active (recently-heard) peer is not reaped");
+        assert!(
+            server.peer_count() >= 1,
+            "an active (recently-heard) peer is not reaped"
+        );
 
         // Silent past the inactivity timeout → reaped (the dead half-open case).
         state.last_recv.insert(
@@ -1302,14 +1318,17 @@ mod tests {
         );
         state.reap_dead_peers(&server);
         let mut reaped = false;
-        for _ in 0..400 {
+        for _ in 0..1500 {
             if server.peer_count() == 0 {
                 reaped = true;
                 break;
             }
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(reaped, "a silent (dead) peer is reaped, clearing the ghost slot");
+        assert!(
+            reaped,
+            "a silent (dead) peer is reaped, clearing the ghost slot"
+        );
     }
 
     #[test]
