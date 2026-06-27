@@ -1,0 +1,7 @@
+# Guest contracts import host-ABI functions (storage_read/write, block_height) from
+# the "env" module — the sov-vm runtime provides them at instantiation, NOT at link
+# time. Tell the wasm linker those undefined symbols are imports (the old default;
+# newer rust-lld errors without this), so the .wasm links with them as
+# `(import "env" …)`. Scoped to the wasm target; the host build is unaffected.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--allow-undefined"]

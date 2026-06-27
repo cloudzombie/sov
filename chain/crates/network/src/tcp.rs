@@ -1352,22 +1352,35 @@ mod tests {
             "peer connected"
         );
 
-        // Blast well past the burst budget as fast as possible: this empties the
-        // token bucket, then every further message accrues a rate-violation
-        // penalty until the misbehavior score crosses the ban threshold.
-        let flood = (MSG_RATE_PER_SEC * 3.0) as usize;
-        for _ in 0..flood {
-            client.broadcast(&status(1));
+        // Flood HARD and SUSTAINED until the server bans + drops us. A single fixed
+        // blast can be paced by TCP flow control to the server's drain rate under
+        // `cargo test --workspace` CPU contention — so the token bucket refills about
+        // as fast as it drains and never trips, which is what flaked on CI. Sustaining
+        // the flood keeps the receive buffer saturated, so a drain burst eventually
+        // exceeds the burst budget and accrues enough rate-violation penalty to ban.
+        // We poll between rounds and stop the instant we're dropped (healthy path bans
+        // in the first round, well under a second); bounded so a real regression (no
+        // ban) still FAILS the assert rather than hanging.
+        //
+        // The rate-scoring math + ban + live-drop are ALSO covered deterministically,
+        // without a socket, by `token_bucket_absorbs_a_burst_then_penalizes_sustained_overage`
+        // and `penalize_peer_bans_and_drops_for_app_layer_misbehavior` — this test is the
+        // end-to-end "a real flood over TCP trips the limiter" integration check.
+        let burst = MSG_BURST as usize; // one full token-budget's worth per round
+        let mut dropped = false;
+        'flood: for _ in 0..60 {
+            for _ in 0..burst {
+                client.broadcast(&status(1));
+            }
+            for _ in 0..10 {
+                if server.peer_count() == 0 {
+                    dropped = true;
+                    break 'flood;
+                }
+                thread::sleep(Duration::from_millis(30));
+            }
         }
-
-        // The flooder is dropped... (generous ceiling: under `cargo test --workspace`
-        // the CPU-bound Noise+ML-KEM handshakes across hundreds of parallel tests can
-        // starve this thread, so a tight 5s wait flaked on CI — the healthy path still
-        // drops in well under a second).
-        assert!(
-            wait_until(30, || server.peer_count() == 0),
-            "flooding peer was dropped"
-        );
+        assert!(dropped, "a sustained flood gets the peer dropped");
         // ...and its IP is banned, so it cannot immediately reconnect.
         let client2 = TcpNode::bind("127.0.0.1:0").unwrap();
         let _ = client2.connect(&addr);
