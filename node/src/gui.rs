@@ -159,7 +159,12 @@ fn now_ms() -> u64 {
 /// Wall-clock `HH:MM:SS` for log line timestamps.
 fn clock_hms() -> String {
     let secs = (now_ms() / 1000) % 86_400;
-    format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
 }
 
 /// Append a timestamped line to the shared node log, capping the buffer so it
@@ -348,7 +353,7 @@ fn install_theme(ctx: &egui::Context, dark: bool) {
     v.window_rounding = Rounding::same(10.0);
     v.panel_fill = palette::bg();
     v.extreme_bg_color = palette::field(); // text-edit / code wells
-    // Striped rows + code wells, mode-aware (a faint stripe on whichever base).
+                                           // Striped rows + code wells, mode-aware (a faint stripe on whichever base).
     v.faint_bg_color = if dark {
         egui::Color32::from_rgb(26, 31, 38)
     } else {
@@ -1007,18 +1012,11 @@ impl SendRoute {
     fn label(&self) -> (String, egui::Color32) {
         match self {
             SendRoute::Empty => (String::new(), palette::text_dim()),
-            SendRoute::Invalid => (
-                "✗ unrecognized address".into(),
-                palette::error(),
-            ),
-            SendRoute::Transparent(a) => (
-                format!("→ transparent · {a} (public)"),
-                palette::warning(),
-            ),
-            SendRoute::Shielded => (
-                "→ shielded (private)".into(),
-                palette::success(),
-            ),
+            SendRoute::Invalid => ("✗ unrecognized address".into(), palette::error()),
+            SendRoute::Transparent(a) => {
+                (format!("→ transparent · {a} (public)"), palette::warning())
+            }
+            SendRoute::Shielded => ("→ shielded (private)".into(), palette::success()),
             SendRoute::Unified => (
                 "→ unified (routes shielded — private)".into(),
                 palette::success(),
@@ -1237,7 +1235,7 @@ pub struct Station {
     reveal_phrase: bool,            // show the active wallet's recovery phrase (export)
     receive_kind: ReceiveKind,      // which address the Receive view shows
     pending_send: Option<PendingSend>, // a send awaiting confirmation (review modal)
-    block_detail: Option<u64>,         // height of the block open in the detail view
+    block_detail: Option<u64>,      // height of the block open in the detail view
     wallets_dirty: bool,            // wallets exist that aren't saved to the keystore
     confirm_quit: bool,             // quit requested with unsaved wallets — show guard
     gen_name: String,
@@ -2231,7 +2229,10 @@ impl Station {
             c.rpc = "127.0.0.1:8645".to_string();
             self.rpc_field = c.rpc.clone();
         }
-        push_log(&self.node_logs, format!("start requested — mining to {label}"));
+        push_log(
+            &self.node_logs,
+            format!("start requested — mining to {label}"),
+        );
 
         // Build + replay the node OFF the UI thread (replaying thousands of blocks
         // would otherwise freeze the window), then publish the running handle.
@@ -2404,7 +2405,10 @@ impl Station {
         if let Some(now) = snap.peers {
             match self.log_prev_authed {
                 Some(prev) if prev != now => {
-                    push_log(&self.node_logs, format!("authenticated peers {prev} → {now}"));
+                    push_log(
+                        &self.node_logs,
+                        format!("authenticated peers {prev} → {now}"),
+                    );
                     self.log_prev_authed = Some(now);
                 }
                 None => self.log_prev_authed = Some(now),
@@ -2462,7 +2466,10 @@ impl Station {
         }
         self.mining_account = None;
         self.node_status = "local node stopped".to_string();
-        push_log(&self.node_logs, "node stopped — RPC + P2P halted, ports released");
+        push_log(
+            &self.node_logs,
+            "node stopped — RPC + P2P halted, ports released",
+        );
     }
 
     /// Node-tab peering controls (Bitcoin/Zcash style): designate a seed peer once;
@@ -2519,17 +2526,11 @@ impl Station {
                                 .collect::<Vec<_>>()
                                 .join(", ");
                             self.node_status = format!("dialing {list} (auto-dial on)");
-                            push_log(
-                                &self.node_logs,
-                                format!("seed peer {p} → dialing {list}"),
-                            );
+                            push_log(&self.node_logs, format!("seed peer {p} → dialing {list}"));
                         }
                         Some(Err(e)) => {
                             self.node_status = format!("seed peer '{p}' rejected: {e}");
-                            push_log(
-                                &self.node_logs,
-                                format!("seed peer '{p}' rejected: {e}"),
-                            );
+                            push_log(&self.node_logs, format!("seed peer '{p}' rejected: {e}"));
                         }
                         None => {
                             // Node not started yet: saved, and auto-dialed on next start.
@@ -2552,8 +2553,12 @@ impl Station {
                     .clicked()
             {
                 add_firewall_rule();
-                self.node_status = "requested Windows Firewall allow — accept the UAC prompt".into();
-                push_log(&self.node_logs, "re-requested Windows Firewall inbound allow");
+                self.node_status =
+                    "requested Windows Firewall allow — accept the UAC prompt".into();
+                push_log(
+                    &self.node_logs,
+                    "re-requested Windows Firewall inbound allow",
+                );
             }
         });
         // Live peer count, read straight from the in-process transport.
@@ -2586,6 +2591,14 @@ impl Station {
                 ))
                 .monospace()
                 .size(12.0),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "RPC for tools/explorer (e.g. the conformance sweep): {ip}:8645",
+                ))
+                .monospace()
+                .size(12.0)
+                .color(palette::text_dim()),
             );
         }
     }
@@ -2880,10 +2893,7 @@ impl eframe::App for Station {
                 // node error, and it can never collide with the top-bar node status here.
                 if !self.show_bottom_toast(ui) {
                     if let Some(err) = &snap.error {
-                        ui.colored_label(
-                            palette::error(),
-                            format!("⚠ {err}"),
-                        );
+                        ui.colored_label(palette::error(), format!("⚠ {err}"));
                     } else if snap.updated_ms > 0 {
                         let age = now_ms().saturating_sub(snap.updated_ms);
                         ui.label(egui::RichText::new(format!("updated {age} ms ago")).weak());
@@ -2984,10 +2994,7 @@ impl eframe::App for Station {
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui
-                            .button(
-                                egui::RichText::new("Quit anyway")
-                                    .color(palette::error()),
-                            )
+                            .button(egui::RichText::new("Quit anyway").color(palette::error()))
                             .clicked()
                         {
                             self.wallets_dirty = false; // accept the loss
@@ -3069,14 +3076,19 @@ fn copy_glyph(ui: &mut egui::Ui, value: &str) {
     }
     let resp = ui
         .add(
-            egui::Button::new(egui::RichText::new("📋").size(11.0).color(palette::text_dim()))
-                .frame(false),
+            egui::Button::new(
+                egui::RichText::new("📋")
+                    .size(11.0)
+                    .color(palette::text_dim()),
+            )
+            .frame(false),
         )
         .on_hover_text("Copy");
     if resp.clicked() {
         ui.output_mut(|o| o.copied_text = value.to_owned());
         let now = now_ms();
-        ui.ctx().data_mut(|d| d.insert_temp(copied_memory_id(), now));
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(copied_memory_id(), now));
     }
 }
 
@@ -3104,7 +3116,11 @@ fn kv_copy(ui: &mut egui::Ui, k: &str, full: &str) {
 fn empty_state(ui: &mut egui::Ui, glyph: &str, title: &str, hint: &str) {
     ui.add_space(28.0);
     ui.vertical_centered(|ui| {
-        ui.label(egui::RichText::new(glyph).size(40.0).color(palette::text_dim()));
+        ui.label(
+            egui::RichText::new(glyph)
+                .size(40.0)
+                .color(palette::text_dim()),
+        );
         ui.add_space(8.0);
         ui.label(egui::RichText::new(title).strong().size(15.0));
         ui.add_space(2.0);
@@ -3122,8 +3138,11 @@ fn node_log_panel(ui: &mut egui::Ui, logs: &[String]) {
     ui.horizontal(|ui| {
         ui.heading("Node log");
         ui.label(
-            egui::RichText::new(format!("(embedded node — in-process · {} lines)", logs.len()))
-                .weak(),
+            egui::RichText::new(format!(
+                "(embedded node — in-process · {} lines)",
+                logs.len()
+            ))
+            .weak(),
         );
     });
     ui.add_space(4.0);
@@ -3295,7 +3314,11 @@ fn interval_sparkline(ui: &mut egui::Ui, blocks: &[BlockRow], target_ms: u64) {
         return;
     }
     let target_s = (target_ms as f32 / 1000.0).max(0.001);
-    let max = intervals.iter().copied().fold(target_s, f32::max).max(0.001);
+    let max = intervals
+        .iter()
+        .copied()
+        .fold(target_s, f32::max)
+        .max(0.001);
     let (w, h) = (240.0_f32, 38.0_f32);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -3435,7 +3458,11 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
                     kv(ui, "Head nonce (the proof)", &n.to_string());
                 }
                 if let Some(ms) = obs {
-                    kv(ui, "Observed block time", &format!("{:.1}s", ms as f64 / 1000.0));
+                    kv(
+                        ui,
+                        "Observed block time",
+                        &format!("{:.1}s", ms as f64 / 1000.0),
+                    );
                 }
                 if s.target_block_ms > 0 {
                     kv(
@@ -4552,7 +4579,10 @@ impl Station {
     fn first_run_checklist(&self, ui: &mut egui::Ui, s: &Snapshot) {
         let has_wallet = !self.wallets.is_empty();
         let node_running = matches!(&*self.node_run.lock().unwrap(), NodeRun::Running(_));
-        let acct = self.wallets.get(self.selected).map(|w| w.effective_account());
+        let acct = self
+            .wallets
+            .get(self.selected)
+            .map(|w| w.effective_account());
         let row = acct
             .as_ref()
             .and_then(|a| s.accounts.iter().find(|r| &r.account == a));
@@ -4789,10 +4819,7 @@ impl Station {
         if self.wallets_dirty && !self.wallets.is_empty() {
             egui::Frame::group(ui.style())
                 .fill(palette::tint(palette::warning(), 30))
-                .stroke(egui::Stroke::new(
-                    1.0,
-                    palette::warning(),
-                ))
+                .stroke(egui::Stroke::new(1.0, palette::warning()))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
@@ -5082,11 +5109,7 @@ impl Station {
                 };
                 ui.label(badge.color(named_color(named)));
                 if is_miner {
-                    ui.label(
-                        egui::RichText::new("⛏")
-                            .small()
-                            .color(palette::success()),
-                    );
+                    ui.label(egui::RichText::new("⛏").small().color(palette::success()));
                 }
             });
         }
@@ -5877,17 +5900,18 @@ impl Station {
                                 .strong()
                                 .color(palette::text()),
                         );
-                        ui.label(egui::RichText::new("XUS").size(14.0).color(palette::text_dim()));
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if p.links_public {
-                                    pill(ui, "PUBLIC", palette::warning());
-                                } else {
-                                    pill(ui, "PRIVATE", palette::success());
-                                }
-                            },
+                        ui.label(
+                            egui::RichText::new("XUS")
+                                .size(14.0)
+                                .color(palette::text_dim()),
                         );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if p.links_public {
+                                pill(ui, "PUBLIC", palette::warning());
+                            } else {
+                                pill(ui, "PRIVATE", palette::success());
+                            }
+                        });
                     });
                     ui.add_space(10.0);
                     egui::Grid::new("confirm_grid")
@@ -5902,14 +5926,16 @@ impl Station {
                             // Full recipient address, monospace + wrapped so it never overflows.
                             ui.label(egui::RichText::new("To").weak());
                             ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&p.to).monospace().size(11.0),
-                                )
-                                .wrap(),
+                                egui::Label::new(egui::RichText::new(&p.to).monospace().size(11.0))
+                                    .wrap(),
                             );
                             ui.end_row();
                             kv(ui, "Route", &p.route_label);
-                            kv(ui, "Network", &format!("{} · {}", network.label(), network.pow_algo()));
+                            kv(
+                                ui,
+                                "Network",
+                                &format!("{} · {}", network.label(), network.pow_algo()),
+                            );
                             // The EXACT network fee for this route (from consensus via
                             // `sov_estimateFee`) and the resulting balance after amount +
                             // fee, so the full cost is visible before broadcast.
@@ -5928,7 +5954,11 @@ impl Station {
                                 .from_balance_grains
                                 .saturating_sub(p.amount_grains)
                                 .saturating_sub(fee);
-                            kv(ui, "Balance after", &format!("{} XUS", xus(&after.to_string())));
+                            kv(
+                                ui,
+                                "Balance after",
+                                &format!("{} XUS", xus(&after.to_string())),
+                            );
                         });
                     ui.add_space(8.0);
                     // Privacy + self-send context.
@@ -6260,7 +6290,12 @@ fn block_time(ts_ms: u64) -> String {
         return "—".to_string();
     }
     let secs = (ts_ms / 1000) % 86_400;
-    let hms = format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60);
+    let hms = format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    );
     let now = now_ms();
     if now < ts_ms {
         return hms;
@@ -7593,14 +7628,25 @@ fn build_and_run_node(
 
     // ── Run the node IN-PROCESS via the library (mirrors `sov-rpcd`'s `run`). ──
     let read = |p: &Path| std::fs::read_to_string(p).map_err(|e| format!("read {p:?}: {e}"));
-    let mut config: NodeConfig = serde_json::from_str(&read(&node_dir.join("node-1/node-config.json"))?)
-        .map_err(|e| format!("node-config: {e}"))?;
+    let mut config: NodeConfig =
+        serde_json::from_str(&read(&node_dir.join("node-1/node-config.json"))?)
+            .map_err(|e| format!("node-config: {e}"))?;
     // The config's data_dir is relative to the node dir (the old subprocess set its
     // cwd there); resolve it to an absolute path for the in-process daemon.
     config.data_dir = node_dir
         .join(&config.data_dir)
         .to_string_lossy()
         .into_owned();
+    // Expose the JSON-RPC on the LAN (not just loopback), so the OTHER machine — and
+    // the two-node conformance dashboard / a remote explorer — can reach this node's
+    // RPC. The RPC surface is key-free (reads + submit of an ALREADY-signed tx; it
+    // never signs or holds wallet keys), and P2P is already 0.0.0.0, so this matches
+    // the node's posture. Migrated in place so existing installs pick it up with no reset.
+    if let Some(port) = config.rpc_addr.strip_prefix("127.0.0.1:") {
+        config.rpc_addr = format!("0.0.0.0:{port}");
+    } else if let Some(port) = config.rpc_addr.strip_prefix("localhost:") {
+        config.rpc_addr = format!("0.0.0.0:{port}");
+    }
     // Seed/bootstrap peer (Bitcoin `addnode` style): auto-dial it on startup and
     // gossip-discover the rest. Persist it into the node config so it is automatic
     // on every future launch — configure a seed once, then it just works.
@@ -7627,9 +7673,12 @@ fn build_and_run_node(
         .map_err(|e| format!("refresh chain-spec: {e}"))?;
     let spec = ChainSpec::from_json(&read(&node_dir.join("chain-spec.json"))?)
         .map_err(|e| format!("chain-spec: {e}"))?;
-    let keystore = Keystore::from_encrypted_or_plain(&read(&node_dir.join("node-1/keystore.json"))?, None)
-        .map_err(|e| format!("keystore: {e}"))?;
-    let genesis = spec.to_genesis_config().map_err(|e| format!("genesis: {e}"))?;
+    let keystore =
+        Keystore::from_encrypted_or_plain(&read(&node_dir.join("node-1/keystore.json"))?, None)
+            .map_err(|e| format!("keystore: {e}"))?;
+    let genesis = spec
+        .to_genesis_config()
+        .map_err(|e| format!("genesis: {e}"))?;
     let miner_keys = keystore.keys().map_err(|e| format!("keys: {e}"))?;
 
     // Build + replay the persisted block log to resume state. This is the bulk of
@@ -7722,7 +7771,10 @@ fn build_and_run_node(
                             .join(", ");
                         push_log(logs, format!("seed peer {peer} → dialing {list}"));
                     }
-                    Err(e) => push_log(logs, format!("seed peer '{peer}' is not a valid address: {e}")),
+                    Err(e) => push_log(
+                        logs,
+                        format!("seed peer '{peer}' is not a valid address: {e}"),
+                    ),
                 }
             }
             let bound = p2p.local_addr();
@@ -7876,7 +7928,10 @@ mod tests {
             tx_status("✓ sent 5 XUS to alice.sov (tx ab12cd34)"),
             TxStatus::Ok
         ));
-        assert!(matches!(tx_status("✓ HTLC opened — id = ff00"), TxStatus::Ok));
+        assert!(matches!(
+            tx_status("✓ HTLC opened — id = ff00"),
+            TxStatus::Ok
+        ));
         // Failure with the ✗ marker.
         assert!(matches!(
             tx_status("✗ send failed: insufficient balance"),
@@ -7887,15 +7942,24 @@ mod tests {
             tx_status("send failed: node unreachable"),
             TxStatus::Err
         ));
-        assert!(matches!(tx_status("issue failed: bad symbol"), TxStatus::Err));
+        assert!(matches!(
+            tx_status("issue failed: bad symbol"),
+            TxStatus::Err
+        ));
         assert!(matches!(
             tx_status("insufficient balance for shielded value"),
             TxStatus::Err
         ));
         assert!(matches!(tx_status("invalid recipient: …"), TxStatus::Err));
         // Neutral / in-progress stays dim (not green, not red).
-        assert!(matches!(tx_status("broadcasting signed tx…"), TxStatus::Info));
-        assert!(matches!(tx_status("scanning the shielded pool…"), TxStatus::Info));
+        assert!(matches!(
+            tx_status("broadcasting signed tx…"),
+            TxStatus::Info
+        ));
+        assert!(matches!(
+            tx_status("scanning the shielded pool…"),
+            TxStatus::Info
+        ));
     }
 
     #[test]
