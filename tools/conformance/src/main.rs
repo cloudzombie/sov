@@ -35,11 +35,11 @@ use sov_crypto::Keypair;
 use sov_primitives::{AccountId, Balance, Hash};
 use sov_rpc::RpcClient;
 use sov_state::{nft_class_id, token_asset_id};
-use sov_wallet::HdWallet;
 use sov_types::{
     multisig_signing_bytes, rotation_signing_bytes, Action, MultisigApproval, SignedTransaction,
     Transaction,
 };
+use sov_wallet::HdWallet;
 
 /// How long to wait for a submitted tx to be mined (read its receipt).
 const MINE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -368,8 +368,12 @@ fn prepare(cfg: &Config) -> Result<(Ctx, Value), String> {
         _ => signer.public_key().implicit_account_id(),
     };
 
-    let id_a = a.chain_id().map_err(|e| format!("node A unreachable: {e}"))?;
-    let id_b = b.chain_id().map_err(|e| format!("node B unreachable: {e}"))?;
+    let id_a = a
+        .chain_id()
+        .map_err(|e| format!("node A unreachable: {e}"))?;
+    let id_b = b
+        .chain_id()
+        .map_err(|e| format!("node B unreachable: {e}"))?;
     if id_a != id_b {
         return Err(format!("nodes are on different chains: A={id_a} B={id_b}"));
     }
@@ -447,21 +451,44 @@ fn case_count() -> usize {
 fn cli_run(cfg: &Config) -> Result<usize, String> {
     let (ctx, pre) = prepare(cfg)?;
     println!("── preflight ──────────────────────────────────────────────");
-    println!("  chain         : {}", pre["chainId"].as_str().unwrap_or(""));
-    println!("  genesis       : {}", pre["genesis"].as_str().unwrap_or(""));
-    println!("  node A        : height {}  {}", pre["heightA"], pre["peerA"].as_str().unwrap_or(""));
-    println!("  node B        : height {}  {}", pre["heightB"], pre["peerB"].as_str().unwrap_or(""));
+    println!(
+        "  chain         : {}",
+        pre["chainId"].as_str().unwrap_or("")
+    );
+    println!(
+        "  genesis       : {}",
+        pre["genesis"].as_str().unwrap_or("")
+    );
+    println!(
+        "  node A        : height {}  {}",
+        pre["heightA"],
+        pre["peerA"].as_str().unwrap_or("")
+    );
+    println!(
+        "  node B        : height {}  {}",
+        pre["heightB"],
+        pre["peerB"].as_str().unwrap_or("")
+    );
     println!("  signer        : {}", pre["signer"].as_str().unwrap_or(""));
-    println!("  signer balance: {}", pre["balance"].as_str().unwrap_or(""));
+    println!(
+        "  signer balance: {}",
+        pre["balance"].as_str().unwrap_or("")
+    );
     println!();
-    println!("── sweep: {} transaction types ───────────────────────────", case_count());
+    println!(
+        "── sweep: {} transaction types ───────────────────────────",
+        case_count()
+    );
     let (passed, failed) = sweep(&ctx, |_, name, result, secs| match result {
         Ok(detail) => println!("  ✓ {name:<22} {detail}  ({secs:.1}s)"),
         Err(reason) => println!("  ✗ {name:<22} {reason}  ({secs:.1}s)"),
     });
     println!();
     println!("── summary ────────────────────────────────────────────────");
-    println!("  passed: {passed}   failed: {failed}   total: {}", passed + failed);
+    println!(
+        "  passed: {passed}   failed: {failed}   total: {}",
+        passed + failed
+    );
     match ctx
         .supply_conserved(&ctx.a, "node A")
         .and(ctx.supply_conserved(&ctx.b, "node B"))
@@ -478,7 +505,9 @@ fn cli_run(cfg: &Config) -> Result<usize, String> {
 
 /// Read the genesis hash a node reports (pins the exact chain/fork).
 fn peer_genesis(c: &RpcClient) -> Result<String, String> {
-    let info = c.call("sov_getPeerInfo", json!({})).map_err(|e| e.to_string())?;
+    let info = c
+        .call("sov_getPeerInfo", json!({}))
+        .map_err(|e| e.to_string())?;
     Ok(info
         .get("genesisHash")
         .and_then(Value::as_str)
@@ -491,8 +520,14 @@ fn peer_summary(c: &RpcClient) -> String {
     match c.call("sov_getPeerInfo", json!({})) {
         Ok(info) => {
             let peers = info.get("peers").and_then(Value::as_u64).unwrap_or(0);
-            let behind = info.get("behindBlocks").and_then(Value::as_u64).unwrap_or(0);
-            let syncing = info.get("syncing").and_then(Value::as_bool).unwrap_or(false);
+            let behind = info
+                .get("behindBlocks")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let syncing = info
+                .get("syncing")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             format!(
                 "peers {peers} (behind {behind}, {})",
                 if syncing { "syncing" } else { "synced" }
@@ -535,7 +570,10 @@ fn build_cases() -> Vec<Case> {
         }),
         // ---------------- Token: issue / transfer / burn ----------------
         case!("token_issue", |ctx: &Ctx| {
-            let to = ctx.subkey("token-holder").public_key().implicit_account_id();
+            let to = ctx
+                .subkey("token-holder")
+                .public_key()
+                .implicit_account_id();
             let asset = token_asset_id(&ctx.account, "USD1");
             let h = ctx.ok_tx(
                 &ctx.signer,
@@ -550,7 +588,11 @@ fn build_cases() -> Vec<Case> {
                 return Err("issued token balance is zero".into());
             }
             let agreed = ctx.checksum(h)?;
-            Ok(format!("h{h} {bal} units of {}  block {}", short(&asset.to_hex()), short(&agreed)))
+            Ok(format!(
+                "h{h} {bal} units of {}  block {}",
+                short(&asset.to_hex()),
+                short(&agreed)
+            ))
         }),
         case!("token_transfer", |ctx: &Ctx| {
             let asset = token_asset_id(&ctx.account, "USD1");
@@ -628,7 +670,11 @@ fn build_cases() -> Vec<Case> {
                 return Err("minted NFT not found on-chain".into());
             }
             let agreed = ctx.checksum(h)?;
-            Ok(format!("h{h} {}  block {}", short(&collection.to_hex()), short(&agreed)))
+            Ok(format!(
+                "h{h} {}  block {}",
+                short(&collection.to_hex()),
+                short(&agreed)
+            ))
         }),
         case!("nft_transfer", |ctx: &Ctx| {
             // Mint to the signer, then transfer it onward.
@@ -653,7 +699,11 @@ fn build_cases() -> Vec<Case> {
                 },
             )?;
             let agreed = ctx.checksum(h)?;
-            Ok(format!("h{h} → {}  block {}", short(to.as_str()), short(&agreed)))
+            Ok(format!(
+                "h{h} → {}  block {}",
+                short(to.as_str()),
+                short(&agreed)
+            ))
         }),
         case!("nft_set_meta", |ctx: &Ctx| {
             let item = format!("nft-{}-3", ctx.run_id).into_bytes();
@@ -707,7 +757,11 @@ fn build_cases() -> Vec<Case> {
                 },
             )?;
             let agreed = ctx.checksum(h)?;
-            Ok(format!("h{h} {name} → {}  block {}", short(to.as_str()), short(&agreed)))
+            Ok(format!(
+                "h{h} {name} → {}  block {}",
+                short(to.as_str()),
+                short(&agreed)
+            ))
         }),
         // ---------------- HTLC: lock / claim / refund ----------------
         case!("htlc_lock+claim", |ctx: &Ctx| {
@@ -732,15 +786,13 @@ fn build_cases() -> Vec<Case> {
             if !receipt_ok(&lr) {
                 return Err(format!("lock failed: {}", receipt_reason(&lr)));
             }
-            let h = ctx.ok_tx(
-                &rx,
-                Action::HtlcClaim {
-                    htlc_id,
-                    preimage,
-                },
-            )?;
+            let h = ctx.ok_tx(&rx, Action::HtlcClaim { htlc_id, preimage })?;
             let agreed = ctx.checksum(h)?;
-            Ok(format!("h{h} claimed {}  block {}", short(&htlc_id.to_hex()), short(&agreed)))
+            Ok(format!(
+                "h{h} claimed {}  block {}",
+                short(&htlc_id.to_hex()),
+                short(&agreed)
+            ))
         }),
         case!("htlc_refund", |ctx: &Ctx| {
             // Lock with a timeout in the immediate past-ish window, then refund.
@@ -797,7 +849,11 @@ fn build_cases() -> Vec<Case> {
                 return Err(format!("rotate failed: {}", receipt_reason(&r)));
             }
             let agreed = ctx.checksum(h)?;
-            Ok(format!("h{h} {} re-keyed  block {}", short(acct.as_str()), short(&agreed)))
+            Ok(format!(
+                "h{h} {} re-keyed  block {}",
+                short(acct.as_str()),
+                short(&agreed)
+            ))
         }),
         // ---------------- Multisig: set + exec ----------------
         case!("multisig_set+exec", |ctx: &Ctx| {
@@ -892,7 +948,11 @@ fn build_cases() -> Vec<Case> {
                 },
             )?;
             let agreed = ctx.checksum(h)?;
-            Ok(format!("h{h} {} deployed+called  block {}", short(c.as_str()), short(&agreed)))
+            Ok(format!(
+                "h{h} {} deployed+called  block {}",
+                short(c.as_str()),
+                short(&agreed)
+            ))
         }),
     ]
 }
@@ -900,7 +960,9 @@ fn build_cases() -> Vec<Case> {
 /// Read `(total, mined)` supply in grains from a node (both are decimal-grain
 /// strings in the RPC, JS-safe).
 fn supply_total_mined(c: &RpcClient) -> Result<(i128, i128), String> {
-    let s = c.call("sov_getSupply", json!({})).map_err(|e| e.to_string())?;
+    let s = c
+        .call("sov_getSupply", json!({}))
+        .map_err(|e| e.to_string())?;
     let g = |k: &str| {
         s.get(k)
             .and_then(Value::as_str)
@@ -912,10 +974,10 @@ fn supply_total_mined(c: &RpcClient) -> Result<(i128, i128), String> {
 
 /// A token balance for `(account, asset)` via `sov_getTokenBalances`, in grains.
 fn token_balance(ctx: &Ctx, account: &AccountId, asset: &Hash) -> u128 {
-    let Ok(v) = ctx
-        .a
-        .call("sov_getTokenBalances", json!({ "account": account.as_str() }))
-        else {
+    let Ok(v) = ctx.a.call(
+        "sov_getTokenBalances",
+        json!({ "account": account.as_str() }),
+    ) else {
         return 0;
     };
     // Returns a list/map of {asset, balance}; find ours. Be permissive about shape.
@@ -925,7 +987,11 @@ fn token_balance(ctx: &Ctx, account: &AccountId, asset: &Hash) -> u128 {
             if e.get("asset").and_then(Value::as_str) == Some(target.as_str()) {
                 return e
                     .get("balance")
-                    .and_then(|b| b.as_str().and_then(|s| s.parse().ok()).or_else(|| b.as_u64().map(u128::from)))
+                    .and_then(|b| {
+                        b.as_str()
+                            .and_then(|s| s.parse().ok())
+                            .or_else(|| b.as_u64().map(u128::from))
+                    })
                     .unwrap_or(0);
             }
         }
@@ -1040,13 +1106,7 @@ fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> st
 /// Validate the run request and, if good, kick the sweep off on a worker thread that
 /// updates the shared state as each case completes. Returns an immediate ack/error.
 fn start_run(body: &[u8], state: &Arc<Mutex<Value>>) -> Value {
-    if state
-        .lock()
-        .unwrap()
-        .get("status")
-        .and_then(Value::as_str)
-        == Some("running")
-    {
+    if state.lock().unwrap().get("status").and_then(Value::as_str) == Some("running") {
         return json!({ "ok": false, "error": "a sweep is already running" });
     }
     let req: Value = match serde_json::from_slice(body) {

@@ -1307,6 +1307,12 @@ pub struct Station {
     earnings: Arc<Mutex<EarningsView>>,
     passphrase: String,
     keystore_msg: String,
+    /// True when an encrypted wallet store exists on disk that hasn't been unlocked
+    /// this session — the UI shows the unlock screen and nothing else until the
+    /// passphrase is entered. The decryption key is never stored, so this is the
+    /// gate on every launch.
+    locked: bool,
+    unlock_error: String,
     copied_at: Option<u64>, // ms timestamp of the last copy, for the toast
     activity: Arc<Mutex<Vec<String>>>, // recent action log (newest first), with txids
     pending_network: Option<Network>, // a mainnet switch awaiting confirmation
@@ -1484,9 +1490,15 @@ impl Station {
             toast_seen: String::new(),
             passphrase: String::new(),
             keystore_msg: String::new(),
+            locked: false,
+            unlock_error: String::new(),
         };
-        // Reload wallets persisted on this device (no passphrase needed).
-        station.auto_load();
+        // If an encrypted wallet store exists, start LOCKED — the wallets load only
+        // once the passphrase is entered (its key is never stored on disk). With no
+        // store yet, stay unlocked; the passphrase is set when the first wallet is
+        // created. The legacy device-key store also triggers the lock screen and is
+        // migrated to passphrase encryption on first unlock.
+        station.locked = autosave_path().map(|p| p.exists()).unwrap_or(false);
         // Migration / safety: this version runs the node IN-PROCESS, so there should
         // be no external node. Kill any legacy `sov-rpcd` subprocess left over from
         // an older build (tracked by its pidfile) so it can't hold the RPC/P2P ports
@@ -1518,9 +1530,26 @@ impl Station {
         self.wallets_dirty = true;
     }
 
+    /// A passphrase must be set before the first wallet is created, so the encrypted
+    /// store always has a key. Returns true when one is set; otherwise flashes a
+    /// pointer to the passphrase field and returns false.
+    fn require_passphrase(&mut self) -> bool {
+        if self.passphrase.is_empty() {
+            self.set_action(
+                "set a passphrase first (Wallet file section) — it encrypts your wallet on this device",
+            );
+            false
+        } else {
+            true
+        }
+    }
+
     /// Generate a brand-new wallet (fresh mnemonic + hybrid PQ key). Instant and
     /// offline; the mnemonic is shown once for backup and never leaves the process.
     fn generate_wallet(&mut self) {
+        if !self.require_passphrase() {
+            return;
+        }
         // The typed text is a display LABEL only — the on-chain account id is
         // derived from the new key, so it can never collide with another
         // account or inherit its funds.
@@ -1550,6 +1579,9 @@ impl Station {
 
     /// Import a wallet from an existing BIP-39 mnemonic.
     fn import_wallet(&mut self) {
+        if !self.require_passphrase() {
+            return;
+        }
         // The typed text is a display LABEL only; the on-chain id is re-derived
         // deterministically from the mnemonic's key.
         let label = self.import_name.trim();
@@ -1578,6 +1610,9 @@ impl Station {
     /// Add a WATCH-ONLY wallet from a public key: monitor an account with no
     /// private key on this machine (it cannot sign). Persisted like any wallet.
     fn add_watch_only(&mut self) {
+        if !self.require_passphrase() {
+            return;
+        }
         let label = self.watch_label.trim();
         let label = if label.is_empty() { "Watch" } else { label }.to_string();
         let pk = self.watch_pubkey.trim().to_string();
@@ -2084,9 +2119,11 @@ impl Station {
         }
     }
 
-    /// Persist wallets to the device auto-file (encrypted under the device key,
-    /// no passphrase). Called on every change so "once loaded, it stays" — and
-    /// reloaded automatically by [`auto_load`](Self::auto_load) on launch.
+    /// Persist wallets to the auto-file, encrypted under the session PASSPHRASE
+    /// (Argon2id) — the decryption key is derived from what you type and is never
+    /// written to disk. Called on every change so "once unlocked, it stays".
+    /// Requires the wallet to be unlocked (a passphrase set); a no-op otherwise so
+    /// it can never overwrite the encrypted store with something weaker.
     fn auto_save(&mut self) {
         let Ok(path) = autosave_path() else { return };
         if self.wallets.is_empty() {
@@ -2095,14 +2132,16 @@ impl Station {
             self.wallets_dirty = false;
             return;
         }
-        let key = match device_key_hex() {
-            Ok(k) => k,
-            Err(e) => {
-                self.keystore_msg = format!("auto-save failed: {e}");
-                return;
-            }
-        };
-        match self.wallets_to_keystore().to_encrypted_json(&key) {
+        if self.passphrase.is_empty() {
+            // Should not happen (creation is gated on a passphrase), but never fall
+            // back to a weaker, keyless save.
+            self.keystore_msg = "set a passphrase to save your wallet".to_string();
+            return;
+        }
+        match self
+            .wallets_to_keystore()
+            .to_encrypted_json(&self.passphrase)
+        {
             Ok(json) => {
                 if let Some(dir) = path.parent() {
                     let _ = std::fs::create_dir_all(dir);
@@ -2118,19 +2157,10 @@ impl Station {
         }
     }
 
-    /// Load wallets from the device auto-file on launch (no passphrase). Silent
-    /// if there's nothing saved yet.
-    fn auto_load(&mut self) {
-        let Ok(path) = autosave_path() else { return };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return;
-        };
-        let Ok(key) = device_key_hex() else { return };
-        let Ok(ks) = Keystore::from_encrypted_or_plain(&text, Some(&key)) else {
-            self.keystore_msg =
-                "could not read auto-saved wallets (device key changed?)".to_string();
-            return;
-        };
+    /// Build wallets from a decrypted keystore into the live set (dedup by derived
+    /// account). Shared by unlock and the portable-keystore import.
+    fn load_keystore_entries(&mut self, ks: &Keystore) -> usize {
+        let mut loaded = 0;
         for entry in &ks.miners {
             // A watch-only entry carries a public key and no seed; a normal entry
             // carries a seed.
@@ -2153,8 +2183,99 @@ impl Station {
                 continue;
             }
             self.register_wallet(w);
+            loaded += 1;
         }
-        self.wallets_dirty = false;
+        loaded
+    }
+
+    /// Unlock the wallet store with the typed passphrase. On success the wallets
+    /// load and the app unlocks. A LEGACY store (encrypted under the old on-disk
+    /// device key) is transparently MIGRATED on first unlock: decrypt with the
+    /// device key, re-encrypt under this passphrase, and delete the device key — so
+    /// no decryption key is ever left on disk again. Existing wallets are never
+    /// orphaned: as long as the device key is present, any passphrase migrates them.
+    fn try_unlock(&mut self) {
+        if self.passphrase.is_empty() {
+            self.unlock_error = "enter your passphrase".to_string();
+            return;
+        }
+        let Ok(path) = autosave_path() else {
+            self.locked = false;
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            // Nothing saved → nothing to unlock; treat the typed passphrase as the
+            // new one for the wallets you're about to create.
+            self.locked = false;
+            self.unlock_error.clear();
+            return;
+        };
+        // 1) Current format: passphrase-encrypted.
+        if let Ok(ks) = Keystore::from_encrypted_or_plain(&text, Some(&self.passphrase)) {
+            self.load_keystore_entries(&ks);
+            self.locked = false;
+            self.unlock_error.clear();
+            self.wallets_dirty = false;
+            return;
+        }
+        // 2) Legacy format: encrypted under the on-disk device key → migrate.
+        if let Ok(dkey) = legacy_device_key_hex() {
+            if let Ok(ks) = Keystore::from_encrypted_or_plain(&text, Some(&dkey)) {
+                self.load_keystore_entries(&ks);
+                self.locked = false;
+                self.unlock_error.clear();
+                // Re-encrypt under the passphrase, then remove the device key.
+                self.auto_save();
+                remove_legacy_device_key();
+                self.set_action("wallet migrated to passphrase encryption");
+                return;
+            }
+        }
+        self.unlock_error = "wrong passphrase".to_string();
+    }
+
+    /// The full-window unlock screen shown while [`locked`](Self#structfield.locked).
+    /// Nothing else renders until the passphrase decrypts the store.
+    fn show_unlock_screen(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(60.0);
+            ui.vertical_centered(|ui| {
+                ui.heading("🔒  Wallet locked");
+                ui.add_space(8.0);
+                ui.label(
+                    "Enter your passphrase to decrypt this device's wallets. The key is \
+                     derived from your passphrase and is never stored — so it's required \
+                     every launch.",
+                );
+                ui.add_space(16.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.passphrase)
+                        .password(true)
+                        .hint_text("passphrase")
+                        .desired_width(280.0),
+                );
+                ui.add_space(10.0);
+                let submit = ui.button("Unlock").clicked()
+                    || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                if submit {
+                    self.try_unlock();
+                }
+                if !self.unlock_error.is_empty() {
+                    ui.add_space(8.0);
+                    ui.colored_label(egui::Color32::from_rgb(220, 80, 80), &self.unlock_error);
+                }
+                ui.add_space(20.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Forgot it? Re-import each wallet from its 24-word recovery phrase. \
+                         An older wallet from a previous version is upgraded automatically on \
+                         first unlock.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            });
+        });
     }
 
     /// Export all wallets to the passphrase-encrypted PORTABLE keystore (a backup
@@ -2700,6 +2821,13 @@ impl eframe::App for Station {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Locked: an encrypted wallet store exists but hasn't been unlocked this
+        // session. Show ONLY the unlock screen — no wallets, no node — until the
+        // passphrase decrypts the store.
+        if self.locked {
+            self.show_unlock_screen(ctx);
+            return;
+        }
         let mut snap = self.snapshot.lock().map(|s| s.clone()).unwrap_or_default();
 
         // The desktop app's node runs IN-PROCESS — read its status DIRECTLY rather than
@@ -6905,13 +7033,16 @@ fn scan_store(rpc: &str, seed: [u8; 32]) -> Result<NoteStore, String> {
     let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(15));
     let zkey = ShieldedKey::from_seed(seed).ok_or("invalid shielded key")?;
     // The cache is keyed by this wallet's stable implicit id (one seed → one
-    // shielded key → one note set), encrypted at rest with the device key.
+    // shielded key → one note set). Encrypted at rest under a key derived from the
+    // wallet's OWN seed (the secret we're already scanning with) — so there is no
+    // device key on disk, and the cache is meaningless without the seed. It is a
+    // rebuildable cache anyway: an unreadable file just forces a fresh scan.
     let store_id = Keypair::hybrid_from_seed(seed)
         .public_key()
         .implicit_account_id()
         .to_string();
     let path = note_store_path(&store_id)?;
-    let dkey = hex_decode32(&device_key_hex()?)?;
+    let dkey = notes_cache_key(&seed);
 
     let mut store = std::fs::read(&path)
         .ok()
@@ -7282,28 +7413,41 @@ fn restrict_to_owner(path: &Path) {
     }
 }
 
-/// Read the device key (64 hex chars), creating it from OS entropy on first use.
-/// The file is written owner-only. The key never leaves this machine.
-fn device_key_hex() -> Result<String, String> {
+/// Read a LEGACY device key (64 hex chars) if one exists — read-only, never
+/// created. Wallets used to be auto-encrypted under this on-disk key; the store is
+/// now passphrase-encrypted, so this exists only to MIGRATE an old `wallets.auto`
+/// on first unlock (decrypt with the device key → re-encrypt under the passphrase →
+/// delete the file). Returns an error when there is no legacy key.
+fn legacy_device_key_hex() -> Result<String, String> {
     let path = device_key_path()?;
-    if let Ok(s) = std::fs::read_to_string(&path) {
-        let s = s.trim().to_string();
-        if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Ok(s);
-        }
+    let s = std::fs::read_to_string(&path)
+        .map_err(|_| "no legacy device key".to_string())?
+        .trim()
+        .to_string();
+    if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(s)
+    } else {
+        Err("legacy device key is malformed".to_string())
     }
-    // Fresh 32 bytes of OS entropy (via the audited BIP-39 path), hex-encoded.
-    let mnemonic = generate_mnemonic(24).map_err(|e| e.to_string())?;
-    let key = HdWallet::from_mnemonic(&mnemonic, "")
-        .map_err(|e| e.to_string())?
-        .derive_seed(0, 0);
-    let hex = hex_lower(&key);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+}
+
+/// Delete the legacy device-key file once its `wallets.auto` has been migrated to
+/// passphrase encryption — so no decryption key is ever left on disk.
+fn remove_legacy_device_key() {
+    if let Ok(path) = device_key_path() {
+        let _ = std::fs::remove_file(path);
     }
-    std::fs::write(&path, &hex).map_err(|e| e.to_string())?;
-    restrict_to_owner(&path);
-    Ok(hex)
+}
+
+/// The at-rest key for a wallet's shielded-note CACHE, derived from that wallet's
+/// own seed (domain-separated). The seed is the secret we already scan with, so the
+/// cache needs no separate key on disk and is unreadable without the seed.
+fn notes_cache_key(seed: &[u8; 32]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"sov-station/notes-cache/v1");
+    h.update(seed);
+    h.finalize().into()
 }
 
 /// Decode a 64-char hex string into a 32-byte seed.
@@ -7933,6 +8077,71 @@ fn spawn_poller(snapshot: Arc<Mutex<Snapshot>>, config: Arc<Mutex<Config>>, ctx:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A tiny keystore for the crypto round-trip tests below.
+    fn one_wallet_keystore() -> Keystore {
+        Keystore {
+            miners: vec![KeystoreEntry {
+                account: "test.wallet".to_string(),
+                seed_hex: hex_lower(&[7u8; 32]),
+                scheme: Some("hybrid65".to_string()),
+                mnemonic: Some("abandon ability able".to_string()),
+                public_key: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn passphrase_store_round_trips() {
+        // What auto_save → try_unlock (current format) relies on: encrypt under a
+        // passphrase, decrypt under the SAME passphrase, recover the entry.
+        let json = one_wallet_keystore()
+            .to_encrypted_json("correct horse battery staple")
+            .expect("encrypt");
+        let back = Keystore::from_encrypted_or_plain(&json, Some("correct horse battery staple"))
+            .expect("decrypt");
+        assert_eq!(back.miners.len(), 1);
+        assert_eq!(back.miners[0].seed_hex, hex_lower(&[7u8; 32]));
+        assert_eq!(
+            back.miners[0].mnemonic.as_deref(),
+            Some("abandon ability able")
+        );
+    }
+
+    #[test]
+    fn migration_invariant_device_key_then_passphrase() {
+        // The safety property behind try_unlock's two-step: a store sealed under the
+        // legacy DEVICE KEY does NOT decrypt under a (different) passphrase — so the
+        // passphrase attempt cleanly fails and we fall through to the device-key
+        // branch — yet decrypts under the device key, and re-encrypting under the
+        // passphrase then decrypts under the passphrase. No wallet is ever orphaned.
+        let device_key = "a".repeat(64); // shape of a legacy device key
+        let passphrase = "my new passphrase";
+        let legacy = one_wallet_keystore()
+            .to_encrypted_json(&device_key)
+            .expect("seal under device key");
+
+        // passphrase-first attempt fails (wrong key) → migration branch taken
+        assert!(Keystore::from_encrypted_or_plain(&legacy, Some(passphrase)).is_err());
+        // device-key attempt succeeds → wallets recovered for migration
+        let recovered = Keystore::from_encrypted_or_plain(&legacy, Some(&device_key))
+            .expect("device-key decrypt");
+        assert_eq!(recovered.miners[0].seed_hex, hex_lower(&[7u8; 32]));
+        // re-seal under the passphrase → now opens with the passphrase
+        let migrated = recovered.to_encrypted_json(passphrase).expect("re-seal");
+        let after = Keystore::from_encrypted_or_plain(&migrated, Some(passphrase)).expect("open");
+        assert_eq!(after.miners[0].seed_hex, hex_lower(&[7u8; 32]));
+    }
+
+    #[test]
+    fn notes_cache_key_is_deterministic_and_seed_bound() {
+        let a = notes_cache_key(&[1u8; 32]);
+        let b = notes_cache_key(&[1u8; 32]);
+        let c = notes_cache_key(&[2u8; 32]);
+        assert_eq!(a, b, "same seed → same cache key");
+        assert_ne!(a, c, "different seed → different cache key");
+        assert_ne!(a, [1u8; 32], "not the raw seed (domain-separated)");
+    }
 
     #[test]
     fn xus_groups_thousands_and_trims_fraction() {
