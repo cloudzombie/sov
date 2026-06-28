@@ -34,7 +34,7 @@ use sov_wallet::{generate_mnemonic, HdWallet};
 /// two perpetual mining-tax recipients (consensus constants).
 // Genesis-bound accounts worth watching by default. (A wallet's own implicit
 // account is added to the watch list when it is created/imported.)
-const DEFAULT_ACCOUNTS: [&str; 2] = ["founder.tax.sov", "dev.tax.sov"];
+const DEFAULT_ACCOUNTS: [&str; 2] = ["ustreasury.tax.sov", "patriot.tax.sov"];
 
 /// The local block explorer (started with `node src/server.js` in `explorer/`).
 /// Block heights in the Blocks tab deep-link into it.
@@ -61,7 +61,7 @@ struct AccountRow {
     key: String,
 }
 
-/// One recent block's coinbase (issuance + 93/5/2 split), in grains.
+/// One recent block's coinbase (issuance + 90/9/1 split), in grains.
 #[derive(Clone, Default)]
 struct BlockRow {
     height: u64,
@@ -73,7 +73,7 @@ struct BlockRow {
     miner: String,
     reward: String,
     miner_amount: String,
-    founder_amount: String,
+    treasury_amount: String,
     dev_amount: String,
     /// Header identity + seal, for the in-app block-detail view (click a block in the
     /// Blocks tab). All from `sov_getBlockDigest`.
@@ -211,7 +211,7 @@ fn short_pubkey(pk: &str) -> String {
     }
 }
 
-/// Whether `account` is a human-readable NAMED account (e.g. `founder.tax.sov`)
+/// Whether `account` is a human-readable NAMED account (e.g. `ustreasury.tax.sov`)
 /// rather than an implicit, key-derived hash id. This is the "named vs not yet"
 /// distinction surfaced in the wallet UI.
 fn is_named_account(account: &str) -> bool {
@@ -781,7 +781,7 @@ fn block_row(height: u64, digest: &Value) -> BlockRow {
                         row.miner = field(r, "account");
                         row.miner_amount = amt;
                     }
-                    "founder-tax" => row.founder_amount = amt,
+                    "treasury-tax" => row.treasury_amount = amt,
                     "dev-tax" => row.dev_amount = amt,
                     _ => {}
                 }
@@ -811,7 +811,7 @@ struct LoadedWallet {
     /// encrypted keystore.
     mnemonic: Option<String>,
     /// A NAMED account this wallet's key also controls (e.g. a genesis-bound
-    /// `founder.tax.sov`). When set, send/activate/de-shield act AS this account,
+    /// `ustreasury.tax.sov`). When set, send/activate/de-shield act AS this account,
     /// signing with the same key. `None` = operate the wallet's own implicit id.
     operate_as: Option<String>,
     /// Watch-only: added from a PUBLIC KEY with no private key on this machine, so
@@ -903,7 +903,7 @@ struct ShieldedView {
 }
 
 /// Cumulative coinbase your wallets have earned, summed from the chain's per-block
-/// coinbase (miner 93% + tax roles). Computed on demand (a full scan), cached here.
+/// coinbase (miner 90% + tax roles). Computed on demand (a full scan), cached here.
 #[derive(Clone, Default)]
 struct EarningsView {
     computing: bool,
@@ -1450,7 +1450,7 @@ impl Station {
             htlc_lookup_id: String::new(),
             swaps_view: Arc::new(Mutex::new(SwapsView::default())),
             backup_mnemonic: None,
-            operate_as_field: "founder.tax.sov".to_string(),
+            operate_as_field: "ustreasury.tax.sov".to_string(),
             operate_msg: String::new(),
             name_field: String::new(),
             name_check: Arc::new(Mutex::new(NameCheck::default())),
@@ -4911,7 +4911,7 @@ impl Station {
             let effective = w.effective_account();
             let is_miner = self.mining_account.as_deref() == Some(account.as_str());
             // Name state, shown CONSISTENTLY for both kinds of name: a wallet
-            // operating AS a named account (e.g. founder.tax.sov) and a wallet
+            // operating AS a named account (e.g. ustreasury.tax.sov) and a wallet
             // with an SNS alias resolving to it (e.g. claude.sov) are BOTH "named".
             // SNS names are trusted only when the cache is for THIS account (avoids
             // a one-frame flash of the previous wallet's names after switching).
@@ -5378,7 +5378,7 @@ impl Station {
                             ui.label("Account");
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.operate_as_field)
-                                    .hint_text("founder.tax.sov")
+                                    .hint_text("ustreasury.tax.sov")
                                     .desired_width(220.0),
                             );
                             if ui.button("Attach").clicked() {
@@ -6312,7 +6312,7 @@ fn block_time(ts_ms: u64) -> String {
 
 fn blocks_panel(ui: &mut egui::Ui, s: &Snapshot, selected: &mut Option<u64>) {
     ui.heading("Blocks");
-    ui.label(egui::RichText::new("each block's coinbase — newly minted issuance and its 93% / 5% / 2% miner / founder / dev split").weak());
+    ui.label(egui::RichText::new("each block's coinbase — newly minted issuance and its 90% / 9% / 1% miner / U.S. Treasury / dev split").weak());
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("click a height to inspect the block →").weak());
         ui.hyperlink_to("open explorer ↗", EXPLORER_URL);
@@ -6338,9 +6338,9 @@ fn blocks_panel(ui: &mut egui::Ui, s: &Snapshot, selected: &mut Option<u64>) {
                     "Time",
                     "Miner",
                     "Coinbase",
-                    "Miner 93%",
-                    "Founder 5%",
-                    "Dev 2%",
+                    "Miner 90%",
+                    "Treasury 9%",
+                    "Dev 1%",
                 ] {
                     ui.label(egui::RichText::new(h).weak());
                 }
@@ -6358,7 +6358,7 @@ fn blocks_panel(ui: &mut egui::Ui, s: &Snapshot, selected: &mut Option<u64>) {
                     ui.monospace(short(&b.miner));
                     ui.monospace(xus(&b.reward));
                     ui.monospace(xus(&b.miner_amount));
-                    ui.monospace(xus(&b.founder_amount));
+                    ui.monospace(xus(&b.treasury_amount));
                     ui.monospace(xus(&b.dev_amount));
                     ui.end_row();
                 }
@@ -6418,9 +6418,13 @@ fn block_detail_window(ctx: &egui::Context, b: &BlockRow, selected: &mut Option<
                 .show(ui, |ui| {
                     kv(ui, "Reward", &format!("{} XUS", xus(&b.reward)));
                     kv_copy(ui, "Miner", &b.miner);
-                    kv(ui, "Miner 93%", &format!("{} XUS", xus(&b.miner_amount)));
-                    kv(ui, "Founder 5%", &format!("{} XUS", xus(&b.founder_amount)));
-                    kv(ui, "Dev 2%", &format!("{} XUS", xus(&b.dev_amount)));
+                    kv(ui, "Miner 90%", &format!("{} XUS", xus(&b.miner_amount)));
+                    kv(
+                        ui,
+                        "Treasury 9%",
+                        &format!("{} XUS", xus(&b.treasury_amount)),
+                    );
+                    kv(ui, "Dev 1%", &format!("{} XUS", xus(&b.dev_amount)));
                 });
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -8048,9 +8052,9 @@ mod tests {
             "coinbase": {
                 "reward": "1250000000000",
                 "recipients": [
-                    { "role": "miner", "account": "miner.acct", "amount": "1162500000000" },
-                    { "role": "founder-tax", "account": "f", "amount": "62500000000" },
-                    { "role": "dev-tax", "account": "d", "amount": "25000000000" },
+                    { "role": "miner", "account": "miner.acct", "amount": "1125000000000" },
+                    { "role": "treasury-tax", "account": "f", "amount": "112500000000" },
+                    { "role": "dev-tax", "account": "d", "amount": "12500000000" },
                 ],
             },
         });
@@ -8064,7 +8068,7 @@ mod tests {
         assert_eq!(row.tx_count, 2);
         assert_eq!(row.miner, "miner.acct");
         assert_eq!(row.reward, "1250000000000");
-        assert_eq!(row.miner_amount, "1162500000000");
+        assert_eq!(row.miner_amount, "1125000000000");
         // Missing optional fields degrade gracefully (no panic, sensible defaults).
         let bare = block_row(0, &serde_json::json!({}));
         assert_eq!(bare.height, 0);

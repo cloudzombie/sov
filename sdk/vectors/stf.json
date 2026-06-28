@@ -14,10 +14,10 @@
     "halving_interval_blocks": 840000,
     "max_code_bytes": 262144,
     "mining_budget_grains": "2100000000000000",
-    "tax_primary_bps": 500,
-    "tax_primary_recipient": "founder.tax.sov",
-    "tax_secondary_bps": 200,
-    "tax_secondary_recipient": "dev.tax.sov"
+    "tax_primary_bps": 900,
+    "tax_primary_recipient": "ustreasury.tax.sov",
+    "tax_secondary_bps": 100,
+    "tax_secondary_recipient": "patriot.tax.sov"
   },
   "post_accounts": [
     {
@@ -39,15 +39,6 @@
       "unlock_height": 0
     },
     {
-      "balance": "25039120",
-      "code_hex": null,
-      "id": "dev.tax.sov",
-      "locked": "0",
-      "nonce": 0,
-      "public_key_hex": null,
-      "unlock_height": 0
-    },
-    {
       "balance": "1499790000",
       "code_hex": null,
       "id": "ecb.reserve.sov",
@@ -66,18 +57,18 @@
       "unlock_height": 0
     },
     {
-      "balance": "62597800",
+      "balance": "1126760400",
       "code_hex": null,
-      "id": "founder.tax.sov",
+      "id": "miner.node.sov",
       "locked": "0",
       "nonce": 0,
       "public_key_hex": null,
       "unlock_height": 0
     },
     {
-      "balance": "1164319080",
+      "balance": "12519560",
       "code_hex": null,
-      "id": "miner.node.sov",
+      "id": "patriot.tax.sov",
       "locked": "0",
       "nonce": 0,
       "public_key_hex": null,
@@ -91,10 +82,19 @@
       "nonce": 2,
       "public_key_hex": "0x8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
       "unlock_height": 0
+    },
+    {
+      "balance": "112676040",
+      "code_hex": null,
+      "id": "ustreasury.tax.sov",
+      "locked": "0",
+      "nonce": 0,
+      "public_key_hex": null,
+      "unlock_height": 0
     }
   ],
   "post_receipts_root": "0xe3f29a491f14ce83f5a787b54a540a1cc48195b6d09a8e53e146e73e6133b00e",
-  "post_state_root": "0x4a7623fcd102e42fa57f29f6514ea0ffb19d75efed8d50c58aedfa8bcf89aadd",
+  "post_state_root": "0x02aa637b8b96f32c4e383798fe30e28bf0a5d04edec9b42161a29841ba4b54ec",
   "prev_accounts": [
     {
       "balance": "100000000",

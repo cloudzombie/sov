@@ -551,8 +551,8 @@ impl Blockchain {
     }
 
     /// The consensus mining/emission policy (read-only) — emission schedule and
-    /// the founder/dev tax split. Used to surface a block's coinbase (subsidy +
-    /// 93/5/2 split) to explorers from the authoritative source.
+    /// the treasury/dev tax split. Used to surface a block's coinbase (subsidy +
+    /// 90/9/1 split) to explorers from the authoritative source.
     pub fn mining_policy(&self) -> &sov_mining::MiningPolicy {
         &self.mining
     }

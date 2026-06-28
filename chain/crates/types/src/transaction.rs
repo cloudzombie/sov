@@ -201,7 +201,7 @@ pub enum Action {
     /// in their own account. First-come — an unclaimed, well-formed `*.sov` name
     /// that does not shadow an existing keyed account may be claimed by paying a
     /// one-time registration fee (on top of the gas fee); the fee is an ordinary
-    /// fee earned by miners (split miner/founder/dev like every fee), not burned.
+    /// fee earned by miners (split miner/treasury/dev like every fee), not burned.
     /// Added after `RotateKey` so existing Borsh action discriminants are stable.
     RegisterName {
         /// The name to claim — a valid account id ending in `.sov`, e.g.

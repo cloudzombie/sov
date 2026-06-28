@@ -618,8 +618,8 @@ fn call(
             Ok(chain.block_by_height(h).map_or(Value::Null, |b| {
                 // The COINBASE: every block's issuance, surfaced from the
                 // authoritative source. The height-keyed subsidy is split exactly
-                // as the runtime applied it — 93% to the miner (the header's
-                // proposer), 5% to the founder tax account, 2% to the dev tax
+                // as the runtime applied it — 90% to the miner (the header's
+                // proposer), 9% to the U.S. Treasury tax account, 1% to the dev tax
                 // account. Genesis (and any post-budget block) mints nothing.
                 let policy = chain.mining_policy();
                 let reward = chain.coinbase_reward_at(h).grains();
@@ -633,7 +633,7 @@ fn call(
                         "reward": reward.to_string(),
                         "recipients": [
                             { "account": b.header.proposer.as_str(), "amount": miner_amount.to_string(), "role": "miner" },
-                            { "account": policy.tax_primary_recipient.as_str(), "amount": primary.to_string(), "role": "founder-tax" },
+                            { "account": policy.tax_primary_recipient.as_str(), "amount": primary.to_string(), "role": "treasury-tax" },
                             { "account": policy.tax_secondary_recipient.as_str(), "amount": secondary.to_string(), "role": "dev-tax" },
                         ],
                     })

@@ -1388,11 +1388,11 @@ mod tests {
         println!("TESTNET-1 STATE ROOT  = {state_root}");
         assert_eq!(
             state_root,
-            "53a16c310523757a381db76699a30c3f1529a3817f6b03c0787d58bd598f98f9"
+            "87edea95a5bdbc1b4d0d915cee7efafabba47d5ee131184f57e4fcce9df76c50"
         );
         assert_eq!(
             genesis_hash,
-            "5e9f3cc54cc3f9e3fdb798019cec9aee8cf0c3881a7e4901e1840aff6f7aa2b1"
+            "4b603052c7f38fe4f086a4d99eace27b2aafc6ce427e1579c316eaa371b20076"
         );
     }
 
@@ -1437,7 +1437,7 @@ mod tests {
         );
         assert_eq!(
             with.to_hex(),
-            "5e9f3cc54cc3f9e3fdb798019cec9aee8cf0c3881a7e4901e1840aff6f7aa2b1"
+            "4b603052c7f38fe4f086a4d99eace27b2aafc6ce427e1579c316eaa371b20076"
         );
     }
 

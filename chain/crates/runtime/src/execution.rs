@@ -44,7 +44,7 @@ pub struct BlockContext<'a> {
     /// `0` disables fees.
     pub gas_price: Balance,
     /// The block's miner — the account its proof-of-work pays. Receives the miner
-    /// share (the remainder after the founder/dev tax) of both the coinbase
+    /// share (the remainder after the treasury/dev tax) of both the coinbase
     /// subsidy and every transaction fee.
     pub miner: AccountId,
     /// The resolved post-quantum sunset schedule, once the miner-signaled
@@ -969,7 +969,7 @@ pub fn apply_transaction(
                     Ok(_) => {
                         // Charge the one-time anti-squat registration fee. It is added
                         // to fee_paid, so distribute_fee splits it to the miner
-                        // (founder/dev get their standing cut) — value-conserving, not
+                        // (treasury/dev get their standing cut) — value-conserving, not
                         // burned. Paid on top of the gas fee already reserved above.
                         let reg_fee = Balance::from_grains(NAME_REGISTRATION_FEE_GRAINS);
                         match signer.balance.checked_sub(reg_fee) {
@@ -1469,7 +1469,7 @@ const MAX_POLICY_ENTRIES: usize = 1024;
 
 /// The one-time fee to register a name in the on-chain name registry, in grains,
 /// charged on top of the transaction's gas fee. Deters name squatting. It is an
-/// ordinary fee **earned by miners** (split miner/founder/dev by
+/// ordinary fee **earned by miners** (split miner/treasury/dev by
 /// [`distribute_fee`], like every fee) — never burned, so the supply invariant is
 /// untouched. 1 XUS (10^8 grains).
 const NAME_REGISTRATION_FEE_GRAINS: u128 = 100_000_000;
@@ -2132,8 +2132,8 @@ mod tests {
         )
         .unwrap();
         let mut p = policy();
-        p.tax_primary_bps = 500; // 5% founder
-        p.tax_secondary_bps = 200; // 2% dev
+        p.tax_primary_bps = 900; // 9% U.S. Treasury (national-debt reserve)
+        p.tax_secondary_bps = 100; // 1% dev
         let mut ledger = Ledger::new();
         ledger.set_account(
             &id("dev.sov"),
@@ -2193,28 +2193,28 @@ mod tests {
         };
         let caller_before = ledger.account(&id("usa.reserve.sov")).balance.grains();
         let miner_before = ledger.account(&id("miner.sov")).balance.grains();
-        let founder_before = ledger.account(&id("founder.tax.sov")).balance.grains();
-        let dev_before = ledger.account(&id("dev.tax.sov")).balance.grains();
+        let treasury_before = ledger.account(&id("ustreasury.tax.sov")).balance.grains();
+        let dev_before = ledger.account(&id("patriot.tax.sov")).balance.grains();
         let receipt = apply_transaction(&mut ledger, &call, &bctx).unwrap();
         assert!(receipt.succeeded());
 
-        // The caller paid a positive gas fee, split 5% founder / 2% dev / 93%
-        // miner. NOTHING is burned — every grain of the fee is paid out.
+        // The caller paid a positive gas fee, split 9% U.S. Treasury / 1% dev /
+        // 90% miner. NOTHING is burned — every grain of the fee is paid out.
         let fee = caller_before - ledger.account(&id("usa.reserve.sov")).balance.grains();
         assert!(fee > 0, "a gas fee should have been charged");
-        let founder_delta =
-            ledger.account(&id("founder.tax.sov")).balance.grains() - founder_before;
-        let dev_delta = ledger.account(&id("dev.tax.sov")).balance.grains() - dev_before;
+        let treasury_delta =
+            ledger.account(&id("ustreasury.tax.sov")).balance.grains() - treasury_before;
+        let dev_delta = ledger.account(&id("patriot.tax.sov")).balance.grains() - dev_before;
         let miner_delta = ledger.account(&id("miner.sov")).balance.grains() - miner_before;
-        assert_eq!(founder_delta, fee * 500 / 10_000, "5% founder tax");
-        assert_eq!(dev_delta, fee * 200 / 10_000, "2% dev tax");
+        assert_eq!(treasury_delta, fee * 900 / 10_000, "9% U.S. Treasury tax");
+        assert_eq!(dev_delta, fee * 100 / 10_000, "1% dev tax");
         assert_eq!(
             miner_delta,
-            fee - founder_delta - dev_delta,
-            "miner keeps the remaining 93%"
+            fee - treasury_delta - dev_delta,
+            "miner keeps the remaining 90%"
         );
         assert_eq!(
-            founder_delta + dev_delta + miner_delta,
+            treasury_delta + dev_delta + miner_delta,
             fee,
             "the whole fee is paid out (no burn)"
         );

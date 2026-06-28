@@ -19,7 +19,7 @@
 //!                    [--base-rpc 8645] [--base-p2p 9645] [--faucet-sov F]
 //!                    [--block-time-ms 60000] [--pow sha256d|randomx]
 //!     # DEFAULT policy is mainnet-like: NO pre-mine (genesis funds nothing, the
-//!     # whole 21M cap is mined at 12.5 XUS/block and taxed 5%/2%). The faucet is
+//!     # whole 21M cap is mined at 12.5 XUS/block and taxed 9%/1%). The faucet is
 //!     # the first miner, dispensing coins it mines. `--policy test` instead
 //!     # pre-funds a faucet (that preset has no emission) for plumbing tests.
 //!     # `--pow randomx` runs the mainnet seal for a full-fidelity rehearsal.
@@ -250,7 +250,7 @@ fn cmd_gen(flags: &Flags) -> Result<(), Box<dyn Error>> {
     let base_p2p: u16 = flags.parse_or("base-p2p", 9645u16)?;
     // DEFAULT is mainnet-faithful: the `mainnet_like` policy reserves the ENTIRE
     // 21M cap for mining, so genesis funds NOTHING — no pre-mine, supply starts
-    // at exactly zero, every coin is mined (12.5 XUS/block) and taxed (5%/2%),
+    // at exactly zero, every coin is mined (12.5 XUS/block) and taxed (9%/1%),
     // exactly like mainnet. `--policy test` is the plumbing-only shortcut whose
     // preset has no emission, so it pre-funds a faucet to have spendable coins.
     let policy = match flags.get("policy").unwrap_or("mainnet-like") {
@@ -754,10 +754,10 @@ fn cmd_status(flags: &Flags) -> Result<(), Box<dyn Error>> {
         }
         // The perpetual mining-tax recipients (consensus constants from
         // `MiningPolicy`): every block's coinbase AND every transaction fee pays
-        // 5% to the primary and 2% to the secondary. Watch these climb to confirm
+        // 9% to the primary and 1% to the secondary. Watch these climb to confirm
         // the tax is flowing into the accounts you control.
         let policy = sov_mining::MiningPolicy::mainnet_like();
-        println!("\nmining tax (5% / 2% of every coinbase + fee):");
+        println!("\nmining tax (9% / 1% of every coinbase + fee):");
         for (label, account) in [
             ("founder 5%", &policy.tax_primary_recipient),
             ("dev     2%", &policy.tax_secondary_recipient),
