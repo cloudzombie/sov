@@ -24,7 +24,7 @@
 //! node in `node-K/keystore.json`). The sweep funds its own helper accounts from it.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -953,6 +953,18 @@ fn short(s: &str) -> String {
 const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
 
 fn serve(addr: &str) -> Result<(), String> {
+    // The dashboard takes a WALLET RECOVERY PHRASE in a web form, so it must never be
+    // reachable off this machine — refuse any non-loopback bind. Use an SSH tunnel if
+    // you need to drive it from elsewhere; the phrase still only ever decodes locally.
+    let parsed: SocketAddr = addr
+        .parse()
+        .map_err(|e| format!("invalid --addr {addr}: {e}"))?;
+    if !parsed.ip().is_loopback() {
+        return Err(format!(
+            "refusing to bind {addr}: this dashboard accepts a wallet phrase and is \
+             loopback-only. Use 127.0.0.1:<port> (and an SSH tunnel for remote access)."
+        ));
+    }
     let listener = TcpListener::bind(addr).map_err(|e| format!("bind {addr}: {e}"))?;
     let bound = listener.local_addr().map_err(|e| e.to_string())?;
     let state: Arc<Mutex<Value>> = Arc::new(Mutex::new(json!({ "status": "idle" })));

@@ -4251,6 +4251,7 @@ dependencies = [
  "sov-shielded",
  "sov-types",
  "sov-wallet",
+ "zeroize",
 ]
 
 [[package]]

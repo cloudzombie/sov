@@ -29,6 +29,7 @@ use sov_shielded::{
 };
 use sov_types::{Action, SignedTransaction, Transaction};
 use sov_wallet::{generate_mnemonic, HdWallet};
+use zeroize::Zeroize;
 
 /// Accounts the wallet panel watches by default: the station's own miner and the
 /// two perpetual mining-tax recipients (consensus constants).
@@ -881,6 +882,21 @@ impl LoadedWallet {
     }
 }
 
+/// Memory hygiene: when a wallet is dropped (removed, replaced, or on shutdown)
+/// scrub every byte that could reconstruct or spend the key — the seed, the BIP-39
+/// phrase, and the shielded viewing key — so they don't survive in freed heap, a
+/// swap page, or a core dump. The public id / account / unified address are not
+/// secret and are left as-is.
+impl Drop for LoadedWallet {
+    fn drop(&mut self) {
+        self.seed.zeroize();
+        if let Some(phrase) = self.mnemonic.as_mut() {
+            phrase.zeroize();
+        }
+        self.shielded.zeroize();
+    }
+}
+
 /// Status of the most recent wallet action. `generate`/`import` are instant;
 /// `send`/`activate` run on a worker thread (a shielded send first builds the
 /// Halo2 prover), so the UI shows progress without freezing.
@@ -1514,11 +1530,13 @@ impl Station {
             Ok(m) => m,
             Err(e) => return self.set_action(&format!("generate failed: {e}")),
         };
-        let seed = match HdWallet::from_mnemonic(&mnemonic, "") {
+        let mut seed = match HdWallet::from_mnemonic(&mnemonic, "") {
             Ok(w) => w.derive_seed(0, 0),
             Err(e) => return self.set_action(&format!("derive failed: {e}")),
         };
-        match LoadedWallet::from_seed(label.clone(), seed, Some(mnemonic.clone())) {
+        let result = LoadedWallet::from_seed(label.clone(), seed, Some(mnemonic.clone()));
+        seed.zeroize(); // wipe the stack copy; the wallet owns its own (also zeroized)
+        match result {
             Ok(w) => {
                 let account = w.account.clone();
                 self.register_wallet(w);
@@ -1537,13 +1555,18 @@ impl Station {
         let label = self.import_name.trim();
         let label = if label.is_empty() { "wallet" } else { label }.to_string();
         let mnemonic = self.import_mnemonic.trim().to_string();
-        let seed = match HdWallet::from_mnemonic(&mnemonic, "") {
+        let mut seed = match HdWallet::from_mnemonic(&mnemonic, "") {
             Ok(w) => w.derive_seed(0, 0),
             Err(e) => return self.set_action(&format!("invalid mnemonic: {e}")),
         };
-        match LoadedWallet::from_seed(label, seed, Some(mnemonic)) {
+        let result = LoadedWallet::from_seed(label, seed, Some(mnemonic));
+        seed.zeroize(); // wipe the stack copy; the wallet owns its own (also zeroized)
+        match result {
             Ok(w) => {
                 self.register_wallet(w);
+                // `.clear()` only resets the length — scrub the bytes first so the
+                // typed phrase doesn't linger in the field's freed capacity.
+                self.import_mnemonic.zeroize();
                 self.import_mnemonic.clear();
                 self.set_action("wallet imported");
                 self.auto_save();
@@ -2657,6 +2680,15 @@ impl Station {
 impl Drop for Station {
     fn drop(&mut self) {
         self.shutdown_node();
+        // Scrub typed secrets that aren't owned by a LoadedWallet: the unlock/keystore
+        // passphrase, the recovery phrase being typed into the Import field, and the
+        // one-time phrase shown right after generating a wallet. (Each LoadedWallet
+        // wipes its own seed/phrase/viewing-key via its Drop impl.)
+        self.passphrase.zeroize();
+        self.import_mnemonic.zeroize();
+        if let Some((_, phrase)) = self.backup_mnemonic.as_mut() {
+            phrase.zeroize();
+        }
     }
 }
 
@@ -4781,6 +4813,9 @@ impl Station {
                     }
                 });
             if acked {
+                if let Some((_, phrase)) = self.backup_mnemonic.as_mut() {
+                    phrase.zeroize(); // scrub before the Option drops the String
+                }
                 self.backup_mnemonic = None;
             }
             return;

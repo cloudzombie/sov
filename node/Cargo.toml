@@ -26,6 +26,9 @@ sha2 = "0.10"
 # keystore uses), keyed by the device key.
 chacha20poly1305 = "0.10"
 getrandom = "0.2"
+# Memory hygiene for wallet secrets: wipe seed / mnemonic / passphrase on drop so
+# they don't linger in freed memory, swap, or a core dump.
+zeroize = "1"
 
 [lints.rust]
 unsafe_code = "forbid"
