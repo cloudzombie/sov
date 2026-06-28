@@ -515,9 +515,30 @@ impl TcpNode {
     pub fn penalize_peer(&self, peer: SocketAddr, points: f64) -> bool {
         let banned = penalize(&self.shared, peer.ip(), points);
         if banned {
-            self.disconnect(&peer);
+            // A banned IP must keep NO live connection — drop EVERY connection from it,
+            // not just this one socket. A peer can hold more than one (e.g. an inbound
+            // link plus a discovery dial-back, both un-deduped on loopback), so a
+            // single-socket disconnect could leave the IP connected.
+            self.disconnect_ip(peer.ip());
         }
         banned
+    }
+
+    /// Drop EVERY live connection whose remote IP is `ip`. Used when an IP is banned,
+    /// so the ban is total and immediate regardless of how many sockets it holds.
+    fn disconnect_ip(&self, ip: IpAddr) {
+        // Extract the writers under the lock, then shut their sockets after releasing
+        // it (never hold the `peers` lock across a syscall).
+        let dropped: Vec<PeerWriter> = {
+            let mut peers = self.shared.peers.lock().unwrap();
+            let keys: Vec<SocketAddr> = peers.keys().copied().filter(|a| a.ip() == ip).collect();
+            keys.iter().filter_map(|k| peers.remove(k)).collect()
+        };
+        for p in dropped {
+            if let Ok(stream) = p.stream.lock() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
     }
 
     /// Drop the live connection to `peer` now: remove it from the peer set and shut
@@ -634,6 +655,12 @@ fn net_log(shared: &Shared, msg: impl AsRef<str>) {
 /// leaves no trace, so a later retry (e.g. once a sleeping seed wakes) succeeds.
 fn attempt_dial(shared: &Arc<Shared>, addr: SocketAddr) -> std::io::Result<()> {
     if addr == shared.local_addr {
+        return Ok(());
+    }
+    // Never (re)dial a banned IP — a ban must stop us reconnecting outbound too, not
+    // just reject the IP's inbound; otherwise a queued discovery dial could re-open a
+    // link to a host we just banned.
+    if is_banned(shared, addr.ip()) {
         return Ok(());
     }
     // Already linked to this host? Skip. This is the AUTHORITATIVE duplicate check that
