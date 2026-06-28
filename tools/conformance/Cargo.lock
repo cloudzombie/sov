@@ -1607,6 +1607,7 @@ dependencies = [
  "sov-rpc",
  "sov-state",
  "sov-types",
+ "sov-wallet",
 ]
 
 [[package]]

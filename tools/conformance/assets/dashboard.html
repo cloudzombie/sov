@@ -78,10 +78,14 @@
         <input id="nodeB" placeholder="192.168.0.7:8645" />
       </div>
     </div>
+    <div class="row">
+      <label for="phrase">Recovery phrase — 24 words (in sov-station: Wallet → Copy phrase) · a FUNDED wallet</label>
+      <input id="phrase" placeholder="word1 word2 word3 … word24" />
+    </div>
     <div class="grid">
       <div class="row">
-        <label for="seed">Wallet seed — 64 hex chars (FUNDED account)</label>
-        <input id="seed" placeholder="64-hex seed of a wallet that holds XUS" />
+        <label for="seed">…or wallet seed — 64 hex chars (alternative to the phrase)</label>
+        <input id="seed" placeholder="optional if you pasted the phrase above" />
       </div>
       <div class="row">
         <label for="account">Account — optional (named genesis/miner account)</label>
@@ -121,7 +125,7 @@ let timer = null;
 async function run() {
   const body = {
     nodeA: $('nodeA').value, nodeB: $('nodeB').value,
-    seedHex: $('seed').value, account: $('account').value,
+    phrase: $('phrase').value, seedHex: $('seed').value, account: $('account').value,
   };
   $('run').disabled = true;
   $('status').innerHTML = '<span class="spinner"></span> starting…';

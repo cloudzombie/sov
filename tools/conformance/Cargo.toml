@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 sov-rpc = { path = "../../chain/crates/rpc" }
 sov-crypto = { path = "../../chain/crates/crypto" }
+sov-wallet = { path = "../../chain/crates/wallet" }
 sov-types = { path = "../../chain/crates/types" }
 sov-primitives = { path = "../../chain/crates/primitives" }
 sov-state = { path = "../../chain/crates/state" }

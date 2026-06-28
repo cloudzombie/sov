@@ -35,6 +35,7 @@ use sov_crypto::Keypair;
 use sov_primitives::{AccountId, Balance, Hash};
 use sov_rpc::RpcClient;
 use sov_state::{nft_class_id, token_asset_id};
+use sov_wallet::HdWallet;
 use sov_types::{
     multisig_signing_bytes, rotation_signing_bytes, Action, MultisigApproval, SignedTransaction,
     Transaction,
@@ -66,7 +67,7 @@ fn main() {
             eprintln!("sov-conformance: {e}\n");
             eprintln!("usage:");
             eprintln!("  sov-conformance serve [--addr 127.0.0.1:8700]   (web dashboard)");
-            eprintln!("  sov-conformance --node-a <ip:port> --node-b <ip:port> --seed-hex <64-hex> [--account <id>]");
+            eprintln!("  sov-conformance --node-a <ip:port> --node-b <ip:port> (--phrase \"<24 words>\" | --seed-hex <64-hex>) [--account <id>]");
             std::process::exit(2);
         }
     };
@@ -83,6 +84,26 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// Resolve the signer seed from EITHER a recovery phrase (preferred — it is what
+/// sov-station lets you copy) OR a raw 64-hex seed. The phrase derivation matches
+/// sov-station's wallet EXACTLY (`HdWallet::from_mnemonic(phrase, "").derive_seed(0, 0)`),
+/// so the same wallet yields the same on-chain account.
+fn resolve_seed(seed_hex: &str, phrase: &str) -> Result<[u8; 32], String> {
+    let phrase = phrase.trim();
+    if !phrase.is_empty() {
+        let w = HdWallet::from_mnemonic(phrase, "")
+            .map_err(|e| format!("invalid recovery phrase: {e}"))?;
+        return Ok(w.derive_seed(0, 0));
+    }
+    let h = seed_hex.trim();
+    if h.is_empty() {
+        return Err("provide a recovery phrase (24 words) or a 64-hex seed".into());
+    }
+    let raw = hex::decode(h).map_err(|e| format!("seed must be hex: {e}"))?;
+    raw.try_into()
+        .map_err(|_| "seed must be exactly 32 bytes (64 hex chars)".to_string())
 }
 
 /// The inputs a sweep needs — shared by the CLI and the web server.
@@ -121,6 +142,7 @@ impl Args {
         let mut node_a = None;
         let mut node_b = None;
         let mut seed_hex = None;
+        let mut phrase = None;
         let mut account = None;
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -129,6 +151,7 @@ impl Args {
                 "--node-a" => node_a = Some(val()?),
                 "--node-b" => node_b = Some(val()?),
                 "--seed-hex" => seed_hex = Some(val()?),
+                "--phrase" => phrase = Some(val()?),
                 "--account" => account = Some(val()?),
                 "-h" | "--help" => return Err("help".into()),
                 other => return Err(format!("unknown flag {other}")),
@@ -144,11 +167,10 @@ impl Args {
         };
         let node_a = norm(node_a.ok_or("missing --node-a")?);
         let node_b = norm(node_b.ok_or("missing --node-b")?);
-        let seed_hex = seed_hex.ok_or("missing --seed-hex")?;
-        let raw = hex::decode(seed_hex.trim()).map_err(|e| format!("bad --seed-hex: {e}"))?;
-        let seed: [u8; 32] = raw
-            .try_into()
-            .map_err(|_| "--seed-hex must be exactly 32 bytes (64 hex chars)".to_string())?;
+        let seed = resolve_seed(
+            seed_hex.as_deref().unwrap_or(""),
+            phrase.as_deref().unwrap_or(""),
+        )?;
         Ok(Args {
             node_a,
             node_b,
@@ -1031,14 +1053,12 @@ fn start_run(body: &[u8], state: &Arc<Mutex<Value>>) -> Value {
     if node_a.is_empty() || node_b.is_empty() {
         return json!({ "ok": false, "error": "node A and node B addresses are required" });
     }
-    let seed_hex = req["seedHex"].as_str().unwrap_or("").trim().to_string();
-    let raw = match hex::decode(&seed_hex) {
-        Ok(r) => r,
-        Err(e) => return json!({ "ok": false, "error": format!("seed must be hex: {e}") }),
-    };
-    let seed: [u8; 32] = match raw.try_into() {
+    let seed = match resolve_seed(
+        req["seedHex"].as_str().unwrap_or(""),
+        req["phrase"].as_str().unwrap_or(""),
+    ) {
         Ok(s) => s,
-        Err(_) => return json!({ "ok": false, "error": "seed must be 32 bytes (64 hex chars)" }),
+        Err(e) => return json!({ "ok": false, "error": e }),
     };
     let account = req["account"]
         .as_str()
