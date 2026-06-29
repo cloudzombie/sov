@@ -270,6 +270,10 @@ impl P2p {
                 for (peer, msg) in tcp.drain() {
                     state.handle(&tcp, &node, &config, peer, msg);
                 }
+                // One fsync for every block imported in this drain (a catch-up batch is
+                // one fsync, not 256) — keeps the single worker thread responsive so peers
+                // are never reaped mid-import.
+                state.sync_log();
                 state.request_missing(&tcp, &node);
                 // Publish live telemetry every poll: how many blocks behind the tip we are
                 // (gates the miner only during a real download, not a 1-block race), the
@@ -300,6 +304,9 @@ impl P2p {
                 };
                 thread::sleep(nap);
             }
+            // On shutdown, make durable any records the last drain wrote but hadn't yet
+            // fsync'd — so a clean stop never relies on the OS to flush the tail.
+            state.sync_log();
         });
 
         P2pHandle {
@@ -413,7 +420,12 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 /// returns and the OS keepalive is hours away) goes silent this long. Reaping it both
 /// frees the ghost slot AND stops catch-up from forever targeting a dead peer that can
 /// never answer — the latter is why a node can be "connected" yet never index.
-const PEER_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(20);
+///
+/// Headroom note: stalled SYNC is already retargeted in [`BLOCK_REQUEST_TIMEOUT`] (2s),
+/// so this timeout is only about reaping a truly silent ghost. Kept generous so a brief
+/// worker stall (e.g. an occasional deep side-branch replay under the node lock) can
+/// never reap a healthy, actively-syncing peer — the "hokey connections" failure mode.
+const PEER_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Of several connections to the SAME node, pick the deterministic survivor: the one
 /// with the lexicographically smallest channel binding (Noise handshake hash). Both
@@ -514,6 +526,16 @@ impl SyncState {
         }
     }
 
+    /// Flush + fsync the block log once, making durable every record written by the
+    /// imports in this poll iteration. Called once after draining all messages, so a
+    /// 256-block catch-up batch costs ONE fsync instead of 256. A cheap no-op when no
+    /// blocks were written.
+    fn sync_log(&self) {
+        if let Some(log) = &self.block_log {
+            let _ = log.sync();
+        }
+    }
+
     /// Import a peer's block and PERSIST it to the block log, both while holding
     /// the node lock so the on-disk order matches the chain-commit order even when
     /// the mining thread is committing concurrently. Returns whether the block was
@@ -547,9 +569,13 @@ impl SyncState {
         }
         let new_head = n.chain().head().hash();
         let new_height = n.chain().height();
-        // Persist under the node lock so the on-disk order matches commit order.
+        // Write under the node lock so the on-disk order matches commit order, but do
+        // NOT fsync here — the worker fsyncs once per drain (see `sync_log`). On the
+        // single P2P thread, an fsync-per-block (a slow Windows FlushFileBuffers) stalls
+        // peer I/O + keepalives across a 256-block batch and gets the node reaped; one
+        // fsync per drain keeps the thread responsive while preserving durability.
         if let Some(log) = &self.block_log {
-            let _ = log.append(&block);
+            let _ = log.append_unsynced(&block);
         }
         let lock_ms = started.elapsed().as_millis();
         drop(n);

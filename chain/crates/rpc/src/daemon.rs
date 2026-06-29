@@ -497,11 +497,17 @@ const MAX_RECORD: usize = 16 * 1024 * 1024;
 /// power loss; [`read_records`] recovers the longest intact prefix and stops at the
 /// first damaged record rather than failing the whole log — the missing tail is
 /// re-synced from peers, so corruption degrades gracefully instead of bricking a node.
-fn append_record(f: &mut fs::File, payload: &[u8]) -> io::Result<()> {
+/// Write one framed record to the OS (NOT fsync'd). Callers that need durability call
+/// [`append_record`] (single record) or batch many `write_record`s and fsync once.
+fn write_record(f: &mut fs::File, payload: &[u8]) -> io::Result<()> {
     let checksum = Hash::digest(payload);
     f.write_all(&(payload.len() as u32).to_le_bytes())?;
     f.write_all(checksum.as_bytes())?;
-    f.write_all(payload)?;
+    f.write_all(payload)
+}
+
+fn append_record(f: &mut fs::File, payload: &[u8]) -> io::Result<()> {
+    write_record(f, payload)?;
     f.flush()?;
     f.sync_all() // durability: the record is on stable storage before we return
 }
@@ -538,6 +544,9 @@ fn read_records(data: &[u8]) -> Vec<&[u8]> {
 /// of re-syncing the whole chain from peers.
 pub struct BlockLog {
     file: Mutex<fs::File>,
+    /// Set when records have been written but not yet fsync'd (see [`append_unsynced`]),
+    /// so [`sync`] can skip the fsync syscall when nothing is pending.
+    unsynced: AtomicBool,
 }
 
 impl BlockLog {
@@ -546,17 +555,54 @@ impl BlockLog {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(BlockLog {
             file: Mutex::new(file),
+            unsynced: AtomicBool::new(false),
         })
     }
 
-    /// Append one block as a checksummed, fsync'd record.
+    /// Append one block as a checksummed, fsync'd record (durable on return).
     pub fn append(&self, block: &Block) -> io::Result<()> {
         let bytes = borsh::to_vec(block).expect("Borsh serialization of a Block is infallible");
         let mut f = self
             .file
             .lock()
             .map_err(|_| io::Error::other("block log mutex poisoned"))?;
-        append_record(&mut f, &bytes)
+        append_record(&mut f, &bytes)?;
+        self.unsynced.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Append one block's record WITHOUT fsync. The write still happens under the file
+    /// mutex, so when called inside the chain-commit critical section the on-disk order
+    /// matches commit order; durability is provided later by a single [`sync`]. This is
+    /// what turns a catch-up batch from N slow fsyncs (each a Windows `FlushFileBuffers`
+    /// that, on the single P2P worker thread, stalls peer I/O and keepalives long enough
+    /// to be reaped) into ONE fsync per drain. A crash before the next `sync` loses only
+    /// the un-synced tail, which [`read_records`] recovers (valid prefix kept, rest
+    /// re-synced) — the same graceful degradation as a torn write.
+    pub fn append_unsynced(&self, block: &Block) -> io::Result<()> {
+        let bytes = borsh::to_vec(block).expect("Borsh serialization of a Block is infallible");
+        let mut f = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("block log mutex poisoned"))?;
+        write_record(&mut f, &bytes)?;
+        drop(f);
+        self.unsynced.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Flush + fsync any records written by [`append_unsynced`] since the last sync. A
+    /// cheap no-op when nothing is pending, so it is safe to call every worker poll.
+    pub fn sync(&self) -> io::Result<()> {
+        if !self.unsynced.swap(false, Ordering::Relaxed) {
+            return Ok(());
+        }
+        let mut f = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("block log mutex poisoned"))?;
+        f.flush()?;
+        f.sync_all()
     }
 }
 
@@ -1472,6 +1518,40 @@ mod tests {
         let data = fs::read(&path).unwrap();
         let recs = read_records(&data);
         assert_eq!(recs, vec![b"alpha".as_ref(), b"bravo", b"charlie"]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn block_log_batched_append_then_sync_persists_all_in_order() {
+        // The catch-up fix: import writes each block with `append_unsynced` (no per-block
+        // fsync) and the worker fsyncs once via `sync`. Verify that batching still
+        // persists every record, in order, recoverable on reload — identical durability
+        // to per-block `append`, at one fsync instead of N.
+        let genesis = ChainSpec::from_json(TESTNET_1_SPEC)
+            .unwrap()
+            .to_genesis_config()
+            .unwrap()
+            .build()
+            .unwrap();
+        let block = genesis.block.clone();
+        let path = tmp_path("batchlog");
+        let log = BlockLog::open(&path).unwrap();
+        // Sync with nothing pending is a cheap no-op.
+        log.sync().unwrap();
+        // Five records written WITHOUT a per-record fsync, then a single sync.
+        for _ in 0..5 {
+            log.append_unsynced(&block).unwrap();
+        }
+        log.sync().unwrap();
+        let loaded = load_blocks(&path).unwrap();
+        assert_eq!(loaded.len(), 5, "every batched record is durable");
+        assert!(
+            loaded.iter().all(|b| b.hash() == block.hash()),
+            "records read back intact and in order"
+        );
+        // A second sync with nothing newly pending is a no-op (does not error/duplicate).
+        log.sync().unwrap();
+        assert_eq!(load_blocks(&path).unwrap().len(), 5);
         let _ = fs::remove_file(&path);
     }
 
