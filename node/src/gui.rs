@@ -1305,6 +1305,9 @@ pub struct Station {
     params: Arc<Mutex<Option<Arc<ShieldedParams>>>>,
     shielded: Arc<Mutex<ShieldedView>>,
     earnings: Arc<Mutex<EarningsView>>,
+    /// The MASTER session passphrase that encrypts the wallet store. Set ONLY via a
+    /// confirmed first-run setup or a VERIFIED unlock/keystore-load — never typed
+    /// once and used directly (see `passphrase_set`).
     passphrase: String,
     keystore_msg: String,
     /// True when an encrypted wallet store exists on disk that hasn't been unlocked
@@ -1313,6 +1316,19 @@ pub struct Station {
     /// gate on every launch.
     locked: bool,
     unlock_error: String,
+    /// First-run passphrase SETUP, shown before the master passphrase is ever used
+    /// to encrypt. Two inputs that must MATCH (and meet a length floor) — so a typo
+    /// can't silently become the key and lock you out.
+    show_setup: bool,
+    setup_pw: String,
+    setup_pw2: String,
+    /// True once the master passphrase has been established by a CONFIRMED setup or a
+    /// VERIFIED unlock / keystore-load — the only paths allowed to encrypt the store.
+    /// Typing into the portable-keystore field never sets this.
+    passphrase_set: bool,
+    /// Passphrase for the PORTABLE keystore file (Save/Load backup), kept separate
+    /// from the master so opening a backup can't silently re-key the live store.
+    keystore_pass: String,
     copied_at: Option<u64>, // ms timestamp of the last copy, for the toast
     activity: Arc<Mutex<Vec<String>>>, // recent action log (newest first), with txids
     pending_network: Option<Network>, // a mainnet switch awaiting confirmation
@@ -1492,6 +1508,11 @@ impl Station {
             keystore_msg: String::new(),
             locked: false,
             unlock_error: String::new(),
+            show_setup: false,
+            setup_pw: String::new(),
+            setup_pw2: String::new(),
+            passphrase_set: false,
+            keystore_pass: String::new(),
         };
         // If an encrypted wallet store exists, start LOCKED — the wallets load only
         // once the passphrase is entered (its key is never stored on disk). With no
@@ -1534,13 +1555,13 @@ impl Station {
     /// store always has a key. Returns true when one is set; otherwise flashes a
     /// pointer to the passphrase field and returns false.
     fn require_passphrase(&mut self) -> bool {
-        if self.passphrase.is_empty() {
-            self.set_action(
-                "set a passphrase first (Wallet file section) — it encrypts your wallet on this device",
-            );
-            false
-        } else {
+        if self.passphrase_set && !self.passphrase.is_empty() {
             true
+        } else {
+            // No confirmed master passphrase yet → open the create-with-confirm
+            // screen rather than encrypting under an unverified string.
+            self.show_setup = true;
+            false
         }
     }
 
@@ -2214,6 +2235,7 @@ impl Station {
         if let Ok(ks) = Keystore::from_encrypted_or_plain(&text, Some(&self.passphrase)) {
             self.load_keystore_entries(&ks);
             self.locked = false;
+            self.passphrase_set = true; // verified against the store
             self.unlock_error.clear();
             self.wallets_dirty = false;
             return;
@@ -2223,6 +2245,7 @@ impl Station {
             if let Ok(ks) = Keystore::from_encrypted_or_plain(&text, Some(&dkey)) {
                 self.load_keystore_entries(&ks);
                 self.locked = false;
+                self.passphrase_set = true; // verified via migration
                 self.unlock_error.clear();
                 // Re-encrypt under the passphrase, then remove the device key.
                 self.auto_save();
@@ -2278,12 +2301,93 @@ impl Station {
         });
     }
 
+    /// The first-run passphrase CREATION screen — two inputs that must match before
+    /// the master passphrase is set, so a typo can't become the encryption key and
+    /// lock you out. Shown when a wallet action needs a passphrase and none is set.
+    fn show_setup_screen(&mut self, ctx: &egui::Context) {
+        let red = egui::Color32::from_rgb(220, 80, 80);
+        let amber = egui::Color32::from_rgb(220, 160, 60);
+        let green = egui::Color32::from_rgb(80, 200, 120);
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(50.0);
+            ui.vertical_centered(|ui| {
+                ui.heading("🔐  Create a passphrase");
+                ui.add_space(8.0);
+                ui.label(
+                    "This encrypts your wallets on this device and is required on every \
+                     launch. There is no reset — if you forget it, the only recovery is \
+                     re-importing each wallet from its 24-word phrase. Write it down.",
+                );
+                ui.add_space(16.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.setup_pw)
+                        .password(true)
+                        .hint_text("passphrase")
+                        .desired_width(280.0),
+                );
+                ui.add_space(6.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.setup_pw2)
+                        .password(true)
+                        .hint_text("re-enter passphrase")
+                        .desired_width(280.0),
+                );
+                ui.add_space(10.0);
+                let len = self.setup_pw.chars().count();
+                let too_short = len < PASSPHRASE_MIN_LEN;
+                let mismatch = self.setup_pw != self.setup_pw2;
+                let ok = passphrase_setup_valid(&self.setup_pw, &self.setup_pw2);
+                // Live feedback so a mismatch/typo is caught BEFORE it's committed.
+                if self.setup_pw.is_empty() && self.setup_pw2.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("at least {PASSPHRASE_MIN_LEN} characters"))
+                            .small()
+                            .weak(),
+                    );
+                } else if too_short {
+                    ui.colored_label(
+                        amber,
+                        format!("use at least {PASSPHRASE_MIN_LEN} characters"),
+                    );
+                } else if mismatch {
+                    ui.colored_label(red, "✗ passphrases don't match");
+                } else {
+                    ui.colored_label(green, "✓ passphrases match");
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(ok, egui::Button::new("Set passphrase"))
+                        .clicked()
+                    {
+                        self.passphrase.zeroize();
+                        self.passphrase = self.setup_pw.clone();
+                        self.passphrase_set = true;
+                        self.setup_pw.zeroize();
+                        self.setup_pw.clear();
+                        self.setup_pw2.zeroize();
+                        self.setup_pw2.clear();
+                        self.show_setup = false;
+                        self.set_action("passphrase set — now create or import a wallet");
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.setup_pw.zeroize();
+                        self.setup_pw.clear();
+                        self.setup_pw2.zeroize();
+                        self.setup_pw2.clear();
+                        self.show_setup = false;
+                    }
+                });
+            });
+        });
+    }
+
     /// Export all wallets to the passphrase-encrypted PORTABLE keystore (a backup
     /// you can move between machines). Day-to-day persistence is automatic via
     /// [`auto_save`](Self::auto_save); this is the hardened/portable copy.
     fn save_wallets(&mut self) {
-        if self.passphrase.is_empty() {
-            self.keystore_msg = "set a passphrase first".to_string();
+        if self.keystore_pass.is_empty() {
+            self.keystore_msg = "enter a passphrase for the backup file first".to_string();
             return;
         }
         if self.wallets.is_empty() {
@@ -2292,7 +2396,7 @@ impl Station {
         }
         self.keystore_msg = match self
             .wallets_to_keystore()
-            .to_encrypted_json(&self.passphrase)
+            .to_encrypted_json(&self.keystore_pass)
         {
             Ok(json) => match write_keystore(&json) {
                 Ok(path) => format!("exported {} wallet(s) → {path}", self.wallets.len()),
@@ -2302,10 +2406,10 @@ impl Station {
         };
     }
 
-    /// Load + decrypt wallets from disk under the passphrase.
+    /// Load + decrypt wallets from the portable backup file under its passphrase.
     fn load_wallets(&mut self) {
-        if self.passphrase.is_empty() {
-            self.keystore_msg = "set the passphrase first".to_string();
+        if self.keystore_pass.is_empty() {
+            self.keystore_msg = "enter the backup file's passphrase first".to_string();
             return;
         }
         let text = match read_keystore() {
@@ -2315,7 +2419,7 @@ impl Station {
                 return;
             }
         };
-        let ks = match Keystore::from_encrypted_or_plain(&text, Some(&self.passphrase)) {
+        let ks = match Keystore::from_encrypted_or_plain(&text, Some(&self.keystore_pass)) {
             Ok(k) => k,
             Err(e) => {
                 self.keystore_msg = format!("decrypt failed: {e}");
@@ -2340,6 +2444,12 @@ impl Station {
             }
             self.register_wallet(w);
             loaded += 1;
+        }
+        // If there's no master passphrase yet, adopt the backup's so the loaded
+        // wallets persist on this device; otherwise keep the existing master.
+        if !self.passphrase_set {
+            self.passphrase = self.keystore_pass.clone();
+            self.passphrase_set = true;
         }
         // Persist the imported backup to this device too, so it auto-loads next time.
         self.auto_save();
@@ -2806,6 +2916,9 @@ impl Drop for Station {
         // one-time phrase shown right after generating a wallet. (Each LoadedWallet
         // wipes its own seed/phrase/viewing-key via its Drop impl.)
         self.passphrase.zeroize();
+        self.keystore_pass.zeroize();
+        self.setup_pw.zeroize();
+        self.setup_pw2.zeroize();
         self.import_mnemonic.zeroize();
         if let Some((_, phrase)) = self.backup_mnemonic.as_mut() {
             phrase.zeroize();
@@ -2826,6 +2939,12 @@ impl eframe::App for Station {
         // passphrase decrypts the store.
         if self.locked {
             self.show_unlock_screen(ctx);
+            return;
+        }
+        // First-run: create a passphrase (with confirmation) before anything can be
+        // encrypted under it.
+        if self.show_setup {
+            self.show_setup_screen(ctx);
             return;
         }
         let mut snap = self.snapshot.lock().map(|s| s.clone()).unwrap_or_default();
@@ -4865,7 +4984,7 @@ impl Station {
                 ui.horizontal(|ui| {
                     ui.label("Passphrase");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.passphrase)
+                        egui::TextEdit::singleline(&mut self.keystore_pass)
                             .password(true)
                             .desired_width(200.0),
                     );
@@ -4993,10 +5112,10 @@ impl Station {
                             ))
                             .color(palette::warning()),
                         );
-                        if self.passphrase.is_empty() {
+                        if self.keystore_pass.is_empty() {
                             ui.label(
                                 egui::RichText::new(
-                                    "set a passphrase in “Wallet file” below, then Save",
+                                    "enter a backup passphrase in “Wallet file” below, then Save",
                                 )
                                 .small()
                                 .weak(),
@@ -6252,7 +6371,7 @@ impl Station {
         ui.horizontal(|ui| {
             ui.label("Passphrase");
             ui.add(
-                egui::TextEdit::singleline(&mut self.passphrase)
+                egui::TextEdit::singleline(&mut self.keystore_pass)
                     .password(true)
                     .desired_width(180.0),
             );
@@ -7439,6 +7558,16 @@ fn remove_legacy_device_key() {
     }
 }
 
+/// Minimum length for a new master passphrase.
+const PASSPHRASE_MIN_LEN: usize = 8;
+
+/// Whether a first-run passphrase is acceptable to COMMIT: non-empty, at least
+/// [`PASSPHRASE_MIN_LEN`] characters, and the confirmation matches exactly. The
+/// match check is the whole point — it stops a typo from silently becoming the key.
+fn passphrase_setup_valid(pw: &str, confirm: &str) -> bool {
+    !pw.is_empty() && pw.chars().count() >= PASSPHRASE_MIN_LEN && pw == confirm
+}
+
 /// The at-rest key for a wallet's shielded-note CACHE, derived from that wallet's
 /// own seed (domain-separated). The seed is the secret we already scan with, so the
 /// cache needs no separate key on disk and is unreadable without the seed.
@@ -8131,6 +8260,28 @@ mod tests {
         let migrated = recovered.to_encrypted_json(passphrase).expect("re-seal");
         let after = Keystore::from_encrypted_or_plain(&migrated, Some(passphrase)).expect("open");
         assert_eq!(after.miners[0].seed_hex, hex_lower(&[7u8; 32]));
+    }
+
+    #[test]
+    fn passphrase_setup_requires_match_and_length() {
+        // The check that prevents a typo'd passphrase from becoming the key.
+        assert!(!passphrase_setup_valid("", ""), "empty rejected");
+        assert!(
+            !passphrase_setup_valid("short", "short"),
+            "too short rejected"
+        );
+        assert!(
+            !passphrase_setup_valid("longenough", "longenuogh"),
+            "mismatch rejected (typo in confirm)"
+        );
+        assert!(
+            !passphrase_setup_valid("longenough", ""),
+            "empty confirm rejected"
+        );
+        assert!(
+            passphrase_setup_valid("correct horse", "correct horse"),
+            "matching + long enough accepted"
+        );
     }
 
     #[test]
