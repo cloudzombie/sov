@@ -10,6 +10,7 @@ use sov_primitives::AccountId;
 use sov_rpc::{RpcClient, RpcClientError};
 
 mod gui;
+mod vault;
 
 const DEFAULT_RPC: &str = "127.0.0.1:8645";
 const DEFAULT_INTERVAL_MS: u64 = 3_000;

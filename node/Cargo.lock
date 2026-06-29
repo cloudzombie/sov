@@ -4237,12 +4237,13 @@ dependencies = [
 
 [[package]]
 name = "sov-station"
-version = "0.1.52"
+version = "0.1.53"
 dependencies = [
  "chacha20poly1305",
  "eframe",
  "getrandom 0.2.17",
  "qrcode",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "sov-crypto",

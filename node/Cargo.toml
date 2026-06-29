@@ -1,6 +1,6 @@
 [package]
 name = "sov-station"
-version = "0.1.52"
+version = "0.1.53"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
@@ -13,6 +13,7 @@ sov-crypto = { path = "../chain/crates/crypto" }
 sov-wallet = { path = "../chain/crates/wallet" }
 sov-shielded = { path = "../chain/crates/shielded" }
 sov-types = { path = "../chain/crates/types" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Native GUI: the `sov-station` desktop window (cross-platform — macOS, Windows,
 # Linux). Pure-Rust immediate-mode UI; no web stack, no JS, a single binary.

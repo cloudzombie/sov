@@ -31,6 +31,8 @@ use sov_types::{Action, SignedTransaction, Transaction};
 use sov_wallet::{generate_mnemonic, HdWallet};
 use zeroize::Zeroize;
 
+use crate::vault;
+
 /// Accounts the wallet panel watches by default: the station's own miner and the
 /// two perpetual mining-tax recipients (consensus constants).
 // Genesis-bound accounts worth watching by default. (A wallet's own implicit
@@ -1252,6 +1254,7 @@ pub struct Station {
     receive_kind: ReceiveKind,      // which address the Receive view shows
     pending_send: Option<PendingSend>, // a send awaiting confirmation (review modal)
     block_detail: Option<u64>,      // height of the block open in the detail view
+    vault_ui: VaultUi,              // all state for the Vault (multisig) tab; isolated
     wallets_dirty: bool,            // wallets exist that aren't saved to the keystore
     confirm_quit: bool,             // quit requested with unsaved wallets — show guard
     gen_name: String,
@@ -1346,8 +1349,42 @@ enum Tab {
     Wallet,
     Tokens,
     Swaps,
+    Vault,
     Blocks,
     Activity,
+}
+
+/// All transient UI state for the Vault (treasury multisig) tab — grouped in ONE
+/// struct so the whole feature is a single Station field. None of this is persisted
+/// in the wallet/keystore; saved vault definitions live in their own public file (see
+/// [`vault`]). Remove this field + the `Tab::Vault` arm to delete the feature cleanly.
+#[derive(Default)]
+struct VaultUi {
+    vaults: Vec<vault::Vault>,
+    loaded: bool,
+    // Create form
+    new_name: String,
+    new_account: String,
+    new_member_name: String,
+    new_member_key: String,
+    new_members: Vec<vault::Member>,
+    new_threshold: u16,
+    create_msg: String,
+    // Request form
+    req_vault: usize,
+    req_to: String,
+    req_amount: String,
+    req_code: String,
+    req_msg: String,
+    // Approve form
+    apv_in: String,
+    apv_code: String,
+    apv_msg: String,
+    // Collect & send form
+    send_req_in: String,
+    send_apv_in: String,
+    send_approvals: Vec<vault::Approval>,
+    send_msg: String,
 }
 
 /// The network the app is pointed at. Wallets are key material and work on ANY
@@ -1453,6 +1490,7 @@ impl Station {
             receive_kind: ReceiveKind::Shielded,
             pending_send: None,
             block_detail: None,
+            vault_ui: VaultUi::default(),
             wallets_dirty: false,
             confirm_quit: false,
             gen_name: "my-wallet".to_string(),
@@ -2337,6 +2375,493 @@ impl Station {
         });
     }
 
+    /// The Vault tab — easy-mode treasury multisig (M-of-N). Drives the already-shipped
+    /// SetMultisig / MultisigExec consensus via the isolated [`vault`] module; never
+    /// touches wallet/keystore internals. UI gathers input + shows copy/paste codes;
+    /// all crypto lives in `vault` (unit-tested) and submits reuse the action helpers.
+    fn vault_panel(&mut self, ui: &mut egui::Ui) {
+        if !self.vault_ui.loaded {
+            self.vault_ui.vaults = vault::load_vaults();
+            self.vault_ui.loaded = true;
+            if self.vault_ui.new_threshold == 0 {
+                self.vault_ui.new_threshold = 2;
+            }
+        }
+        let rpc = self
+            .config
+            .lock()
+            .map(|c| c.rpc.clone())
+            .unwrap_or_default();
+        // Pre-extract the selected wallet's identity so closures never borrow self.wallets.
+        let sel = self.wallets.get(self.selected);
+        let my_account = sel.map(|w| w.effective_account()).unwrap_or_default();
+        let my_key = sel.map(|w| w.public_key.clone()).unwrap_or_default();
+        let my_seed = sel.filter(|w| !w.watch_only).map(|w| w.seed);
+
+        ui.heading("🛡 Shared Vault");
+        ui.label(
+            egui::RichText::new(
+                "A vault is an account that needs several people to approve before it can \
+                 spend (M-of-N) — use it to secure the treasury keys. Requests and \
+                 approvals are shared as copy/paste codes; there is no server.",
+            )
+            .weak(),
+        );
+        ui.separator();
+
+        // Intents collected inside closures, executed afterwards (so closures never
+        // need to borrow `self` to call a method).
+        let mut do_create = false;
+        let mut do_request = false;
+        let mut do_approve = false;
+        let mut do_add_approval = false;
+        let mut do_send = false;
+
+        // ── Your vaults ──
+        egui::CollapsingHeader::new(egui::RichText::new("Your vaults").strong())
+            .default_open(true)
+            .show(ui, |ui| {
+                if self.vault_ui.vaults.is_empty() {
+                    ui.label(egui::RichText::new("none yet — create one below").weak());
+                }
+                let mut forget: Option<usize> = None;
+                for (i, v) in self.vault_ui.vaults.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "“{}” — {}  ({} of {})",
+                            v.name,
+                            v.account,
+                            v.threshold,
+                            v.members.len()
+                        ));
+                        if ui.small_button("Forget").clicked() {
+                            forget = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = forget {
+                    self.vault_ui.vaults.remove(i);
+                    let _ = vault::save_vaults(&self.vault_ui.vaults);
+                }
+            });
+
+        // ── Create a vault ──
+        egui::CollapsingHeader::new(egui::RichText::new("Create a vault").strong()).show(
+            ui,
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Vault name");
+                    ui.text_edit_singleline(&mut self.vault_ui.new_name);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Account to secure");
+                    ui.text_edit_singleline(&mut self.vault_ui.new_account);
+                    if !my_account.is_empty() && ui.button("Use selected wallet").clicked() {
+                        self.vault_ui.new_account = my_account.clone();
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label("Members — each holder's name + public key:");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vault_ui.new_member_name)
+                            .hint_text("name")
+                            .desired_width(110.0),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vault_ui.new_member_key)
+                            .hint_text("hybrid65:0x…")
+                            .desired_width(260.0),
+                    );
+                    if ui.button("Add").clicked() {
+                        match vault::parse_pubkey(&self.vault_ui.new_member_key) {
+                            Ok(_) => {
+                                let name = if self.vault_ui.new_member_name.trim().is_empty() {
+                                    format!("member {}", self.vault_ui.new_members.len() + 1)
+                                } else {
+                                    self.vault_ui.new_member_name.trim().to_string()
+                                };
+                                self.vault_ui.new_members.push(vault::Member {
+                                    name,
+                                    pubkey: self.vault_ui.new_member_key.trim().to_string(),
+                                });
+                                self.vault_ui.new_member_name.clear();
+                                self.vault_ui.new_member_key.clear();
+                                self.vault_ui.create_msg.clear();
+                            }
+                            Err(e) => self.vault_ui.create_msg = e,
+                        }
+                    }
+                    if !my_key.is_empty()
+                        && ui.button("Add me").clicked()
+                        && !self.vault_ui.new_members.iter().any(|m| m.pubkey == my_key)
+                    {
+                        self.vault_ui.new_members.push(vault::Member {
+                            name: "Me".to_string(),
+                            pubkey: my_key.clone(),
+                        });
+                    }
+                });
+                let mut drop_member: Option<usize> = None;
+                for (i, m) in self.vault_ui.new_members.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("• {} — {}", m.name, short_pubkey(&m.pubkey)));
+                        if ui.small_button("✕").clicked() {
+                            drop_member = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = drop_member {
+                    self.vault_ui.new_members.remove(i);
+                }
+                let n = self.vault_ui.new_members.len().max(1) as u16;
+                ui.horizontal(|ui| {
+                    ui.label("Approvals required");
+                    ui.add(egui::DragValue::new(&mut self.vault_ui.new_threshold).range(1..=n));
+                    ui.label(format!("of {}", self.vault_ui.new_members.len()));
+                });
+                if ui
+                    .add_enabled(
+                        my_seed.is_some(),
+                        egui::Button::new("Create vault on-chain"),
+                    )
+                    .clicked()
+                {
+                    do_create = true;
+                }
+                if my_seed.is_none() {
+                    ui.label(
+                        egui::RichText::new("select a signing wallet (not watch-only) first")
+                            .small()
+                            .weak(),
+                    );
+                }
+                if !self.vault_ui.create_msg.is_empty() {
+                    ui.label(egui::RichText::new(&self.vault_ui.create_msg).weak());
+                }
+            },
+        );
+
+        // ── Request a spend ──
+        egui::CollapsingHeader::new(egui::RichText::new("Request a spend").strong()).show(
+            ui,
+            |ui| {
+                if self.vault_ui.vaults.is_empty() {
+                    ui.label(egui::RichText::new("create a vault first").weak());
+                    return;
+                }
+                let names: Vec<String> = self
+                    .vault_ui
+                    .vaults
+                    .iter()
+                    .map(|v| format!("{} ({})", v.name, v.account))
+                    .collect();
+                if self.vault_ui.req_vault >= names.len() {
+                    self.vault_ui.req_vault = 0;
+                }
+                egui::ComboBox::from_label("vault")
+                    .selected_text(names[self.vault_ui.req_vault].clone())
+                    .show_ui(ui, |ui| {
+                        for (i, n) in names.iter().enumerate() {
+                            ui.selectable_value(&mut self.vault_ui.req_vault, i, n);
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    ui.label("Send to");
+                    ui.text_edit_singleline(&mut self.vault_ui.req_to);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Amount (XUS)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vault_ui.req_amount)
+                            .desired_width(120.0),
+                    );
+                });
+                if ui.button("Create request").clicked() {
+                    do_request = true;
+                }
+                if !self.vault_ui.req_msg.is_empty() {
+                    ui.label(egui::RichText::new(&self.vault_ui.req_msg).weak());
+                }
+                if !self.vault_ui.req_code.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label("Share this request code with your co-signers:");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.vault_ui.req_code)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if ui.button("Copy request code").clicked() {
+                        ui.output_mut(|o| o.copied_text = self.vault_ui.req_code.clone());
+                    }
+                }
+            },
+        );
+
+        // ── Approve a request ──
+        egui::CollapsingHeader::new(egui::RichText::new("Approve a request").strong()).show(
+            ui,
+            |ui| {
+                ui.label("Paste a request code to review and approve it:");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.vault_ui.apv_in)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                );
+                // Plain-English preview of what you'd be approving.
+                if let Ok(req) = vault::decode_request(&self.vault_ui.apv_in) {
+                    ui.label(egui::RichText::new(req.summary(grains_to_xus_plain)).strong());
+                }
+                if ui
+                    .add_enabled(
+                        my_seed.is_some(),
+                        egui::Button::new("Approve with selected wallet"),
+                    )
+                    .clicked()
+                {
+                    do_approve = true;
+                }
+                if !self.vault_ui.apv_msg.is_empty() {
+                    ui.label(egui::RichText::new(&self.vault_ui.apv_msg).weak());
+                }
+                if !self.vault_ui.apv_code.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label("Send this approval code back to the requester:");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.vault_ui.apv_code)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if ui.button("Copy approval code").clicked() {
+                        ui.output_mut(|o| o.copied_text = self.vault_ui.apv_code.clone());
+                    }
+                }
+            },
+        );
+
+        // ── Collect approvals & send ──
+        egui::CollapsingHeader::new(egui::RichText::new("Collect approvals & send").strong()).show(
+            ui,
+            |ui| {
+                ui.label("1) Paste the request code:");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.vault_ui.send_req_in)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                );
+                let req = vault::decode_request(&self.vault_ui.send_req_in).ok();
+                if let Some(r) = &req {
+                    ui.label(egui::RichText::new(r.summary(grains_to_xus_plain)).strong());
+                    let have = vault::approval_count(r, &self.vault_ui.send_approvals);
+                    let dots: String = (0..r.members.len())
+                        .map(|i| if i < have { '✓' } else { '○' })
+                        .collect();
+                    ui.label(format!("{have} of {} approvals  {dots}", r.threshold));
+                }
+                ui.label("2) Paste each approval code, then Add:");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vault_ui.send_apv_in)
+                            .hint_text("SOVAPV1:…")
+                            .desired_width(320.0),
+                    );
+                    if ui.button("Add approval").clicked() {
+                        do_add_approval = true;
+                    }
+                });
+                let ready = req
+                    .as_ref()
+                    .map(|r| {
+                        vault::approval_count(r, &self.vault_ui.send_approvals)
+                            >= r.threshold as usize
+                    })
+                    .unwrap_or(false);
+                if ui
+                    .add_enabled(ready && my_seed.is_some(), egui::Button::new("Send"))
+                    .clicked()
+                {
+                    do_send = true;
+                }
+                if !self.vault_ui.send_msg.is_empty() {
+                    ui.label(egui::RichText::new(&self.vault_ui.send_msg).weak());
+                }
+            },
+        );
+
+        // ── Execute collected intents (clean &mut self here) ──
+        if do_create {
+            self.vault_create(&rpc, my_seed);
+        }
+        if do_request {
+            self.vault_make_request(&rpc);
+        }
+        if do_approve {
+            self.vault_approve(my_seed);
+        }
+        if do_add_approval {
+            match vault::decode_approval(&self.vault_ui.send_apv_in) {
+                Ok(a) => {
+                    self.vault_ui.send_approvals.push(a);
+                    self.vault_ui.send_apv_in.clear();
+                    self.vault_ui.send_msg.clear();
+                }
+                Err(e) => self.vault_ui.send_msg = e,
+            }
+        }
+        if do_send {
+            self.vault_send(&rpc, my_seed);
+        }
+    }
+
+    /// Build a vault from the create-form fields, save it locally, and submit the
+    /// `SetMultisig` that opts the account into M-of-N (signed by the selected wallet).
+    fn vault_create(&mut self, rpc: &str, my_seed: Option<[u8; 32]>) {
+        let Some(seed) = my_seed else {
+            self.vault_ui.create_msg = "select a signing wallet first".to_string();
+            return;
+        };
+        let v = vault::Vault {
+            name: if self.vault_ui.new_name.trim().is_empty() {
+                "Vault".to_string()
+            } else {
+                self.vault_ui.new_name.trim().to_string()
+            },
+            account: self.vault_ui.new_account.trim().to_string(),
+            members: self.vault_ui.new_members.clone(),
+            threshold: self.vault_ui.new_threshold,
+        };
+        let action = match v.set_multisig_action() {
+            Ok(a) => a,
+            Err(e) => {
+                self.vault_ui.create_msg = e;
+                return;
+            }
+        };
+        // Save the definition locally so it's usable immediately (public data only).
+        if !self.vault_ui.vaults.iter().any(|x| x.account == v.account) {
+            self.vault_ui.vaults.push(v.clone());
+            let _ = vault::save_vaults(&self.vault_ui.vaults);
+        }
+        // Reset the form.
+        self.vault_ui.new_name.clear();
+        self.vault_ui.new_account.clear();
+        self.vault_ui.new_members.clear();
+        self.vault_ui.new_threshold = 2;
+        self.vault_ui.create_msg = "saved — submitting SetMultisig…".to_string();
+        // Dispatch the on-chain opt-in (signed by the account's current controller).
+        let rpc = rpc.to_string();
+        let signer = v.account.clone();
+        let action_state = self.action.clone();
+        let activity = self.activity.clone();
+        begin(&action_state, "securing the account as a vault…");
+        std::thread::spawn(move || {
+            let msg = match submit_action(&rpc, seed, &signer, action) {
+                Ok(tx) => format!(
+                    "✓ vault secured (SetMultisig tx {})",
+                    &tx[..tx.len().min(14)]
+                ),
+                Err(e) => format!("✗ could not secure vault: {e}"),
+            };
+            finish(&action_state, &msg);
+            record(&activity, &msg);
+        });
+    }
+
+    /// Fetch the vault account's current nonce and build+encode a spend request.
+    fn vault_make_request(&mut self, rpc: &str) {
+        let Some(v) = self.vault_ui.vaults.get(self.vault_ui.req_vault).cloned() else {
+            self.vault_ui.req_msg = "pick a vault".to_string();
+            return;
+        };
+        let to = self.vault_ui.req_to.trim().to_string();
+        if to.is_empty() {
+            self.vault_ui.req_msg = "enter a recipient".to_string();
+            return;
+        }
+        let Some(grains) = parse_xus(&self.vault_ui.req_amount) else {
+            self.vault_ui.req_msg = "amount must be a number of XUS".to_string();
+            return;
+        };
+        let nonce = match fetch_account_nonce(rpc, &v.account) {
+            Ok(n) => n,
+            Err(e) => {
+                self.vault_ui.req_msg = format!("could not read the vault's nonce: {e}");
+                return;
+            }
+        };
+        let req = v.request(to, grains, nonce);
+        match vault::encode_request(&req) {
+            Ok(code) => {
+                self.vault_ui.req_code = code;
+                self.vault_ui.req_msg =
+                    "request created — share the code below with your co-signers".to_string();
+            }
+            Err(e) => self.vault_ui.req_msg = format!("encode failed: {e}"),
+        }
+    }
+
+    /// Sign the pasted request with the selected wallet → an approval code to return.
+    fn vault_approve(&mut self, my_seed: Option<[u8; 32]>) {
+        let Some(seed) = my_seed else {
+            self.vault_ui.apv_msg = "select a signing wallet first".to_string();
+            return;
+        };
+        let req = match vault::decode_request(&self.vault_ui.apv_in) {
+            Ok(r) => r,
+            Err(e) => {
+                self.vault_ui.apv_msg = e;
+                return;
+            }
+        };
+        let kp = Keypair::hybrid_from_seed(seed);
+        match vault::sign_request(&req, &kp).and_then(|a| vault::encode_approval(&a)) {
+            Ok(code) => {
+                self.vault_ui.apv_code = code;
+                self.vault_ui.apv_msg = "approved — send the code below back".to_string();
+            }
+            Err(e) => self.vault_ui.apv_msg = e,
+        }
+    }
+
+    /// Assemble the collected approvals into a `MultisigExec` and submit it with the
+    /// request's exact nonce (the nonce the approvals were signed over).
+    fn vault_send(&mut self, rpc: &str, my_seed: Option<[u8; 32]>) {
+        let Some(seed) = my_seed else {
+            self.vault_ui.send_msg = "select a signing wallet (a vault member) first".to_string();
+            return;
+        };
+        let req = match vault::decode_request(&self.vault_ui.send_req_in) {
+            Ok(r) => r,
+            Err(e) => {
+                self.vault_ui.send_msg = e;
+                return;
+            }
+        };
+        let action = match vault::assemble_exec(&req, &self.vault_ui.send_approvals) {
+            Ok(a) => a,
+            Err(e) => {
+                self.vault_ui.send_msg = e;
+                return;
+            }
+        };
+        let rpc = rpc.to_string();
+        let account = req.account.clone();
+        let nonce = req.nonce;
+        let action_state = self.action.clone();
+        let activity = self.activity.clone();
+        begin(&action_state, "submitting the vault spend…");
+        std::thread::spawn(move || {
+            let msg = match submit_multisig_exec(&rpc, seed, &account, nonce, action) {
+                Ok(tx) => format!("✓ vault spend submitted (tx {})", &tx[..tx.len().min(14)]),
+                Err(e) => format!("✗ vault spend failed: {e}"),
+            };
+            finish(&action_state, &msg);
+            record(&activity, &msg);
+        });
+        self.vault_ui.send_msg = "submitting…".to_string();
+        self.vault_ui.send_approvals.clear();
+    }
+
     /// Export all wallets to the passphrase-encrypted PORTABLE keystore (a backup
     /// you can move between machines). Day-to-day persistence is automatic via
     /// [`auto_save`](Self::auto_save); this is the hardened/portable copy.
@@ -3112,6 +3637,7 @@ impl eframe::App for Station {
                 self.tab_button(ui, Tab::Wallet, "👛", "Wallet");
                 self.tab_button(ui, Tab::Tokens, "⬡", "Tokens");
                 self.tab_button(ui, Tab::Swaps, "⇄", "Swaps");
+                self.tab_button(ui, Tab::Vault, "🛡", "Vault");
                 self.tab_button(ui, Tab::Blocks, "▦", "Blocks");
                 self.tab_button(ui, Tab::Activity, "◷", "Activity");
             });
@@ -3197,6 +3723,11 @@ impl eframe::App for Station {
                     egui::ScrollArea::vertical()
                         .id_salt("scroll_swaps")
                         .show(ui, |ui| self.swaps_panel(ui));
+                }
+                Tab::Vault => {
+                    egui::ScrollArea::vertical()
+                        .id_salt("scroll_vault")
+                        .show(ui, |ui| self.vault_panel(ui));
                 }
                 Tab::Blocks => blocks_panel(ui, &snap, &mut self.block_detail),
                 Tab::Activity => {
@@ -6774,6 +7305,39 @@ fn submit_action(
     let kp = Keypair::hybrid_from_seed(seed);
     let id = AccountId::new(signer).map_err(|e| e.to_string())?;
     let nonce = client.nonce(&id).map_err(|e| e.to_string())?;
+    let tx = Transaction {
+        signer: id,
+        public_key: kp.public_key(),
+        nonce,
+        action,
+    };
+    let stx = SignedTransaction::sign(tx, &kp).map_err(|e| e.to_string())?;
+    let txid = client.submit_transaction(&stx).map_err(|e| e.to_string())?;
+    Ok(txid.to_hex())
+}
+
+/// Read an account's current on-chain nonce (the exec nonce a vault spend is built and
+/// signed against).
+fn fetch_account_nonce(rpc: &str, account: &str) -> Result<u64, String> {
+    let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(8));
+    let id = AccountId::new(account).map_err(|e| e.to_string())?;
+    client.nonce(&id).map_err(|e| e.to_string())
+}
+
+/// Submit a `MultisigExec` for `account` with the EXACT `nonce` the approvals were
+/// signed over (so the bundled signatures verify). The envelope is signed by the
+/// relayer (`relayer_seed`), which must be a policy member; the on-chain `signer` stays
+/// the multisig account. Mirrors the proven conformance-tool exec path.
+fn submit_multisig_exec(
+    rpc: &str,
+    relayer_seed: [u8; 32],
+    account: &str,
+    nonce: u64,
+    action: Action,
+) -> Result<String, String> {
+    let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(15));
+    let kp = Keypair::hybrid_from_seed(relayer_seed);
+    let id = AccountId::new(account).map_err(|e| e.to_string())?;
     let tx = Transaction {
         signer: id,
         public_key: kp.public_key(),
