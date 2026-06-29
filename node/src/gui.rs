@@ -2305,80 +2305,35 @@ impl Station {
     /// the master passphrase is set, so a typo can't become the encryption key and
     /// lock you out. Shown when a wallet action needs a passphrase and none is set.
     fn show_setup_screen(&mut self, ctx: &egui::Context) {
-        let red = egui::Color32::from_rgb(220, 80, 80);
-        let amber = egui::Color32::from_rgb(220, 160, 60);
-        let green = egui::Color32::from_rgb(80, 200, 120);
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(50.0);
-            ui.vertical_centered(|ui| {
-                ui.heading("🔐  Create a passphrase");
-                ui.add_space(8.0);
-                ui.label(
-                    "This encrypts your wallets on this device and is required on every \
-                     launch. There is no reset — if you forget it, the only recovery is \
-                     re-importing each wallet from its 24-word phrase. Write it down.",
-                );
-                ui.add_space(16.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.setup_pw)
-                        .password(true)
-                        .hint_text("passphrase")
-                        .desired_width(280.0),
-                );
-                ui.add_space(6.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.setup_pw2)
-                        .password(true)
-                        .hint_text("re-enter passphrase")
-                        .desired_width(280.0),
-                );
-                ui.add_space(10.0);
-                let len = self.setup_pw.chars().count();
-                let too_short = len < PASSPHRASE_MIN_LEN;
-                let mismatch = self.setup_pw != self.setup_pw2;
-                let ok = passphrase_setup_valid(&self.setup_pw, &self.setup_pw2);
-                // Live feedback so a mismatch/typo is caught BEFORE it's committed.
-                if self.setup_pw.is_empty() && self.setup_pw2.is_empty() {
-                    ui.label(
-                        egui::RichText::new(format!("at least {PASSPHRASE_MIN_LEN} characters"))
-                            .small()
-                            .weak(),
-                    );
-                } else if too_short {
-                    ui.colored_label(
-                        amber,
-                        format!("use at least {PASSPHRASE_MIN_LEN} characters"),
-                    );
-                } else if mismatch {
-                    ui.colored_label(red, "✗ passphrases don't match");
-                } else {
-                    ui.colored_label(green, "✓ passphrases match");
+            let action = ui
+                .vertical_centered(|ui| {
+                    render_passphrase_setup(ui, &mut self.setup_pw, &mut self.setup_pw2).0
+                })
+                .inner;
+            match action {
+                SetupAction::Set => {
+                    // Committed only because the two inputs matched (button was enabled).
+                    self.passphrase.zeroize();
+                    self.passphrase = self.setup_pw.clone();
+                    self.passphrase_set = true;
+                    self.setup_pw.zeroize();
+                    self.setup_pw.clear();
+                    self.setup_pw2.zeroize();
+                    self.setup_pw2.clear();
+                    self.show_setup = false;
+                    self.set_action("passphrase set — now create or import a wallet");
                 }
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(ok, egui::Button::new("Set passphrase"))
-                        .clicked()
-                    {
-                        self.passphrase.zeroize();
-                        self.passphrase = self.setup_pw.clone();
-                        self.passphrase_set = true;
-                        self.setup_pw.zeroize();
-                        self.setup_pw.clear();
-                        self.setup_pw2.zeroize();
-                        self.setup_pw2.clear();
-                        self.show_setup = false;
-                        self.set_action("passphrase set — now create or import a wallet");
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.setup_pw.zeroize();
-                        self.setup_pw.clear();
-                        self.setup_pw2.zeroize();
-                        self.setup_pw2.clear();
-                        self.show_setup = false;
-                    }
-                });
-            });
+                SetupAction::Cancel => {
+                    self.setup_pw.zeroize();
+                    self.setup_pw.clear();
+                    self.setup_pw2.zeroize();
+                    self.setup_pw2.clear();
+                    self.show_setup = false;
+                }
+                SetupAction::None => {}
+            }
         });
     }
 
@@ -7568,6 +7523,85 @@ fn passphrase_setup_valid(pw: &str, confirm: &str) -> bool {
     !pw.is_empty() && pw.chars().count() >= PASSPHRASE_MIN_LEN && pw == confirm
 }
 
+/// Which button (if any) the create-a-passphrase form reported this frame.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+enum SetupAction {
+    None,
+    Set,
+    Cancel,
+}
+
+/// Render the create-a-passphrase form into `ui`. Returns which button fired and the
+/// "Set passphrase" button's rect (exposed so a headless test can click it). The Set
+/// button is ENABLED only when [`passphrase_setup_valid`] holds, so a mismatch or a
+/// too-short passphrase can never be committed — this is the typo/lockout guard, and
+/// the test drives this exact function.
+fn render_passphrase_setup(
+    ui: &mut egui::Ui,
+    pw: &mut String,
+    pw2: &mut String,
+) -> (SetupAction, egui::Rect) {
+    let red = egui::Color32::from_rgb(220, 80, 80);
+    let amber = egui::Color32::from_rgb(220, 160, 60);
+    let green = egui::Color32::from_rgb(80, 200, 120);
+    ui.heading("🔐  Create a passphrase");
+    ui.add_space(8.0);
+    ui.label(
+        "This encrypts your wallets on this device and is required on every launch. \
+         There is no reset — if you forget it, the only recovery is re-importing each \
+         wallet from its 24-word phrase. Write it down.",
+    );
+    ui.add_space(16.0);
+    ui.add(
+        egui::TextEdit::singleline(pw)
+            .password(true)
+            .hint_text("passphrase")
+            .desired_width(280.0),
+    );
+    ui.add_space(6.0);
+    ui.add(
+        egui::TextEdit::singleline(pw2)
+            .password(true)
+            .hint_text("re-enter passphrase")
+            .desired_width(280.0),
+    );
+    ui.add_space(10.0);
+    let too_short = pw.chars().count() < PASSPHRASE_MIN_LEN;
+    let mismatch = pw.as_str() != pw2.as_str();
+    let ok = passphrase_setup_valid(pw, pw2);
+    // Live feedback so a mismatch/typo is caught BEFORE it's committed.
+    if pw.is_empty() && pw2.is_empty() {
+        ui.label(
+            egui::RichText::new(format!("at least {PASSPHRASE_MIN_LEN} characters"))
+                .small()
+                .weak(),
+        );
+    } else if too_short {
+        ui.colored_label(
+            amber,
+            format!("use at least {PASSPHRASE_MIN_LEN} characters"),
+        );
+    } else if mismatch {
+        ui.colored_label(red, "✗ passphrases don't match");
+    } else {
+        ui.colored_label(green, "✓ passphrases match");
+    }
+    ui.add_space(12.0);
+    let mut action = SetupAction::None;
+    let mut set_rect = egui::Rect::NOTHING;
+    ui.horizontal(|ui| {
+        let set = ui.add_enabled(ok, egui::Button::new("Set passphrase"));
+        set_rect = set.rect;
+        if set.clicked() {
+            action = SetupAction::Set;
+        }
+        if ui.button("Cancel").clicked() {
+            action = SetupAction::Cancel;
+        }
+    });
+    (action, set_rect)
+}
+
 /// The at-rest key for a wallet's shielded-note CACHE, derived from that wallet's
 /// own seed (domain-separated). The seed is the secret we already scan with, so the
 /// cache needs no separate key on disk and is unreadable without the seed.
@@ -8281,6 +8315,102 @@ mod tests {
         assert!(
             passphrase_setup_valid("correct horse", "correct horse"),
             "matching + long enough accepted"
+        );
+    }
+
+    /// A real headless CLICK-TEST: render the actual create-a-passphrase screen and
+    /// inject a genuine pointer press+release on the rendered "Set passphrase" button.
+    /// It must fire ONLY when the two inputs match (and meet the length floor) — i.e.
+    /// the disabled-button guard against a typo'd, unconfirmed passphrase actually
+    /// works at the widget level, not just in the validity helper.
+    #[test]
+    fn setup_screen_set_button_clicks_only_when_inputs_match() {
+        use egui::{Event, Modifiers, PointerButton, RawInput};
+
+        // Run ONE headless frame; returns which button fired + the Set button's rect.
+        fn frame(
+            ctx: &egui::Context,
+            p: &mut String,
+            p2: &mut String,
+            input: RawInput,
+        ) -> (SetupAction, egui::Rect) {
+            let mut action = SetupAction::None;
+            let mut rect = egui::Rect::NOTHING;
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let (a, r) = render_passphrase_setup(ui, p, p2);
+                    action = a;
+                    rect = r;
+                });
+            });
+            (action, rect)
+        }
+
+        fn click_set(pw: &str, pw2: &str) -> SetupAction {
+            let ctx = egui::Context::default();
+            let mut p = pw.to_string();
+            let mut p2 = pw2.to_string();
+            let btn = PointerButton::Primary;
+            let m = Modifiers::default();
+            // Frame 1: lay out the screen and capture the Set button's rect.
+            let (_, rect) = frame(&ctx, &mut p, &mut p2, RawInput::default());
+            let c = rect.center();
+            // Frame 2: press on the button.
+            frame(
+                &ctx,
+                &mut p,
+                &mut p2,
+                RawInput {
+                    events: vec![
+                        Event::PointerMoved(c),
+                        Event::PointerButton {
+                            pos: c,
+                            button: btn,
+                            pressed: true,
+                            modifiers: m,
+                        },
+                    ],
+                    ..Default::default()
+                },
+            );
+            // Frame 3: release on the button → a click registers (if it's enabled).
+            let (action, _) = frame(
+                &ctx,
+                &mut p,
+                &mut p2,
+                RawInput {
+                    events: vec![
+                        Event::PointerMoved(c),
+                        Event::PointerButton {
+                            pos: c,
+                            button: btn,
+                            pressed: false,
+                            modifiers: m,
+                        },
+                    ],
+                    ..Default::default()
+                },
+            );
+            action
+        }
+
+        // Matching + long enough → the button is live, the click commits.
+        assert_eq!(
+            click_set("correct horse", "correct horse"),
+            SetupAction::Set,
+            "matching passphrases: Set should fire on click"
+        );
+        // A typo in the confirm → button disabled → clicking does nothing.
+        assert_eq!(
+            click_set("correct horse", "correct hoarse"),
+            SetupAction::None,
+            "mismatch: Set must NOT fire (no silent typo lockout)"
+        );
+        // Too short → button disabled.
+        assert_eq!(
+            click_set("short", "short"),
+            SetupAction::None,
+            "too short: Set must NOT fire"
         );
     }
 
