@@ -1344,16 +1344,21 @@ mod tests {
             "an active (recently-heard) peer is not reaped"
         );
 
-        // Silent past the inactivity timeout → reaped (the dead half-open case).
-        state.last_recv.insert(
-            peer,
+        // Silent past the inactivity timeout → reaped (the dead half-open case). On
+        // loopback the client may re-dial after a reap, so re-mark every current peer
+        // silent and reap each iteration until the slot is observed clear — the reap
+        // logic is what's under test, not the OS's reconnect timing.
+        let stale = || {
             Instant::now()
                 .checked_sub(PEER_INACTIVITY_TIMEOUT + Duration::from_secs(1))
-                .unwrap(),
-        );
-        state.reap_dead_peers(&server);
+                .unwrap()
+        };
         let mut reaped = false;
         for _ in 0..1500 {
+            for p in server.connected_peers() {
+                state.last_recv.insert(p, stale());
+            }
+            state.reap_dead_peers(&server);
             if server.peer_count() == 0 {
                 reaped = true;
                 break;
