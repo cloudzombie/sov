@@ -1291,12 +1291,21 @@ mod tests {
         assert!(connected, "peer connected");
 
         let mut state = SyncState::new(None, None);
-        state.sweep_unauthenticated(&server);
-        assert_eq!(
-            state.first_seen.len(),
-            1,
-            "the new peer's first-seen time is recorded"
-        );
+        // Poll the sweep until the peer is recorded. `peer_count()` ticks up at the TCP
+        // accept, but `sweep_unauthenticated` reads `connected_peers()`, which only lists
+        // a peer once its Noise+ML-KEM handshake completes — a beat later under CI load.
+        // Retry rather than flake; HELLO_TIMEOUT (30s) is far longer than this wait, so a
+        // freshly-recorded peer is never dropped here.
+        let mut recorded = false;
+        for _ in 0..500 {
+            state.sweep_unauthenticated(&server);
+            if state.first_seen.len() == 1 {
+                recorded = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(recorded, "the new peer's first-seen time is recorded");
         assert!(
             server.peer_count() >= 1,
             "a just-connected peer is given time to authenticate, not dropped on sight"
