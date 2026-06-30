@@ -752,21 +752,6 @@ fn cmd_status(flags: &Flags) -> Result<(), Box<dyn Error>> {
                 }
             }
         }
-        // The perpetual mining-tax recipients (consensus constants from
-        // `MiningPolicy`): every block's coinbase AND every transaction fee pays
-        // 9% to the primary and 1% to the secondary. Watch these climb to confirm
-        // the tax is flowing into the accounts you control.
-        let policy = sov_mining::MiningPolicy::mainnet_like();
-        println!("\nmining tax (9% / 1% of every coinbase + fee):");
-        for (label, account) in [
-            ("founder 5%", &policy.tax_primary_recipient),
-            ("dev     2%", &policy.tax_secondary_recipient),
-        ] {
-            match client.balance(account) {
-                Ok(bal) => println!("  {label}  {:18} {bal}", account.as_str()),
-                Err(_) => println!("  {label}  {:18} —", account.as_str()),
-            }
-        }
     } else {
         println!("\n(no node reachable for balances — `sov-testnet up` first)");
     }

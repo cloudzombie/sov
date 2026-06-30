@@ -106,26 +106,6 @@ impl GenesisConfig {
             });
         }
 
-        // Tax fractions are basis points and may not exceed 100% individually or
-        // in sum, or the coinbase/fee split would pay out more than was collected
-        // (and the miner's remainder would underflow).
-        for (what, bps) in [
-            ("tax_primary_bps", self.mining.tax_primary_bps),
-            ("tax_secondary_bps", self.mining.tax_secondary_bps),
-        ] {
-            if bps > 10_000 {
-                return Err(GenesisError::InvalidFeeParameter { what, bps });
-            }
-        }
-        if u32::from(self.mining.tax_primary_bps) + u32::from(self.mining.tax_secondary_bps)
-            > 10_000
-        {
-            return Err(GenesisError::InvalidFeeParameter {
-                what: "tax_primary_bps + tax_secondary_bps",
-                bps: 10_001,
-            });
-        }
-
         // Build the ledger.
         let mut ledger = Ledger::new();
         for a in &self.accounts {
@@ -198,14 +178,6 @@ pub enum GenesisError {
     /// A balance sum overflowed `u128`.
     #[error("genesis balance overflow")]
     Overflow,
-    /// A fee split fraction exceeds 100% (10,000 basis points).
-    #[error("invalid fee parameter {what}: {bps} basis points exceeds 10000")]
-    InvalidFeeParameter {
-        /// Which parameter was out of range.
-        what: &'static str,
-        /// The configured basis points.
-        bps: u16,
-    },
 }
 
 #[cfg(test)]
@@ -219,26 +191,6 @@ mod tests {
             key: Keypair::from_seed([seed; 32]).public_key(),
             balance: Balance::from_sov(balance).unwrap(),
         }
-    }
-
-    #[test]
-    fn rejects_out_of_range_fee_bps() {
-        let mut mining = MiningPolicy::test();
-        mining.tax_primary_bps = 10_001; // > 100%
-        let config = GenesisConfig {
-            chain_id: "sov-test".into(),
-            timestamp_ms: 0,
-            accounts: vec![acct("val01.node.sov", 1, 0)],
-            mining,
-            vesting: vec![],
-        };
-        assert!(matches!(
-            config.build(),
-            Err(GenesisError::InvalidFeeParameter {
-                what: "tax_primary_bps",
-                ..
-            })
-        ));
     }
 
     #[test]

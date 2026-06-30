@@ -32,11 +32,7 @@ describe("emission schedule (reward_at) cross-impl KAT", () => {
   const ctx = {
     height: 0,
     gasPrice: 0n,
-    taxPrimaryBps: 0,
-    taxSecondaryBps: 0,
     maxCodeBytes: 0,
-    taxPrimaryRecipient: "",
-    taxSecondaryRecipient: "",
     miner: "",
     baseReward: BigInt(vec.policy.base_reward_grains),
     halvingIntervalBlocks: BigInt(vec.policy.halving_interval_blocks),

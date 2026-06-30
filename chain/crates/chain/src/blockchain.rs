@@ -550,9 +550,9 @@ impl Blockchain {
             .reward_at(self.height() + 1, self.ledger.mined_emitted())
     }
 
-    /// The consensus mining/emission policy (read-only) — emission schedule and
-    /// the treasury/dev tax split. Used to surface a block's coinbase (subsidy +
-    /// 90/9/1 split) to explorers from the authoritative source.
+    /// The consensus mining/emission policy (read-only) — the emission schedule.
+    /// Used to surface a block's coinbase (the subsidy, paid entirely to the miner)
+    /// to explorers from the authoritative source.
     pub fn mining_policy(&self) -> &sov_mining::MiningPolicy {
         &self.mining
     }

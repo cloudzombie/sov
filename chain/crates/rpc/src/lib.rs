@@ -617,24 +617,17 @@ fn call(
             let chain = node.chain();
             Ok(chain.block_by_height(h).map_or(Value::Null, |b| {
                 // The COINBASE: every block's issuance, surfaced from the
-                // authoritative source. The height-keyed subsidy is split exactly
-                // as the runtime applied it — 90% to the miner (the header's
-                // proposer), 9% to the U.S. Treasury tax account, 1% to the dev tax
-                // account. Genesis (and any post-budget block) mints nothing.
-                let policy = chain.mining_policy();
+                // authoritative source. The ENTIRE height-keyed subsidy goes to the
+                // miner (the header's proposer) — no tax, nothing burned (pure
+                // Nakamoto). Genesis (and any post-budget block) mints nothing.
                 let reward = chain.coinbase_reward_at(h).grains();
-                let primary = reward * u128::from(policy.tax_primary_bps) / 10_000;
-                let secondary = reward * u128::from(policy.tax_secondary_bps) / 10_000;
-                let miner_amount = reward - primary - secondary;
                 let coinbase = if reward == 0 {
                     Value::Null
                 } else {
                     json!({
                         "reward": reward.to_string(),
                         "recipients": [
-                            { "account": b.header.proposer.as_str(), "amount": miner_amount.to_string(), "role": "miner" },
-                            { "account": policy.tax_primary_recipient.as_str(), "amount": primary.to_string(), "role": "treasury-tax" },
-                            { "account": policy.tax_secondary_recipient.as_str(), "amount": secondary.to_string(), "role": "dev-tax" },
+                            { "account": b.header.proposer.as_str(), "amount": reward.to_string(), "role": "miner" },
                         ],
                     })
                 };

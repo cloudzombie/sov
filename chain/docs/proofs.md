@@ -58,12 +58,11 @@ The proofs are unconditional **except** where they explicitly invoke one of:
   (Part XIII): **A4a** — X25519 CDH is hard (the Noise channel); **A4b** —
   ML-KEM-768 (FIPS 203, `fips203` crate) is IND-CCA secure. Transport
   confidentiality holds if **either** A4a *or* A4b holds.
-- **P1 (policy precondition).** `tax_primary_bps + tax_secondary_bps ≤ 10 000`.
-  `MiningPolicy::mainnet_like` sets `500 + 200 = 700` (5% founder + 2% dev);
-  `MiningPolicy::test` sets both to `0`
-  ([`mining/lib.rs`](../crates/mining/src/lib.rs)). P1 is enforced at genesis:
-  `GenesisConfig::build` rejects any policy whose two tax fractions exceed 100%
-  individually or in sum. Lemma 2 states exactly where P1 is used.
+- **P1 (distribution).** There is **no protocol tax**: the entire coinbase and every
+  fee are paid to the block's miner (`distribute_fee` / `apply_coinbase` in
+  [`runtime/src/execution.rs`](../crates/runtime/src/execution.rs)). Distribution is a
+  single credit to one recipient, so it trivially pays out exactly what was collected
+  (no rounding, no remainder). Lemma 2 states where this is used.
 
 ---
 
@@ -143,42 +142,31 @@ recipient's `checked_add` before writing either account). ∎
 
 ## Part I — Monetary theorems
 
-### Lemma 2 (coinbase/fee tax-split exactness)
+### Lemma 2 (coinbase/fee distribution exactness)
 
-Assume P1. For any amount `f ≥ 0` grains — a transaction fee in `distribute_fee`
-or a block subsidy in `apply_coinbase`
-([`execution.rs`](../crates/runtime/src/execution.rs)) — the protocol computes the
-same three-way split
+For any amount `f ≥ 0` grains — a transaction fee in `distribute_fee` or a block
+subsidy in `apply_coinbase`
+([`execution.rs`](../crates/runtime/src/execution.rs)) — the protocol credits the
+**entire** amount to the block's miner:
 
 $$
-\mathrm{primary} = \Big\lfloor \tfrac{f \cdot \tau_1}{10^4} \Big\rfloor,\quad
-\mathrm{secondary} = \Big\lfloor \tfrac{f \cdot \tau_2}{10^4} \Big\rfloor,\quad
-\mathrm{miner} = f - \mathrm{primary} - \mathrm{secondary}
+\mathrm{miner} = f
 $$
 
-with `τ₁ = tax_primary_bps`, `τ₂ = tax_secondary_bps` (mainnet `500`/`200` — 5% and
-2%). These satisfy, exactly over `ℤ`:
+There is no tax and no burn term. Trivially:
 
-1. `primary + secondary + miner = f` — **every grain is paid out; nothing is
-   created, lost, or burned**;
-2. `0 ≤ primary`, `0 ≤ secondary`, `primary + secondary ≤ f`, so `0 ≤ miner ≤ f`.
+1. `miner = f` — **every grain is paid out; nothing is created, lost, or burned**;
+2. `0 ≤ miner ≤ f`.
 
-**Proof.** Floors of non-negative reals are `≥ 0`, so `primary, secondary ≥ 0`.
-Since `⌊x⌋ ≤ x`,
-`primary + secondary ≤ f·τ₁/10⁴ + f·τ₂/10⁴ = f·(τ₁+τ₂)/10⁴ ≤ f` by P1
-(`τ₁+τ₂ ≤ 10⁴`); the left side is an integer no greater than the integer `f`, so
-`primary + secondary ≤ f`. Hence `miner = f − primary − secondary ≥ 0` is exact
-(no underflow). Claim 1 is literal: `miner` is defined by subtraction from `f`,
-so the two floor remainders are absorbed into the miner's share — the **whole**
-amount is distributed and there is **no burn term**. ∎
+**Proof.** Distribution is a single `credit(miner, f)`, so the amount paid out equals
+`f` exactly, with no rounding, remainder, or burn. ∎
 
 **Code:** `distribute_fee`, `apply_coinbase`, `credit`
 ([`execution.rs`](../crates/runtime/src/execution.rs)).
 **Machine-checked-by:**
-`execution::tests::deploy_then_call_contract_charges_gas_fee_to_caller` (asserts
-`founder == fee·500/10⁴`, `dev == fee·200/10⁴`, the miner keeps the rest, and the
-three sum to exactly `f` — no burn); the SDK `stf.test.ts` coinbase test
-reproduces the identical split byte-for-byte.
+`execution::tests::deploy_then_call_contract_charges_gas_fee_to_caller` (asserts the
+miner receives the entire fee — no tax, no burn); the SDK `stf.test.ts` coinbase test
+reproduces the identical full-to-miner credit byte-for-byte.
 
 ### Theorem 1 (value conservation)
 
@@ -338,11 +326,9 @@ genesis has `S(L₀) = 0`, and by Theorem 1 every later grain of supply is a
 coinbase mint: there is **no pre-mine**, founder allocation, or premined
 treasury, and genesis supply is zero. ∎
 
-*Honest scope.* This is no-pre-mine, **not a Bitcoin-style fair launch**: a
-perpetual protocol tax routes `tax_primary_bps + tax_secondary_bps` (mainnet 5% +
-2%) of every coinbase — and every fee — to the founder and dev recipients
-(Lemma 2). Every coin is still *mined* (none pre-allocated), but not every mined
-coin reaches the miner; 93% does.
+*Scope.* This is a **Bitcoin-style fair launch**: no pre-mine and no protocol tax.
+Every coin is mined, and the **entire** coinbase (and every fee) reaches the block's
+miner — 100% (Lemma 2).
 
 **Machine-checked-by:**
 `genesis::tests::mainnet_policy_forbids_any_premine` (a 1-grain balance or

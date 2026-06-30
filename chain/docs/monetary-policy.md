@@ -33,22 +33,16 @@ so there is **no integer-overflow resumption** (the [BIP-42] class of bug), and
 every reward is clamped to the room left in the budget, so issuance approaches
 the cap and then is **exactly zero**.
 
-## 3. The tax: how the coinbase and fees are distributed (no burn)
+## 3. How the coinbase and fees are distributed (100% miner, no tax, no burn)
 
-`fee = gas_used × gas_price`. **Every coinbase and every fee** is split the same
-three ways (`distribute_fee` / `apply_coinbase` in
-`crates/runtime/src/execution.rs`):
-
-- **5% to the founder** (`tax_primary_bps = 500`, `tax_primary_recipient`);
-- **2% to a dev fund** (`tax_secondary_bps = 200`, `tax_secondary_recipient`);
-- the remaining **93% to the block's miner**.
-
-**Nothing is burned** — every grain of every fee and every subsidy is paid out.
-The tax is a perpetual protocol allocation, so SOV is **no-pre-mine but not a
-Bitcoin-style fair launch**. Genesis validates
-`tax_primary_bps + tax_secondary_bps ≤ 100%`. The native-SOV `burned` counter has
-been removed; the per-asset `TokenBurn` redemption of *issued tokens* is a
-separate, unrelated feature and does not touch SOV supply.
+`fee = gas_used × gas_price`. **The entire coinbase AND every fee go to the block's
+miner** — the account that found the proof of work (`distribute_fee` /
+`apply_coinbase` in `crates/runtime/src/execution.rs`). There is **no protocol tax**
+and **nothing is burned**: every grain of every subsidy and every fee is paid out to
+the miner. This is a pure Nakamoto / Bitcoin-style fair launch — no pre-mine, no
+founder/dev allocation, no perpetual protocol cut. The native-SOV `burned` counter
+was removed; the per-asset `TokenBurn` redemption of *issued tokens* is a separate,
+unrelated feature and does not touch SOV supply.
 
 ## 4. Conservation and a fixed terminal supply
 
@@ -62,7 +56,7 @@ supply_after == supply_before + Δmined
 - **During emission** (`Δmined > 0`): supply grows, but the rate falls with every
   halving — *disinflation*.
 - **After emission** (budget exhausted ⇒ `Δmined = 0`): every block has `ΔS = 0`.
-  A fee only *moves* value (sender → founder/dev/miner); it never changes total
+  A fee only *moves* value (sender → miner); it never changes total
   supply. The terminal supply is therefore **fixed forever** — a hard-capped
   reserve asset, not a deflationary one.
 
@@ -73,10 +67,9 @@ invariant.
 
 ## 5. Long-term security budget (the deliberate choice)
 
-After the subsidy decays, miner revenue comes entirely from the **93% miner share
-of transaction fees** — the fee-funded long tail Bitcoin chose, on purpose. The
-founder/dev tax (5% + 2%) continues to apply to those fees in perpetuity. A tail
-*emission* would fund miners forever but make SOV inflationary, contradicting the
-reserve-asset thesis; SOV funds long-run security from fees instead.
+After the subsidy decays, miner revenue comes entirely from **transaction fees**,
+all of which go to the miner — the fee-funded long tail Bitcoin chose, on purpose. A
+tail *emission* would fund miners forever but make SOV inflationary, contradicting
+the reserve-asset thesis; SOV funds long-run security from fees instead.
 
 [BIP-42]: https://github.com/bitcoin/bips/blob/master/bip-0042.mediawiki

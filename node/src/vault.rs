@@ -355,7 +355,7 @@ mod tests {
     fn vault_2of3(a: &Keypair, b: &Keypair, c: &Keypair) -> Vault {
         Vault {
             name: "National Debt Vault".into(),
-            account: "ustreasury.tax.sov".into(),
+            account: "treasury.reserve.sov".into(),
             members: vec![member("Me", a), member("Bessent", b), member("Deputy", c)],
             threshold: 2,
         }

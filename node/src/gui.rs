@@ -37,7 +37,10 @@ use crate::vault;
 /// two perpetual mining-tax recipients (consensus constants).
 // Genesis-bound accounts worth watching by default. (A wallet's own implicit
 // account is added to the watch list when it is created/imported.)
-const DEFAULT_ACCOUNTS: [&str; 2] = ["ustreasury.tax.sov", "patriot.tax.sov"];
+/// Named accounts the dashboard tracks balances for out of the box. Empty: the
+/// coinbase pays the miner directly (no tax accounts), and a user adds any named
+/// accounts they care about themselves.
+const DEFAULT_ACCOUNTS: [&str; 0] = [];
 
 /// The local block explorer (started with `node src/server.js` in `explorer/`).
 /// Block heights in the Blocks tab deep-link into it.
@@ -64,7 +67,7 @@ struct AccountRow {
     key: String,
 }
 
-/// One recent block's coinbase (issuance + 90/9/1 split), in grains.
+/// One recent block's coinbase (issuance, paid entirely to the miner), in grains.
 #[derive(Clone, Default)]
 struct BlockRow {
     height: u64,
@@ -76,8 +79,6 @@ struct BlockRow {
     miner: String,
     reward: String,
     miner_amount: String,
-    treasury_amount: String,
-    dev_amount: String,
     /// Header identity + seal, for the in-app block-detail view (click a block in the
     /// Blocks tab). All from `sov_getBlockDigest`.
     hash: String,
@@ -214,7 +215,7 @@ fn short_pubkey(pk: &str) -> String {
     }
 }
 
-/// Whether `account` is a human-readable NAMED account (e.g. `ustreasury.tax.sov`)
+/// Whether `account` is a human-readable NAMED account (e.g. `name.reserve.sov`)
 /// rather than an implicit, key-derived hash id. This is the "named vs not yet"
 /// distinction surfaced in the wallet UI.
 fn is_named_account(account: &str) -> bool {
@@ -779,14 +780,9 @@ fn block_row(height: u64, digest: &Value) -> BlockRow {
         if let Some(Value::Array(recips)) = cb.get("recipients") {
             for r in recips {
                 let amt = field(r, "amount");
-                match r.get("role").and_then(Value::as_str).unwrap_or_default() {
-                    "miner" => {
-                        row.miner = field(r, "account");
-                        row.miner_amount = amt;
-                    }
-                    "treasury-tax" => row.treasury_amount = amt,
-                    "dev-tax" => row.dev_amount = amt,
-                    _ => {}
+                if r.get("role").and_then(Value::as_str) == Some("miner") {
+                    row.miner = field(r, "account");
+                    row.miner_amount = amt;
                 }
             }
         }
@@ -814,7 +810,7 @@ struct LoadedWallet {
     /// encrypted keystore.
     mnemonic: Option<String>,
     /// A NAMED account this wallet's key also controls (e.g. a genesis-bound
-    /// `ustreasury.tax.sov`). When set, send/activate/de-shield act AS this account,
+    /// `name.reserve.sov`). When set, send/activate/de-shield act AS this account,
     /// signing with the same key. `None` = operate the wallet's own implicit id.
     operate_as: Option<String>,
     /// Watch-only: added from a PUBLIC KEY with no private key on this machine, so
@@ -921,7 +917,7 @@ struct ShieldedView {
 }
 
 /// Cumulative coinbase your wallets have earned, summed from the chain's per-block
-/// coinbase (miner 90% + tax roles). Computed on demand (a full scan), cached here.
+/// coinbase (paid entirely to the miner). Computed on demand (a full scan), cached here.
 #[derive(Clone, Default)]
 struct EarningsView {
     computing: bool,
@@ -1526,7 +1522,7 @@ impl Station {
             htlc_lookup_id: String::new(),
             swaps_view: Arc::new(Mutex::new(SwapsView::default())),
             backup_mnemonic: None,
-            operate_as_field: "ustreasury.tax.sov".to_string(),
+            operate_as_field: String::new(),
             operate_msg: String::new(),
             name_field: String::new(),
             name_check: Arc::new(Mutex::new(NameCheck::default())),
@@ -5679,7 +5675,7 @@ impl Station {
             let effective = w.effective_account();
             let is_miner = self.mining_account.as_deref() == Some(account.as_str());
             // Name state, shown CONSISTENTLY for both kinds of name: a wallet
-            // operating AS a named account (e.g. ustreasury.tax.sov) and a wallet
+            // operating AS a named account (e.g. name.reserve.sov) and a wallet
             // with an SNS alias resolving to it (e.g. claude.sov) are BOTH "named".
             // SNS names are trusted only when the cache is for THIS account (avoids
             // a one-frame flash of the previous wallet's names after switching).
@@ -6146,7 +6142,7 @@ impl Station {
                             ui.label("Account");
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.operate_as_field)
-                                    .hint_text("ustreasury.tax.sov")
+                                    .hint_text("name.reserve.sov")
                                     .desired_width(220.0),
                             );
                             if ui.button("Attach").clicked() {
@@ -7080,7 +7076,12 @@ fn block_time(ts_ms: u64) -> String {
 
 fn blocks_panel(ui: &mut egui::Ui, s: &Snapshot, selected: &mut Option<u64>) {
     ui.heading("Blocks");
-    ui.label(egui::RichText::new("each block's coinbase — newly minted issuance and its 90% / 9% / 1% miner / U.S. Treasury / dev split").weak());
+    ui.label(
+        egui::RichText::new(
+            "each block's coinbase — newly minted issuance, paid entirely to the miner (no tax)",
+        )
+        .weak(),
+    );
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("click a height to inspect the block →").weak());
         ui.hyperlink_to("open explorer ↗", EXPLORER_URL);
@@ -7097,19 +7098,11 @@ fn blocks_panel(ui: &mut egui::Ui, s: &Snapshot, selected: &mut Option<u64>) {
     }
     egui::ScrollArea::vertical().show(ui, |ui| {
         egui::Grid::new("blocks")
-            .num_columns(7)
+            .num_columns(4)
             .striped(true)
             .spacing([18.0, 5.0])
             .show(ui, |ui| {
-                for h in [
-                    "Height",
-                    "Time",
-                    "Miner",
-                    "Coinbase",
-                    "Miner 90%",
-                    "Treasury 9%",
-                    "Dev 1%",
-                ] {
+                for h in ["Height", "Time", "Miner", "Coinbase"] {
                     ui.label(egui::RichText::new(h).weak());
                 }
                 ui.end_row();
@@ -7125,9 +7118,6 @@ fn blocks_panel(ui: &mut egui::Ui, s: &Snapshot, selected: &mut Option<u64>) {
                     ui.monospace(block_time(b.timestamp_ms));
                     ui.monospace(short(&b.miner));
                     ui.monospace(xus(&b.reward));
-                    ui.monospace(xus(&b.miner_amount));
-                    ui.monospace(xus(&b.treasury_amount));
-                    ui.monospace(xus(&b.dev_amount));
                     ui.end_row();
                 }
             });
@@ -7186,13 +7176,7 @@ fn block_detail_window(ctx: &egui::Context, b: &BlockRow, selected: &mut Option<
                 .show(ui, |ui| {
                     kv(ui, "Reward", &format!("{} XUS", xus(&b.reward)));
                     kv_copy(ui, "Miner", &b.miner);
-                    kv(ui, "Miner 90%", &format!("{} XUS", xus(&b.miner_amount)));
-                    kv(
-                        ui,
-                        "Treasury 9%",
-                        &format!("{} XUS", xus(&b.treasury_amount)),
-                    );
-                    kv(ui, "Dev 1%", &format!("{} XUS", xus(&b.dev_amount)));
+                    kv(ui, "To miner", &format!("{} XUS", xus(&b.miner_amount)));
                 });
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -9141,9 +9125,7 @@ mod tests {
             "coinbase": {
                 "reward": "1250000000000",
                 "recipients": [
-                    { "role": "miner", "account": "miner.acct", "amount": "1125000000000" },
-                    { "role": "treasury-tax", "account": "f", "amount": "112500000000" },
-                    { "role": "dev-tax", "account": "d", "amount": "12500000000" },
+                    { "role": "miner", "account": "miner.acct", "amount": "1250000000000" },
                 ],
             },
         });
@@ -9157,7 +9139,8 @@ mod tests {
         assert_eq!(row.tx_count, 2);
         assert_eq!(row.miner, "miner.acct");
         assert_eq!(row.reward, "1250000000000");
-        assert_eq!(row.miner_amount, "1125000000000");
+        // The entire coinbase goes to the miner — no tax.
+        assert_eq!(row.miner_amount, "1250000000000");
         // Missing optional fields degrade gracefully (no panic, sensible defaults).
         let bare = block_row(0, &serde_json::json!({}));
         assert_eq!(bare.height, 0);

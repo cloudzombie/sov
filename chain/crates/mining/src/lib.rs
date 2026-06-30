@@ -32,7 +32,7 @@ pub use sov_pow::{PowAlgo, Target};
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
-use sov_primitives::{AccountId, Balance};
+use sov_primitives::Balance;
 
 /// The resolved **post-quantum sunset schedule** (the Q-day runbook as
 /// consensus policy, Phase 18 p18-i3). Once a chain's miner-signaled
@@ -101,22 +101,6 @@ pub struct MiningPolicy {
     /// Transaction-fee price per unit of gas, in grains: a sender pays
     /// `gas_used × gas_price`. `0` disables fees. Governance-tunable.
     pub gas_price: Balance,
-    /// Fraction of **every coinbase AND every transaction fee** paid to the
-    /// [`tax_primary_recipient`](Self::tax_primary_recipient), in basis points
-    /// (0..=10000). Nothing is burned: the block's miner keeps whatever remains
-    /// after the primary and secondary tax cuts.
-    pub tax_primary_bps: u16,
-    /// Fraction of **every coinbase AND every transaction fee** paid to the
-    /// [`tax_secondary_recipient`](Self::tax_secondary_recipient), in basis
-    /// points (0..=10000).
-    pub tax_secondary_bps: u16,
-    /// Account that receives the primary tax cut of every coinbase and fee — a
-    /// consensus constant fixed at genesis (hardcoded on mainnet). The tax is a
-    /// perpetual protocol allocation; SOV is therefore NOT a pure fair-launch
-    /// coin (cf. Bitcoin), though every coin is still mined (no pre-mine).
-    pub tax_primary_recipient: AccountId,
-    /// Account that receives the secondary tax cut of every coinbase and fee.
-    pub tax_secondary_recipient: AccountId,
     /// BIP-110: the maximum bytes of arbitrary data a transaction may carry (its
     /// `Deploy` contract code), keeping block space reserved for monetary use
     /// rather than data storage. `0` means no limit.
@@ -181,17 +165,10 @@ impl MiningPolicy {
             halving_interval_blocks: 840_000,
             mining_budget_grains: sov_primitives::MAX_SUPPLY_GRAINS,
             target_block_ms: 150_000, // 2.5-minute blocks (Zcash's cadence ⇒ ~4-year halvings)
-            // Fees are live: a 21,000-gas transfer costs ~0.0021 SOV. Every
-            // coinbase and every fee is taxed 9% to the U.S. Treasury reserve
-            // (dedicated to retiring the national debt) and 1% to the dev fund
-            // (perpetual); the miner keeps the remaining 90%. Nothing is burned.
-            // The recipients are PLACEHOLDERS until mainnet launch, when the real
-            // addresses are hardcoded here forever.
+            // Fees are live: a 21,000-gas transfer costs ~0.0021 SOV. The entire
+            // coinbase AND every fee go to the block's miner — no tax, nothing
+            // burned (pure Nakamoto).
             gas_price: Balance::from_grains(10),
-            tax_primary_bps: 900,   // 9% → U.S. Treasury (national-debt reserve)
-            tax_secondary_bps: 100, // 1% → dev fund (patriot.tax.sov)
-            tax_primary_recipient: AccountId::new("ustreasury.tax.sov").expect("valid account id"),
-            tax_secondary_recipient: AccountId::new("patriot.tax.sov").expect("valid account id"),
             max_code_bytes: 256 * 1024, // 256 KiB (BIP-110)
             // Drain limiter ON: at 2.5-minute blocks, 576 blocks ≈ one day; at most
             // 21,000 SOV (0.1% of the 21M cap) can leave the pool per day even
@@ -221,13 +198,9 @@ impl MiningPolicy {
                 .grains(),
             target_block_ms: 1_000,
             // Fees OFF in the test preset (gas_price 0) so existing balance
-            // assertions are unaffected; the fee/tax/split logic is exercised by
-            // dedicated tests that set a non-zero gas_price and tax bps.
+            // assertions are unaffected; the fee logic is exercised by dedicated
+            // tests that set a non-zero gas_price.
             gas_price: Balance::ZERO,
-            tax_primary_bps: 0,
-            tax_secondary_bps: 0,
-            tax_primary_recipient: AccountId::new("ustreasury.tax.sov").expect("valid account id"),
-            tax_secondary_recipient: AccountId::new("patriot.tax.sov").expect("valid account id"),
             max_code_bytes: 256 * 1024,
             // Limiter OFF in the test preset; the dedicated rate-limit tests
             // enable it explicitly.
@@ -251,10 +224,6 @@ mod tests {
             mining_budget_grains: Balance::from_sov(1_000_000).unwrap().grains(),
             target_block_ms: 1_000,
             gas_price: Balance::ZERO,
-            tax_primary_bps: 0,
-            tax_secondary_bps: 0,
-            tax_primary_recipient: AccountId::new("ustreasury.tax.sov").expect("valid account id"),
-            tax_secondary_recipient: AccountId::new("patriot.tax.sov").expect("valid account id"),
             max_code_bytes: 256 * 1024,
             deshield_window_blocks: 0,
             deshield_limit_grains: 0,
@@ -325,10 +294,6 @@ mod tests {
             mining_budget_grains: budget,
             target_block_ms: 1_000,
             gas_price: Balance::ZERO,
-            tax_primary_bps: 0,
-            tax_secondary_bps: 0,
-            tax_primary_recipient: AccountId::new("ustreasury.tax.sov").expect("valid account id"),
-            tax_secondary_recipient: AccountId::new("patriot.tax.sov").expect("valid account id"),
             max_code_bytes: 256 * 1024,
             deshield_window_blocks: 0,
             deshield_limit_grains: 0,

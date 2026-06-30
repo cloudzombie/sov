@@ -16,7 +16,7 @@ The first cross-machine SOV network — a faithful mainnet rehearsal.
 | `chain_id` | `sov-testnet-1` | distinct from `sov-mainnet` |
 | `policy` | `mainnet_like` | **no pre-mine** — the whole 21M cap is mined |
 | emission | 12.5 XUS / block, halving every 840,000 blocks | identical to mainnet |
-| tax | 5% founder / 2% dev / 93% miner, on coinbase **and** fees, **no burn** | identical to mainnet |
+| coinbase | 100% to the miner, on coinbase **and** fees, **no tax, no burn** | identical to mainnet |
 | `pow` | `sha256d` | single-box mineable; isolates consensus/networking from RandomX build complexity. The **RandomX dress rehearsal** before mainnet flips this to `randomx`. |
 | `block_time_ms` | `60000` | 60-second blocks for a watchable testnet |
 | accounts | one anchor `genesis.node.sov`, **balance 0** | genesis needs ≥1 account to fix the hash; zero balance = no pre-mine. Its key is derived from the documented seed `sha256("sov-testnet-1:genesis-anchor:v1")` and holds nothing forever — it is a public, throwaway anchor, not anyone's wallet. |
@@ -80,6 +80,5 @@ block hashes and identical `{mined,total}` supply.
 ## Mainnet
 
 `sov-mainnet` will be the same shape with `chain_id: sov-mainnet`, `pow:
-randomx`, the mainnet block time, and the **real** founder/dev tax recipients
-hardcoded — frozen and pinned the same way, only after testnet-1 validates the
+randomx`, the mainnet block time — frozen and pinned the same way, only after testnet-1 validates the
 wallet end to end.

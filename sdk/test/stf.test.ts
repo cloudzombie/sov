@@ -39,10 +39,6 @@ interface VecAccount {
 interface StfVector {
   policy: {
     gas_price: string;
-    tax_primary_bps: number;
-    tax_secondary_bps: number;
-    tax_primary_recipient: string;
-    tax_secondary_recipient: string;
     max_code_bytes: number;
     base_reward: string;
     halving_interval_blocks: number;
@@ -75,11 +71,7 @@ const toAccountState = (a: VecAccount): AccountState => ({
 const ctx: BlockContext = {
   height: vec.context.height,
   gasPrice: BigInt(vec.policy.gas_price),
-  taxPrimaryBps: vec.policy.tax_primary_bps,
-  taxSecondaryBps: vec.policy.tax_secondary_bps,
   maxCodeBytes: vec.policy.max_code_bytes,
-  taxPrimaryRecipient: vec.policy.tax_primary_recipient,
-  taxSecondaryRecipient: vec.policy.tax_secondary_recipient,
   miner: vec.context.miner,
   baseReward: BigInt(vec.policy.base_reward),
   halvingIntervalBlocks: BigInt(vec.policy.halving_interval_blocks),
@@ -119,22 +111,17 @@ function freshLedger(): Ledger {
 }
 
 describe("cross-impl STF re-execution (byte-for-byte parity with the Rust node)", () => {
-  it("mints the Bitcoin-schedule coinbase, taxed 5%/2%, before the transactions", () => {
+  it("mints the Bitcoin-schedule coinbase entirely to the miner before the transactions", () => {
     const ledger = freshLedger();
     const reward = applyCoinbase(ledger, ctx);
-    // Independently derived subsidy equals the node's minted amount (the TOTAL,
-    // before the tax split)...
+    // Independently derived subsidy equals the node's minted amount...
     expect(reward.toString()).toBe(vec.coinbase.reward);
     // ...the whole reward is newly issued (mined counter advances by the total)...
     expect(ledger.minedEmittedGrains()).toBe(reward);
-    // ...and it is split: 5% founder, 2% dev, the rest to the miner.
-    const primary = (reward * BigInt(ctx.taxPrimaryBps)) / 10_000n;
-    const secondary = (reward * BigInt(ctx.taxSecondaryBps)) / 10_000n;
+    // ...and the ENTIRE reward goes to the miner — no tax, nothing burned.
     const find = (id: string) =>
       BigInt(ledger.accountStates().find((a) => a.id === id)?.account.balance ?? 0n);
-    expect(find(vec.coinbase.miner)).toBe(reward - primary - secondary);
-    expect(find(ctx.taxPrimaryRecipient)).toBe(primary);
-    expect(find(ctx.taxSecondaryRecipient)).toBe(secondary);
+    expect(find(vec.coinbase.miner)).toBe(reward);
   });
 
   it("derives the same post-state state_root", () => {

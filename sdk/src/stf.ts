@@ -16,8 +16,8 @@
  *
  * SCOPE (honest, and the inherent boundary of a TS client). It re-executes the
  * full DETERMINISTIC TRANSPARENT STF: Transfer, ClaimVesting,
- * Deploy, HtlcLock/Claim/Refund, the fee model (5%/2% tax to the founder/dev
- * recipients, miner keeps the rest; no burn), and authentication/authorization/
+ * Deploy, HtlcLock/Claim/Refund, the fee model (the whole fee to the miner; no tax,
+ * no burn), and authentication/authorization/
  * nonce/replay checks. It
  * does NOT re-execute the three actions that depend on an audited external engine
  * the project deliberately delegates to (re-implementing them in TS would
@@ -54,17 +54,9 @@ export interface BlockContext {
   height: number | bigint;
   /** Per-gas price in grains; `0n` disables fees. */
   gasPrice: bigint;
-  /** Basis points of every coinbase and fee paid to the primary tax recipient. */
-  taxPrimaryBps: number;
-  /** Basis points of every coinbase and fee paid to the secondary tax recipient. */
-  taxSecondaryBps: number;
   /** BIP-110 cap on `Deploy` code bytes; `0` disables the cap. */
   maxCodeBytes: number;
-  /** Primary tax recipient (founder) — a cut of every coinbase and fee. */
-  taxPrimaryRecipient: string;
-  /** Secondary tax recipient (dev fund) — a cut of every coinbase and fee. */
-  taxSecondaryRecipient: string;
-  /** The block's miner — collects the miner share of fees AND the coinbase. */
+  /** The block's miner — collects the ENTIRE coinbase AND every fee (no tax). */
   miner: string;
   /** Coinbase base subsidy in grains (height-1 reward before any halving). */
   baseReward?: bigint;
@@ -474,15 +466,10 @@ function applyAction(
   }
 }
 
-/** Split `fee` 5%/2%/93% to the tax recipients and the miner. No burn. */
+/** Pay `fee` to the miner. No tax, no burn — pure Nakamoto. */
 function distributeFee(ledger: Ledger, ctx: BlockContext, fee: bigint): void {
   if (fee === 0n) return;
-  const primary = (fee * BigInt(ctx.taxPrimaryBps)) / 10_000n;
-  const secondary = (fee * BigInt(ctx.taxSecondaryBps)) / 10_000n;
-  const minerCut = fee - primary - secondary;
-  ledger.credit(ctx.taxPrimaryRecipient, primary);
-  ledger.credit(ctx.taxSecondaryRecipient, secondary);
-  ledger.credit(ctx.miner, minerCut);
+  ledger.credit(ctx.miner, fee);
 }
 
 // --- Coinbase / emission (mirror mining/lib.rs + runtime apply_coinbase) ----
@@ -520,13 +507,8 @@ export function rewardAt(height: bigint, mined: bigint, ctx: BlockContext): bigi
 export function applyCoinbase(ledger: Ledger, ctx: BlockContext): bigint {
   const reward = rewardAt(BigInt(ctx.height), ledger.minedEmittedGrains(), ctx);
   if (reward === 0n) return 0n;
-  // The coinbase is taxed exactly like a fee; the whole reward is newly issued.
-  const primary = (reward * BigInt(ctx.taxPrimaryBps)) / 10_000n;
-  const secondary = (reward * BigInt(ctx.taxSecondaryBps)) / 10_000n;
-  const minerCut = reward - primary - secondary;
-  ledger.credit(ctx.taxPrimaryRecipient, primary);
-  ledger.credit(ctx.taxSecondaryRecipient, secondary);
-  ledger.credit(ctx.miner, minerCut);
+  // The ENTIRE coinbase goes to the miner — no tax, nothing burned (pure Nakamoto).
+  ledger.credit(ctx.miner, reward);
   ledger.addMinedEmitted(reward);
   return reward;
 }

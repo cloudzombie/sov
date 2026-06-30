@@ -56,7 +56,7 @@ Useful `gen` flags:
 
 - `--miners N` — number of local miner nodes (default 2).
 - `--policy mainnet-like` (default) — **no pre-mine**: the whole 21M cap is mined via the
-  coinbase (12.5 XUS/block, 5%/2% founder/dev tax). `--policy test` is the plumbing-only
+  coinbase (12.5 XUS/block, paid entirely to the miner; no tax). `--policy test` is the plumbing-only
   shortcut whose preset has no emission, so it pre-funds a faucet for spendable coins.
 - `--block-time-ms 60000` (default) — consensus target + daemon cadence. Use `150000`
   for the exact mainnet cadence (~2.5-min blocks).

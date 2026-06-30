@@ -1219,42 +1219,15 @@ fn settle_contract_token_transfers(
     Ok(())
 }
 
-/// Split `fee` between the two tax recipients and the block's miner: the primary
-/// tax cut, the secondary tax cut, then the miner keeps the remainder. **Nothing
-/// is burned** — every grain of every fee is paid out. A no-op when `fee` is
-/// zero.
+/// Pay `fee` to the block's miner. There is no tax and **nothing is burned** —
+/// every grain of every fee goes to whoever found the block (pure Nakamoto). A
+/// no-op when `fee` is zero.
 fn distribute_fee(
     ledger: &mut Ledger,
     ctx: &BlockContext<'_>,
     fee: Balance,
 ) -> Result<(), ExecutionError> {
-    if fee == Balance::ZERO {
-        return Ok(());
-    }
-    let grains = fee.grains();
-    let primary = grains
-        .checked_mul(u128::from(ctx.mining.tax_primary_bps))
-        .ok_or(ExecutionError::Overflow)?
-        / 10_000;
-    let secondary = grains
-        .checked_mul(u128::from(ctx.mining.tax_secondary_bps))
-        .ok_or(ExecutionError::Overflow)?
-        / 10_000;
-    // tax_primary_bps + tax_secondary_bps ≤ 10_000, so this never underflows.
-    let miner_cut = grains - primary - secondary;
-
-    credit(
-        ledger,
-        &ctx.mining.tax_primary_recipient,
-        Balance::from_grains(primary),
-    )?;
-    credit(
-        ledger,
-        &ctx.mining.tax_secondary_recipient,
-        Balance::from_grains(secondary),
-    )?;
-    credit(ledger, &ctx.miner, Balance::from_grains(miner_cut))?;
-    Ok(())
+    credit(ledger, &ctx.miner, fee)
 }
 
 /// Credit `amount` to `id`'s liquid balance (a fresh read-modify-write).
@@ -1580,30 +1553,9 @@ pub fn apply_coinbase(
         return Ok(Balance::ZERO);
     }
     let mint = |l: &mut Ledger| -> Result<(), ExecutionError> {
-        // The coinbase is taxed exactly like a fee: primary + secondary cuts off
-        // the top, miner keeps the rest. The WHOLE reward is newly issued
-        // regardless of the split, so `mined_emitted` advances by the full amount.
-        let grains = reward.grains();
-        let primary = grains
-            .checked_mul(u128::from(ctx.mining.tax_primary_bps))
-            .ok_or(ExecutionError::Overflow)?
-            / 10_000;
-        let secondary = grains
-            .checked_mul(u128::from(ctx.mining.tax_secondary_bps))
-            .ok_or(ExecutionError::Overflow)?
-            / 10_000;
-        let miner_cut = grains - primary - secondary;
-        credit(
-            l,
-            &ctx.mining.tax_primary_recipient,
-            Balance::from_grains(primary),
-        )?;
-        credit(
-            l,
-            &ctx.mining.tax_secondary_recipient,
-            Balance::from_grains(secondary),
-        )?;
-        credit(l, &ctx.miner, Balance::from_grains(miner_cut))?;
+        // The ENTIRE coinbase goes to the miner — no tax, nothing burned (pure
+        // Nakamoto issuance). `mined_emitted` advances by the full reward.
+        credit(l, &ctx.miner, reward)?;
         l.add_mined_emitted(reward)
             .ok_or(ExecutionError::Overflow)?;
         Ok(())
@@ -2131,9 +2083,7 @@ mod tests {
             r#"(module (memory (export "memory") 1) (func (export "call") (result i32) (i32.const 7)))"#,
         )
         .unwrap();
-        let mut p = policy();
-        p.tax_primary_bps = 900; // 9% U.S. Treasury (national-debt reserve)
-        p.tax_secondary_bps = 100; // 1% dev
+        let p = policy();
         let mut ledger = Ledger::new();
         ledger.set_account(
             &id("dev.sov"),
@@ -2193,30 +2143,17 @@ mod tests {
         };
         let caller_before = ledger.account(&id("usa.reserve.sov")).balance.grains();
         let miner_before = ledger.account(&id("miner.sov")).balance.grains();
-        let treasury_before = ledger.account(&id("ustreasury.tax.sov")).balance.grains();
-        let dev_before = ledger.account(&id("patriot.tax.sov")).balance.grains();
         let receipt = apply_transaction(&mut ledger, &call, &bctx).unwrap();
         assert!(receipt.succeeded());
 
-        // The caller paid a positive gas fee, split 9% U.S. Treasury / 1% dev /
-        // 90% miner. NOTHING is burned — every grain of the fee is paid out.
+        // The caller paid a positive gas fee, and the WHOLE fee goes to the miner —
+        // no tax, nothing burned (pure Nakamoto).
         let fee = caller_before - ledger.account(&id("usa.reserve.sov")).balance.grains();
         assert!(fee > 0, "a gas fee should have been charged");
-        let treasury_delta =
-            ledger.account(&id("ustreasury.tax.sov")).balance.grains() - treasury_before;
-        let dev_delta = ledger.account(&id("patriot.tax.sov")).balance.grains() - dev_before;
         let miner_delta = ledger.account(&id("miner.sov")).balance.grains() - miner_before;
-        assert_eq!(treasury_delta, fee * 900 / 10_000, "9% U.S. Treasury tax");
-        assert_eq!(dev_delta, fee * 100 / 10_000, "1% dev tax");
         assert_eq!(
-            miner_delta,
-            fee - treasury_delta - dev_delta,
-            "miner keeps the remaining 90%"
-        );
-        assert_eq!(
-            treasury_delta + dev_delta + miner_delta,
-            fee,
-            "the whole fee is paid out (no burn)"
+            miner_delta, fee,
+            "the miner receives the entire fee (no tax, no burn)"
         );
     }
 

@@ -8,10 +8,9 @@ SOV is a sovereign reserve-asset L1: **no premine, no investor allocation** —
 every coin is mined. Consensus is **pure Nakamoto proof-of-work** — Bitcoin's
 model, verbatim: blocks are sealed by proof of work, the heaviest-work chain
 wins, finality is confirmation depth, and the block **coinbase is the only
-issuance path** (genesis supply is exactly zero). A perpetual protocol tax routes
-**5% to the founder and 2% to a dev fund** out of every coinbase **and** every
-fee (the miner keeps the remaining 93%), so SOV is *not* a pure Bitcoin-style
-fair launch — but nothing is pre-mined and the 21M cap is absolute. The mainnet
+issuance path** (genesis supply is exactly zero). The entire coinbase **and** every
+fee go to the block's miner — no tax, no burn, a pure Bitcoin-style fair launch;
+nothing is pre-mined and the 21M cap is absolute. The mainnet
 seal is **RandomX** (Monero's memory-hard,
 CPU-optimized algorithm) so commodity machines — **Apple M-series included** —
 mine fairly and the chain resists ASIC capture. On top of that sound-money base
@@ -112,7 +111,7 @@ series sums to **20,999,999.9076 XUS** — strictly under the 21M cap — so the
 budget backstop is never actually reached; after the subsidy decays the chain
 runs on fees. At the 2.5-minute cadence a halving falls roughly every 4 years,
 and half of all SOV is mined in the first ~4 years. Every coinbase **and** every
-fee is then split **5% founder / 2% dev / 93% miner** — no burn.
+fee goes **entirely to the block's miner** — no tax, no burn (pure Nakamoto).
 
 Emission is driven by one monotonic, **state-root-committed** counter,
 `mined_emitted` ([`crates/state/src/ledger.rs`](crates/state/src/ledger.rs)) —
@@ -146,7 +145,7 @@ with `grep -A1 ^name crates/*/Cargo.toml`.
 | [`sov-runtime`](crates/runtime/src/lib.rs) | The execution layer: applies the coinbase + transactions to the ledger, meters gas, and produces receipts. |
 | [`sov-mempool`](crates/mempool/src/lib.rs) | The transaction pool: validated, nonce-ordered pending transactions awaiting inclusion. |
 | [`sov-pow`](crates/pow/src/lib.rs) | Proof-of-work primitives: the **RandomX** (mainnet) / SHA-256d (dev) seal as a genesis-fixed `PowAlgo`, 256-bit difficulty `Target`s with Bitcoin's compact **nBits** codec, and meets-target verification. |
-| [`sov-mining`](crates/mining/src/lib.rs) | Mining policy: the difficulty target, **height-keyed coinbase emission** (12.5 SOV halving every 840,000 blocks, budget-capped, no pre-mine), the 5%/2% founder/dev tax split, and cumulative proof-of-work (`Work`) accounting for fork choice. |
+| [`sov-mining`](crates/mining/src/lib.rs) | Mining policy: the difficulty target, **height-keyed coinbase emission** (12.5 SOV halving every 840,000 blocks, budget-capped, no pre-mine), and cumulative proof-of-work (`Work`) accounting for fork choice. |
 | [`sov-network`](crates/network/src/lib.rs) | Peer-to-peer layer: Noise-encrypted gossip transport (blocks, transactions) with channel binding and DoS guards. |
 | [`sov-node`](crates/node/src/lib.rs) | The node: drives mempool, continuous mining, and block import into a running chain; ships a local devnet binary. |
 | [`sov-chain`](crates/chain/src/lib.rs) | Genesis construction + the validated block-import state machine: **heaviest-work fork choice with reorg**, confirmation-depth finality, and the seal/difficulty rules tying state, execution, and consensus together. |
@@ -356,8 +355,7 @@ The on-chain integration is wired end-to-end: `Account` carries optional
 `code: Option<Vec<u8>>`, the ledger carries per-contract storage committed
 to `state_root`, and `sov-types` defines `Action::Deploy { code }` and
 `Action::Call { contract, gas_limit }`. The runtime charges the caller
-`vm_gas_used × gas_price`, paid out via the protocol tax split (5% founder /
-2% dev / 93% miner) — nothing is burned.
+`vm_gas_used × gas_price`, paid entirely to the miner — no tax, nothing is burned.
 
 Guest contracts live in the separate [`chain/contracts/`](contracts/) `no_std`
 workspace; the committed [`crates/vm/tests/counter.wasm`](crates/vm/tests/counter.wasm)

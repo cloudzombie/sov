@@ -404,10 +404,6 @@ fn stf_vector() -> Value {
     json!({
         "policy": {
             "gas_price": mining.gas_price.grains().to_string(),
-            "tax_primary_bps": mining.tax_primary_bps,
-            "tax_secondary_bps": mining.tax_secondary_bps,
-            "tax_primary_recipient": mining.tax_primary_recipient.as_str(),
-            "tax_secondary_recipient": mining.tax_secondary_recipient.as_str(),
             "max_code_bytes": mining.max_code_bytes,
             // Emission schedule: the SDK reproduces the coinbase from these —
             // 12.5-XUS base, halving every 840,000 blocks, full-cap budget.
