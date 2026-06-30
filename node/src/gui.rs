@@ -3651,57 +3651,54 @@ impl eframe::App for Station {
                     }
                 }
                 ui.separator();
-                // Sandbox controls (self-mine + destructive reset) exist ONLY on a
-                // sandbox network. On mainnet there is no "reset" — a real chain is
-                // never wipeable from the wallet — so these are simply absent.
-                if self.network.is_sandbox() {
-                    if self.local_node_running() {
-                        if ui.button("Stop local node").clicked() {
-                            self.stop_local_node();
-                        }
-                    } else {
-                        // Mining is bound to a wallet: disable until one is active,
-                        // and name the target so it's unmistakable which earns.
-                        let target = self.wallets.get(self.selected).map(|w| w.label.clone());
-                        let enabled = target.is_some();
-                        let btn = ui.add_enabled(enabled, egui::Button::new("Start local node"));
-                        let btn = match &target {
-                            Some(l) => {
-                                btn.on_hover_text(format!("mines to “{l}” (the active wallet)"))
-                            }
-                            None => btn.on_hover_text("create or open a wallet first"),
-                        };
-                        if btn.clicked() {
-                            self.start_local_node();
-                        }
-                        if ui
-                            .button("Reset local chain")
-                            .on_hover_text(
-                                "Sandbox only. Wipe the local chain back to genesis (height 0). \
-                                 Use after a genesis change or to clear coins mined to an old \
-                                 account.",
-                            )
-                            .clicked()
-                        {
-                            self.reset_local_chain();
-                        }
-                        // VISIBLE guidance (not just a hover) for the most common
-                        // first-run confusion: a greyed "Start" because there is no
-                        // wallet yet. A node must mine to a wallet you control.
-                        if !enabled {
-                            ui.label(
-                                egui::RichText::new(
-                                    "← create or import a wallet in the Wallet tab first \
-                                     (a node mines to a wallet you control)",
-                                )
-                                .color(palette::warning()),
-                            );
-                        }
+                // A local node runs IN-STATION on BOTH networks: tap Start and it mines
+                // this network's chain (testnet sandbox OR the real mainnet genesis) to
+                // the active wallet — same flow either way. (Reset wipes only THIS
+                // machine's local copy; on mainnet it simply re-syncs/re-mines.)
+                if self.local_node_running() {
+                    if ui.button("Stop local node").clicked() {
+                        self.stop_local_node();
                     }
                 } else {
-                    ui.label(
-                        egui::RichText::new("connect to a mainnet node via the RPC field").weak(),
-                    );
+                    // Mining is bound to a wallet: disable until one is active,
+                    // and name the target so it's unmistakable which earns.
+                    let target = self.wallets.get(self.selected).map(|w| w.label.clone());
+                    let enabled = target.is_some();
+                    let label = format!("Start local node ({})", self.network.label());
+                    let btn = ui.add_enabled(enabled, egui::Button::new(label));
+                    let btn = match &target {
+                        Some(l) => btn.on_hover_text(format!(
+                            "mines the {} chain to “{l}” (the active wallet)",
+                            self.network.label()
+                        )),
+                        None => btn.on_hover_text("create or open a wallet first"),
+                    };
+                    if btn.clicked() {
+                        self.start_local_node();
+                    }
+                    if ui
+                        .button("Reset local chain")
+                        .on_hover_text(
+                            "Wipe THIS machine's local chain back to genesis (height 0). \
+                             Only affects local data — on mainnet the node simply re-syncs \
+                             from peers afterward.",
+                        )
+                        .clicked()
+                    {
+                        self.reset_local_chain();
+                    }
+                    // VISIBLE guidance (not just a hover) for the most common
+                    // first-run confusion: a greyed "Start" because there is no
+                    // wallet yet. A node must mine to a wallet you control.
+                    if !enabled {
+                        ui.label(
+                            egui::RichText::new(
+                                "← create or import a wallet in the Wallet tab first \
+                                 (a node mines to a wallet you control)",
+                            )
+                            .color(palette::warning()),
+                        );
+                    }
                 }
                 // Live status derived from the ACTUAL in-process run state, so it
                 // always reflects reality — "starting (replaying)" instead of a bare
