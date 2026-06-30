@@ -893,10 +893,22 @@ impl Blockchain {
                 reverted_txs,
             })
         } else {
-            // A valid block on a lighter side branch: fully replay its branch and
-            // check committed roots before keeping it. Proof of work alone is not
-            // enough to make an invalid full block durable or gossipable.
-            let _ = self.rebuild_branch(&block, &cand)?;
+            // A valid block on a LIGHTER side branch. It must still be FULLY validated —
+            // executed, with its committed roots AND the protocol invariants checked —
+            // before we store or gossip it: proof of work alone can never make a
+            // fabricated block durable. FAST PATH: validate the branch INCREMENTALLY from
+            // the fork point (the SAME end-to-end check the active path runs), then
+            // restore the active chain since the branch is lighter — O(reorg depth), no
+            // genesis replay. FALLBACK: when the fork predates the undo window, replay the
+            // whole branch from genesis. Either way an invalid block is rejected and never
+            // stored, so the defense is identical — only the cost changes.
+            match self.try_incremental_side_branch(&block, &cand) {
+                Some(Ok(())) => {}
+                Some(Err(e)) => return Err(e),
+                None => {
+                    let _ = self.rebuild_branch(&block, &cand)?;
+                }
+            }
             self.insert_entry(block, &cand);
             Ok(Imported::empty())
         }
@@ -1501,6 +1513,76 @@ impl Blockchain {
             receipts: tip_receipts,
             reverted_txs,
         }))
+    }
+
+    /// **Incremental side-branch validation** — the lighter-branch counterpart of
+    /// [`try_incremental_reorg`](Self::try_incremental_reorg). A valid block on a branch
+    /// LIGHTER than the active chain must still be fully validated (executed, with its
+    /// committed roots and the protocol invariants checked) before it is stored or
+    /// gossiped — proof of work alone can never make a fabricated block durable. This
+    /// does that validation INCREMENTALLY: disconnect the active chain to the fork point
+    /// via undo logs, execute the side branch there (the SAME end-to-end check
+    /// [`connect_to_active`](Self::connect_to_active) runs on the active path), then —
+    /// because the branch is lighter — RESTORE the original active chain exactly
+    /// (deterministic re-execution). O(reorg depth), not O(chain length).
+    ///
+    /// Returns `Some(Ok(()))` when the branch validated (the caller stores the block),
+    /// `Some(Err)` when it is invalid (the caller rejects it — exactly as the
+    /// from-genesis replay would), and `None` when the fork predates the undo window, so
+    /// the caller falls back to the full genesis replay. The active chain is left
+    /// byte-for-byte unchanged in every case.
+    fn try_incremental_side_branch(
+        &mut self,
+        block: &Block,
+        cand: &Candidate,
+    ) -> Option<Result<(), ChainError>> {
+        let (fork_height, new_blocks) = self.locate_fork(block)?;
+        // The undo ring must cover every active block above the fork point; if the fork
+        // is deeper than the window, defer to the full genesis replay.
+        let depth = self.height().saturating_sub(fork_height);
+        if depth == 0 || (self.undo_ring.len() as u64) < depth {
+            return None;
+        }
+
+        // Roll the active chain back to the fork point (O(depth), via undo logs).
+        let old = self.disconnect_to(fork_height);
+
+        // Execute + validate every block on the side branch from the fork point. This is
+        // the SAME committed-roots + invariants check `connect_to_active` applies on the
+        // active path; the first invalid block rejects the whole branch. Receipts are
+        // discarded — these blocks are not joining the active chain.
+        let mut outcome: Result<(), ChainError> = Ok(());
+        for (i, b) in new_blocks.iter().enumerate() {
+            let is_tip = i + 1 == new_blocks.len();
+            let target = if is_tip {
+                cand.sha_target
+            } else {
+                match self.index.get(&b.hash()) {
+                    Some(e) => e.sha_target,
+                    None => {
+                        // An unindexed interior block (cannot normally happen): restore
+                        // and defer to the full replay rather than risk a partial state.
+                        self.disconnect_to(fork_height);
+                        self.reconnect(old);
+                        self.sync_active_difficulty();
+                        return None;
+                    }
+                }
+            };
+            if let Err(e) = self.connect_to_active(b, target) {
+                outcome = Err(e);
+                break;
+            }
+        }
+
+        // The branch is LIGHTER, so it is NEVER adopted: undo whatever was connected for
+        // validation and re-attach the original active chain exactly as it was. This runs
+        // identically whether validation passed or failed, so the active state is
+        // restored byte-for-byte either way.
+        self.disconnect_to(fork_height);
+        self.reconnect(old);
+        self.sync_active_difficulty();
+        Some(outcome)
     }
 
     /// Replay the entire branch tipped by `tip` from the genesis ledger,
@@ -3043,6 +3125,95 @@ mod tests {
         assert!(
             !node1.contains_block(&b1_hash),
             "invalid side branch was not inserted into the block index"
+        );
+    }
+
+    #[test]
+    fn incremental_side_branch_stores_without_changing_the_active_chain() {
+        // A VALID block on a LIGHTER side branch must be fully validated and stored, yet
+        // leave the active chain byte-for-byte unchanged. This exercises the incremental
+        // side-branch path: disconnect to the fork point, validate the branch, restore.
+        let mut node1 = fresh_chain();
+        let a1 = node1
+            .produce_block(vec![usa_transfer("ecb.reserve.sov", 100, 0)], 2_000)
+            .unwrap();
+        node1.import_block(a1.clone()).unwrap();
+        let a2 = node1.produce_block(vec![], 4_000).unwrap();
+        node1.import_block(a2.clone()).unwrap();
+
+        let head_before = node1.head().hash();
+        let height_before = node1.height();
+        let root_before = node1.ledger().state_root();
+
+        // A valid competing height-1 block built on genesis by an independent miner —
+        // one block of work < the active chain's two, so it is a lighter side branch.
+        let node2 = fresh_chain();
+        let b1 = node2
+            .produce_block(vec![usa_transfer("ecb.reserve.sov", 250, 0)], 3_000)
+            .unwrap();
+        let b1_hash = b1.hash();
+        assert_ne!(b1_hash, a1.hash());
+
+        let imported = node1.import_block(b1).unwrap();
+        assert!(imported.is_empty(), "a side-branch store commits nothing");
+        assert!(
+            node1.contains_block(&b1_hash),
+            "the valid side branch is stored"
+        );
+        assert_eq!(node1.height(), height_before, "active height unchanged");
+        assert_eq!(node1.head().hash(), head_before, "active head unchanged");
+        assert_eq!(
+            node1.ledger().state_root(),
+            root_before,
+            "the active state is restored byte-for-byte after side-branch validation"
+        );
+    }
+
+    #[test]
+    fn invalid_lighter_side_branch_is_rejected_and_active_chain_restored() {
+        // The defense, on the incremental path: an INVALID block on a lighter side branch
+        // (forged state root) is rejected and NOT stored, and the active chain is
+        // restored exactly — proof of work alone never makes a fabricated block durable.
+        let mut node1 = fresh_chain();
+        let a1 = node1
+            .produce_block(vec![usa_transfer("ecb.reserve.sov", 100, 0)], 2_000)
+            .unwrap();
+        node1.import_block(a1.clone()).unwrap();
+        let a2 = node1.produce_block(vec![], 4_000).unwrap();
+        node1.import_block(a2.clone()).unwrap();
+
+        let head_before = node1.head().hash();
+        let root_before = node1.ledger().state_root();
+
+        // A height-1 competitor with a forged state root, re-sealed so its PoW is valid.
+        let node2 = fresh_chain();
+        let mut b1 = node2
+            .produce_block(vec![usa_transfer("ecb.reserve.sov", 250, 0)], 3_000)
+            .unwrap();
+        b1.header.state_root = Hash::digest(b"forged lighter side branch");
+        let target = MiningPolicy::test().sha256d_target;
+        for nonce in 0.. {
+            b1.header.nonce = nonce;
+            if target.is_met_by(&b1.header.pow_hash()) {
+                break;
+            }
+        }
+        let b1_hash = b1.hash();
+
+        assert!(matches!(
+            node1.import_block(b1),
+            Err(ChainError::StateRootMismatch)
+        ));
+        assert!(
+            !node1.contains_block(&b1_hash),
+            "an invalid side branch is never stored"
+        );
+        assert_eq!(node1.height(), 2, "active height unchanged after rejection");
+        assert_eq!(node1.head().hash(), head_before, "active head unchanged");
+        assert_eq!(
+            node1.ledger().state_root(),
+            root_before,
+            "the active state is restored byte-for-byte after a rejected side branch"
         );
     }
 
