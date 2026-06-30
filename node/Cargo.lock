@@ -4191,6 +4191,7 @@ dependencies = [
 name = "sov-runtime"
 version = "0.0.0"
 dependencies = [
+ "borsh",
  "sha2 0.10.9",
  "sov-compliance",
  "sov-crypto",
@@ -4237,7 +4238,7 @@ dependencies = [
 
 [[package]]
 name = "sov-station"
-version = "0.1.56"
+version = "0.1.57"
 dependencies = [
  "chacha20poly1305",
  "eframe",
