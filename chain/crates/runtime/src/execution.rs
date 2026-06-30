@@ -329,32 +329,7 @@ pub fn apply_transaction(
     } else {
         match effective_action {
             Action::Transfer { to, amount } => {
-                // Resolve a `.sov` name to the owner's safe account (an SNS alias); an
-                // implicit id / existing / fresh account passes through unchanged.
-                let dest = resolve_recipient(ledger, to);
-                let to = &dest;
-                match signer.balance.checked_sub(*amount) {
-                    None => ExecutionStatus::Failed {
-                        reason: "insufficient balance".into(),
-                    },
-                    Some(remaining) => {
-                        if to == &tx.signer {
-                            // Self-transfer: funds stay put; only the nonce advanced.
-                            ExecutionStatus::Success
-                        } else {
-                            let mut recipient = ledger.account(to);
-                            match recipient.balance.checked_add(*amount) {
-                                None => return Err(ExecutionError::Overflow),
-                                Some(credited) => {
-                                    signer.balance = remaining;
-                                    recipient.balance = credited;
-                                    ledger.set_account(to, recipient);
-                                    ExecutionStatus::Success
-                                }
-                            }
-                        }
-                    }
-                }
+                do_transfer(ledger, &tx.signer, &mut signer, to, *amount)?
             }
             Action::ClaimVesting => {
                 if !signer.can_claim_vesting(ctx.height) {
@@ -1123,6 +1098,119 @@ pub fn apply_transaction(
             Action::MultisigExec { .. } => ExecutionStatus::Failed {
                 reason: "multisig: nested MultisigExec is not allowed".into(),
             },
+            // ── On-chain multisig coordination ───────────────────────────────────
+            // The member is `tx.signer` (their own key/nonce/fee); their signature on
+            // this very transaction IS their approval. The vault is named in `account`.
+            Action::ProposeMultisig { account, action } => {
+                match ledger.multisig_of(account).cloned() {
+                    None => ExecutionStatus::Failed {
+                        reason: "multisig: account has no multisig policy".into(),
+                    },
+                    Some(policy) => {
+                        let member = policy.signers.iter().position(|k| *k == tx.public_key);
+                        let inner = action.as_ref();
+                        match member {
+                            None => ExecutionStatus::Failed {
+                                reason: "multisig: signer is not a policy member".into(),
+                            },
+                            Some(_) if !is_proposable(inner) => ExecutionStatus::Failed {
+                                reason: "multisig: only a Transfer can be proposed".into(),
+                            },
+                            Some(idx) => {
+                                let action_bytes = borsh::to_vec(inner)
+                                    .expect("Action serialization is infallible");
+                                let key_bytes = borsh::to_vec(&tx.public_key)
+                                    .expect("PublicKey serialization is infallible");
+                                let id = proposal_id(account, &key_bytes, tx_nonce, &action_bytes);
+                                let prop = sov_state::MultisigProposal {
+                                    account: account.clone(),
+                                    action: action_bytes,
+                                    approvers: vec![idx as u16],
+                                };
+                                // Threshold already met (e.g. 1-of-N) → execute now,
+                                // never stored; otherwise store it pending.
+                                if (prop.approvers.len() as u16) >= policy.threshold {
+                                    execute_proposal_action(ledger, account, inner)?
+                                } else {
+                                    ledger.set_proposal(id, prop);
+                                    ExecutionStatus::Success
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Action::ApproveMultisig { account, proposal } => {
+                match ledger.multisig_of(account).cloned() {
+                    None => ExecutionStatus::Failed {
+                        reason: "multisig: account has no multisig policy".into(),
+                    },
+                    Some(policy) => {
+                        let member = policy.signers.iter().position(|k| *k == tx.public_key);
+                        let existing = ledger.proposal(proposal).cloned();
+                        match (member, existing) {
+                            (None, _) => ExecutionStatus::Failed {
+                                reason: "multisig: signer is not a policy member".into(),
+                            },
+                            (_, None) => ExecutionStatus::Failed {
+                                reason: "multisig: no such pending proposal".into(),
+                            },
+                            (Some(idx), Some(prop)) if prop.account != *account => {
+                                let _ = (idx, prop);
+                                ExecutionStatus::Failed {
+                                    reason: "multisig: proposal does not belong to this account"
+                                        .into(),
+                                }
+                            }
+                            (Some(idx), Some(mut prop)) => {
+                                let idx = idx as u16;
+                                if !prop.approvers.contains(&idx) {
+                                    prop.approvers.push(idx);
+                                }
+                                if (prop.approvers.len() as u16) >= policy.threshold {
+                                    // Enough approvals: execute AS the vault, then clear.
+                                    match borsh::from_slice::<Action>(&prop.action) {
+                                        Ok(inner) => {
+                                            let status =
+                                                execute_proposal_action(ledger, account, &inner)?;
+                                            ledger.remove_proposal(proposal);
+                                            status
+                                        }
+                                        Err(_) => ExecutionStatus::Failed {
+                                            reason: "multisig: corrupt stored proposal".into(),
+                                        },
+                                    }
+                                } else {
+                                    ledger.set_proposal(*proposal, prop);
+                                    ExecutionStatus::Success
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Action::CancelMultisig { account, proposal } => {
+                let is_member = ledger
+                    .multisig_of(account)
+                    .map(|p| p.signers.contains(&tx.public_key))
+                    .unwrap_or(false);
+                let belongs = ledger
+                    .proposal(proposal)
+                    .map(|p| p.account == *account)
+                    .unwrap_or(false);
+                if !is_member {
+                    ExecutionStatus::Failed {
+                        reason: "multisig: signer is not a policy member".into(),
+                    }
+                } else if !belongs {
+                    ExecutionStatus::Failed {
+                        reason: "multisig: no such pending proposal".into(),
+                    }
+                } else {
+                    ledger.remove_proposal(proposal);
+                    ExecutionStatus::Success
+                }
+            }
         }
     };
 
@@ -1242,6 +1330,93 @@ fn credit(ledger: &mut Ledger, id: &AccountId, amount: Balance) -> Result<(), Ex
         .ok_or(ExecutionError::Overflow)?;
     ledger.set_account(id, account);
     Ok(())
+}
+
+/// The native-SOV transfer primitive, parameterized by the paying account, so it
+/// serves both a normal `Transfer` (from = the tx signer) and an executed multisig
+/// proposal (from = the vault). `from_acct` is the loaded, mutable account of `from`;
+/// the caller commits it. Resolves a `.sov` recipient, checks the balance, and on
+/// success debits `from_acct` and credits the recipient. Byte-identical to the
+/// original inline `Transfer` arm.
+fn do_transfer(
+    ledger: &mut Ledger,
+    from: &AccountId,
+    from_acct: &mut sov_state::Account,
+    to: &AccountId,
+    amount: Balance,
+) -> Result<ExecutionStatus, ExecutionError> {
+    let dest = resolve_recipient(ledger, to);
+    let to = &dest;
+    match from_acct.balance.checked_sub(amount) {
+        None => Ok(ExecutionStatus::Failed {
+            reason: "insufficient balance".into(),
+        }),
+        Some(remaining) => {
+            if to == from {
+                // Self-transfer: funds stay put.
+                Ok(ExecutionStatus::Success)
+            } else {
+                let mut recipient = ledger.account(to);
+                match recipient.balance.checked_add(amount) {
+                    None => Err(ExecutionError::Overflow),
+                    Some(credited) => {
+                        from_acct.balance = remaining;
+                        recipient.balance = credited;
+                        ledger.set_account(to, recipient);
+                        Ok(ExecutionStatus::Success)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether `action` may be carried by an on-chain multisig proposal. v1 supports
+/// native-SOV transfers (the core vault use — a treasury or shared account paying
+/// out); arbitrary actions remain available via the legacy `MultisigExec` path.
+fn is_proposable(action: &Action) -> bool {
+    matches!(action, Action::Transfer { .. })
+}
+
+/// Deterministic id for a new proposal: domain-separated over the vault account, the
+/// proposer's key + nonce (globally unique ⇒ no collision), and the encoded action.
+/// Reproducible in replay (no dependency on the tx wrapper).
+fn proposal_id(
+    account: &AccountId,
+    proposer_key: &[u8],
+    proposer_nonce: u64,
+    action_bytes: &[u8],
+) -> Hash {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"sov:msprop:v1");
+    buf.push(0x00);
+    buf.extend_from_slice(account.as_str().as_bytes());
+    buf.push(0x00);
+    buf.extend_from_slice(proposer_key);
+    buf.extend_from_slice(&proposer_nonce.to_le_bytes());
+    buf.extend_from_slice(action_bytes);
+    Hash::digest(&buf)
+}
+
+/// Execute a pending proposal's stored action AS the vault `account` (load the vault,
+/// run the value transfer, commit it). Only [`is_proposable`] actions reach here.
+fn execute_proposal_action(
+    ledger: &mut Ledger,
+    account: &AccountId,
+    action: &Action,
+) -> Result<ExecutionStatus, ExecutionError> {
+    match action {
+        Action::Transfer { to, amount } => {
+            let mut vault = ledger.account(account);
+            let status = do_transfer(ledger, account, &mut vault, to, *amount)?;
+            ledger.set_account(account, vault);
+            Ok(status)
+        }
+        // Defensive: a non-proposable action should never have been stored.
+        _ => Ok(ExecutionStatus::Failed {
+            reason: "multisig: proposal carries an unsupported action".into(),
+        }),
+    }
 }
 
 /// One settleable leg of an intent swap: native SOV or an existing on-chain
@@ -4918,5 +5093,164 @@ mod tests {
             Balance::ZERO
         );
         assert_eq!(ledger.account(&id("attacker.sov")).balance, Balance::ZERO);
+    }
+
+    /// The implicit account string a key controls.
+    fn implicit(seed: [u8; 32]) -> String {
+        Keypair::from_seed(seed)
+            .public_key()
+            .implicit_account_id()
+            .to_string()
+    }
+
+    #[test]
+    fn onchain_proposal_executes_at_threshold() {
+        // 2-of-3 vault funded with 100. A member proposes a 10-SOV spend from their
+        // OWN account; a second member approves from theirs; the chain executes it AS
+        // the vault. No detached approvals — each member just signs one transaction.
+        let mut ledger = ledger_with_usa(100);
+        let p = policy();
+        let signers = vec![
+            Keypair::from_seed([1; 32]).public_key(),
+            Keypair::from_seed([2; 32]).public_key(),
+            Keypair::from_seed([3; 32]).public_key(),
+        ];
+        let set = signed(
+            [1; 32],
+            "usa.reserve.sov",
+            0,
+            Action::SetMultisig {
+                signers,
+                threshold: 2,
+            },
+        );
+        assert!(apply_transaction(&mut ledger, &set, &ctx(&p))
+            .unwrap()
+            .succeeded());
+
+        let inner = Action::Transfer {
+            to: id("ecb.reserve.sov"),
+            amount: Balance::from_sov(10).unwrap(),
+        };
+        // Member A (key 1) proposes from their own implicit account — 1 of 2; unspent.
+        let propose = signed(
+            [1; 32],
+            &implicit([1; 32]),
+            0,
+            Action::ProposeMultisig {
+                account: id("usa.reserve.sov"),
+                action: Box::new(inner.clone()),
+            },
+        );
+        assert!(apply_transaction(&mut ledger, &propose, &ctx(&p))
+            .unwrap()
+            .succeeded());
+        assert_eq!(
+            ledger.account(&id("usa.reserve.sov")).balance,
+            Balance::from_sov(100).unwrap(),
+            "nothing spent at 1 of 2"
+        );
+        let pending = ledger.proposals_for(&id("usa.reserve.sov"));
+        assert_eq!(pending.len(), 1, "one pending proposal");
+        let prop_id = pending[0].0;
+
+        // A non-member cannot approve.
+        let bad = signed(
+            [9; 32],
+            &implicit([9; 32]),
+            0,
+            Action::ApproveMultisig {
+                account: id("usa.reserve.sov"),
+                proposal: prop_id,
+            },
+        );
+        assert!(
+            !apply_transaction(&mut ledger, &bad, &ctx(&p))
+                .unwrap()
+                .succeeded(),
+            "a non-member's approval is rejected"
+        );
+
+        // Member B approves → threshold met → the chain executes AS the vault.
+        let approve = signed(
+            [2; 32],
+            &implicit([2; 32]),
+            0,
+            Action::ApproveMultisig {
+                account: id("usa.reserve.sov"),
+                proposal: prop_id,
+            },
+        );
+        assert!(apply_transaction(&mut ledger, &approve, &ctx(&p))
+            .unwrap()
+            .succeeded());
+        assert_eq!(
+            ledger.account(&id("usa.reserve.sov")).balance,
+            Balance::from_sov(90).unwrap(),
+            "vault debited 10"
+        );
+        assert_eq!(
+            ledger.account(&id("ecb.reserve.sov")).balance,
+            Balance::from_sov(10).unwrap(),
+            "recipient credited 10"
+        );
+        assert!(
+            ledger.proposals_for(&id("usa.reserve.sov")).is_empty(),
+            "proposal cleared after execution"
+        );
+    }
+
+    #[test]
+    fn onchain_proposal_can_be_cancelled_by_a_member() {
+        let mut ledger = ledger_with_usa(100);
+        let p = policy();
+        let signers = vec![
+            Keypair::from_seed([1; 32]).public_key(),
+            Keypair::from_seed([2; 32]).public_key(),
+            Keypair::from_seed([3; 32]).public_key(),
+        ];
+        let set = signed(
+            [1; 32],
+            "usa.reserve.sov",
+            0,
+            Action::SetMultisig {
+                signers,
+                threshold: 2,
+            },
+        );
+        apply_transaction(&mut ledger, &set, &ctx(&p)).unwrap();
+        let propose = signed(
+            [1; 32],
+            &implicit([1; 32]),
+            0,
+            Action::ProposeMultisig {
+                account: id("usa.reserve.sov"),
+                action: Box::new(Action::Transfer {
+                    to: id("ecb.reserve.sov"),
+                    amount: Balance::from_sov(10).unwrap(),
+                }),
+            },
+        );
+        apply_transaction(&mut ledger, &propose, &ctx(&p)).unwrap();
+        let prop_id = ledger.proposals_for(&id("usa.reserve.sov"))[0].0;
+
+        // Member B cancels it — gone, nothing spent.
+        let cancel = signed(
+            [2; 32],
+            &implicit([2; 32]),
+            0,
+            Action::CancelMultisig {
+                account: id("usa.reserve.sov"),
+                proposal: prop_id,
+            },
+        );
+        assert!(apply_transaction(&mut ledger, &cancel, &ctx(&p))
+            .unwrap()
+            .succeeded());
+        assert!(ledger.proposals_for(&id("usa.reserve.sov")).is_empty());
+        assert_eq!(
+            ledger.account(&id("usa.reserve.sov")).balance,
+            Balance::from_sov(100).unwrap()
+        );
     }
 }

@@ -11,6 +11,7 @@ description = "The SOV execution layer: applies transactions to the ledger, mete
 sov-primitives = { path = "../primitives" }
 sov-types = { path = "../types" }
 sov-state = { path = "../state" }
+borsh.workspace = true
 sov-pow = { path = "../pow" }
 sov-mining = { path = "../mining" }
 sov-vm = { path = "../vm" }

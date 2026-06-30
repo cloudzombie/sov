@@ -283,6 +283,37 @@ pub enum Action {
         /// Approvals from distinct policy signers over `multisig_signing_bytes`.
         approvals: Vec<MultisigApproval>,
     },
+    /// ON-CHAIN multisig coordination (the ergonomic path; the chain is the
+    /// coordinator). A policy member PROPOSES a spend from a multisig `account`: the
+    /// proposal is stored pending, with the proposer counted as its first approval.
+    /// The transaction is the *member's own* (their key, their nonce, their fee), so
+    /// the member's signature on it IS their authenticated approval — no detached
+    /// approval blobs. Appended at the tail so existing Borsh discriminants are stable.
+    ProposeMultisig {
+        /// The multisig account the spend draws from.
+        account: AccountId,
+        /// The action to perform as `account` once enough members approve. May not be
+        /// `MultisigExec`, `RotateKey`, or another multisig-coordination action.
+        action: Box<Action>,
+    },
+    /// A policy member APPROVES a pending proposal on `account`. Signed by the
+    /// member's own key (their signature is the approval). When the approvals reach
+    /// the policy threshold, the chain executes the proposal's action AS `account`
+    /// and clears it.
+    ApproveMultisig {
+        /// The multisig account the proposal draws from.
+        account: AccountId,
+        /// The pending proposal's id.
+        proposal: Hash,
+    },
+    /// A policy member CANCELS a pending proposal on `account` (it is removed without
+    /// executing). Signed by the member's own key.
+    CancelMultisig {
+        /// The multisig account the proposal draws from.
+        account: AccountId,
+        /// The pending proposal's id.
+        proposal: Hash,
+    },
 }
 
 /// One signer's approval of a [`Action::MultisigExec`]: the signer's index into

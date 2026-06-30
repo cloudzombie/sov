@@ -104,6 +104,11 @@ pub fn gas_for(action: &Action) -> u64 {
             };
             INTRINSIC_GAS + approvals.len() as u64 * INTENT_VERIFY_GAS + inner
         }
+        // On-chain multisig coordination: each is a member-signed bookkeeping tx
+        // (propose stores a proposal; approve may execute it; cancel removes it).
+        Action::ProposeMultisig { .. }
+        | Action::ApproveMultisig { .. }
+        | Action::CancelMultisig { .. } => INTRINSIC_GAS + BOOKKEEPING_GAS,
     }
 }
 

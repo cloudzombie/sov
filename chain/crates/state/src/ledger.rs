@@ -42,6 +42,8 @@ type NftClassEntry = (Hash, NftClass);
 type NftEntry = ((Hash, Vec<u8>), NftToken);
 /// A persisted multisig policy: `(account, policy)`.
 type MultisigEntry = (AccountId, Multisig);
+/// A persisted pending multisig proposal: `(proposal id, proposal)`.
+type ProposalEntry = (Hash, MultisigProposal);
 
 /// Domain tag for native-asset id derivation. Versioned so any future change to
 /// the derivation is a *new* domain rather than a silent redefinition.
@@ -108,6 +110,25 @@ pub struct Multisig {
     pub signers: Vec<PublicKey>,
     /// How many distinct signers must approve (M, with `1 ≤ M ≤ N`).
     pub threshold: u16,
+}
+
+/// A **pending on-chain multisig proposal**: a spend a policy member has proposed
+/// from a multisig account, awaiting enough approvals to execute. Each approver is a
+/// signer *index* into the account's [`Multisig::signers`] (the same by-index
+/// convention as a detached approval). When `approvers.len() ≥ threshold` the chain
+/// executes `action` AS `account` and removes the proposal. Held in its own
+/// absent-when-empty map (the genesis root is unaffected), and carries no balance —
+/// value moves only when the inner action executes, so supply is conserved.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, serde::Serialize)]
+pub struct MultisigProposal {
+    /// The multisig account the spend draws from.
+    pub account: AccountId,
+    /// The action to perform AS `account` once approved, as Borsh-encoded bytes. The
+    /// state layer is action-agnostic (it never depends on `sov-types`); the runtime
+    /// encodes on propose and decodes on execute, and the RPC decodes for display.
+    pub action: Vec<u8>,
+    /// Distinct signer indices that have approved (the proposer is the first).
+    pub approvers: Vec<u16>,
 }
 
 /// A **non-fungible token collection** (ERC-721-style): a named set of unique
@@ -217,6 +238,9 @@ enum UndoOp {
     NftClass(Hash, Option<NftClass>),
     Nft(Hash, Vec<u8>, Option<NftToken>),
     Multisig(AccountId, Option<Multisig>),
+    /// A pending multisig proposal write (`proposal id`, pre-image — `None` = it was
+    /// absent, so undo removes it).
+    Proposal(Hash, Option<MultisigProposal>),
     /// `intent_id` was absent before being consumed ⇒ undo removes it.
     Intent(Hash),
     /// The whole shielded sub-state, captured before a bundle was applied.
@@ -311,6 +335,10 @@ pub struct Ledger {
     /// non-empty, so a chain with no multisig accounts has the exact root it would
     /// have without the feature.
     multisig: BTreeMap<AccountId, Multisig>,
+    /// Pending on-chain multisig proposals, keyed by proposal id. Absent-when-empty:
+    /// its digest folds into the state root only once non-empty, so a chain with no
+    /// pending proposals keeps the exact root it would have without the feature.
+    proposals: BTreeMap<Hash, MultisigProposal>,
     commitment: SparseMerkleTree,
 }
 
@@ -353,6 +381,8 @@ impl Ledger {
     const NFTS_SLOT: &'static [u8] = b"sov:nfts";
     /// Reserved Merkle slot name for the multisig-policies digest.
     const MULTISIG_SLOT: &'static [u8] = b"sov:multisig";
+
+    const PROPOSALS_SLOT: &'static [u8] = b"sov:multisig_proposals";
 
     /// A reserved Merkle slot for a protocol-level scalar (not an account or a
     /// contract entry). Domain-separated by a `0x02` tag: no [`AccountId`] preimage
@@ -510,6 +540,26 @@ impl Ledger {
                 .collect();
             let digest = Hash::digest(
                 &borsh::to_vec(&entries).expect("multisig serialization is infallible"),
+            );
+            self.commitment.insert(slot, digest.as_bytes().to_vec());
+        }
+    }
+
+    /// Recompute the pending-proposals slot. Absent-when-empty (an empty map removes
+    /// the slot), so a chain with no proposals keeps the exact root it would have
+    /// without the feature — the genesis root is unaffected.
+    fn recommit_proposals(&mut self) {
+        let slot = Self::reserved_slot(Self::PROPOSALS_SLOT);
+        if self.proposals.is_empty() {
+            self.commitment.remove(&slot);
+        } else {
+            let entries: Vec<ProposalEntry> = self
+                .proposals
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
+            let digest = Hash::digest(
+                &borsh::to_vec(&entries).expect("proposal serialization is infallible"),
             );
             self.commitment.insert(slot, digest.as_bytes().to_vec());
         }
@@ -700,6 +750,17 @@ impl Ledger {
                     }
                 }
                 self.recommit_multisig();
+            }
+            UndoOp::Proposal(id, prev) => {
+                match prev {
+                    Some(p) => {
+                        self.proposals.insert(id, p);
+                    }
+                    None => {
+                        self.proposals.remove(&id);
+                    }
+                }
+                self.recommit_proposals();
             }
             UndoOp::Intent(intent_id) => {
                 self.consumed_intents.remove(&intent_id);
@@ -1032,6 +1093,40 @@ impl Ledger {
     /// Number of accounts under multisig control.
     pub fn multisig_count(&self) -> usize {
         self.multisig.len()
+    }
+
+    /// A pending multisig proposal by id, if present.
+    pub fn proposal(&self, id: &Hash) -> Option<&MultisigProposal> {
+        self.proposals.get(id)
+    }
+
+    /// All pending proposals drawing from `account`, as `(id, proposal)` pairs.
+    pub fn proposals_for(&self, account: &AccountId) -> Vec<(Hash, &MultisigProposal)> {
+        self.proposals
+            .iter()
+            .filter(|(_, p)| &p.account == account)
+            .map(|(id, p)| (*id, p))
+            .collect()
+    }
+
+    /// Store (or replace) a pending proposal, committing it to the root.
+    pub fn set_proposal(&mut self, id: Hash, proposal: MultisigProposal) {
+        if self.undo.is_some() {
+            let prev = self.proposals.get(&id).cloned();
+            self.record(UndoOp::Proposal(id, prev));
+        }
+        self.proposals.insert(id, proposal);
+        self.recommit_proposals();
+    }
+
+    /// Remove a pending proposal (executed or cancelled), committing the change.
+    pub fn remove_proposal(&mut self, id: &Hash) {
+        if self.undo.is_some() {
+            let prev = self.proposals.get(id).cloned();
+            self.record(UndoOp::Proposal(*id, prev));
+        }
+        self.proposals.remove(id);
+        self.recommit_proposals();
     }
 
     /// An NFT collection by id, if it exists.
@@ -1407,6 +1502,11 @@ impl Ledger {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let proposals: Vec<ProposalEntry> = self
+            .proposals
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
         borsh::to_vec(&(
             accounts,
             storage,
@@ -1425,6 +1525,7 @@ impl Ledger {
             nft_classes,
             nfts,
             multisig,
+            proposals,
         ))
         .expect("ledger snapshot serialization is infallible")
     }
@@ -1458,6 +1559,7 @@ impl Ledger {
             nft_classes,
             nfts,
             multisig,
+            proposals,
         ): (
             Vec<AccountEntry>,
             Vec<ContractEntry>,
@@ -1476,6 +1578,7 @@ impl Ledger {
             Vec<NftClassEntry>,
             Vec<NftEntry>,
             Vec<MultisigEntry>,
+            Vec<ProposalEntry>,
         ) = borsh::from_slice(bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let mut ledger = Ledger::new();
@@ -1519,6 +1622,8 @@ impl Ledger {
         ledger.recommit_nfts();
         ledger.multisig = multisig.into_iter().collect();
         ledger.recommit_multisig();
+        ledger.proposals = proposals.into_iter().collect();
+        ledger.recommit_proposals();
         Ok(ledger)
     }
 }
@@ -1529,6 +1634,32 @@ mod tests {
 
     fn id(s: &str) -> AccountId {
         AccountId::new(s).unwrap()
+    }
+
+    #[test]
+    fn proposals_map_is_absent_when_empty() {
+        // The pending-proposals map folds into the state root ONLY when non-empty —
+        // this is what makes the on-chain-proposal feature need no genesis reset.
+        let mut l = Ledger::new();
+        l.begin_undo();
+        let root0 = l.state_root();
+        let pid = Hash::digest(b"test-proposal");
+        let prop = MultisigProposal {
+            account: id("vault.sov"),
+            action: vec![1, 2, 3],
+            approvers: vec![0],
+        };
+        l.set_proposal(pid, prop.clone());
+        assert_ne!(l.state_root(), root0, "a pending proposal changes the root");
+        assert_eq!(l.proposal(&pid), Some(&prop));
+        l.remove_proposal(&pid);
+        assert_eq!(
+            l.state_root(),
+            root0,
+            "removing the last proposal restores the empty-map root (absent-when-empty)"
+        );
+        // And the change is undoable (reorg-safe): re-applying the undo log is a no-op
+        // here since we already removed it; the round-trip above proves the slot math.
     }
 
     #[test]

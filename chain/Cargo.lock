@@ -1985,6 +1985,7 @@ dependencies = [
 name = "sov-runtime"
 version = "0.0.0"
 dependencies = [
+ "borsh",
  "sha2 0.10.9",
  "sov-compliance",
  "sov-crypto",
