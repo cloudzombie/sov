@@ -1446,6 +1446,16 @@ impl Network {
         }
     }
 
+    /// The per-network data-dir suffix, so testnet and mainnet chains live in
+    /// SEPARATE directories and can never collide (mainnet blocks must never land in
+    /// the testnet log, and vice-versa).
+    fn data_subdir(self) -> &'static str {
+        match self {
+            Network::Testnet => "testnet",
+            Network::Mainnet => "mainnet",
+        }
+    }
+
     /// Whether this network is a local sandbox: self-mining and a destructive
     /// "reset chain" are offered ONLY here. A real chain (mainnet) is never
     /// wipeable from the wallet, so those controls are hidden.
@@ -3043,6 +3053,7 @@ impl Station {
         let account = w.account.clone();
         let seed = w.seed;
         let spec = self.network.spec_filename().to_string();
+        let net = self.network.data_subdir().to_string();
 
         *self.node_run.lock().unwrap() = NodeRun::Starting;
         self.mining_account = Some(account.clone());
@@ -3062,7 +3073,7 @@ impl Station {
         let logs = Arc::clone(&self.node_logs);
         let peer = self.peer_addr.clone();
         std::thread::spawn(move || {
-            let result = build_and_run_node(&spec, &account, seed, &peer, &logs);
+            let result = build_and_run_node(&spec, &net, &account, seed, &peer, &logs);
             let mut slot = run.lock().unwrap();
             match result {
                 Ok(node) => {
@@ -3431,7 +3442,7 @@ impl Station {
     /// (e.g. binding tax keys) or to clear coins mined to an old account.
     fn reset_local_chain(&mut self) {
         self.stop_local_node();
-        let dir = local_node_dir();
+        let dir = local_node_dir(self.network.data_subdir());
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => {
                 self.node_status =
@@ -8279,8 +8290,8 @@ fn chain_bin(name: &str) -> Option<PathBuf> {
 }
 
 /// The directory the GUI's supervised local node keeps its chain + keystore in.
-fn local_node_dir() -> PathBuf {
-    std::env::temp_dir().join("sov-station-node")
+fn local_node_dir(net: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("sov-station-node-{net}"))
 }
 
 /// Where the seed/bootstrap peer address is persisted. CRITICAL: this lives OUTSIDE the
@@ -8407,7 +8418,9 @@ fn lan_ipv4() -> Option<String> {
 /// File holding the running local node's PID, so it can be stopped even across a
 /// GUI restart (otherwise an orphaned node keeps mining with no way to halt it).
 fn node_pid_path() -> PathBuf {
-    local_node_dir().join("node.pid")
+    // Legacy sov-rpcd pidfile cleanup — a fixed location (not per-network), since it
+    // only reaps a leftover subprocess from older builds.
+    std::env::temp_dir().join("sov-station-node.pid")
 }
 
 /// The PID recorded in the pidfile, if any.
@@ -8485,15 +8498,17 @@ fn kill_other_instances() {
 /// `CARGO_MANIFEST_DIR` (which does not exist on a user's machine). This is the same
 /// frozen spec the dev tree ships in `chain/specs/testnet-1.json`.
 const TESTNET_1_SPEC: &str = include_str!("../../chain/specs/testnet-1.json");
+const MAINNET_SPEC: &str = include_str!("../../chain/specs/mainnet.json");
 
-/// The genesis spec text for `spec_filename`, from the embedded copy. Only the
-/// shipped testnet is bundled; other networks return a clear error rather than a
-/// confusing missing-file failure.
+/// The genesis spec text for `spec_filename`, from the embedded copy — both the
+/// frozen testnet-1 and the mainnet (RandomX, 21M cap, zero pre-mine) genesis are
+/// bundled, so a shipped app can run either network self-contained.
 fn embedded_spec(spec_filename: &str) -> Result<&'static str, String> {
     match spec_filename {
         "testnet-1.json" => Ok(TESTNET_1_SPEC),
+        "mainnet.json" => Ok(MAINNET_SPEC),
         other => Err(format!(
-            "no genesis spec bundled for this network ({other}) — this is a testnet build"
+            "no genesis spec bundled for this network ({other})"
         )),
     }
 }
@@ -8505,6 +8520,7 @@ fn embedded_spec(spec_filename: &str) -> Result<&'static str, String> {
 /// `sov-rpcd` subprocess, so nothing can outlive the GUI.
 fn build_and_run_node(
     spec_filename: &str,
+    net: &str,
     account: &str,
     seed: [u8; 32],
     peer: &str,
@@ -8518,7 +8534,7 @@ fn build_and_run_node(
     // On Windows, make sure we're allowed inbound through the firewall (once), so LAN
     // peers can actually reach this node — otherwise discovery silently never connects.
     ensure_firewall(logs);
-    let node_dir = local_node_dir();
+    let node_dir = local_node_dir(net);
     let testnet = chain_bin("sov-testnet")
         .ok_or("sov-testnet not built (run `cargo build --release` in chain/)")?;
 
@@ -8542,7 +8558,7 @@ fn build_and_run_node(
     // genesis spec is EMBEDDED in the binary (see `embedded_spec`), so a shipped
     // app is self-contained — it does not depend on a source checkout or the
     // build-machine path baked into `CARGO_MANIFEST_DIR`.
-    if !node_dir.join("testnet.json").exists() {
+    if !node_dir.join(spec_filename).exists() {
         let spec_text = embedded_spec(spec_filename)?;
         std::fs::create_dir_all(&node_dir).map_err(|e| format!("create node dir: {e}"))?;
         let spec_path = node_dir.join(spec_filename);

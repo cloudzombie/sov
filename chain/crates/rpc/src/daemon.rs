@@ -1404,6 +1404,40 @@ mod tests {
     /// is the single source of truth both the macOS seed and the Windows validator
     /// load; its genesis hash is the cross-machine identity.
     const TESTNET_1_SPEC: &str = include_str!("../../../specs/testnet-1.json");
+    const MAINNET_SPEC: &str = include_str!("../../../specs/mainnet.json");
+
+    #[test]
+    fn mainnet_genesis_builds_and_is_frozen() {
+        // The permanent MAINNET genesis. It must build deterministically (RandomX,
+        // 2.5-minute blocks, the full 21M mining budget) with ZERO pre-mine — a pure
+        // fair launch, every coin mined, no tax. Pin the hash so it can never silently
+        // change. (RandomX vs SHA-256d does not affect the genesis HASH — the seal is
+        // not a header field — so this runs on any platform.)
+        let spec = ChainSpec::from_json(MAINNET_SPEC).expect("mainnet spec parses");
+        assert_eq!(spec.chain_id, "sov-mainnet");
+        let genesis = spec
+            .to_genesis_config()
+            .expect("spec -> genesis config")
+            .build()
+            .expect("genesis builds (zero pre-mine under the 21M cap)");
+        // No pre-mine: genesis supply is exactly zero.
+        assert_eq!(
+            genesis.ledger.total_supply().unwrap(),
+            sov_primitives::Balance::ZERO
+        );
+        let genesis_hash = genesis.block.hash().to_hex();
+        let state_root = genesis.ledger.state_root().to_hex();
+        println!("MAINNET GENESIS HASH = {genesis_hash}");
+        println!("MAINNET STATE ROOT  = {state_root}");
+        assert_eq!(
+            state_root,
+            "53852c7404ac6cb402b385ffeec50fa4fe8f59ed34c0a851357ced5dac6ce6aa"
+        );
+        assert_eq!(
+            genesis_hash,
+            "e2e1ec02a13cb3626c06e2a1d5056e988499963ef177f60a5aec2d84a368e7e0"
+        );
+    }
 
     #[test]
     fn testnet_1_frozen_genesis_is_byte_for_byte_deterministic() {

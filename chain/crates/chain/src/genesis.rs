@@ -75,11 +75,12 @@ pub struct Genesis {
 
 impl GenesisConfig {
     /// Validate the configuration and construct the genesis artifacts.
+    ///
+    /// An EMPTY account set is valid: it is the purest fair launch — genesis supply is
+    /// exactly zero, no account is pre-funded or pre-controlled, and every coin is
+    /// mined from block 1 (mainnet does this). The ledger starts empty; accounts are
+    /// created as coinbases and transfers land.
     pub fn build(&self) -> Result<Genesis, GenesisError> {
-        if self.accounts.is_empty() {
-            return Err(GenesisError::Empty);
-        }
-
         // Enforce the supply cap across every liquid + vesting balance.
         let mut total: u128 = 0;
         for a in &self.accounts {
@@ -131,8 +132,14 @@ impl GenesisConfig {
         // Block 0: no transactions, committing to the genesis state root. The
         // `proposer` is the canonical-first funded account — deterministic across
         // nodes. Genesis mints nothing (no pre-mine), so this is only the header's
-        // cosmetic coinbase field and the chain's default coinbase recipient.
-        let coinbase = self.accounts[0].account.clone();
+        // cosmetic coinbase field and the chain's default coinbase recipient. With an
+        // EMPTY (fair-launch) genesis there is no account, so it falls back to a fixed
+        // keyless name — a header label only; it holds no balance and the real miner
+        // always names its own account, so nothing is ever paid to it.
+        let coinbase = match self.accounts.first() {
+            Some(a) => a.account.clone(),
+            None => AccountId::new("genesis.sov").expect("valid genesis proposer label"),
+        };
         let proposer = coinbase.clone();
         let mut block = Block::assemble(
             BlockHeight::GENESIS,
@@ -158,9 +165,6 @@ impl GenesisConfig {
 /// Errors building genesis.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum GenesisError {
-    /// No accounts were configured.
-    #[error("genesis has no accounts")]
-    Empty,
     /// A vesting grant referenced an account not present in `accounts`.
     #[error("vesting grant for unknown account {account}")]
     VestingUnknownAccount {
@@ -290,14 +294,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_accounts() {
+    fn empty_accounts_is_a_valid_fair_launch_genesis() {
+        // Zero accounts = the purest fair launch: genesis supply is exactly zero, no
+        // account is pre-funded or pre-controlled, every coin is mined. Mainnet ships
+        // this. The genesis must still build deterministically.
         let config = GenesisConfig {
-            chain_id: "sov-test".into(),
+            chain_id: "sov-mainnet".into(),
             timestamp_ms: 0,
             accounts: vec![],
-            mining: MiningPolicy::test(),
+            mining: MiningPolicy::mainnet_like(),
             vesting: vec![],
         };
-        assert!(matches!(config.build(), Err(GenesisError::Empty)));
+        let g = config.build().expect("empty genesis builds");
+        assert_eq!(g.ledger.total_supply().unwrap(), Balance::ZERO);
     }
 }
