@@ -513,6 +513,40 @@ fn call(
                 Ok(Value::Null)
             }
         }
+        "sov_getMultisigProposals" => {
+            // Pending on-chain multisig proposals drawing from `account`, with each
+            // spend decoded to a plain summary so a wallet can render an approval
+            // inbox ("send N XUS to X — k of m") without understanding any codes.
+            let account = param_account(params)?;
+            let ledger = node.chain().ledger();
+            let policy = ledger.multisig_of(&account);
+            let threshold = policy.map(|p| p.threshold).unwrap_or(0);
+            let signer_count = policy.map(|p| p.signers.len()).unwrap_or(0);
+            let out: Vec<Value> = ledger
+                .proposals_for(&account)
+                .into_iter()
+                .map(|(pid, prop)| {
+                    let action = match borsh::from_slice::<sov_types::Action>(&prop.action) {
+                        Ok(sov_types::Action::Transfer { to, amount }) => json!({
+                            "type": "transfer",
+                            "to": to.as_str(),
+                            "amount": amount.grains().to_string(),
+                        }),
+                        _ => Value::Null,
+                    };
+                    json!({
+                        "id": to_value(pid),
+                        "account": prop.account.as_str(),
+                        "approvers": prop.approvers,
+                        "approved": prop.approvers.len(),
+                        "threshold": threshold,
+                        "signers": signer_count,
+                        "action": action,
+                    })
+                })
+                .collect();
+            Ok(Value::Array(out))
+        }
         "sov_getBalance" => {
             let id = param_account(params)?;
             Ok(to_value(node.chain().ledger().account(&id).balance))
