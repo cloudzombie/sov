@@ -145,6 +145,19 @@ const MALFORMED_FRAME_PENALTY: f64 = 25.0;
 /// How long a misbehaving IP stays banned once its score crosses the threshold.
 const BAN_DURATION: Duration = Duration::from_secs(300);
 
+/// Discovery hygiene: process at most this many addresses from ONE `Peers` gossip
+/// message. An honest node advertises a handful; a malicious one could pack ~100k
+/// `host:port` strings into a single 8 MiB frame, and since each unknown address is
+/// dialed with a [`CONNECT_TIMEOUT`] (5 s) on the single dial thread, an unbounded
+/// list would wedge bootstrap/discovery for the node's lifetime and bloat `known`.
+/// An oversized list is penalized (it is a protocol violation, not mere volume — the
+/// per-IP token bucket never trips on a single message) and only this prefix is used.
+const MAX_PEERS_PER_MSG: usize = 128;
+
+/// Cap on the discovered-address (`known`) set, so peer-supplied gossip can never
+/// grow node memory without bound. Far more than a healthy network needs.
+const MAX_KNOWN_PEERS: usize = 4_096;
+
 /// LAN auto-discovery (mDNS-style): nodes announce themselves on this
 /// administratively-scoped IPv4 multicast group + port, so peers on the SAME LAN
 /// find and dial each other with **zero configuration**. The group is site-local
@@ -1142,18 +1155,34 @@ fn reader_loop(shared: &Arc<Shared>, key: SocketAddr, mut reader: TcpStream, pee
                 match message {
                     // Discovery messages are handled here, not surfaced to the app.
                     NetMessage::Peers(list) => {
-                        for addr in list {
-                            if let Ok(sa) = addr.parse::<SocketAddr>() {
-                                if sa != shared.local_addr {
-                                    // Record it for future dials, but don't open a
-                                    // SECOND connection to a host we're already linked to
-                                    // (see `dial_would_duplicate`). The `known` lock is
-                                    // released at this statement's end, before the call.
-                                    let unseen = shared.known.lock().unwrap().insert(sa);
-                                    if unseen && !dial_would_duplicate(shared, sa) {
-                                        let _ = shared.dial_tx.send(sa);
-                                    }
+                        // Bound gossip: an honest node advertises a handful of peers; a
+                        // flood (up to ~100k entries in an 8 MiB frame) would wedge the
+                        // single dial thread (CONNECT_TIMEOUT per bogus address) and bloat
+                        // `known`. An oversized list is a protocol violation the token
+                        // bucket can't catch (one message) — penalize it, and process only
+                        // a bounded prefix into a bounded `known` set.
+                        if list.len() > MAX_PEERS_PER_MSG {
+                            penalize(shared, ip, MALFORMED_FRAME_PENALTY);
+                        }
+                        for addr in list.into_iter().take(MAX_PEERS_PER_MSG) {
+                            let Ok(sa) = addr.parse::<SocketAddr>() else {
+                                continue;
+                            };
+                            if sa == shared.local_addr {
+                                continue;
+                            }
+                            // Record it for future dials under one lock; stop if the
+                            // discovered set is already full, so gossip can't grow memory
+                            // without bound. Drop the lock before dialing.
+                            let unseen = {
+                                let mut known = shared.known.lock().unwrap();
+                                if known.len() >= MAX_KNOWN_PEERS {
+                                    break;
                                 }
+                                known.insert(sa)
+                            };
+                            if unseen && !dial_would_duplicate(shared, sa) {
+                                let _ = shared.dial_tx.send(sa);
                             }
                         }
                     }

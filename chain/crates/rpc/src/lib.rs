@@ -75,6 +75,16 @@ pub use sync_status::SyncShared;
 /// transaction, small enough that a public bind cannot be memory-DoSed.
 const MAX_RPC_BODY_BYTES: usize = 4 * 1024 * 1024;
 
+/// Maximum bytes for the HTTP request line and for any single header line. Bounds
+/// each `read_line` allocation so a peer can't stream an endless no-newline line to
+/// exhaust memory (a slowloris/OOM vector on a public bind) — the body cap above only
+/// covers the body.
+const MAX_REQUEST_LINE_BYTES: u64 = 16 * 1024;
+
+/// Maximum number of header lines accepted, so the header section is bounded in count
+/// as well as per-line size.
+const MAX_REQUEST_HEADERS: usize = 64;
+
 /// Maximum JSON-RPC batch length, so one request cannot fan out without bound.
 const MAX_RPC_BATCH: usize = 100;
 
@@ -232,20 +242,51 @@ impl RpcServer {
 fn read_request(stream: &TcpStream) -> io::Result<Option<(String, String, Vec<u8>)>> {
     let mut reader = BufReader::new(stream.try_clone()?);
 
+    // Reject a too-long request/header line at the source: a header read that fills the
+    // cap without a terminating newline is oversized (or a slowloris) — refuse it
+    // instead of growing the buffer without bound. (`Take<&mut BufRead>` is `BufRead`.)
+    let reject_oversized = |stream: &TcpStream| -> io::Result<Option<(String, String, Vec<u8>)>> {
+        if let Ok(mut s) = stream.try_clone() {
+            let _ = write_response(
+                &mut s,
+                "431 Request Header Fields Too Large",
+                br#"{"error":"request header exceeds limit"}"#,
+            );
+        }
+        Ok(None)
+    };
+
     let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
+    let n = (&mut reader)
+        .take(MAX_REQUEST_LINE_BYTES)
+        .read_line(&mut request_line)?;
+    if n == 0 {
         return Ok(None);
+    }
+    if !request_line.ends_with('\n') {
+        return reject_oversized(stream); // no newline within the cap ⇒ oversized
     }
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or("/").to_string();
 
     let mut content_length = 0usize;
+    let mut headers = 0usize;
     loop {
+        if headers >= MAX_REQUEST_HEADERS {
+            return reject_oversized(stream);
+        }
         let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
+        let n = (&mut reader)
+            .take(MAX_REQUEST_LINE_BYTES)
+            .read_line(&mut line)?;
+        if n == 0 {
             break;
         }
+        if !line.ends_with('\n') {
+            return reject_oversized(stream); // header line exceeded the cap
+        }
+        headers += 1;
         let trimmed = line.trim_end();
         if trimmed.is_empty() {
             break; // end of headers
