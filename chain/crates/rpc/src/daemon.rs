@@ -328,6 +328,16 @@ struct EncryptedKeystore {
     nonce: String,
     /// Ciphertext (includes the AEAD tag), hex.
     ciphertext: String,
+    /// A short, human-readable fingerprint of the passphrase (e.g. `SOV-4F9A`),
+    /// derived from the Argon2 key + this envelope's salt (see
+    /// [`fingerprint_from_key`]). It is a hash, not a secret: reproducing it costs a
+    /// full Argon2 evaluation per guess — exactly as much as attacking the ciphertext
+    /// — so storing it grants no brute-force shortcut. Lets the UI show the user a
+    /// stable code to recognize their passphrase across launches, and tell a typo
+    /// ("you typed SOV-9C2B, this wallet is SOV-4F9A") from a wrong/corrupt file.
+    /// Optional so keystores sealed before this field still load.
+    #[serde(default)]
+    fingerprint: String,
 }
 
 /// Derive a 32-byte symmetric key from `passphrase` + `salt` using Argon2id (a
@@ -338,6 +348,47 @@ fn derive_keystore_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], Daemon
         .hash_password_into(passphrase.as_bytes(), salt, &mut key)
         .map_err(|e| DaemonError::config(format!("keystore key derivation failed: {e}")))?;
     Ok(key)
+}
+
+/// A short, stable, human-readable fingerprint of an Argon2 keystore key, e.g.
+/// `SOV-4F9A`. Domain-separated Blake3 of the key, rendered as 16 bits of hex —
+/// enough that a typo or a different passphrase almost always shows a different code,
+/// small enough to memorize. Because it is derived from the (slow, salted) Argon2 key
+/// rather than the passphrase directly, it is NOT a fast offline oracle: an attacker
+/// who sees the code must still pay one Argon2 per guess to match it.
+fn fingerprint_from_key(key: &[u8; 32]) -> String {
+    let mut buf = Vec::with_capacity(40 + key.len());
+    buf.extend_from_slice(b"sov-station/passphrase-fingerprint/v1");
+    buf.extend_from_slice(key);
+    let digest = Hash::digest(&buf);
+    let bytes = digest.as_bytes();
+    let code = u16::from_be_bytes([bytes[0], bytes[1]]);
+    format!("SOV-{code:04X}")
+}
+
+/// The passphrase fingerprint for `passphrase` against the salt in `envelope_text`
+/// (an encrypted-keystore JSON). Runs the full Argon2 KDF, so it is as slow as an
+/// unlock attempt. Returns `None` if the text is not an encrypted envelope or the
+/// salt/KDF is malformed. Used by the UI to show "the code you just typed".
+pub fn keystore_fingerprint_of(envelope_text: &str, passphrase: &str) -> Option<String> {
+    let env: EncryptedKeystore = serde_json::from_str(envelope_text).ok()?;
+    if !env.encrypted {
+        return None;
+    }
+    let salt = hex::decode(&env.salt).ok()?;
+    let key = derive_keystore_key(passphrase, &salt).ok()?;
+    Some(fingerprint_from_key(&key))
+}
+
+/// The fingerprint stored in an encrypted-keystore envelope (the wallet's OWN code),
+/// if present. Requires no passphrase — it is a non-secret hash. Returns `None` for a
+/// plaintext keystore or an envelope sealed before fingerprints existed.
+pub fn keystore_stored_fingerprint(envelope_text: &str) -> Option<String> {
+    let env: EncryptedKeystore = serde_json::from_str(envelope_text).ok()?;
+    if !env.encrypted || env.fingerprint.is_empty() {
+        return None;
+    }
+    Some(env.fingerprint)
 }
 
 impl Keystore {
@@ -407,6 +458,7 @@ impl Keystore {
             salt: hex::encode(salt),
             nonce: hex::encode(nonce),
             ciphertext: hex::encode(ciphertext),
+            fingerprint: fingerprint_from_key(&key),
         };
         serde_json::to_string_pretty(&env)
             .map_err(|e| DaemonError::config(format!("serialize envelope: {e}")))
@@ -1648,6 +1700,47 @@ mod tests {
         let plain = serde_json::to_string(&ks).unwrap();
         let p = Keystore::from_encrypted_or_plain(&plain, None).unwrap();
         assert_eq!(p.miners[0].seed_hex, ks.miners[0].seed_hex);
+    }
+
+    #[test]
+    fn passphrase_fingerprint_recognizes_and_distinguishes() {
+        let ks = Keystore { miners: vec![] };
+        let pass = "correct horse battery staple";
+        let enc = ks.to_encrypted_json(pass).unwrap();
+
+        // The envelope carries the wallet's own code, readable without the passphrase.
+        let stored = keystore_stored_fingerprint(&enc).expect("stored code");
+        assert!(
+            stored.starts_with("SOV-") && stored.len() == 8,
+            "shape SOV-XXXX"
+        );
+
+        // The RIGHT passphrase reproduces the SAME code (recognition across launches).
+        assert_eq!(
+            keystore_fingerprint_of(&enc, pass).as_deref(),
+            Some(&*stored)
+        );
+
+        // A WRONG passphrase almost always yields a DIFFERENT code (typo detection) —
+        // and it is computed against THIS envelope's salt, so it's the code the user
+        // "typed", enabling "you typed X, this wallet is Y".
+        assert_ne!(
+            keystore_fingerprint_of(&enc, "wrong passphrase").as_deref(),
+            Some(&*stored)
+        );
+
+        // Re-sealing the SAME passphrase gets a fresh salt ⇒ a different code, so the
+        // code is bound to a specific stored envelope (not a global oracle for the pass).
+        let enc2 = ks.to_encrypted_json(pass).unwrap();
+        assert_ne!(
+            keystore_stored_fingerprint(&enc).unwrap(),
+            keystore_stored_fingerprint(&enc2).unwrap(),
+            "salt is per-envelope, so the code is too"
+        );
+
+        // Plaintext / pre-fingerprint envelopes simply have no code (no panic).
+        assert_eq!(keystore_stored_fingerprint("{}"), None);
+        assert_eq!(keystore_fingerprint_of("not json", pass), None);
     }
 
     #[test]

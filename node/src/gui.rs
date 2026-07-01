@@ -1315,6 +1315,12 @@ pub struct Station {
     /// gate on every launch.
     locked: bool,
     unlock_error: String,
+    /// Set once we've revealed the passphrase FINGERPRINT (e.g. `SOV-4F9A`) after the
+    /// first save, so the reveal toast fires exactly once — thereafter it lives on the
+    /// lock screen. The code is a salt-bound hash of the Argon2 key (see
+    /// `keystore_stored_fingerprint`), so the user can recognize their passphrase
+    /// across launches and a typo shows a different code.
+    code_shown_once: bool,
     /// First-run passphrase SETUP, shown before the master passphrase is ever used
     /// to encrypt. Two inputs that must MATCH (and meet a length floor) — so a typo
     /// can't silently become the key and lock you out.
@@ -1571,6 +1577,7 @@ impl Station {
             keystore_msg: String::new(),
             locked: false,
             unlock_error: String::new(),
+            code_shown_once: false,
             show_setup: false,
             setup_pw: String::new(),
             setup_pw2: String::new(),
@@ -2230,9 +2237,22 @@ impl Station {
                 if let Some(dir) = path.parent() {
                     let _ = std::fs::create_dir_all(dir);
                 }
-                if std::fs::write(&path, json).is_ok() {
+                if std::fs::write(&path, &json).is_ok() {
                     restrict_to_owner(&path);
                     self.wallets_dirty = false;
+                    // Reveal the passphrase fingerprint ONCE, right after the store is
+                    // first sealed (the code is bound to this envelope's salt, so it
+                    // doesn't exist until now). Thereafter it lives on the lock screen.
+                    if !self.code_shown_once {
+                        if let Some(code) = sov_rpc::keystore_stored_fingerprint(&json) {
+                            self.code_shown_once = true;
+                            self.set_action(&format!(
+                                "wallet saved · your passphrase code is {code} — you'll \
+                                 confirm this on the lock screen each launch; a different \
+                                 code means a typo"
+                            ));
+                        }
+                    }
                 } else {
                     self.keystore_msg = "auto-save failed to write".to_string();
                 }
@@ -2317,7 +2337,17 @@ impl Station {
                 return;
             }
         }
-        self.unlock_error = "wrong passphrase".to_string();
+        // Wrong passphrase. Use the salt-bound fingerprints to tell a near-miss typo
+        // from an entirely different passphrase or a foreign/corrupt file — matching
+        // either code still costs a full Argon2, so this leaks no brute-force shortcut.
+        let typed = sov_rpc::keystore_fingerprint_of(&text, &self.passphrase);
+        let stored = sov_rpc::keystore_stored_fingerprint(&text);
+        self.unlock_error = match (typed, stored) {
+            (Some(t), Some(s)) => {
+                format!("wrong passphrase — you entered {t}, but this wallet is {s}")
+            }
+            _ => "wrong passphrase".to_string(),
+        };
     }
 
     /// The full-window unlock screen shown while [`locked`](Self#structfield.locked).
@@ -2333,6 +2363,22 @@ impl Station {
                      derived from your passphrase and is never stored — so it's required \
                      every launch.",
                 );
+                // The wallet's own recognition code, read straight from the envelope
+                // (a stored hash — no passphrase or KDF needed, so this is cheap). Seeing
+                // the SAME code you memorized confirms it's your store; a wrong file shows
+                // a different one. Absent for a store sealed before codes existed.
+                if let Some(code) = autosave_path()
+                    .ok()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .and_then(|t| sov_rpc::keystore_stored_fingerprint(&t))
+                {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(format!("this wallet's code: {code}"))
+                            .small()
+                            .weak(),
+                    );
+                }
                 ui.add_space(16.0);
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.passphrase)

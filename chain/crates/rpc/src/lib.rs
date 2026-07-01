@@ -61,8 +61,9 @@ pub use client::{RpcClient, RpcClientError};
 
 pub mod daemon;
 pub use daemon::{
-    BlockLog, ChainSpec, CheckpointSpec, Daemon, DaemonError, DaemonHandle, Keystore,
-    KeystoreEntry, NodeConfig, PolicyPreset, SpecAccount,
+    keystore_fingerprint_of, keystore_stored_fingerprint, BlockLog, ChainSpec, CheckpointSpec,
+    Daemon, DaemonError, DaemonHandle, Keystore, KeystoreEntry, NodeConfig, PolicyPreset,
+    SpecAccount,
 };
 
 pub mod p2p;
