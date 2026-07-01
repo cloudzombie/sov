@@ -3,5 +3,7 @@
   "timestamp_ms": 1735689600000,
   "policy": "mainnet_like",
   "difficulty_leading_zeros": 16,
+  "seeds": [],
+  "expected_genesis_hash": "00d863ee74a76e51f74d012dd6b336275951a00e2b082ac7925357ddd67d2ec8",
   "accounts": []
 }

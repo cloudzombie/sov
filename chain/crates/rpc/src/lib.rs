@@ -734,6 +734,9 @@ fn call(
                 "sha256d": c.sha256d_difficulty().0.to_string(),
                 "algo": format!("{:?}", c.mining_policy().pow_algo),
                 "targetBlockMs": c.mining_policy().target_block_ms,
+                // Measured network hash rate in hashes/second (Bitcoin's
+                // getnetworkhashps), or null until there are enough blocks to measure.
+                "hashrate": c.estimate_hashrate(),
             }))
         }
         "sov_estimateFee" => {

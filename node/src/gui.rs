@@ -8706,13 +8706,23 @@ fn build_and_run_node(
         .map_err(|e| format!("refresh chain-spec: {e}"))?;
     let spec = ChainSpec::from_json(&read(&node_dir.join("chain-spec.json"))?)
         .map_err(|e| format!("chain-spec: {e}"))?;
+    // Merge the spec's baked-in seed peers into the bootstrap set (dedup, after any
+    // operator-typed peer), so a fresh node can find the network off its LAN even with
+    // no peer typed in. mDNS still covers same-LAN discovery.
+    for s in &spec.seeds {
+        if !config.bootstrap_peers.contains(s) {
+            config.bootstrap_peers.push(s.clone());
+        }
+    }
     let keystore = Keystore::from_encrypted_or_plain(
         &read(&node_dir.join("node-1/keystore.json"))?,
         Some(passphrase),
     )
     .map_err(|e| format!("keystore: {e}"))?;
+    // Verify the built genesis matches the spec's pinned hash before starting, so a
+    // corrupt/drifted embedded spec fails loudly instead of forking off the real chain.
     let genesis = spec
-        .to_genesis_config()
+        .to_genesis_config_verified()
         .map_err(|e| format!("genesis: {e}"))?;
     let miner_keys = keystore.keys().map_err(|e| format!("keys: {e}"))?;
 

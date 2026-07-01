@@ -219,7 +219,7 @@ export class Store {
       volumeGrains: volume.toString(),
       medianTransactionFeeUsd: null,
       averageTransactionFeeUsd: null,
-      hashrate: null,
+      hashrate: this.difficulty?.hashrate ?? null,
       indexedTransactionBytes: txBytes,
     };
   }

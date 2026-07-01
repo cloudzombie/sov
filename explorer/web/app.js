@@ -51,6 +51,21 @@ function fmtBytes(bytes) {
   }
   return `${fmtDecimal(value, value >= 100 ? 0 : 2)} ${units[i]}`;
 }
+
+/** Format a hash rate (hashes/second) with SI-scaled units. */
+function fmtHashrate(hps) {
+  if (hps === null || hps === undefined) return '—';
+  const n = Number(hps);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  const units = ['H/s', 'kH/s', 'MH/s', 'GH/s', 'TH/s', 'PH/s'];
+  let value = n;
+  let i = 0;
+  while (value >= 1000 && i < units.length - 1) {
+    value /= 1000;
+    i += 1;
+  }
+  return `${fmtDecimal(value, value >= 100 ? 0 : 2)} ${units[i]}`;
+}
 function shortHash(h, head = 10, tail = 8) {
   if (!h) return '—';
   return h.length > head + tail + 2 ? `${h.slice(0, head)}…${h.slice(-tail)}` : h;
@@ -203,7 +218,7 @@ async function renderOverview() {
         ${statItem('Volume', `${fmtCoin(day.volumeGrains)} ${COIN_SYMBOL}`, `transparent ${COIN_SYMBOL} volume`)}
         ${statItem('Median transaction fee', fmtUsd(day.medianTransactionFeeUsd), 'fee index not exposed by node')}
         ${statItem('Average transaction fee', fmtUsd(day.averageTransactionFeeUsd), 'fee index not exposed by node')}
-        ${statItem('Hashrate', day.hashrate ?? '—', 'not exposed by node')}
+        ${statItem('Hashrate', fmtHashrate(day.hashrate), day.hashrate == null ? 'measuring — needs a few blocks' : 'estimated from recent block work')}
       </section>
 
       <section class="stat-card">

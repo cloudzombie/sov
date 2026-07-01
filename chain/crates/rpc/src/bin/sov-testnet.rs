@@ -399,6 +399,10 @@ fn cmd_gen(flags: &Flags) -> Result<(), Box<dyn Error>> {
         // testnet-1.json relaxes it via these optional overrides.
         deshield_limit_sov: None,
         deshield_window_blocks: None,
+        // A freshly generated dev testnet has no baked seeds and does not pin its
+        // genesis hash (the shipped frozen specs do both).
+        seeds: Vec::new(),
+        expected_genesis_hash: None,
         accounts,
     };
     write_json(&out.join("chain-spec.json"), &spec)?;

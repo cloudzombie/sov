@@ -394,6 +394,40 @@ impl Blockchain {
         self.sha256d_difficulty
     }
 
+    /// An estimate of the network hash rate in **hashes per second**, measured from
+    /// the actual work and timestamps of recent blocks — Bitcoin's `getnetworkhashps`
+    /// method. Since a block's [`Difficulty`] IS its expected number of hashes, this
+    /// sums the work of the blocks in a trailing window and divides by the wall-clock
+    /// span they were found in — a *measured* rate, with no assumption that block time
+    /// equals the target (so it's meaningful even during the LWMA warmup). The window
+    /// starts at height 1, never genesis, whose timestamp is a fixed epoch rather than
+    /// a mining time and would otherwise poison the span. Returns `None` until there
+    /// are at least two mined blocks spanning a positive interval, so a fresh or
+    /// clock-skewed chain reports "unknown" instead of a bogus figure.
+    pub fn estimate_hashrate(&self) -> Option<f64> {
+        let head_h = self.height();
+        if head_h < 2 {
+            return None;
+        }
+        // Bitcoin uses a 120-block window; use what we have on a young chain, but never
+        // reach back to genesis (height 0) — its timestamp isn't a mining time.
+        let start_h = head_h.saturating_sub(120).max(1);
+        let t_start = self.block_by_height(start_h)?.header.timestamp_ms;
+        let t_head = self.block_by_height(head_h)?.header.timestamp_ms;
+        if t_head <= t_start {
+            return None;
+        }
+        // Sum the expected work of the blocks found in (t_start, t_head].
+        let mut work = 0.0_f64;
+        for h in (start_h + 1)..=head_h {
+            let bits = self.block_by_height(h)?.header.bits;
+            let target = Target::from_compact(bits)?;
+            work += Difficulty::from_target(target).0 as f64;
+        }
+        let seconds = (t_head - t_start) as f64 / 1000.0;
+        Some(work / seconds)
+    }
+
     /// Set the version-bits mask this node commits in blocks it produces — its
     /// miner-signaled governance votes (e.g. the `pq-sunset` deployment bit).
     pub fn set_signal_mask(&mut self, mask: u32) {

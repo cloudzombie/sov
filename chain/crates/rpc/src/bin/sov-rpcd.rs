@@ -87,7 +87,9 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
         passphrase.as_deref(),
     )?;
 
-    let genesis = spec.to_genesis_config()?;
+    // Verify the built genesis matches the spec's pinned hash (if any) before starting,
+    // so a drifted/corrupt spec fails loudly instead of forking off the real network.
+    let genesis = spec.to_genesis_config_verified()?;
     let miner_keys = keystore.keys()?;
 
     // One shared log buffer for the whole node; start streaming it to stdout immediately so
@@ -148,6 +150,15 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
                 "p2p_addr is set but the keystore has no miner key to identify this node"
                     .to_string()
             })?;
+            // A fresh node dials BOTH the operator's configured bootstrap peers AND the
+            // stable seeds baked into the chain spec, so it can find the network off its
+            // LAN. Dedup, config peers first (operator intent wins ordering).
+            let mut bootstrap = config.bootstrap_peers.clone();
+            for s in &spec.seeds {
+                if !bootstrap.contains(s) {
+                    bootstrap.push(s.clone());
+                }
+            }
             let p2p = P2p::bind(
                 daemon.node(),
                 P2pConfig {
@@ -159,7 +170,7 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
                 p2p_addr,
             )?
             .with_block_log(daemon.block_log())
-            .with_bootstrap(config.bootstrap_peers.clone())
+            .with_bootstrap(bootstrap.clone())
             .with_sync_status(Arc::clone(&sync))
             .with_log_sink(Arc::clone(&logs));
             // Surface transport-level dial/handshake diagnostics (dialing → tcp connected
@@ -170,7 +181,7 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
                 &logs,
                 format!("P2P gossip listening on {}", p2p.local_addr()),
             );
-            for peer in &config.bootstrap_peers {
+            for peer in &bootstrap {
                 // Best-effort first dial; if the seed isn't up yet, the engine keeps
                 // retrying in the background, so the link forms once it is.
                 match p2p.connect(peer) {

@@ -140,6 +140,22 @@ pub struct ChainSpec {
     /// no-reset / replay-safe properties as [`deshield_limit_sov`](Self::deshield_limit_sov).
     #[serde(default)]
     pub deshield_window_blocks: Option<u64>,
+    /// Stable bootstrap peers baked into the network's genesis spec — a fresh node
+    /// dials these on first launch to find the network, in ADDITION to any operator-
+    /// configured `bootstrap_peers` and LAN mDNS discovery. Each entry is a
+    /// `host:port`, a bare IP (default P2P port assumed), or a DNS name (a "DNS seed"
+    /// resolving to several nodes) — the dialer resolves all three. Without these a
+    /// public-internet node has no way to find peers off its LAN. Not a genesis-header
+    /// field, so it never affects the genesis hash.
+    #[serde(default)]
+    pub seeds: Vec<String>,
+    /// The frozen genesis block hash this spec MUST produce, as lowercase hex. When
+    /// set, a node verifies the genesis it builds matches before starting and refuses
+    /// otherwise — so a corrupted or drifted embedded spec fails LOUDLY instead of
+    /// silently mining a private fork that peers with nobody. It is a checked identity,
+    /// not an input to genesis, so it never affects the hash it pins.
+    #[serde(default)]
+    pub expected_genesis_hash: Option<String>,
     /// Funded accounts.
     pub accounts: Vec<SpecAccount>,
 }
@@ -204,6 +220,32 @@ impl ChainSpec {
             mining,
             vesting: Vec::new(),
         })
+    }
+
+    /// Build the [`GenesisConfig`] AND, when the spec pins an
+    /// [`expected_genesis_hash`](Self::expected_genesis_hash), verify the genesis block
+    /// it produces matches — refusing to start on a mismatch. This is the guard against
+    /// a corrupted/drifted embedded spec silently forking off the real network (peers
+    /// bind to the genesis hash in the handshake, so a wrong hash finds nobody with no
+    /// diagnostic). Every node bring-up should use this rather than
+    /// [`to_genesis_config`](Self::to_genesis_config) directly.
+    pub fn to_genesis_config_verified(&self) -> Result<GenesisConfig, DaemonError> {
+        let cfg = self.to_genesis_config()?;
+        if let Some(expected) = &self.expected_genesis_hash {
+            let genesis = cfg
+                .build()
+                .map_err(|e| DaemonError::config(format!("genesis build: {e}")))?;
+            let actual = genesis.block.hash().to_hex();
+            if actual != *expected {
+                return Err(DaemonError::config(format!(
+                    "genesis hash mismatch for {}: spec pins {expected} but this build produces \
+                     {actual}. The chain spec has drifted from the frozen network identity — \
+                     refusing to start (it would fork off the real chain and peer with nobody).",
+                    self.chain_id
+                )));
+            }
+        }
+        Ok(cfg)
     }
 }
 
@@ -1493,6 +1535,49 @@ mod tests {
             genesis_hash,
             "00d863ee74a76e51f74d012dd6b336275951a00e2b082ac7925357ddd67d2ec8"
         );
+    }
+
+    #[test]
+    fn genesis_hash_pin_is_enforced() {
+        // H3: a node must refuse to start on a genesis that doesn't match the spec's
+        // pinned hash — otherwise a drifted/corrupt embedded spec silently forks off
+        // the real chain (peers bind to the genesis hash, so it finds nobody).
+        let mut spec = ChainSpec::from_json(MAINNET_SPEC).expect("mainnet spec parses");
+        assert!(
+            spec.expected_genesis_hash.is_some(),
+            "mainnet spec must pin its genesis hash"
+        );
+        // The real spec verifies (its build matches the pin).
+        assert!(spec.to_genesis_config_verified().is_ok());
+
+        // A WRONG pin is rejected — this is the drift/corruption guard.
+        spec.expected_genesis_hash = Some("00".repeat(32));
+        let err = spec.to_genesis_config_verified().unwrap_err();
+        assert!(
+            format!("{err}").contains("genesis hash mismatch"),
+            "mismatch must fail loudly, got: {err}"
+        );
+
+        // No pin ⇒ no check (back-compat: specs sealed before this field still build).
+        spec.expected_genesis_hash = None;
+        assert!(spec.to_genesis_config_verified().is_ok());
+    }
+
+    #[test]
+    fn spec_seeds_default_empty_and_parse() {
+        // H2: the `seeds` field is optional (older specs omit it) and round-trips.
+        let no_seeds: ChainSpec = serde_json::from_str(
+            r#"{"chain_id":"x","timestamp_ms":0,"policy":"mainnet_like","accounts":[]}"#,
+        )
+        .expect("spec without seeds parses");
+        assert!(no_seeds.seeds.is_empty());
+
+        let seeded: ChainSpec = serde_json::from_str(
+            r#"{"chain_id":"x","timestamp_ms":0,"policy":"mainnet_like",
+                "seeds":["seed.example:9645","203.0.113.7"],"accounts":[]}"#,
+        )
+        .expect("spec with seeds parses");
+        assert_eq!(seeded.seeds, vec!["seed.example:9645", "203.0.113.7"]);
     }
 
     #[test]
