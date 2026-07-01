@@ -3367,7 +3367,7 @@ impl Station {
         ui.heading("Peering");
         ui.label(
             egui::RichText::new(
-                "Join other machines to this testnet. Enter one peer's address — it is saved \
+                "Join other machines to this network. Enter one peer's address — it is saved \
                  and auto-dialed every start, then the rest of the network is discovered \
                  automatically (gossip). Solo mining works with zero peers.",
             )
@@ -3452,7 +3452,7 @@ impl Station {
             Some(n) if n > 0 => {
                 ui.colored_label(
                     palette::success(),
-                    format!("● {n} peer(s) connected — on the same testnet"),
+                    format!("● {n} peer(s) connected — on the same network"),
                 );
             }
             Some(_) => {
@@ -3808,7 +3808,7 @@ impl eframe::App for Station {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(format!(
-                            "SOV Station v{} · {} (testnet)",
+                            "SOV Station v{} · {}",
                             env!("CARGO_PKG_VERSION"),
                             self.network.label()
                         ))
@@ -6858,7 +6858,7 @@ impl Station {
                                 s.fee_shielded_grains
                             };
                             let fee_str = if fee == 0 {
-                                "0 XUS  ·  no network fee on testnet".to_string()
+                                "0 XUS  ·  no network fee".to_string()
                             } else {
                                 format!("{} XUS", xus(&fee.to_string()))
                             };
