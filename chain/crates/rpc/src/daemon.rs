@@ -1461,10 +1461,14 @@ mod tests {
     #[test]
     fn mainnet_genesis_builds_and_is_frozen() {
         // The permanent MAINNET genesis. It must build deterministically (RandomX,
-        // 2.5-minute blocks, the full 21M mining budget) with ZERO pre-mine — a pure
-        // fair launch, every coin mined, no tax. Pin the hash so it can never silently
-        // change. (RandomX vs SHA-256d does not affect the genesis HASH — the seal is
-        // not a header field — so this runs on any platform.)
+        // 2.5-minute target, the full 21M mining budget) with ZERO pre-mine — a pure
+        // fair launch, every coin mined, no tax. The genesis DIFFICULTY is seeded low
+        // (16 leading-zero bits) so a single machine can bootstrap the chain; LWMA then
+        // ramps it toward the 2.5-minute equilibrium as hashrate joins (a too-HIGH seed
+        // is what stalls a new chain). The `bits` header field ⇒ this difficulty is part
+        // of the genesis HASH. Pin the hash so it can never silently change. (RandomX vs
+        // SHA-256d does not affect the hash — the seal is not a header field — so this
+        // runs on any platform.)
         let spec = ChainSpec::from_json(MAINNET_SPEC).expect("mainnet spec parses");
         assert_eq!(spec.chain_id, "sov-mainnet");
         let genesis = spec
@@ -1487,7 +1491,7 @@ mod tests {
         );
         assert_eq!(
             genesis_hash,
-            "e2e1ec02a13cb3626c06e2a1d5056e988499963ef177f60a5aec2d84a368e7e0"
+            "00d863ee74a76e51f74d012dd6b336275951a00e2b082ac7925357ddd67d2ec8"
         );
     }
 
