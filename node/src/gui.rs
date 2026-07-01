@@ -3118,8 +3118,11 @@ impl Station {
         let run = Arc::clone(&self.node_run);
         let logs = Arc::clone(&self.node_logs);
         let peer = self.peer_addr.clone();
+        // The master passphrase seals the miner keystore at rest. Clone into a
+        // Zeroizing so this copy is wiped when the build thread finishes.
+        let passphrase = zeroize::Zeroizing::new(self.passphrase.clone());
         std::thread::spawn(move || {
-            let result = build_and_run_node(&spec, &net, &account, seed, &peer, &logs);
+            let result = build_and_run_node(&spec, &net, &account, seed, &peer, &passphrase, &logs);
             let mut slot = run.lock().unwrap();
             match result {
                 Ok(node) => {
@@ -8567,6 +8570,7 @@ fn build_and_run_node(
     account: &str,
     seed: [u8; 32],
     peer: &str,
+    passphrase: &str,
     logs: &Arc<Mutex<Vec<String>>>,
 ) -> Result<EmbeddedNode, String> {
     // SINGLE INSTANCE: kill any ghost copy of this app first, so a leftover process from
@@ -8626,16 +8630,33 @@ fn build_and_run_node(
         // continuous miner).
     }
 
-    // Point the node's keystore at this wallet's account+seed, so the coinbase
-    // funds a wallet the GUI controls. (Plaintext testnet keystore by design.)
-    let keystore_json = json!({
-        "miners": [{ "account": account, "seed_hex": hex_lower(&seed), "scheme": "hybrid65" }]
-    });
-    std::fs::write(
-        node_dir.join("node-1/keystore.json"),
-        keystore_json.to_string(),
-    )
-    .map_err(|e| format!("could not set miner keystore: {e}"))?;
+    // Point the node's keystore at this wallet's account+seed, so the coinbase funds a
+    // wallet the GUI controls. The miner seed is a SPENDING KEY — it must never touch
+    // disk in the clear (this is a mainnet key). Seal it under the master passphrase
+    // (Argon2id + ChaCha20-Poly1305, same envelope as the wallet store) and lock the
+    // file to the owner. Refuse to start rather than write a plaintext seed.
+    if passphrase.is_empty() {
+        return Err(
+            "unlock your wallet first — the miner seed is encrypted at rest and \
+                    needs your passphrase, so a spending key is never written in the clear"
+                .to_string(),
+        );
+    }
+    let keystore_json = Keystore {
+        miners: vec![KeystoreEntry {
+            account: account.to_string(),
+            seed_hex: hex_lower(&seed),
+            scheme: Some("hybrid65".to_string()),
+            mnemonic: None,
+            public_key: None,
+        }],
+    }
+    .to_encrypted_json(passphrase)
+    .map_err(|e| format!("encrypt miner keystore: {e}"))?;
+    let ks_path = node_dir.join("node-1/keystore.json");
+    std::fs::write(&ks_path, keystore_json)
+        .map_err(|e| format!("could not set miner keystore: {e}"))?;
+    restrict_to_owner(&ks_path);
     let _ = std::fs::write(&marker, account);
 
     // ── Run the node IN-PROCESS via the library (mirrors `sov-rpcd`'s `run`). ──
@@ -8685,9 +8706,11 @@ fn build_and_run_node(
         .map_err(|e| format!("refresh chain-spec: {e}"))?;
     let spec = ChainSpec::from_json(&read(&node_dir.join("chain-spec.json"))?)
         .map_err(|e| format!("chain-spec: {e}"))?;
-    let keystore =
-        Keystore::from_encrypted_or_plain(&read(&node_dir.join("node-1/keystore.json"))?, None)
-            .map_err(|e| format!("keystore: {e}"))?;
+    let keystore = Keystore::from_encrypted_or_plain(
+        &read(&node_dir.join("node-1/keystore.json"))?,
+        Some(passphrase),
+    )
+    .map_err(|e| format!("keystore: {e}"))?;
     let genesis = spec
         .to_genesis_config()
         .map_err(|e| format!("genesis: {e}"))?;
