@@ -425,6 +425,16 @@ impl SignedTransaction {
         self.transaction.id()
     }
 
+    /// The transaction's canonical serialized size in bytes (its Borsh encoding). A
+    /// block's size is its header plus the length-prefixed concatenation of its
+    /// transactions' encodings, so summing this is how the producer keeps an assembled
+    /// block within the elastic block-size cap.
+    pub fn serialized_size(&self) -> usize {
+        borsh::to_vec(self)
+            .expect("Borsh serialization of a SignedTransaction is infallible")
+            .len()
+    }
+
     /// Whether the signature verifies against the transaction's committed
     /// public key over its canonical signing bytes.
     #[must_use]

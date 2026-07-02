@@ -134,6 +134,16 @@ impl Block {
         self.header.hash()
     }
 
+    /// The block's canonical serialized size in bytes — the exact Borsh encoding that
+    /// is written to the block log and gossiped on the wire. This is the "weight" the
+    /// elastic block-size cap bounds (consensus): deterministic across nodes and
+    /// platforms because Borsh is a canonical, length-prefixed encoding.
+    pub fn serialized_size(&self) -> usize {
+        borsh::to_vec(self)
+            .expect("Borsh serialization of a Block is infallible")
+            .len()
+    }
+
     /// Whether this is the genesis block (height 0).
     pub fn is_genesis(&self) -> bool {
         self.header.height.is_genesis()

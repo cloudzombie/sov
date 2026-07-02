@@ -117,6 +117,11 @@ struct BlockIndexEntry {
     chain_work: Work,
     /// The block's height (cached; equals `block.header.height`).
     height: u64,
+    /// The block's canonical serialized size in bytes (cached; equals
+    /// `block.serialized_size()`). The elastic block-size cap takes the median of these
+    /// over the trailing [`BLOCK_SIZE_WINDOW`]. Cached so that computing the cap is O(1)
+    /// per ancestor rather than re-serializing every block in the window.
+    size: usize,
 }
 
 /// The validated, not-yet-stored result of checking an incoming block against
@@ -277,6 +282,35 @@ pub struct MinerStats {
 /// genesis hash is unchanged.
 const DIFFICULTY_WINDOW: u64 = 60;
 
+/// Elastic block-size cap — the trailing block count whose MEDIAN serialized size
+/// governs the next block's ceiling (Monero's dynamic-block-size window, 100). The cap
+/// is [`BLOCK_SIZE_GROWTH`]× that median, clamped to
+/// [[`BLOCK_SIZE_FLOOR`], [`BLOCK_SIZE_CEILING`]]. So block capacity grows on its own
+/// under sustained demand and relaxes when demand fades — within fixed guardrails, with
+/// no governance and no future upgrade. Consensus-critical: every node must derive the
+/// same ceiling, so the median is an integer over cached, canonical Borsh sizes.
+const BLOCK_SIZE_WINDOW: u64 = 100;
+/// Multiplier applied to the median recent block size to get the cap: a block may be up
+/// to 2× the recent median, so headroom is always ~2× real demand.
+const BLOCK_SIZE_GROWTH: usize = 2;
+/// Floor for the elastic cap: a block may ALWAYS be at least this large, so ordinary
+/// traffic is never constrained. A near-empty chain (like mainnet today) sits here — its
+/// kilobyte blocks are orders of magnitude below the floor, so the cap changes nothing
+/// for existing blocks (it can only reject a FUTURE oversized block). 1 MiB ≈ ~170
+/// post-quantum-signed transfers (~5 KiB each) per 2.5-minute block.
+const BLOCK_SIZE_FLOOR: usize = 1024 * 1024;
+/// Hard ceiling for the elastic cap regardless of demand — an absolute upper bound on
+/// how large any block can ever be, kept well under the 8 MiB P2P frame so that every
+/// valid block still fits in a single gossip message.
+const BLOCK_SIZE_CEILING: usize = 4 * 1024 * 1024;
+
+/// Producer-side headroom reserved for the block header + the transactions' length
+/// prefix when selecting transactions against the elastic cap. Far larger than the
+/// header actually needs (a few hundred bytes), so the assembled block is always
+/// comfortably under the importer's exact limit — the producer only ever UNDER-fills,
+/// never producing a block the importer would reject. Not a consensus value.
+const BLOCK_HEADER_SIZE_RESERVE: usize = 4096;
+
 /// Snap a difficulty target to the value representable in Bitcoin's compact
 /// "nBits" form — the canonical on-chain target. Difficulty arithmetic produces
 /// a full-precision 256-bit target, but the header carries only the 3-byte
@@ -287,6 +321,25 @@ const DIFFICULTY_WINDOW: u64 = 60;
 fn canonical_target(target: Target) -> Target {
     Target::from_compact(target.to_compact())
         .expect("to_compact always yields a decodable, in-range target")
+}
+
+/// The elastic block-size cap from a window of recent block sizes: `BLOCK_SIZE_GROWTH ×`
+/// the integer median, clamped to `[BLOCK_SIZE_FLOOR, BLOCK_SIZE_CEILING]`. Pure and
+/// deterministic (integer-only, single upper-median pick for even counts). `sizes` must
+/// be non-empty. Kept separate from [`Blockchain::block_size_limit`] so the arithmetic
+/// is unit-testable without constructing a chain.
+fn elastic_block_cap(mut sizes: Vec<usize>) -> usize {
+    debug_assert!(
+        !sizes.is_empty(),
+        "cap window is never empty (parent is present)"
+    );
+    sizes.sort_unstable();
+    // Upper median for an even count — a single deterministic pick (no averaging /
+    // rounding ambiguity across platforms).
+    let median = sizes[sizes.len() / 2];
+    median
+        .saturating_mul(BLOCK_SIZE_GROWTH)
+        .clamp(BLOCK_SIZE_FLOOR, BLOCK_SIZE_CEILING)
 }
 
 /// Confirmation depth at which a block is reported **final**: buried this many
@@ -335,6 +388,7 @@ impl Blockchain {
         index.insert(
             genesis_hash,
             BlockIndexEntry {
+                size: genesis.block.serialized_size(),
                 block: genesis.block.clone(),
                 sha_target,
                 chain_work: Work::zero().saturating_add(Work::of_target(&sha_target)),
@@ -514,6 +568,27 @@ impl Blockchain {
     /// so the value tracks the live hashrate and converges smoothly to
     /// `target_block_ms` without overshoot/oscillation. The result is canonical
     /// (snapped to the compact `nBits` grid).
+    /// The maximum serialized size (bytes) a block extending `parent` may have — the
+    /// ELASTIC block-size cap. It is [`BLOCK_SIZE_GROWTH`]× the MEDIAN serialized size of
+    /// the last [`BLOCK_SIZE_WINDOW`] blocks (walking parent links, genesis included when
+    /// the chain is shorter than the window), clamped to
+    /// [[`BLOCK_SIZE_FLOOR`], [`BLOCK_SIZE_CEILING`]]. Computed identically by the
+    /// producer and every importer from the same ancestors (like `expected_target`), over
+    /// cached integer sizes with an integer median, so it is fully deterministic. Grows
+    /// with sustained demand and relaxes when it fades, within the fixed guardrails.
+    fn block_size_limit(&self, parent: &BlockIndexEntry) -> usize {
+        let mut sizes: Vec<usize> = Vec::with_capacity(BLOCK_SIZE_WINDOW as usize);
+        let mut cur = parent;
+        for _ in 0..BLOCK_SIZE_WINDOW {
+            sizes.push(cur.size);
+            match self.index.get(&cur.block.header.prev_hash) {
+                Some(prev) => cur = prev,
+                None => break, // reached genesis (its parent link is not indexed)
+            }
+        }
+        elastic_block_cap(sizes)
+    }
+
     fn expected_target(&self, parent: &BlockIndexEntry) -> Target {
         let height = parent.height + 1;
         // Warmup: until a full window of history exists, carry the parent's (ultimately
@@ -746,10 +821,16 @@ impl Blockchain {
         // Meter and seal against the targets in force for a block extending the
         // head — derived from the head's branch, exactly as `import_block` will
         // recompute them, so the producer and the importer agree bit-for-bit.
-        let sha_target = {
+        let (sha_target, size_limit) = {
             let head = self.index.get(&self.head).expect("head is always indexed");
-            self.expected_target(head)
+            (self.expected_target(head), self.block_size_limit(head))
         };
+        // Transactions are selected only while the assembled block stays within the
+        // elastic block-size cap (reserving headroom for the header + length prefix, so
+        // the producer never builds a block the importer would reject as too large). A
+        // transaction that doesn't fit is left in the mempool for a later block.
+        let tx_budget = size_limit.saturating_sub(BLOCK_HEADER_SIZE_RESERVE);
+        let mut size_acc = 0usize;
         let policy = self.policy_with(sha_target);
         let prev_hash = self.head().hash();
 
@@ -778,8 +859,17 @@ impl Blockchain {
         // clogging the mempool and producing empty blocks.
         let mut excluded: Vec<(SignedTransaction, String)> = Vec::new();
         for stx in transactions {
+            // Skip (but keep in the mempool) any transaction that would push the block
+            // past the elastic size cap; a smaller later transaction may still fit.
+            let tx_size = stx.serialized_size();
+            if size_acc.saturating_add(tx_size) > tx_budget {
+                continue;
+            }
             match apply_transaction(&mut probe, &stx, &selection_ctx) {
-                Ok(_) => included.push(stx),
+                Ok(_) => {
+                    size_acc = size_acc.saturating_add(tx_size);
+                    included.push(stx);
+                }
                 Err(e) => excluded.push((stx, e.to_string())),
             }
         }
@@ -963,6 +1053,19 @@ impl Blockchain {
             .index
             .get(&block.header.prev_hash)
             .ok_or(ChainError::PrevHashMismatch)?;
+
+        // Elastic block-size cap: reject an oversized block up front (cheap, before PoW
+        // and tx re-execution), so no miner can force every node to download/verify a
+        // giant block. The limit is derived from the parent's branch, identically to the
+        // producer, so honest blocks always pass.
+        let size = block.serialized_size();
+        let size_limit = self.block_size_limit(parent);
+        if size > size_limit {
+            return Err(ChainError::BlockTooLarge {
+                size,
+                limit: size_limit,
+            });
+        }
 
         let sha_target = self.expected_target(parent);
         let expected_height = parent.height + 1;
@@ -1717,6 +1820,7 @@ impl Blockchain {
     /// Record an accepted block in the fork-choice index.
     fn insert_entry(&mut self, block: Block, cand: &Candidate) {
         let hash = block.hash();
+        let size = block.serialized_size();
         self.index.insert(
             hash,
             BlockIndexEntry {
@@ -1724,6 +1828,7 @@ impl Blockchain {
                 sha_target: cand.sha_target,
                 chain_work: cand.new_work,
                 height: cand.height,
+                size,
             },
         );
     }
@@ -1819,6 +1924,14 @@ pub enum ChainError {
     /// The block did not point at the current head.
     #[error("previous-hash mismatch: block does not extend the head")]
     PrevHashMismatch,
+    /// The block's serialized size exceeds the elastic block-size cap for its height.
+    #[error("block too large: {size} bytes exceeds the {limit}-byte cap")]
+    BlockTooLarge {
+        /// The block's canonical serialized size, in bytes.
+        size: usize,
+        /// The elastic cap for this height (see [`Blockchain::block_size_limit`]).
+        limit: usize,
+    },
     /// The block's timestamp went backwards.
     #[error("non-monotonic timestamp")]
     NonMonotonicTimestamp,
@@ -2636,6 +2749,63 @@ mod tests {
             chain.ledger().total_supply().unwrap(),
             Balance::from_sov(1_000).unwrap()
         );
+    }
+
+    #[test]
+    fn elastic_block_cap_math() {
+        let mib = 1024 * 1024;
+        // Near-empty (small blocks): 2× a tiny median is below the floor → floored.
+        assert_eq!(elastic_block_cap(vec![1000, 2000, 500]), BLOCK_SIZE_FLOOR);
+        // Median in range: 2× a ~1.46 MiB median = ~2.93 MiB, inside [1, 4] MiB.
+        let m = 1_500 * 1024;
+        assert_eq!(elastic_block_cap(vec![m, m, m]), m * BLOCK_SIZE_GROWTH);
+        // Huge blocks: 2× median is clamped down to the ceiling.
+        assert_eq!(elastic_block_cap(vec![10 * mib]), BLOCK_SIZE_CEILING);
+        // Even count uses the upper median (sorted[len/2]): [1,1,m,m] MiB → m.
+        assert_eq!(
+            elastic_block_cap(vec![mib, mib, m, m]),
+            (m * BLOCK_SIZE_GROWTH).clamp(BLOCK_SIZE_FLOOR, BLOCK_SIZE_CEILING)
+        );
+    }
+
+    #[test]
+    fn near_empty_chain_cap_is_the_floor() {
+        // Real blocks are kilobytes, so the elastic cap sits exactly at the 1 MiB floor —
+        // i.e. existing/near-empty blocks are never constrained by the cap.
+        let mut chain = fresh_chain();
+        for i in 0..3 {
+            let b = chain
+                .produce_block(
+                    vec![usa_transfer("ecb.reserve.sov", 1, i)],
+                    2_000 + i * 1_000,
+                )
+                .unwrap();
+            chain.import_block(b).unwrap();
+        }
+        let head = chain.index.get(&chain.head).expect("head indexed");
+        assert!(
+            head.size < BLOCK_SIZE_FLOOR,
+            "a real block is far under the floor"
+        );
+        assert_eq!(chain.block_size_limit(head), BLOCK_SIZE_FLOOR);
+    }
+
+    #[test]
+    fn oversized_block_is_rejected_by_the_elastic_cap() {
+        let mut chain = fresh_chain();
+        let mut block = chain
+            .produce_block(vec![usa_transfer("ecb.reserve.sov", 1, 0)], 2_000)
+            .unwrap();
+        // Inflate the body past the 1 MiB floor by repeating a transaction. The size
+        // check runs BEFORE PoW/tx validation, so an oversized block is rejected as such.
+        let tx = block.transactions[0].clone();
+        let n = BLOCK_SIZE_FLOOR / tx.serialized_size().max(1) + 2;
+        block.transactions = vec![tx; n];
+        assert!(block.serialized_size() > BLOCK_SIZE_FLOOR);
+        assert!(matches!(
+            chain.import_block(block),
+            Err(ChainError::BlockTooLarge { .. })
+        ));
     }
 
     #[test]
