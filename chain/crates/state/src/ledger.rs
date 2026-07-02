@@ -265,6 +265,17 @@ impl UndoLog {
 }
 
 /// The world state: all accounts and their Merkle commitment.
+///
+/// ⚠️ **FROZEN — CONSENSUS ENCODING.** Every persisted struct committed into the state
+/// root here (`Account`, `TokenInfo`, `Multisig`, `MultisigProposal`, `NftClass`,
+/// `NftToken`, `NameRecord`, `Htlc`, `SpendWindow`, `CompliancePolicy`, …) is Borsh-
+/// encoded with NO field tags — so adding, removing, or reordering ANY field, even a
+/// tail append, re-encodes every existing leaf and changes the state root: instant
+/// replay + cross-node fork. A NEW sub-state is only safe if it lives in its own
+/// absent-when-empty slot (see the `recommit_*` helpers) so an unused feature leaves
+/// the existing root byte-identical. Extend by adding a new map/slot, NEVER by widening
+/// an existing committed struct. Changing this is a coordinated network upgrade, not an
+/// in-place edit.
 #[derive(Clone, Default)]
 pub struct Ledger {
     /// In-memory undo journal: when `Some`, every state write records its pre-image

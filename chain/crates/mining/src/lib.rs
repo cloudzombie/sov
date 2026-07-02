@@ -99,7 +99,9 @@ pub struct MiningPolicy {
     /// difficulty toward this cadence (see [`Difficulty::retarget`]).
     pub target_block_ms: u64,
     /// Transaction-fee price per unit of gas, in grains: a sender pays
-    /// `gas_used × gas_price`. `0` disables fees. Governance-tunable.
+    /// `gas_used × gas_price`. `0` disables fees. ⚠️ CONSENSUS-CRITICAL: the fee
+    /// enters the state root (debited from sender, credited to miner), so on a live
+    /// chain this can only change via a coordinated upgrade — never tuned in place.
     pub gas_price: Balance,
     /// BIP-110: the maximum bytes of arbitrary data a transaction may carry (its
     /// `Deploy` contract code), keeping block space reserved for monetary use
@@ -172,8 +174,9 @@ impl MiningPolicy {
             max_code_bytes: 256 * 1024, // 256 KiB (BIP-110)
             // Drain limiter ON: at 2.5-minute blocks, 576 blocks ≈ one day; at most
             // 21,000 SOV (0.1% of the 21M cap) can leave the pool per day even
-            // under a proof-system failure. Governance-tunable like every
-            // policy parameter here.
+            // under a proof-system failure. ⚠️ CONSENSUS-CRITICAL on a live chain:
+            // these bound tx validity, so a change forks the chain — only via a
+            // coordinated upgrade, not an in-place tune.
             deshield_window_blocks: 576,
             deshield_limit_grains: Balance::from_sov(21_000).expect("representable").grains(),
         }
@@ -263,8 +266,9 @@ mod tests {
         // breach `genesis + budget <= cap`, so a pre-mine is impossible.
         assert_eq!(p.mining_budget_grains, sov_primitives::MAX_SUPPLY_GRAINS);
 
-        // Sum the whole geometric series by epochs (each epoch is 210,000
-        // blocks at a constant integer subsidy): the Bitcoin asymptote.
+        // Sum the whole geometric series by epochs (each epoch is
+        // `halving_interval_blocks` — 840,000 — blocks at a constant integer
+        // subsidy): the Bitcoin asymptote.
         let mut total: u128 = 0;
         let mut k = 0u64;
         loop {

@@ -1,10 +1,16 @@
 //! Gas metering.
 //!
-//! Gas measures the work a transaction costs the network. In this phase the
-//! schedule is intentionally simple and fixed: every transaction pays a flat
-//! intrinsic cost. Fee *pricing* (turning gas into a charged amount) belongs to
-//! the tokenomics phase; here we only meter and record gas so that economics can
-//! be layered on without reworking execution.
+//! Gas measures the work a transaction costs the network: every transaction pays
+//! a flat intrinsic cost plus per-byte/per-verify surcharges. The fee charged is
+//! `gas_used × gas_price` (see [`MiningPolicy::gas_price`](sov_mining)).
+//!
+//! ⚠️ **FROZEN — CONSENSUS-CRITICAL.** These gas constants are part of mainnet
+//! consensus: the fee they produce is debited from the sender and credited to the
+//! miner inside the STF, so it enters the **state root**. Changing ANY value here
+//! (or `gas_price`) changes balances → the state root → and every node that runs the
+//! new schedule computes a different chain from every node that runs the old one — a
+//! hard fork / chain restart. These are NOT "tune later" values. Do not modify them
+//! on the live chain; a change is only possible via a coordinated network upgrade.
 
 use sov_types::Action;
 
