@@ -339,6 +339,40 @@ fn stf_vector() -> Value {
                 amount: sov(999_999),
             },
         ),
+        // 7. Native-asset issuance: usa issues 1000 USD1 units to itself. Exercises the
+        //    token_slot (TokenInfo) + token_balance_slot per-entry SMT commitments — the
+        //    second client must reproduce both to match the state root.
+        sign(
+            "usa.reserve.sov",
+            1,
+            2,
+            Action::TokenIssue {
+                symbol: "USD1".to_string(),
+                amount: sov(1_000),
+                to: id("usa.reserve.sov"),
+            },
+        ),
+        // 8. Token transfer: 300 USD1 usa -> ecb.
+        sign(
+            "usa.reserve.sov",
+            1,
+            3,
+            Action::TokenTransfer {
+                asset: sov_state::token_asset_id(&id("usa.reserve.sov"), "USD1"),
+                to: id("ecb.reserve.sov"),
+                amount: sov(300),
+            },
+        ),
+        // 9. Token burn: usa burns 100 USD1 (issued − burned shrinks).
+        sign(
+            "usa.reserve.sov",
+            1,
+            4,
+            Action::TokenBurn {
+                asset: sov_state::token_asset_id(&id("usa.reserve.sov"), "USD1"),
+                amount: sov(100),
+            },
+        ),
     ];
 
     let ctx = BlockContext {
@@ -387,6 +421,23 @@ fn stf_vector() -> Value {
                 "type": "htlc_claim",
                 "htlc_id": format!("0x{}", hex::encode(htlc_id.as_bytes())),
                 "preimage": preimage,
+            }),
+            Action::TokenIssue { symbol, amount, to } => json!({
+                "type": "token_issue",
+                "symbol": symbol,
+                "amount": amount.grains().to_string(),
+                "to": to.as_str(),
+            }),
+            Action::TokenTransfer { asset, to, amount } => json!({
+                "type": "token_transfer",
+                "asset": format!("0x{}", hex::encode(asset.as_bytes())),
+                "to": to.as_str(),
+                "amount": amount.grains().to_string(),
+            }),
+            Action::TokenBurn { asset, amount } => json!({
+                "type": "token_burn",
+                "asset": format!("0x{}", hex::encode(asset.as_bytes())),
+                "amount": amount.grains().to_string(),
             }),
             other => panic!("unsupported action in STF vector: {other:?}"),
         };

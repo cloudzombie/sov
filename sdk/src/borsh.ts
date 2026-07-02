@@ -72,6 +72,10 @@ export class BorshWriter {
     return this;
   }
 
+  u16(n: number | bigint): this {
+    return this.uint(BigInt(n), 2);
+  }
+
   u32(n: number | bigint): this {
     return this.uint(BigInt(n), 4);
   }
@@ -110,6 +114,54 @@ export class BorshWriter {
   }
 }
 
+/** Coerce a `number[] | Uint8Array` byte field to `Uint8Array`. */
+function bytes(b: number[] | Uint8Array): Uint8Array {
+  return b instanceof Uint8Array ? b : Uint8Array.from(b);
+}
+
+/** Borsh a `Vec<AccountId>` from a BTreeSet — sorted (Rust's BTreeSet iterates in
+ * key order), so the SDK's encoding matches byte-for-byte. */
+function writeAccountSet(w: BorshWriter, accounts: string[]): void {
+  const sorted = [...accounts].sort();
+  w.u32(sorted.length);
+  for (const a of sorted) w.string(a);
+}
+
+/** `intents::Asset` — enum: 0 Sov, 1 Token(Hash). */
+function writeAsset(w: BorshWriter, asset: { type: "sov" } | { type: "token"; asset: string }): void {
+  if (asset.type === "sov") w.u8(0);
+  else w.u8(1).fixed(hexToBytes(asset.asset), 32);
+}
+
+/** `intents::Intent`. */
+function writeIntent(w: BorshWriter, i: import("./types.js").Intent): void {
+  w.string(i.owner);
+  writeVersionedPublicKey(w, i.public_key);
+  w.u64(i.nonce);
+  writeAsset(w, i.give_asset);
+  w.u128(BigInt(i.give_amount));
+  writeAsset(w, i.want_asset);
+  w.u128(BigInt(i.min_receive));
+  w.u64(i.expiry_height);
+}
+
+/** `compliance::CompliancePolicy` = { frozen: bool, transfer_control, spend_limit: Option }. */
+function writeCompliancePolicy(w: BorshWriter, p: import("./types.js").CompliancePolicy): void {
+  w.u8(p.frozen ? 1 : 0);
+  // TransferControl enum: 0 Unrestricted, 1 AllowList(set), 2 DenyList(set).
+  if (p.transfer_control.type === "unrestricted") w.u8(0);
+  else if (p.transfer_control.type === "allow_list") {
+    w.u8(1);
+    writeAccountSet(w, p.transfer_control.accounts);
+  } else {
+    w.u8(2);
+    writeAccountSet(w, p.transfer_control.accounts);
+  }
+  // Option<SpendLimit>: 0 none, 1 some { max_per_window: u128, window_blocks: u64 }.
+  if (p.spend_limit == null) w.u8(0);
+  else w.u8(1).u128(BigInt(p.spend_limit.max_per_window)).u64(p.spend_limit.window_blocks);
+}
+
 function writeAction(w: BorshWriter, action: Action): void {
   switch (action.type) {
     case "transfer":
@@ -119,16 +171,16 @@ function writeAction(w: BorshWriter, action: Action): void {
       w.u8(1);
       break;
     case "deploy":
-      w.u8(2).vecU8(Uint8Array.from(action.code));
+      w.u8(2).vecU8(bytes(action.code));
       break;
     case "call":
       w.u8(3)
         .string(action.contract)
         .u64(action.gas_limit)
-        .vecU8(Uint8Array.from(action.calldata ?? []));
+        .vecU8(bytes(action.calldata ?? []));
       break;
     case "shielded":
-      w.u8(4).vecU8(Uint8Array.from(action.bundle));
+      w.u8(4).vecU8(bytes(action.bundle));
       break;
     case "htlc_lock":
       w
@@ -139,10 +191,77 @@ function writeAction(w: BorshWriter, action: Action): void {
         .u64(action.timeout_height);
       break;
     case "htlc_claim":
-      w.u8(6).fixed(hexToBytes(action.htlc_id), 32).vecU8(Uint8Array.from(action.preimage));
+      w.u8(6).fixed(hexToBytes(action.htlc_id), 32).vecU8(bytes(action.preimage));
       break;
     case "htlc_refund":
       w.u8(7).fixed(hexToBytes(action.htlc_id), 32);
+      break;
+    case "token_issue":
+      w.u8(8).string(action.symbol).u128(BigInt(action.amount)).string(action.to);
+      break;
+    case "token_transfer":
+      w.u8(9).fixed(hexToBytes(action.asset), 32).string(action.to).u128(BigInt(action.amount));
+      break;
+    case "token_burn":
+      w.u8(10).fixed(hexToBytes(action.asset), 32).u128(BigInt(action.amount));
+      break;
+    case "token_set_policy":
+      w.u8(11).fixed(hexToBytes(action.asset), 32);
+      writeCompliancePolicy(w, action.policy);
+      break;
+    case "intent_settle":
+      w.u8(12);
+      writeIntent(w, action.settlement.intent.intent);
+      writeVersionedSignature(w, action.settlement.intent.signature);
+      w.string(action.settlement.solver).u128(BigInt(action.settlement.deliver_amount));
+      break;
+    case "intent_cancel":
+      w.u8(13);
+      writeIntent(w, action.intent);
+      break;
+    case "rotate_key":
+      w.u8(14);
+      writeVersionedPublicKey(w, action.new_key);
+      writeVersionedSignature(w, action.proof);
+      break;
+    case "register_name":
+      w.u8(15).string(action.name);
+      break;
+    case "transfer_name":
+      w.u8(16).string(action.name).string(action.to);
+      break;
+    case "nft_mint":
+      w.u8(17).string(action.symbol).vecU8(bytes(action.token_id)).string(action.to).vecU8(bytes(action.metadata));
+      break;
+    case "nft_transfer":
+      w.u8(18).fixed(hexToBytes(action.collection), 32).vecU8(bytes(action.token_id)).string(action.to);
+      break;
+    case "nft_set_meta":
+      w.u8(19).fixed(hexToBytes(action.collection), 32).vecU8(bytes(action.token_id)).vecU8(bytes(action.metadata));
+      break;
+    case "set_multisig":
+      w.u8(20).u32(action.signers.length);
+      for (const s of action.signers) writeVersionedPublicKey(w, s);
+      w.u16(action.threshold);
+      break;
+    case "multisig_exec":
+      w.u8(21);
+      writeAction(w, action.action);
+      w.u32(action.approvals.length);
+      for (const ap of action.approvals) {
+        w.u16(ap.signer);
+        writeVersionedSignature(w, ap.signature);
+      }
+      break;
+    case "propose_multisig":
+      w.u8(22).string(action.account);
+      writeAction(w, action.action);
+      break;
+    case "approve_multisig":
+      w.u8(23).string(action.account).fixed(hexToBytes(action.proposal), 32);
+      break;
+    case "cancel_multisig":
+      w.u8(24).string(action.account).fixed(hexToBytes(action.proposal), 32);
       break;
     default: {
       const _never: never = action;
@@ -173,6 +292,22 @@ function writeVersionedPublicKey(w: BorshWriter, publicKey: string): void {
     w.u8(1).fixed(bytes, HYBRID_PK_LEN);
   } else {
     w.u8(0).fixed(hexToBytes(publicKey), ED25519_PK_LEN);
+  }
+}
+
+/** Borsh-encode a versioned signature (scheme byte first) — mirrors the node's
+ * `Signature` enum: Ed25519 (`0x00` + 64 bytes) or hybrid Ed25519 + ML-DSA-65
+ * (`0x01` + 3373 bytes). Used inside actions that carry a detached signature
+ * (RotateKey proof, MultisigApproval, a settled intent's owner signature). */
+function writeVersionedSignature(w: BorshWriter, signature: string): void {
+  if (signature.startsWith(HYBRID_PREFIX)) {
+    const b = hexToBytes(signature.slice(HYBRID_PREFIX.length));
+    if (b.length !== HYBRID_SIG_LEN) {
+      throw new BorshError(`hybrid65 signature must be ${HYBRID_SIG_LEN} bytes, got ${b.length}`);
+    }
+    w.u8(1).fixed(b, HYBRID_SIG_LEN);
+  } else {
+    w.u8(0).fixed(hexToBytes(signature), ED25519_SIG_LEN);
   }
 }
 

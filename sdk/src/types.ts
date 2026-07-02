@@ -120,8 +120,184 @@ export interface HtlcRefundAction {
   htlc_id: string;
 }
 
+/** Mint `amount` units of the signer's native asset `symbol` to `to`. */
+export interface TokenIssueAction {
+  type: "token_issue";
+  symbol: string;
+  amount: GrainString;
+  to: AccountIdStr;
+}
+
+/** Move `amount` units of `asset` (32-byte id hex) from the signer to `to`. */
+export interface TokenTransferAction {
+  type: "token_transfer";
+  asset: HashHex;
+  to: AccountIdStr;
+  amount: GrainString;
+}
+
+/** Burn `amount` units of `asset` from the signer's balance. */
+export interface TokenBurnAction {
+  type: "token_burn";
+  asset: HashHex;
+  amount: GrainString;
+}
+
+/** A native-asset transfer control (mirror `compliance::TransferControl`). */
+export type TransferControl =
+  | { type: "unrestricted" }
+  | { type: "allow_list"; accounts: AccountIdStr[] }
+  | { type: "deny_list"; accounts: AccountIdStr[] };
+
+/** A per-window spend limit (mirror `compliance::SpendLimit`). */
+export interface SpendLimit {
+  max_per_window: GrainString;
+  window_blocks: number;
+}
+
+/** An asset's compliance policy (mirror `compliance::CompliancePolicy`). */
+export interface CompliancePolicy {
+  frozen: boolean;
+  transfer_control: TransferControl;
+  spend_limit: SpendLimit | null;
+}
+
+/** Set (replace) the compliance policy of `asset`. Issuer-only. */
+export interface TokenSetPolicyAction {
+  type: "token_set_policy";
+  asset: HashHex;
+  policy: CompliancePolicy;
+}
+
+/** An intent's asset leg (mirror `intents::Asset`). */
+export type IntentAsset = { type: "sov" } | { type: "token"; asset: HashHex };
+
+/** A declarative swap intent (mirror `intents::Intent`). */
+export interface Intent {
+  owner: AccountIdStr;
+  public_key: PublicKeyHex;
+  nonce: number;
+  give_asset: IntentAsset;
+  give_amount: GrainString;
+  want_asset: IntentAsset;
+  min_receive: GrainString;
+  expiry_height: number;
+}
+
+/** A signed intent (mirror `intents::SignedIntent`). */
+export interface SignedIntent {
+  intent: Intent;
+  signature: SignatureHex;
+}
+
+/** A solver's settlement of a signed intent (mirror `intents::Settlement`). */
+export interface Settlement {
+  intent: SignedIntent;
+  solver: AccountIdStr;
+  deliver_amount: GrainString;
+}
+
+/** Atomically settle a signed swap intent. */
+export interface IntentSettleAction {
+  type: "intent_settle";
+  settlement: Settlement;
+}
+
+/** Cancel one of the signer's own intents before it is filled. */
+export interface IntentCancelAction {
+  type: "intent_cancel";
+  intent: Intent;
+}
+
+/** Re-key the signer's account to `new_key`, proving possession with `proof`. */
+export interface RotateKeyAction {
+  type: "rotate_key";
+  new_key: PublicKeyHex;
+  proof: SignatureHex;
+}
+
+/** Register a human-readable `*.sov` name bound to the signer's account. */
+export interface RegisterNameAction {
+  type: "register_name";
+  name: string;
+}
+
+/** Reassign an owned name to `to`. */
+export interface TransferNameAction {
+  type: "transfer_name";
+  name: string;
+  to: AccountIdStr;
+}
+
+/** Mint a unique NFT `token_id` in the signer's collection `symbol`, owned by `to`. */
+export interface NftMintAction {
+  type: "nft_mint";
+  symbol: string;
+  token_id: number[] | Uint8Array;
+  to: AccountIdStr;
+  metadata: number[] | Uint8Array;
+}
+
+/** Transfer an NFT to `to`. */
+export interface NftTransferAction {
+  type: "nft_transfer";
+  collection: HashHex;
+  token_id: number[] | Uint8Array;
+  to: AccountIdStr;
+}
+
+/** Replace an NFT's metadata. */
+export interface NftSetMetaAction {
+  type: "nft_set_meta";
+  collection: HashHex;
+  token_id: number[] | Uint8Array;
+  metadata: number[] | Uint8Array;
+}
+
+/** Opt the signer's account into (or replace) M-of-N multisig. */
+export interface SetMultisigAction {
+  type: "set_multisig";
+  signers: PublicKeyHex[];
+  threshold: number;
+}
+
+/** One approval within a `MultisigExec` (mirror `types::MultisigApproval`). */
+export interface MultisigApproval {
+  signer: number;
+  signature: SignatureHex;
+}
+
+/** Execute `action` on a multisig account with detached `approvals`. */
+export interface MultisigExecAction {
+  type: "multisig_exec";
+  action: Action;
+  approvals: MultisigApproval[];
+}
+
+/** Propose a spend from a multisig `account` (the member's tx signature is their approval). */
+export interface ProposeMultisigAction {
+  type: "propose_multisig";
+  account: AccountIdStr;
+  action: Action;
+}
+
+/** Approve a pending proposal on `account`. */
+export interface ApproveMultisigAction {
+  type: "approve_multisig";
+  account: AccountIdStr;
+  proposal: HashHex;
+}
+
+/** Cancel a pending proposal on `account`. */
+export interface CancelMultisigAction {
+  type: "cancel_multisig";
+  account: AccountIdStr;
+  proposal: HashHex;
+}
+
 /**
- * The closed set of transaction actions. Mirrors `types::Action`.
+ * The closed set of transaction actions. Mirrors `types::Action` — all 25
+ * variants, in Borsh-discriminant order (Transfer=0 … CancelMultisig=24).
  *
  * Issuance is NOT an action: under Nakamoto consensus the block coinbase mints
  * the scheduled reward to the block's miner (the pre-Nakamoto Mine/MineShielded
@@ -135,7 +311,24 @@ export type Action =
   | ShieldedAction
   | HtlcLockAction
   | HtlcClaimAction
-  | HtlcRefundAction;
+  | HtlcRefundAction
+  | TokenIssueAction
+  | TokenTransferAction
+  | TokenBurnAction
+  | TokenSetPolicyAction
+  | IntentSettleAction
+  | IntentCancelAction
+  | RotateKeyAction
+  | RegisterNameAction
+  | TransferNameAction
+  | NftMintAction
+  | NftTransferAction
+  | NftSetMetaAction
+  | SetMultisigAction
+  | MultisigExecAction
+  | ProposeMultisigAction
+  | ApproveMultisigAction
+  | CancelMultisigAction;
 
 /** The unsigned body of a transaction. Mirrors `types::Transaction`. */
 export interface Transaction {

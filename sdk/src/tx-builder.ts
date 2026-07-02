@@ -55,12 +55,35 @@ function validateAction(action: Action): void {
       assertValidAccountId(action.recipient);
       assertWithinCap(BigInt(action.amount));
       break;
+    // Token amounts are the asset's own denomination (not SOV-capped); validate the
+    // recipient account where present.
+    case "token_issue":
+    case "token_transfer":
+    case "transfer_name":
+    case "nft_mint":
+    case "nft_transfer":
+      assertValidAccountId(action.to);
+      break;
+    case "propose_multisig":
+    case "approve_multisig":
+    case "cancel_multisig":
+      assertValidAccountId(action.account);
+      break;
     case "deploy":
     case "claim_vesting":
-    // A shielded bundle and an HTLC id/preimage are opaque, node-verified data.
+    // Opaque or node-verified payloads (bundles, ids, policies, intents, keys, names).
     case "shielded":
     case "htlc_claim":
     case "htlc_refund":
+    case "token_burn":
+    case "token_set_policy":
+    case "intent_settle":
+    case "intent_cancel":
+    case "rotate_key":
+    case "register_name":
+    case "nft_set_meta":
+    case "set_multisig":
+    case "multisig_exec":
       break;
     default: {
       const _never: never = action;

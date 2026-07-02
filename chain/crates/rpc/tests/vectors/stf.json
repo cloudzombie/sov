@@ -53,7 +53,7 @@
       "unlock_height": 0
     },
     {
-      "balance": "1251956000",
+      "balance": "1253486000",
       "code_hex": null,
       "id": "miner.node.sov",
       "locked": "0",
@@ -62,17 +62,17 @@
       "unlock_height": 0
     },
     {
-      "balance": "99998499280000",
+      "balance": "99998497750000",
       "code_hex": null,
       "id": "usa.reserve.sov",
       "locked": "0",
-      "nonce": 2,
+      "nonce": 5,
       "public_key_hex": "0x8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
       "unlock_height": 0
     }
   ],
-  "post_receipts_root": "0xe3f29a491f14ce83f5a787b54a540a1cc48195b6d09a8e53e146e73e6133b00e",
-  "post_state_root": "0x39202cfbf038a8d3eced074f7e8e68a0978efabf3ef9a60c3c3d2f4f6d0f7477",
+  "post_receipts_root": "0x804c08d7a6c375e18affb5901406578ff2725447eadba251579bf2e16cb37ea6",
+  "post_state_root": "0x43368ca327f7e0bfa92403c4cf076d3d8a3ea97857396a0b71c59baa6e99cac1",
   "prev_accounts": [
     {
       "balance": "100000000",
@@ -175,6 +175,33 @@
         "status": "failed"
       },
       "tx_id": "0x68decb9c0277df65d4a5a8c487da3d8291e16065ab2e7ab6e8b47987c862265c"
+    },
+    {
+      "events": [],
+      "gas_used": 51000,
+      "return_data": [],
+      "status": {
+        "status": "success"
+      },
+      "tx_id": "0xacc15a9d508b426e96ce6b0a84e3fce04736087e6fa8c2d33eb1d869802d8892"
+    },
+    {
+      "events": [],
+      "gas_used": 51000,
+      "return_data": [],
+      "status": {
+        "status": "success"
+      },
+      "tx_id": "0xdbfcb2db77e7a209cda0b4df56a987c18d41ae0c561941dcbd7d62038fca6dfb"
+    },
+    {
+      "events": [],
+      "gas_used": 51000,
+      "return_data": [],
+      "status": {
+        "status": "success"
+      },
+      "tx_id": "0x6c076bfdd016bc11e9c38c619c6c42057db78968fdc0a1c718844f727e08b0cf"
     }
   ],
   "transactions": [
@@ -332,6 +359,47 @@
         "nonce": 0,
         "public_key": "0x6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1",
         "signer": "ecb.reserve.sov"
+      }
+    },
+    {
+      "signature": "0xf49b9e327bd5e45c8e02d692352ac07ba7be08cd6be4f219b00230e7f1119a3b43054d8be78cf9d58416fd241a01a87d9fb4c78c5dab263c621ef556cd69ac02",
+      "transaction": {
+        "action": {
+          "amount": "100000000000",
+          "symbol": "USD1",
+          "to": "usa.reserve.sov",
+          "type": "token_issue"
+        },
+        "nonce": 2,
+        "public_key": "0x8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+        "signer": "usa.reserve.sov"
+      }
+    },
+    {
+      "signature": "0xe2ee353d9882c7c17e3e10f9d10d6eef16a141771abd2dc9d6acdcfd2dfcff297984b4c37154932a3b8cb89016b63ef454dfaee178b9279b7e945ac9991b6d0f",
+      "transaction": {
+        "action": {
+          "amount": "30000000000",
+          "asset": "0x4b1968854fee196f7a7fa65952646401130693fca5facc84de35d69a38baf8d6",
+          "to": "ecb.reserve.sov",
+          "type": "token_transfer"
+        },
+        "nonce": 3,
+        "public_key": "0x8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+        "signer": "usa.reserve.sov"
+      }
+    },
+    {
+      "signature": "0x77c74d6e27d83ec8ac07a43954cca65828e6bd7855a5c00ed9a80abc9c7cc3f25c882ad13dca5dff6d71176f922a18f5989a95c3769a538158ed47b941466f0b",
+      "transaction": {
+        "action": {
+          "amount": "10000000000",
+          "asset": "0x4b1968854fee196f7a7fa65952646401130693fca5facc84de35d69a38baf8d6",
+          "type": "token_burn"
+        },
+        "nonce": 4,
+        "public_key": "0x8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+        "signer": "usa.reserve.sov"
       }
     }
   ]
