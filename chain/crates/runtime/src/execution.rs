@@ -1090,6 +1090,15 @@ pub fn apply_transaction(
                             threshold: *threshold,
                         },
                     );
+                    // SECURITY (H1): a pending proposal's approvals are stored as signer
+                    // INDICES into the policy active when each was cast. Changing the
+                    // policy here would silently remap those indices onto the NEW signer
+                    // set (or a lowered threshold), so approvals given under the old
+                    // policy would authorize a spend under the new one — signers who never
+                    // approved. Invalidate every pending proposal for this account so an
+                    // approval can never cross a policy change; members re-propose under
+                    // the new policy.
+                    ledger.remove_proposals_for(&tx.signer);
                     ExecutionStatus::Success
                 }
             }
@@ -5197,6 +5206,131 @@ mod tests {
         assert!(
             ledger.proposals_for(&id("usa.reserve.sov")).is_empty(),
             "proposal cleared after execution"
+        );
+    }
+
+    #[test]
+    fn policy_change_invalidates_pending_proposals_so_stale_approvers_cannot_spend() {
+        // H1 regression. A pending proposal's approvals are stored as signer INDICES into
+        // the policy active when each was cast. If a policy change left them in place, the
+        // indices would remap onto the NEW signer set / threshold — so approvals given
+        // under the old policy would authorize a spend under the new one (signers who
+        // never approved, or a lowered threshold). A policy change MUST invalidate every
+        // pending proposal.
+        let mut ledger = ledger_with_usa(100);
+        let p = policy();
+
+        // Vault opts into 3-of-3 [A, B, C].
+        let old_signers = vec![
+            Keypair::from_seed([1; 32]).public_key(), // A (idx 0)
+            Keypair::from_seed([2; 32]).public_key(), // B (idx 1)
+            Keypair::from_seed([3; 32]).public_key(), // C (idx 2)
+        ];
+        let set = signed(
+            [1; 32],
+            "usa.reserve.sov",
+            0,
+            Action::SetMultisig {
+                signers: old_signers,
+                threshold: 3,
+            },
+        );
+        assert!(apply_transaction(&mut ledger, &set, &ctx(&p))
+            .unwrap()
+            .succeeded());
+
+        // A proposes a 10-SOV spend; B approves → 2 of 3, PENDING (not executed).
+        let inner = Action::Transfer {
+            to: id("ecb.reserve.sov"),
+            amount: Balance::from_sov(10).unwrap(),
+        };
+        let propose = signed(
+            [1; 32],
+            &implicit([1; 32]),
+            0,
+            Action::ProposeMultisig {
+                account: id("usa.reserve.sov"),
+                action: Box::new(inner),
+            },
+        );
+        assert!(apply_transaction(&mut ledger, &propose, &ctx(&p))
+            .unwrap()
+            .succeeded());
+        let prop_id = ledger.proposals_for(&id("usa.reserve.sov"))[0].0;
+        let approve_b = signed(
+            [2; 32],
+            &implicit([2; 32]),
+            0,
+            Action::ApproveMultisig {
+                account: id("usa.reserve.sov"),
+                proposal: prop_id,
+            },
+        );
+        assert!(apply_transaction(&mut ledger, &approve_b, &ctx(&p))
+            .unwrap()
+            .succeeded());
+        assert_eq!(
+            ledger.proposals_for(&id("usa.reserve.sov")).len(),
+            1,
+            "pending at 2 of 3"
+        );
+
+        // The members legitimately ROTATE to a NEW 2-of-2 set [A, D] (vault nonce 1),
+        // approved by the current 3-of-3. Threshold DROPS to 2 and D is a brand-new
+        // signer who NEVER approved the spend — exactly the conditions the old bug
+        // would have let the stale 2-approver proposal execute under.
+        let new_signers = vec![
+            Keypair::from_seed([1; 32]).public_key(), // A (idx 0)
+            Keypair::from_seed([4; 32]).public_key(), // D (idx 1) — never approved
+        ];
+        let rotate = multisig_exec(
+            [1; 32],
+            "usa.reserve.sov",
+            1,
+            Action::SetMultisig {
+                signers: new_signers,
+                threshold: 2,
+            },
+            &[(0, [1; 32]), (1, [2; 32]), (2, [3; 32])],
+        );
+        assert!(apply_transaction(&mut ledger, &rotate, &ctx(&p))
+            .unwrap()
+            .succeeded());
+        assert_eq!(
+            ledger
+                .multisig_of(&id("usa.reserve.sov"))
+                .unwrap()
+                .threshold,
+            2,
+            "policy rotated"
+        );
+
+        // THE FIX: the in-flight proposal is gone — old-policy approvals can't carry over.
+        assert!(
+            ledger.proposals_for(&id("usa.reserve.sov")).is_empty(),
+            "policy change invalidated the pending proposal"
+        );
+
+        // The new signer D cannot execute the stale proposal — it no longer exists.
+        let attack = signed(
+            [4; 32],
+            &implicit([4; 32]),
+            0,
+            Action::ApproveMultisig {
+                account: id("usa.reserve.sov"),
+                proposal: prop_id,
+            },
+        );
+        assert!(
+            !apply_transaction(&mut ledger, &attack, &ctx(&p))
+                .unwrap()
+                .succeeded(),
+            "a stale proposal cannot be approved after a policy change"
+        );
+        assert_eq!(
+            ledger.account(&id("usa.reserve.sov")).balance,
+            Balance::from_sov(100).unwrap(),
+            "vault never debited — the stale-approver spend was blocked"
         );
     }
 

@@ -1129,6 +1129,34 @@ impl Ledger {
         self.recommit_proposals();
     }
 
+    /// Remove ALL pending proposals drawing from `account`, committing the change, and
+    /// return how many were removed. Called when the account's multisig policy changes
+    /// (`SetMultisig`): a proposal's approvals are stored as signer *indices* into the
+    /// policy that was active when each was cast, so a policy change makes them
+    /// meaningless — they would otherwise count toward the new threshold as signers who
+    /// never approved (an authorization break). Records an undo per removal so a reorg
+    /// restores them, and recommits once.
+    pub fn remove_proposals_for(&mut self, account: &AccountId) -> usize {
+        let ids: Vec<Hash> = self
+            .proposals
+            .iter()
+            .filter(|(_, p)| &p.account == account)
+            .map(|(id, _)| *id)
+            .collect();
+        if ids.is_empty() {
+            return 0;
+        }
+        for id in &ids {
+            if self.undo.is_some() {
+                let prev = self.proposals.get(id).cloned();
+                self.record(UndoOp::Proposal(*id, prev));
+            }
+            self.proposals.remove(id);
+        }
+        self.recommit_proposals();
+        ids.len()
+    }
+
     /// An NFT collection by id, if it exists.
     pub fn nft_class(&self, id: &Hash) -> Option<&NftClass> {
         self.nft_classes.get(id)
