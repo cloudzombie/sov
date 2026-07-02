@@ -19,5 +19,5 @@ pub mod seal;
 pub mod target;
 
 pub use algorithm::sha256d;
-pub use seal::{pow_seal, PowAlgo};
+pub use seal::{pow_seal, pow_seal_mining, PowAlgo};
 pub use target::{mine, pow_hash, verify, Target};

@@ -220,7 +220,9 @@ impl MiningCandidate {
         let end = start.saturating_add(count);
         for nonce in start..end {
             self.block.header.nonce = nonce;
-            let seal = Hash::from_bytes(sov_pow::pow_seal(
+            // Mining hot loop: use the FAST (full-dataset) RandomX VM — ~10× the hash
+            // rate of the light verify VM. Byte-identical output, so blocks still verify.
+            let seal = Hash::from_bytes(sov_pow::pow_seal_mining(
                 self.pow_algo,
                 self.pow_key.as_bytes(),
                 &self.block.header.pow_preimage(),
