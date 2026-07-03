@@ -132,8 +132,9 @@ correct nodes on any platform compute identical block hashes and state roots.
 - **`sov-station`** ([`node/`](node)) — the native desktop wallet + mining node
   (eframe/egui). Generate/import wallets, run an in-process node, and mine to your
   wallet on testnet or mainnet, all from one window.
-- **Block explorer** ([`explorer/`](explorer)) — reads only real chain data from a live
-  node's RPC; nothing is simulated.
+- **Block explorer** ([cloudzombie/sov-explorer](https://github.com/cloudzombie/sov-explorer)) —
+  its own project. Indexes a live node's RPC (with a seamless testnet/mainnet switch) and
+  serves REST + GraphQL + a WebSocket feed + a web UI; nothing is simulated.
 - **TypeScript SDK** ([`sdk/`](sdk)) — an *independent second client*. It re-derives
   block hashes, transaction roots, and the emission schedule from raw bytes with no
   shared code, and re-executes the transparent state-transition function (transfers,
