@@ -8845,7 +8845,7 @@ fn build_and_run_node(
     let handle = daemon
         .with_sync_status(Arc::clone(&sync))
         .with_log_sink(logs.clone())
-        .run(&config.rpc_addr, config.rpc_workers, config.block_time_ms)
+        .run(&config.rpc_addr, config.rpc_workers, config.block_time_ms, config.mine)
         .map_err(|e| format!("run: {e}"))?;
     push_log(
         logs,

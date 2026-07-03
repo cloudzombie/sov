@@ -268,6 +268,12 @@ pub struct NodeConfig {
     /// Maximum transactions per block.
     #[serde(default = "default_max_block_txs")]
     pub max_block_txs: usize,
+    /// Whether this node MINES. `true` (default) = a normal miner. `false` = a
+    /// RELAY-ONLY node: it still serves RPC, snapshots, and imports/relays peers'
+    /// blocks (so it anchors the network as an always-on seed), but never produces
+    /// blocks itself — so the actual miner clients are the ones that find blocks.
+    #[serde(default = "default_true")]
+    pub mine: bool,
     /// Address to bind the P2P gossip transport (e.g. `0.0.0.0:9645`). If unset,
     /// the node runs standalone — it produces blocks and serves RPC, but does not
     /// peer with anyone.
@@ -318,6 +324,9 @@ fn default_mempool_capacity() -> usize {
 }
 fn default_max_block_txs() -> usize {
     4_096
+}
+fn default_true() -> bool {
+    true
 }
 
 /// A keystore: miner signing keys, by seed. (Plaintext seeds suit a testnet;
@@ -1218,6 +1227,7 @@ impl Daemon {
         addr: &str,
         workers: usize,
         block_time_ms: u64,
+        mine: bool,
     ) -> Result<DaemonHandle, DaemonError> {
         let rpc = self.serve_rpc(addr, workers)?;
         let rpc_addr = rpc.local_addr();
@@ -1278,6 +1288,26 @@ impl Daemon {
                     if write_snapshot_bytes(&snap_path, &bytes).is_ok() {
                         last_snap_height = h;
                     }
+                }
+
+                // RELAY-ONLY: a seed/anchor node that never mines. It still snapshots
+                // (above), serves RPC, and imports+relays peers' blocks via the gossip
+                // thread — so it holds the network up without competing for blocks. The
+                // real miner clients are the ones that find them.
+                if !mine {
+                    if let Some(ss) = sync_status.as_ref() {
+                        ss.set_local_hashrate(0);
+                    }
+                    if last_phase != Some(MinePhase::Connecting) {
+                        daemon_log(&log, "🛰 relay-only node — serving + syncing, not mining");
+                        last_phase = Some(MinePhase::Connecting);
+                    }
+                    let mut waited = 0u64;
+                    while waited < 500 && !sd.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(50));
+                        waited += 50;
+                    }
+                    continue;
                 }
 
                 // CONNECT-then-SYNC-then-MINE. Decide the phase:
@@ -1948,7 +1978,7 @@ mod tests {
         .unwrap()
         .with_sync_status(Arc::clone(&sync));
         // Fast cadence so the test is quick; the node mines empty blocks each interval.
-        let handle = daemon.run("127.0.0.1:0", 1, 20).unwrap();
+        let handle = daemon.run("127.0.0.1:0", 1, 20, true).unwrap();
 
         // Across many intervals while "behind", the chain must NOT advance past genesis.
         thread::sleep(Duration::from_millis(300));
@@ -1998,7 +2028,7 @@ mod tests {
             )],
         )
         .unwrap();
-        let handle = daemon.run("127.0.0.1:0", 1, 20).unwrap();
+        let handle = daemon.run("127.0.0.1:0", 1, 20, true).unwrap();
         let mut mined = false;
         for _ in 0..200 {
             if handle.node().lock().unwrap().chain().height() > 0 {

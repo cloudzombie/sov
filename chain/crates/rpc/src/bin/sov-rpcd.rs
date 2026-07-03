@@ -209,7 +209,7 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
     let handle = daemon
         .with_sync_status(Arc::clone(&sync))
         .with_log_sink(Arc::clone(&logs))
-        .run(&config.rpc_addr, config.rpc_workers, config.block_time_ms)?;
+        .run(&config.rpc_addr, config.rpc_workers, config.block_time_ms, config.mine)?;
     log(
         &logs,
         format!("JSON-RPC listening on http://{}", handle.rpc_addr()),

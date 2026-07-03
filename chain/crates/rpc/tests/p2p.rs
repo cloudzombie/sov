@@ -589,7 +589,7 @@ fn two_miners_share_one_chain_and_both_earn_blocks() {
         .with_sync_status(Arc::clone(&sync));
         let d = d.with_gossip(p2p.tcp()).with_sync_status(Arc::clone(&sync));
         let net = p2p.start();
-        let dae = d.run("127.0.0.1:0", 1, 0).unwrap(); // block_time_ms unused (difficulty governs)
+        let dae = d.run("127.0.0.1:0", 1, 0, true).unwrap(); // block_time_ms unused (difficulty governs)
         (dae, net)
     };
 
@@ -708,7 +708,7 @@ fn a_tx_submitted_to_one_node_is_gossiped_to_a_peer_and_mined() {
         .with_gossip(b_p2p.tcp())
         .with_sync_status(Arc::clone(&b_sync));
     let b_net = b_p2p.start();
-    let b_dae = b_d.run("127.0.0.1:0", 1, 0).unwrap();
+    let b_dae = b_d.run("127.0.0.1:0", 1, 0, true).unwrap();
 
     // Peer them and WAIT for the APP-authenticated link (Noise handshake AND the signed
     // `Hello` — `authed_peers`, not the raw connection count) — A gossips the tx once, so
