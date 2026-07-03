@@ -7,6 +7,7 @@
   "difficulty_leading_zeros": 8,
   "deshield_limit_sov": 1000000,
   "deshield_window_blocks": 12,
+  "seeds": ["159.203.109.204:9645"],
   "expected_genesis_hash": "4d7d9123a489f4fd29486da3d66a6c20b04953cb886dee847662e11af293da15",
   "accounts": [
     {
