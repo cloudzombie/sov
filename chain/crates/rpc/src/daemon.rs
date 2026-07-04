@@ -1561,9 +1561,12 @@ mod tests {
             state_root,
             "53852c7404ac6cb402b385ffeec50fa4fe8f59ed34c0a851357ced5dac6ce6aa"
         );
+        // Genesis timestamp is midnight July 4th, 2026 (America's 250th birthday) — so no
+        // valid block 1 can be mined until that instant, gating the mainnet launch.
+        assert_eq!(spec.timestamp_ms, 1783141200000);
         assert_eq!(
             genesis_hash,
-            "00d863ee74a76e51f74d012dd6b336275951a00e2b082ac7925357ddd67d2ec8"
+            "cb0272ff88e64c18cde0257f7fae1c8236b02651f10cc7a02456fd682ee2e72d"
         );
     }
 
