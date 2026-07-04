@@ -225,6 +225,78 @@ pub fn unshield_amount(
     Ok(ShieldedBundle::from_authorized(bundle))
 }
 
+/// Build a **multi-note de-shield**: spend several `notes` (each paired with its own
+/// Merkle path, all witnessed against the shared `anchor`), move `amount` out of the
+/// pool to the submitting account's transparent balance, and return the remainder as
+/// a single private change note. The bundle's value balance is exactly `+amount`, so
+/// only `amount` leaves the pool.
+///
+/// This lets a wallet de-shield **more than any single note holds** by combining
+/// notes in one bundle. It is purely a wallet-side capability — the runtime already
+/// verifies multi-action Orchard bundles and still enforces the pool-balance turnstile
+/// and the per-window de-shield rate limit — so it changes no consensus rule.
+pub fn unshield_amount_multi(
+    params: &ShieldedParams,
+    spender: &ShieldedKey,
+    notes: &[(ReceivedNote, MerklePath)],
+    anchor: Anchor,
+    amount: u64,
+) -> Result<ShieldedBundle, ShieldedError> {
+    if notes.is_empty() {
+        return Err(ShieldedError::Build("no notes to de-shield".to_string()));
+    }
+    let mut total_in: u64 = 0;
+    for (n, _) in notes {
+        total_in = total_in
+            .checked_add(n.value())
+            .ok_or_else(|| ShieldedError::Build("note total overflow".to_string()))?;
+    }
+    let change = total_in
+        .checked_sub(amount)
+        .ok_or_else(|| ShieldedError::Build("amount exceeds total note value".to_string()))?;
+
+    let mut rng = OsRng;
+    let fvk = spender.fvk();
+
+    let mut builder = Builder::new(BundleType::DEFAULT, anchor);
+    for (note, merkle_path) in notes {
+        builder
+            .add_spend(fvk.clone(), note.note(), merkle_path.clone())
+            .map_err(|e| ShieldedError::Build(e.to_string()))?;
+    }
+    // A single change note back to the spender for the un-de-shielded remainder; the
+    // value NOT returned (`amount`) becomes the bundle's positive value balance.
+    if change > 0 {
+        let ovk = fvk.to_ovk(Scope::External);
+        let change_addr = spender.address();
+        builder
+            .add_output(
+                Some(ovk),
+                change_addr.0,
+                NoteValue::from_raw(change),
+                [0u8; 512],
+            )
+            .map_err(|e| ShieldedError::Build(e.to_string()))?;
+    }
+
+    let unauthorized = builder
+        .build::<i64>(&mut rng)
+        .map_err(|e| ShieldedError::Build(e.to_string()))?
+        .ok_or(ShieldedError::EmptyBundle)?
+        .0;
+
+    // Every spend is authorized by the same key; Orchard matches it to each action,
+    // so a single `ask` in the slice signs all spends in the bundle.
+    let ask = SpendAuthorizingKey::from(spender.spending_key());
+    let bundle = unauthorized
+        .create_proof(params.proving_key(), &mut rng)
+        .map_err(|e| ShieldedError::Prove(e.to_string()))?
+        .apply_signatures(rng, [0u8; 32], &[ask])
+        .map_err(|e| ShieldedError::Build(e.to_string()))?;
+
+    Ok(ShieldedBundle::from_authorized(bundle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +423,44 @@ mod tests {
             51,
         )
         .is_err());
+    }
+
+    #[test]
+    fn multi_note_deshield_combines_notes_to_exceed_any_single_note() {
+        let params = ShieldedParams::build();
+        let alice = ShieldedKey::from_seed([7u8; 32]).unwrap();
+
+        // Two separate notes, 30 and 40 — NEITHER alone covers a 60 de-shield.
+        let mint_a = mint_to_shielded(&params, &alice.address(), 30).unwrap();
+        let mint_b = mint_to_shielded(&params, &alice.address(), 40).unwrap();
+        let note_a = recover_outputs(&alice, &mint_a).remove(0);
+        let note_b = recover_outputs(&alice, &mint_b).remove(0);
+
+        // One tree holds both commitments; witness each against the shared root.
+        let mut tree = NoteWitnessTree::new();
+        tree.append(&mint_a.note_commitment_bytes()[0]).unwrap();
+        let pos_a = tree.mark().unwrap();
+        tree.append(&mint_b.note_commitment_bytes()[0]).unwrap();
+        let pos_b = tree.mark().unwrap();
+        let (path_a, anchor) = tree.witness(pos_a).unwrap();
+        let (path_b, anchor_b) = tree.witness(pos_b).unwrap();
+        assert_eq!(anchor, anchor_b, "both notes witness against the same root");
+
+        // De-shield 60 — more than either note alone — by spending BOTH in one bundle.
+        let notes = vec![(note_a, path_a), (note_b, path_b)];
+        let bundle = unshield_amount_multi(&params, &alice, &notes, anchor, 60).unwrap();
+        assert!(bundle.verify(&params), "multi-note de-shield proof must verify");
+        assert_eq!(bundle.value_balance(), 60, "exactly 60 leaves the pool");
+
+        // 10 change (70 in − 60 out) returns shielded to Alice.
+        let change = recover_outputs(&alice, &bundle);
+        assert_eq!(change.len(), 1);
+        assert_eq!(change[0].value(), 10);
+
+        // Integrates with consensus state; both nullifiers spent (replay rejected).
+        let mut state = ShieldedState::new();
+        state.apply_bundle(&bundle).unwrap();
+        assert_eq!(state.apply_bundle(&bundle), Err(ShieldedError::DoubleSpend));
     }
 
     #[test]

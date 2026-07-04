@@ -24,7 +24,7 @@ use sov_rpc::{
     P2pHandle, RpcClient, SyncShared,
 };
 use sov_shielded::{
-    encode_shielded, shielded_transfer_with_change, unshield_amount, AnyAddress, NoteStore,
+    encode_shielded, shielded_transfer_with_change, unshield_amount_multi, AnyAddress, NoteStore,
     Receiver, ShieldedBundle, ShieldedKey, ShieldedParams, UnifiedAddress,
 };
 use sov_types::{Action, SignedTransaction, Transaction};
@@ -7911,26 +7911,32 @@ fn deshield_amount(
             ));
         }
     }
-    // Coin selection: de-shield from the SMALLEST single note that covers the
-    // amount (minimizes the shielded change left behind). A partial de-shield keeps
-    // the remainder shielded as change, so any variable amount up to a note's value
-    // works. If no single note is large enough, ask the user to de-shield in parts
-    // (each ≤ the largest note) — value is never trapped, just paced.
-    let (note, pos) = unspent
-        .iter()
-        .filter(|(n, _)| n.value() >= amount)
-        .min_by_key(|(n, _)| n.value())
-        .ok_or_else(|| {
-            let largest = unspent.iter().map(|(n, _)| n.value()).max().unwrap_or(0);
-            format!(
-                "no single shielded note covers {} XUS (largest note is {} XUS) — \
-                 de-shield in parts of {} XUS or less",
-                grains_to_xus_plain(amount_grains),
-                grains_to_xus_plain(u128::from(largest)),
-                grains_to_xus_plain(u128::from(largest)),
-            )
-        })?;
-    let (path, anchor) = store.witness(*pos).ok_or("could not witness the note")?;
+    // Coin selection: accumulate notes LARGEST-first until they cover `amount`, then
+    // spend them all in ONE bundle — this is what lets a de-shield exceed any single
+    // note's value. Capped at MAX_DESHIELD_NOTES to bound proof time + tx size; if the
+    // request needs more, de-shield the largest cap-many this round (the most possible
+    // in one tx) and leave the rest shielded for a follow-up — value is never trapped,
+    // just paced. All notes are witnessed against the same tree root (a shared anchor).
+    const MAX_DESHIELD_NOTES: usize = 32;
+    let mut ranked: Vec<_> = unspent.iter().collect();
+    ranked.sort_by_key(|it| std::cmp::Reverse(it.0.value()));
+    let mut selected = Vec::new();
+    let mut acc: u64 = 0;
+    let mut anchor_opt = None;
+    for (n, pos) in ranked.into_iter().take(MAX_DESHIELD_NOTES) {
+        let (path, anchor) = store.witness(*pos).ok_or("could not witness a note")?;
+        anchor_opt = Some(anchor);
+        acc = acc.saturating_add(n.value());
+        selected.push((n.clone(), path));
+        if acc >= amount {
+            break;
+        }
+    }
+    let anchor = anchor_opt.ok_or("no unspent shielded notes to de-shield")?;
+    // If the largest MAX_DESHIELD_NOTES notes still don't cover the request, de-shield
+    // everything they hold this round (the most achievable in one transaction).
+    let effective = amount.min(acc);
+    let note_count = selected.len();
     let params = {
         let cached = params_cache.lock().ok().and_then(|p| p.clone());
         match cached {
@@ -7945,9 +7951,12 @@ fn deshield_amount(
             }
         }
     };
-    begin(action, "proving the de-shield (real Halo2)…");
-    let bundle =
-        unshield_amount(&params, &zkey, note, path, anchor, amount).map_err(|e| e.to_string())?;
+    begin(
+        action,
+        &format!("proving the de-shield of {note_count} note(s) (real Halo2)…"),
+    );
+    let bundle = unshield_amount_multi(&params, &zkey, &selected, anchor, effective)
+        .map_err(|e| e.to_string())?;
     // Wrap the de-shield bundle in a tx signed by the transparent account that
     // receives the funds and pays the fee.
     let kp = Keypair::hybrid_from_seed(seed);
@@ -8845,7 +8854,12 @@ fn build_and_run_node(
     let handle = daemon
         .with_sync_status(Arc::clone(&sync))
         .with_log_sink(logs.clone())
-        .run(&config.rpc_addr, config.rpc_workers, config.block_time_ms, config.mine)
+        .run(
+            &config.rpc_addr,
+            config.rpc_workers,
+            config.block_time_ms,
+            config.mine,
+        )
         .map_err(|e| format!("run: {e}"))?;
     push_log(
         logs,

@@ -56,7 +56,10 @@ pub use keys::{ShieldedAddress, ShieldedKey};
 pub use pool::{mint_to_shielded, ShieldedBundle, ShieldedParams};
 pub use state::ShieldedState;
 pub use store::NoteStore;
-pub use transfer::{shielded_transfer, shielded_transfer_with_change, unshield, unshield_amount};
+pub use transfer::{
+    shielded_transfer, shielded_transfer_with_change, unshield, unshield_amount,
+    unshield_amount_multi,
+};
 pub mod address;
 pub use wallet::{recover_outputs, witness_latest, NoteWitnessTree, ReceivedNote};
 
