@@ -631,6 +631,22 @@ impl SyncState {
                 .cloned()
         });
         if let Some(account) = authed_account {
+            // Self-connection: a peer gossiped OUR OWN public address back and we dialed
+            // ourselves, so the authenticated Hello carries our own account. There is
+            // nothing to sync from ourselves — record the address so the dialer never
+            // reopens it (`local_addr` only knows our bind address, not our reachable
+            // one), drop the link, and never register it as a peer. (Two distinct nodes
+            // sharing one account identity is a misconfiguration and is treated the same.)
+            if account == config.account {
+                tcp.mark_self_addr(peer);
+                tcp.disconnect(&peer);
+                self.last_recv.remove(&peer);
+                p2p_log(
+                    &self.log,
+                    format!("dropped self-connection {}", short_peer(&peer)),
+                );
+                return;
+            }
             let first_time = self.authenticated.insert(peer);
             self.identity.insert(peer, account.clone());
             if first_time {

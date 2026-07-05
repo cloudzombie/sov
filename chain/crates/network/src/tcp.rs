@@ -200,6 +200,12 @@ struct Shared {
     /// Set to stop the background threads and release the listen port, so the node
     /// can be cleanly shut down and its address rebound (e.g. an in-process restart).
     shutdown: AtomicBool,
+    /// Addresses that authenticated as OUR OWN node identity — a peer gossiped our
+    /// public address back and we connected to ourselves. Skipped by [`attempt_dial`]
+    /// so the pointless self-link isn't reopened every discovery pass. Populated by the
+    /// app layer via [`TcpNode::mark_self_addr`] when it sees a `Hello` whose account is
+    /// ours (the network layer can't see the signed app-level identity itself).
+    self_addrs: Mutex<HashSet<SocketAddr>>,
 }
 
 /// Per-IP connection health. Both the rate bucket and the misbehavior score are
@@ -286,6 +292,7 @@ impl TcpNode {
             dial_tx,
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
+            self_addrs: Mutex::new(HashSet::new()),
         });
 
         // Accept inbound connections (we are the Noise *responder*). Non-blocking so
@@ -568,6 +575,15 @@ impl TcpNode {
         }
     }
 
+    /// Record `addr` as one of OUR OWN reachable addresses: the app layer authenticated
+    /// a connection to it whose `Hello` account is ours — i.e. we dialed ourselves after
+    /// a peer gossiped our public address back. Future [`attempt_dial`]s to it are
+    /// skipped, and it's forgotten from the discovery set so we don't re-gossip it.
+    pub fn mark_self_addr(&self, addr: SocketAddr) {
+        self.shared.self_addrs.lock().unwrap().insert(addr);
+        self.shared.known.lock().unwrap().remove(&addr);
+    }
+
     /// The Noise handshake hash for the connection to `peer` (its channel
     /// fingerprint), or `None` if not connected. Used to bind the signed `Hello`.
     pub fn peer_handshake_hash(&self, peer: &SocketAddr) -> Option<Vec<u8>> {
@@ -668,6 +684,13 @@ fn net_log(shared: &Shared, msg: impl AsRef<str>) {
 /// leaves no trace, so a later retry (e.g. once a sleeping seed wakes) succeeds.
 fn attempt_dial(shared: &Arc<Shared>, addr: SocketAddr) -> std::io::Result<()> {
     if addr == shared.local_addr {
+        return Ok(());
+    }
+    // Never re-dial an address that already authenticated as OUR OWN identity: a peer
+    // gossiped our public address back and we connected to ourselves. `local_addr` only
+    // catches our bind address (e.g. 0.0.0.0:9645), not our reachable public address, so
+    // without this the self-link is reopened every discovery pass — pure churn.
+    if shared.self_addrs.lock().unwrap().contains(&addr) {
         return Ok(());
     }
     // Never (re)dial a banned IP — a ban must stop us reconnecting outbound too, not
@@ -1715,6 +1738,7 @@ mod tests {
             dial_tx: tx,
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
+            self_addrs: Mutex::new(HashSet::new()),
         };
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
 
@@ -1751,6 +1775,7 @@ mod tests {
             dial_tx: tx,
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
+            self_addrs: Mutex::new(HashSet::new()),
         };
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
 
@@ -1881,6 +1906,7 @@ mod tests {
             dial_tx: tx,
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
+            self_addrs: Mutex::new(HashSet::new()),
         };
         // Same host, its advertised LISTEN port → duplicate (matched by IP).
         assert!(dial_would_duplicate(
