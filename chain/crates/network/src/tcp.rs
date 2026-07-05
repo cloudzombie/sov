@@ -1171,6 +1171,16 @@ fn reader_loop(shared: &Arc<Shared>, key: SocketAddr, mut reader: TcpStream, pee
                             if sa == shared.local_addr {
                                 continue;
                             }
+                            // Never store, dial, or re-gossip non-routable LAN addresses. A
+                            // NAT'd peer advertises its own / same-LAN 192.168|10|172.16|
+                            // 169.254 addresses, which are unreachable from the public
+                            // internet: dialing them just times out and churns the single
+                            // dial thread, and re-gossiping them spreads that churn to every
+                            // other node. (Loopback is kept for single-host dev.)
+                            if matches!(sa.ip(), IpAddr::V4(v4) if v4.is_private() || v4.is_link_local())
+                            {
+                                continue;
+                            }
                             // Record it for future dials under one lock; stop if the
                             // discovered set is already full, so gossip can't grow memory
                             // without bound. Drop the lock before dialing.
