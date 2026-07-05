@@ -449,7 +449,10 @@ mod tests {
         // De-shield 60 — more than either note alone — by spending BOTH in one bundle.
         let notes = vec![(note_a, path_a), (note_b, path_b)];
         let bundle = unshield_amount_multi(&params, &alice, &notes, anchor, 60).unwrap();
-        assert!(bundle.verify(&params), "multi-note de-shield proof must verify");
+        assert!(
+            bundle.verify(&params),
+            "multi-note de-shield proof must verify"
+        );
         assert_eq!(bundle.value_balance(), 60, "exactly 60 leaves the pool");
 
         // 10 change (70 in − 60 out) returns shielded to Alice.
