@@ -62,6 +62,15 @@ const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 /// How long the Noise handshake may take before the connection is abandoned.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long one socket write may block before it fails (`SO_SNDTIMEO`). Without
+/// this, a peer that vanishes without closing (NAT expiry, sleep, cable pull)
+/// leaves its TCP send window full and a blocking `send()` wedges the calling
+/// thread FOREVER — observed live on mainnet 2026-07-07: the p2p dispatch thread
+/// stuck in `write_frame`, so no Hello was ever answered again and the whole
+/// network churned. After a timeout the connection MUST be dropped (the cipher
+/// nonce streams are desynced by the partial write); callers do exactly that.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// An established, encrypted peer connection: the writable socket half, the
 /// shared Noise transport cipher (both directions), and the inner hybrid
 /// post-quantum channel. The reader half lives on the per-connection reader
@@ -474,20 +483,25 @@ impl TcpNode {
     }
 
     /// Broadcast `message` to every connected peer; returns how many writes
-    /// succeeded.
+    /// succeeded. A peer whose write fails (including an `SO_SNDTIMEO` timeout)
+    /// is dropped on the spot: a partial write desyncs the cipher nonce streams,
+    /// so the connection is unrecoverable — and keeping it would let the same
+    /// dead peer stall the next broadcast too.
     pub fn broadcast(&self, message: &NetMessage) -> usize {
-        let writers: Vec<PeerWriter> = self
+        let writers: Vec<(SocketAddr, PeerWriter)> = self
             .shared
             .peers
             .lock()
             .unwrap()
-            .values()
-            .cloned()
+            .iter()
+            .map(|(k, v)| (*k, Arc::clone(v)))
             .collect();
         let mut sent = 0;
-        for w in &writers {
+        for (addr, w) in &writers {
             if write_frame(w, message).is_ok() {
                 sent += 1;
+            } else {
+                self.drop_broken_peer(addr);
             }
         }
         sent
@@ -495,13 +509,32 @@ impl TcpNode {
 
     /// Send `message` to a single connected peer by its connection address;
     /// returns whether the write succeeded. Used for targeted replies such as
-    /// catch-up [`BlockResponse`](NetMessage::BlockResponse)s.
+    /// catch-up [`BlockResponse`](NetMessage::BlockResponse)s. A failed write
+    /// drops the connection (see [`Self::broadcast`]).
     pub fn send(&self, peer: SocketAddr, message: &NetMessage) -> bool {
         let writer = self.shared.peers.lock().unwrap().get(&peer).cloned();
         match writer {
-            Some(w) => write_frame(&w, message).is_ok(),
+            Some(w) => {
+                if write_frame(&w, message).is_ok() {
+                    true
+                } else {
+                    self.drop_broken_peer(&peer);
+                    false
+                }
+            }
             None => false,
         }
+    }
+
+    /// Tear down a connection whose socket write failed: the cipher streams are
+    /// desynced, so the link can only produce malformed frames from here on.
+    /// The peer reconnects with a fresh handshake and re-auths cleanly.
+    fn drop_broken_peer(&self, peer: &SocketAddr) {
+        net_log(
+            &self.shared,
+            format!("dropping {peer}: socket write failed"),
+        );
+        self.disconnect(peer);
     }
 
     /// Drain all received application messages.
@@ -784,6 +817,9 @@ fn setup_connection(
     // slot so the address can be retried.
     let setup = (|| -> io::Result<(TcpStream, TransportState, PqChannel, Vec<u8>)> {
         stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        // A write must never block forever: a vanished peer's full send window
+        // would otherwise wedge whichever thread hits it (see WRITE_TIMEOUT).
+        stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
         let (mut transport, handshake_hash) = noise_handshake(&mut stream, initiator)?;
         // Hybrid PQ key exchange, inside the Noise channel. Fail-closed: a
         // peer that cannot complete it never becomes a connection.
