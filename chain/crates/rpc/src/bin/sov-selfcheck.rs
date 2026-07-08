@@ -64,13 +64,20 @@ fn main() {
 }
 
 fn arg<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(String::as_str)
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
 }
 
 // ── keys: mnemonic / seed / account collision + entropy sweep ─────────────────
 fn keys_check(args: &[String]) -> bool {
-    let count: usize = arg(args, "--count").and_then(|s| s.parse().ok()).unwrap_or(20_000);
-    let words: usize = arg(args, "--words").and_then(|s| s.parse().ok()).unwrap_or(24);
+    let count: usize = arg(args, "--count")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20_000);
+    let words: usize = arg(args, "--words")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
     println!("\x1b[1mKEY PIPELINE COLLISION + ENTROPY SWEEP\x1b[0m");
     println!("  generating {count} wallets · {words}-word mnemonics");
     println!("  path: OS entropy → BIP-39 → seed → hybrid Ed25519+ML-DSA-65 → implicit account\n");
@@ -92,7 +99,11 @@ fn keys_check(args: &[String]) -> bool {
         };
         let wallet = HdWallet::from_mnemonic(&phrase, "").expect("fresh mnemonic parses");
         let seed = wallet.derive_seed(0, 0);
-        let account = wallet.derive_keypair(0, 0).public_key().implicit_account_id().to_string();
+        let account = wallet
+            .derive_keypair(0, 0)
+            .public_key()
+            .implicit_account_id()
+            .to_string();
 
         if !mnemonics.insert(phrase) {
             println!("  \x1b[31mCOLLISION\x1b[0m: duplicate mnemonic at #{i}");
@@ -141,16 +152,32 @@ fn keys_check(args: &[String]) -> bool {
         worst = worst.max(dev);
     }
     if worst < 0.10 {
-        println!("  \x1b[32m✓\x1b[0m account-id bits unbiased (worst bit {:.2}% off 50/50)", worst * 100.0);
+        println!(
+            "  \x1b[32m✓\x1b[0m account-id bits unbiased (worst bit {:.2}% off 50/50)",
+            worst * 100.0
+        );
     } else {
-        println!("  \x1b[31m✗\x1b[0m account-id bit bias {:.2}% — entropy source suspect", worst * 100.0);
+        println!(
+            "  \x1b[31m✗\x1b[0m account-id bit bias {:.2}% — entropy source suspect",
+            worst * 100.0
+        );
         ok = false;
     }
 
     // Determinism: the same mnemonic must always derive the same account.
     let sample = generate_mnemonic(words).unwrap();
-    let a = HdWallet::from_mnemonic(&sample, "").unwrap().derive_keypair(0, 0).public_key().implicit_account_id().to_string();
-    let b = HdWallet::from_mnemonic(&sample, "").unwrap().derive_keypair(0, 0).public_key().implicit_account_id().to_string();
+    let a = HdWallet::from_mnemonic(&sample, "")
+        .unwrap()
+        .derive_keypair(0, 0)
+        .public_key()
+        .implicit_account_id()
+        .to_string();
+    let b = HdWallet::from_mnemonic(&sample, "")
+        .unwrap()
+        .derive_keypair(0, 0)
+        .public_key()
+        .implicit_account_id()
+        .to_string();
     if a == b {
         println!("  \x1b[32m✓\x1b[0m derivation is deterministic (re-derive is identical)");
     } else {
@@ -159,13 +186,20 @@ fn keys_check(args: &[String]) -> bool {
     }
 
     // KAT: the fixed test mnemonic pins the whole pipeline to a known account.
-    let kat = HdWallet::from_mnemonic(KAT_MNEMONIC, "").unwrap().derive_keypair(0, 0).public_key().implicit_account_id().to_string();
+    let kat = HdWallet::from_mnemonic(KAT_MNEMONIC, "")
+        .unwrap()
+        .derive_keypair(0, 0)
+        .public_key()
+        .implicit_account_id()
+        .to_string();
     if KAT_ACCOUNT == "@KAT@" {
         println!("  \x1b[33m•\x1b[0m KAT fingerprint (pin this into KAT_ACCOUNT): {kat}");
     } else if kat == KAT_ACCOUNT {
         println!("  \x1b[32m✓\x1b[0m KAT: test mnemonic derives to the pinned account");
     } else {
-        println!("  \x1b[31m✗\x1b[0m KAT MISMATCH: {kat} != pinned {KAT_ACCOUNT} — derivation drifted");
+        println!(
+            "  \x1b[31m✗\x1b[0m KAT MISMATCH: {kat} != pinned {KAT_ACCOUNT} — derivation drifted"
+        );
         ok = false;
     }
     ok
@@ -176,7 +210,10 @@ fn report_unique(label: &str, got: usize, want: usize) -> bool {
         println!("  \x1b[32m✓\x1b[0m {label}: {got}/{want}");
         true
     } else {
-        println!("  \x1b[31m✗\x1b[0m {label}: {got}/{want} — {} duplicate(s)", want - got);
+        println!(
+            "  \x1b[31m✗\x1b[0m {label}: {got}/{want} — {} duplicate(s)",
+            want - got
+        );
         false
     }
 }
@@ -207,21 +244,30 @@ fn chain_check(args: &[String]) -> bool {
             return false;
         }
     };
-    let tip = client.call("sov_getHeight", json!({})).ok().and_then(|v| v.as_u64()).unwrap_or(0);
+    let tip = client
+        .call("sov_getHeight", json!({}))
+        .ok()
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let pinned = match chain_id.as_str() {
         "sov-mainnet" => Some(MAINNET_GENESIS),
         "sov-testnet-1" => Some(TESTNET_GENESIS),
         _ => None,
     };
     println!("  chain {chain_id} · tip {tip}");
-    let from: u64 = arg(args, "--from").and_then(|s| s.parse().ok()).unwrap_or(0);
-    let to: u64 = arg(args, "--to").and_then(|s| s.parse().ok()).unwrap_or(tip);
+    let from: u64 = arg(args, "--from")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let to: u64 = arg(args, "--to")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(tip);
 
     let policy = MiningPolicy::mainnet_like();
     let mut prev_hash: Option<Hash> = None;
     let mut prev_ts = 0u64;
     let mut mined: u128 = 0;
-    let (mut hash_ok, mut root_ok, mut link_ok, mut emit_ok, mut n) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut hash_ok, mut root_ok, mut link_ok, mut emit_ok, mut n) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut ok = true;
 
     for h in from..=to {
@@ -238,25 +284,37 @@ fn chain_check(args: &[String]) -> bool {
                 return false;
             }
         };
-        let digest = client.call("sov_getBlockDigest", json!({ "height": h })).unwrap_or(Value::Null);
+        let digest = client
+            .call("sov_getBlockDigest", json!({ "height": h }))
+            .unwrap_or(Value::Null);
         n += 1;
 
         // 1. Hash integrity: the block's content hashes to its committed id.
         let recomputed = block.hash();
-        let committed = digest.get("hash").and_then(Value::as_str).map(|s| s.trim_start_matches("0x").to_string());
+        let committed = digest
+            .get("hash")
+            .and_then(Value::as_str)
+            .map(|s| s.trim_start_matches("0x").to_string());
         if committed.as_deref() == Some(recomputed.to_hex().as_str()) {
             hash_ok += 1;
         } else {
-            println!("  \x1b[31m✗\x1b[0m block {h}: hash mismatch — content does not match committed id");
+            println!(
+                "  \x1b[31m✗\x1b[0m block {h}: hash mismatch — content does not match committed id"
+            );
             ok = false;
         }
         // Genesis must be the frozen identity.
         if h == 0 {
             if let Some(pin) = pinned {
                 if recomputed.to_hex() == pin {
-                    println!("  \x1b[32m✓\x1b[0m genesis is the frozen {chain_id} identity ({pin})");
+                    println!(
+                        "  \x1b[32m✓\x1b[0m genesis is the frozen {chain_id} identity ({pin})"
+                    );
                 } else {
-                    println!("  \x1b[31m✗\x1b[0m genesis {} != frozen {pin}", recomputed.to_hex());
+                    println!(
+                        "  \x1b[31m✗\x1b[0m genesis {} != frozen {pin}",
+                        recomputed.to_hex()
+                    );
                     ok = false;
                 }
             }
@@ -281,8 +339,12 @@ fn chain_check(args: &[String]) -> bool {
             ok = false;
         }
         // 4. Emission: coinbase equals the schedule, within the 21M budget.
-        let reward = digest.get("coinbase").and_then(|c| c.get("reward")).and_then(Value::as_str)
-            .and_then(|s| s.parse::<u128>().ok()).unwrap_or(0);
+        let reward = digest
+            .get("coinbase")
+            .and_then(|c| c.get("reward"))
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(0);
         let expected = policy.reward_at(h, Balance::from_grains(mined)).grains();
         if reward == expected && mined + reward <= MAX_SUPPLY_GRAINS {
             emit_ok += 1;
@@ -310,7 +372,10 @@ fn chain_check(args: &[String]) -> bool {
     // can't reconcile against whole-chain supply, so we only assert on a full walk.
     let full_audit = from == 0 && to == tip;
     if let Ok(sup) = client.call("sov_getSupply", json!({})) {
-        let reported = sup.get("mined").and_then(Value::as_str).and_then(|s| s.parse::<u128>().ok());
+        let reported = sup
+            .get("mined")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<u128>().ok());
         if !full_audit {
             println!("  \x1b[33m•\x1b[0m supply reconciliation skipped (partial range {from}..={to}, not genesis→tip)");
         } else if reported == Some(mined) {
