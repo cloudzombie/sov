@@ -555,6 +555,44 @@ fn call(
                 Ok(Value::Null)
             }
         }
+        "sov_getVault" => {
+            // The account's xUSD CDP vault, priced at the current oracle: locked
+            // XUS collateral, xUSD debt, the health ratio, and how much MORE xUSD
+            // can be safely minted right now. All real chain state — the webapp
+            // reads this to show a mint limit and liquidation price honestly.
+            let id = param_account(params)?;
+            let ledger = node.chain().ledger();
+            let vault = ledger.vault(&id);
+            let price = ledger.oracle_price();
+            let xusd = sov_state::vault::xusd_asset_id();
+            let xusd_balance = ledger.token_balance(&xusd, &id);
+            let max_debt = sov_state::vault::max_debt(vault.collateral, price).unwrap_or(0);
+            let mintable = max_debt.saturating_sub(vault.debt.grains());
+            let ratio = sov_state::vault::collateral_ratio_pct(vault.collateral, vault.debt, price);
+            Ok(json!({
+                "account": id,
+                "collateralGrains": vault.collateral,
+                "debtGrains": vault.debt,
+                "xusdBalanceGrains": xusd_balance,
+                "oraclePriceUsd1e8": price.to_string(),
+                "minRatioPct": sov_state::vault::MIN_COLLATERAL_RATIO_PCT.to_string(),
+                "maxDebtGrains": max_debt.to_string(),
+                "mintableGrains": mintable.to_string(),
+                "collateralRatioPct": ratio.map(|r| r.to_string()),
+            }))
+        }
+        "sov_getOracle" => {
+            // The xUSD system's price + parameters. `seeded` is true while the
+            // honest $1.00 launch price still stands (no signed feed update yet).
+            let ledger = node.chain().ledger();
+            Ok(json!({
+                "priceUsd1e8": ledger.oracle_price().to_string(),
+                "seeded": ledger.oracle_is_seeded(),
+                "minRatioPct": sov_state::vault::MIN_COLLATERAL_RATIO_PCT.to_string(),
+                "xusdAsset": sov_state::vault::xusd_asset_id(),
+                "oracleAccount": sov_state::vault::ORACLE_ACCOUNT,
+            }))
+        }
         "sov_getMultisigProposals" => {
             // Pending on-chain multisig proposals drawing from `account`, with each
             // spend decoded to a plain summary so a wallet can render an approval

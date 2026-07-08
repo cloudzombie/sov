@@ -19,7 +19,29 @@ permissions:
   contents: write
 
 jobs:
+  # HARD GATE — nothing builds or publishes unless the genesis is byte-for-byte
+  # frozen (double-locked: the pinned hashes are unchanged AND genesis rebuilds to
+  # them) and the full verification surface is green. --strict allows no skips.
+  gate:
+    name: release gate (genesis double-lock + full verification)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: chain
+          cache-on-failure: true
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: HARD GATE — scripts/release-gate.sh --strict
+        run: scripts/release-gate.sh --strict
+
   windows:
+    needs: gate
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -53,6 +75,7 @@ jobs:
           path: dist/*.zip
 
   macos:
+    needs: gate
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -101,6 +124,7 @@ jobs:
           path: dist/*.dmg
 
   linux:
+    needs: gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
