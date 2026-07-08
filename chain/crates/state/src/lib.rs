@@ -18,6 +18,7 @@
 pub mod account;
 pub mod ledger;
 pub mod smt;
+pub mod vault;
 
 pub use account::Account;
 pub use ledger::{
@@ -25,3 +26,7 @@ pub use ledger::{
     NftClass, NftToken, TokenInfo, UndoLog,
 };
 pub use smt::{MerkleProof, SparseMerkleTree, TREE_HEIGHT};
+pub use vault::{
+    collateral_ratio_pct, is_healthy, max_debt, xusd_asset_id, Vault, MIN_COLLATERAL_RATIO_PCT,
+    ORACLE_ACCOUNT, SEED_XUS_USD_PRICE, XUSD_ISSUER, XUSD_SYMBOL,
+};

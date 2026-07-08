@@ -314,6 +314,40 @@ pub enum Action {
         /// The pending proposal's id.
         proposal: Hash,
     },
+    /// Lock `amount` XUS from the signer's liquid balance into their CDP vault as
+    /// collateral for xUSD. Supply-neutral: the XUS moves out of the balance into
+    /// the vault (still counted in total supply). Appended at the tail so existing
+    /// Borsh action discriminants stay stable.
+    VaultDeposit {
+        /// XUS grains to lock as collateral.
+        amount: Balance,
+    },
+    /// Mint `amount` xUSD against the signer's vault collateral, up to the minimum
+    /// collateral ratio at the current oracle price. Fails if it would leave the
+    /// vault under-collateralized.
+    VaultMint {
+        /// xUSD grains to mint.
+        amount: Balance,
+    },
+    /// Burn `amount` xUSD to repay the signer's vault debt (reducing what must be
+    /// covered before collateral can be withdrawn). Burns real xUSD supply.
+    VaultBurn {
+        /// xUSD grains to repay.
+        amount: Balance,
+    },
+    /// Withdraw `amount` XUS collateral from the signer's vault back to their
+    /// liquid balance, permitted only while the vault stays at/above the minimum
+    /// collateral ratio afterward.
+    VaultWithdraw {
+        /// XUS grains of collateral to release.
+        amount: Balance,
+    },
+    /// Publish a new XUS/USD oracle price (USD per XUS, 10^8 fixed point). Accepted
+    /// only from the authorized oracle account; every other signer is rejected.
+    OracleUpdate {
+        /// The new price: USD per 1 XUS in 10^8 fixed point.
+        price: u128,
+    },
 }
 
 /// One signer's approval of a [`Action::MultisigExec`]: the signer's index into

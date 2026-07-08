@@ -115,6 +115,13 @@ pub fn gas_for(action: &Action) -> u64 {
         Action::ProposeMultisig { .. }
         | Action::ApproveMultisig { .. }
         | Action::CancelMultisig { .. } => INTRINSIC_GAS + BOOKKEEPING_GAS,
+        // xUSD vault operations: each is a bookkeeping state update (move balance
+        // ↔ collateral, mint/burn xUSD, or record a price). Priced like a token op.
+        Action::VaultDeposit { .. }
+        | Action::VaultMint { .. }
+        | Action::VaultBurn { .. }
+        | Action::VaultWithdraw { .. }
+        | Action::OracleUpdate { .. } => INTRINSIC_GAS + BOOKKEEPING_GAS,
     }
 }
 

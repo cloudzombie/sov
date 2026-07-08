@@ -651,6 +651,15 @@ pub fn apply_transaction(
                     ExecutionStatus::Failed {
                         reason: "cannot issue zero".into(),
                     }
+                } else if sov_state::token_asset_id(&tx.signer, symbol)
+                    == sov_state::vault::xusd_asset_id()
+                {
+                    // Defense in depth: xUSD is protocol-minted (vault system) only.
+                    // Its reserved issuer holds no key, so this is already
+                    // unreachable — reject explicitly regardless.
+                    ExecutionStatus::Failed {
+                        reason: "xUSD is a reserved protocol asset".into(),
+                    }
                 } else {
                     let asset = sov_state::token_asset_id(&tx.signer, symbol);
                     let mut info = ledger.token(&asset).cloned().unwrap_or(TokenInfo {
@@ -1217,6 +1226,186 @@ pub fn apply_transaction(
                     }
                 } else {
                     ledger.remove_proposal(proposal);
+                    ExecutionStatus::Success
+                }
+            }
+            Action::VaultDeposit { amount } => {
+                // Lock XUS from the signer's liquid balance into their vault as
+                // collateral. Supply-neutral: the value moves out of the account
+                // into the vault-collateral counter (still counted in total supply).
+                if *amount == Balance::ZERO {
+                    ExecutionStatus::Failed {
+                        reason: "cannot deposit zero".into(),
+                    }
+                } else {
+                    match signer.balance.checked_sub(*amount) {
+                        None => ExecutionStatus::Failed {
+                            reason: "insufficient balance".into(),
+                        },
+                        Some(remaining) => {
+                            let mut vault = ledger.vault(&tx.signer);
+                            match vault.collateral.checked_add(*amount) {
+                                None => ExecutionStatus::Failed {
+                                    reason: "vault collateral overflow".into(),
+                                },
+                                Some(collateral) => {
+                                    vault.collateral = collateral;
+                                    signer.balance = remaining;
+                                    ledger.set_vault(&tx.signer, vault);
+                                    ExecutionStatus::Success
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Action::VaultWithdraw { amount } => {
+                // Release collateral back to the liquid balance, but only while the
+                // vault stays at/above the minimum collateral ratio afterward.
+                if *amount == Balance::ZERO {
+                    ExecutionStatus::Failed {
+                        reason: "cannot withdraw zero".into(),
+                    }
+                } else {
+                    let mut vault = ledger.vault(&tx.signer);
+                    match vault.collateral.checked_sub(*amount) {
+                        None => ExecutionStatus::Failed {
+                            reason: "vault holds less collateral than requested".into(),
+                        },
+                        Some(remaining_collateral) => {
+                            let price = ledger.oracle_price();
+                            if !sov_state::vault::is_healthy(
+                                remaining_collateral,
+                                vault.debt,
+                                price,
+                            ) {
+                                ExecutionStatus::Failed {
+                                    reason: "withdrawal would under-collateralize the vault".into(),
+                                }
+                            } else {
+                                match signer.balance.checked_add(*amount) {
+                                    None => ExecutionStatus::Failed {
+                                        reason: "balance overflow".into(),
+                                    },
+                                    Some(balance) => {
+                                        vault.collateral = remaining_collateral;
+                                        signer.balance = balance;
+                                        ledger.set_vault(&tx.signer, vault);
+                                        ExecutionStatus::Success
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Action::VaultMint { amount } => {
+                // Mint xUSD against the vault's collateral, up to the minimum ratio
+                // at the current oracle price. xUSD is a native asset, so this obeys
+                // the per-asset conservation theorem automatically.
+                if *amount == Balance::ZERO {
+                    ExecutionStatus::Failed {
+                        reason: "cannot mint zero".into(),
+                    }
+                } else {
+                    let mut vault = ledger.vault(&tx.signer);
+                    let price = ledger.oracle_price();
+                    match vault.debt.checked_add(*amount) {
+                        None => ExecutionStatus::Failed {
+                            reason: "vault debt overflow".into(),
+                        },
+                        Some(new_debt) => {
+                            if !sov_state::vault::is_healthy(vault.collateral, new_debt, price) {
+                                ExecutionStatus::Failed {
+                                    reason:
+                                        "insufficient collateral: mint would breach the 150% ratio"
+                                            .into(),
+                                }
+                            } else {
+                                let asset = sov_state::vault::xusd_asset_id();
+                                let issuer = AccountId::new(sov_state::vault::XUSD_ISSUER)
+                                    .expect("reserved xUSD issuer id is valid");
+                                let mut info = ledger.token(&asset).cloned().unwrap_or(TokenInfo {
+                                    issuer,
+                                    symbol: sov_state::vault::XUSD_SYMBOL.to_string(),
+                                    issued: Balance::ZERO,
+                                    burned: Balance::ZERO,
+                                });
+                                let bal = ledger.token_balance(&asset, &tx.signer);
+                                match (info.issued.checked_add(*amount), bal.checked_add(*amount)) {
+                                    (Some(issued), Some(credited)) => {
+                                        info.issued = issued;
+                                        vault.debt = new_debt;
+                                        ledger.set_token(asset, info);
+                                        ledger.set_token_balance(&asset, &tx.signer, credited);
+                                        ledger.set_vault(&tx.signer, vault);
+                                        ExecutionStatus::Success
+                                    }
+                                    _ => ExecutionStatus::Failed {
+                                        reason: "xUSD supply overflow".into(),
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Action::VaultBurn { amount } => {
+                // Repay xUSD debt by burning the signer's xUSD, freeing the vault to
+                // release collateral later. Burns real xUSD supply.
+                if *amount == Balance::ZERO {
+                    ExecutionStatus::Failed {
+                        reason: "cannot burn zero".into(),
+                    }
+                } else {
+                    let asset = sov_state::vault::xusd_asset_id();
+                    let bal = ledger.token_balance(&asset, &tx.signer);
+                    let mut vault = ledger.vault(&tx.signer);
+                    match (bal.checked_sub(*amount), vault.debt.checked_sub(*amount)) {
+                        (None, _) => ExecutionStatus::Failed {
+                            reason: "insufficient xUSD balance to burn".into(),
+                        },
+                        (_, None) => ExecutionStatus::Failed {
+                            reason: "repaying more than the vault's debt".into(),
+                        },
+                        (Some(remaining_bal), Some(new_debt)) => {
+                            match ledger.token(&asset).cloned() {
+                                None => ExecutionStatus::Failed {
+                                    reason: "no xUSD outstanding".into(),
+                                },
+                                Some(mut info) => match info.burned.checked_add(*amount) {
+                                    None => ExecutionStatus::Failed {
+                                        reason: "xUSD burn overflow".into(),
+                                    },
+                                    Some(burned) => {
+                                        info.burned = burned;
+                                        vault.debt = new_debt;
+                                        ledger.set_token(asset, info);
+                                        ledger.set_token_balance(&asset, &tx.signer, remaining_bal);
+                                        ledger.set_vault(&tx.signer, vault);
+                                        ExecutionStatus::Success
+                                    }
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+            Action::OracleUpdate { price } => {
+                // Only the authorized price feed may publish; every other signer is
+                // rejected. A zero price is nonsensical (would divide by zero).
+                let oracle = AccountId::new(sov_state::vault::ORACLE_ACCOUNT)
+                    .expect("oracle account id is valid");
+                if tx.signer != oracle {
+                    ExecutionStatus::Failed {
+                        reason: "oracle: only the authorized price feed may publish".into(),
+                    }
+                } else if *price == 0 {
+                    ExecutionStatus::Failed {
+                        reason: "oracle: price must be positive".into(),
+                    }
+                } else {
+                    ledger.set_oracle_price(*price);
                     ExecutionStatus::Success
                 }
             }
@@ -1931,6 +2120,136 @@ mod tests {
             &kp,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn xusd_vault_deposit_mint_burn_withdraw_roundtrips_and_conserves_supply() {
+        // The full DAI-style CDP loop at the honest $1 seed price: lock 150 XUS,
+        // mint exactly 100 xUSD (the 150% ceiling), fail to mint one grain more or
+        // withdraw while indebted, then repay and reclaim every XUS — with total
+        // SOV supply conserved end-to-end and xUSD's own conservation intact.
+        let mut ledger = ledger_with_usa(1000);
+        let p = policy();
+        let who = id("usa.reserve.sov");
+        let xusd = sov_state::vault::xusd_asset_id();
+        let supply_before = ledger.total_supply().unwrap();
+
+        // Until the oracle publishes, XUS is priced at the honest $1 seed.
+        assert_eq!(ledger.oracle_price(), sov_state::vault::SEED_XUS_USD_PRICE);
+
+        // Deposit 150 XUS as collateral — pure movement, supply-neutral.
+        let dep = signed(
+            [1; 32],
+            "usa.reserve.sov",
+            0,
+            Action::VaultDeposit {
+                amount: Balance::from_sov(150).unwrap(),
+            },
+        );
+        assert!(apply_transaction(&mut ledger, &dep, &ctx(&p))
+            .unwrap()
+            .succeeded());
+        assert_eq!(
+            ledger.vault(&who).collateral,
+            Balance::from_sov(150).unwrap()
+        );
+        assert_eq!(ledger.total_supply().unwrap(), supply_before);
+
+        // Mint exactly $100 xUSD (150 XUS × $1 ÷ 150%). One grain more must fail.
+        let mint = signed(
+            [1; 32],
+            "usa.reserve.sov",
+            1,
+            Action::VaultMint {
+                amount: Balance::from_sov(100).unwrap(),
+            },
+        );
+        assert!(apply_transaction(&mut ledger, &mint, &ctx(&p))
+            .unwrap()
+            .succeeded());
+        assert_eq!(
+            ledger.token_balance(&xusd, &who),
+            Balance::from_sov(100).unwrap()
+        );
+        let over = signed(
+            [1; 32],
+            "usa.reserve.sov",
+            2,
+            Action::VaultMint {
+                amount: Balance::from_grains(1),
+            },
+        );
+        assert!(!apply_transaction(&mut ledger, &over, &ctx(&p))
+            .unwrap()
+            .succeeded());
+
+        // Withdrawing collateral while indebted must fail (would under-collateralize).
+        let bad_wd = signed(
+            [1; 32],
+            "usa.reserve.sov",
+            3,
+            Action::VaultWithdraw {
+                amount: Balance::from_sov(1).unwrap(),
+            },
+        );
+        assert!(!apply_transaction(&mut ledger, &bad_wd, &ctx(&p))
+            .unwrap()
+            .succeeded());
+
+        // Repay the full 100 xUSD; the asset's supply returns to zero.
+        let burn = signed(
+            [1; 32],
+            "usa.reserve.sov",
+            4,
+            Action::VaultBurn {
+                amount: Balance::from_sov(100).unwrap(),
+            },
+        );
+        assert!(apply_transaction(&mut ledger, &burn, &ctx(&p))
+            .unwrap()
+            .succeeded());
+        assert_eq!(ledger.token_balance(&xusd, &who), Balance::ZERO);
+        assert_eq!(ledger.token(&xusd).unwrap().supply(), Some(Balance::ZERO));
+
+        // Now the collateral is free — reclaim all 150 XUS.
+        let wd = signed(
+            [1; 32],
+            "usa.reserve.sov",
+            5,
+            Action::VaultWithdraw {
+                amount: Balance::from_sov(150).unwrap(),
+            },
+        );
+        assert!(apply_transaction(&mut ledger, &wd, &ctx(&p))
+            .unwrap()
+            .succeeded());
+        assert!(ledger.vault(&who).is_empty());
+        assert_eq!(
+            ledger.account(&who).balance,
+            Balance::from_sov(1000).unwrap()
+        );
+        // Every XUS is accounted for: supply conserved across the whole loop.
+        assert_eq!(ledger.total_supply().unwrap(), supply_before);
+    }
+
+    #[test]
+    fn oracle_update_is_rejected_from_an_unauthorized_signer() {
+        // Only the authorized feed may move the price; anyone else is refused and
+        // the honest $1 seed stands — no minting against a wished-for price.
+        let mut ledger = ledger_with_usa(10);
+        let p = policy();
+        let bad = signed(
+            [1; 32],
+            "usa.reserve.sov",
+            0,
+            Action::OracleUpdate {
+                price: 5 * sov_state::vault::SCALE,
+            },
+        );
+        assert!(!apply_transaction(&mut ledger, &bad, &ctx(&p))
+            .unwrap()
+            .succeeded());
+        assert_eq!(ledger.oracle_price(), sov_state::vault::SEED_XUS_USD_PRICE);
     }
 
     #[test]

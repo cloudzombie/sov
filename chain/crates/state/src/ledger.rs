@@ -44,6 +44,7 @@ type NftEntry = ((Hash, Vec<u8>), NftToken);
 type MultisigEntry = (AccountId, Multisig);
 /// A persisted pending multisig proposal: `(proposal id, proposal)`.
 type ProposalEntry = (Hash, MultisigProposal);
+type VaultEntry = (AccountId, crate::vault::Vault);
 
 /// Domain tag for native-asset id derivation. Versioned so any future change to
 /// the derivation is a *new* domain rather than a silent redefinition.
@@ -249,6 +250,12 @@ enum UndoOp {
     ShieldedValue(Balance),
     HtlcLocked(Balance),
     DeshieldWindow(u64, Balance),
+    /// A CDP vault write (`owner`, pre-image — `None` = it was absent, so undo removes it).
+    Vault(AccountId, Option<crate::vault::Vault>),
+    /// The total-collateral-locked counter, captured before a vault movement.
+    VaultCollateral(Balance),
+    /// The oracle price cell, captured before an update (`None` = it was unset).
+    OraclePrice(Option<u128>),
 }
 
 /// A captured undo log for one block — replay it with [`Ledger::apply_undo`] to
@@ -350,6 +357,19 @@ pub struct Ledger {
     /// its digest folds into the state root only once non-empty, so a chain with no
     /// pending proposals keeps the exact root it would have without the feature.
     proposals: BTreeMap<Hash, MultisigProposal>,
+    /// CDP vaults, keyed by owner: XUS collateral locked + xUSD debt owed. Absent
+    /// for accounts with no position; its digest folds into the state root only
+    /// once non-empty, so a chain with no vaults keeps the exact root it would
+    /// have without the feature (frozen genesis is untouched).
+    vaults: BTreeMap<AccountId, crate::vault::Vault>,
+    /// Total XUS (grains) locked as vault collateral. Counted in
+    /// [`total_supply`](Ledger::total_supply) — exactly like [`htlc_locked`] — so
+    /// locking/freeing collateral is supply-neutral. Zero ⇒ its slot is removed.
+    vault_collateral: Balance,
+    /// The oracle's XUS/USD price (USD per XUS, 10^8 fixed point), or `None` while
+    /// no signed update has ever landed — in which case reads fall back to the
+    /// honest launch seed. Absent-when-unset ⇒ genesis root is untouched.
+    oracle_price: Option<u128>,
     commitment: SparseMerkleTree,
 }
 
@@ -394,6 +414,13 @@ impl Ledger {
     const MULTISIG_SLOT: &'static [u8] = b"sov:multisig";
 
     const PROPOSALS_SLOT: &'static [u8] = b"sov:multisig_proposals";
+
+    /// Reserved Merkle slot name for the CDP-vaults digest.
+    const VAULTS_SLOT: &'static [u8] = b"sov:vaults";
+    /// Reserved Merkle slot name for the total-collateral-locked counter.
+    const VAULT_COLLATERAL_SLOT: &'static [u8] = b"sov:vault_collateral";
+    /// Reserved Merkle slot name for the oracle XUS/USD price.
+    const ORACLE_PRICE_SLOT: &'static [u8] = b"sov:xus_oracle_price";
 
     /// A reserved Merkle slot for a protocol-level scalar (not an account or a
     /// contract entry). Domain-separated by a `0x02` tag: no [`AccountId`] preimage
@@ -573,6 +600,41 @@ impl Ledger {
                 &borsh::to_vec(&entries).expect("proposal serialization is infallible"),
             );
             self.commitment.insert(slot, digest.as_bytes().to_vec());
+        }
+    }
+
+    /// Re-commit the CDP-vaults digest. Empty ⇒ slot removed, so a chain with no
+    /// vaults keeps the exact state root it would have without the feature.
+    fn recommit_vaults(&mut self) {
+        let slot = Self::reserved_slot(Self::VAULTS_SLOT);
+        if self.vaults.is_empty() {
+            self.commitment.remove(&slot);
+        } else {
+            let entries: Vec<VaultEntry> = self
+                .vaults
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let digest =
+                Hash::digest(&borsh::to_vec(&entries).expect("vault serialization is infallible"));
+            self.commitment.insert(slot, digest.as_bytes().to_vec());
+        }
+    }
+
+    /// Re-commit the oracle price to its reserved slot. Unset ⇒ slot removed, so a
+    /// chain whose oracle has never published keeps the exact root it would have
+    /// without the feature (and reads fall back to the honest seed price).
+    fn recommit_oracle(&mut self) {
+        let slot = Self::reserved_slot(Self::ORACLE_PRICE_SLOT);
+        match self.oracle_price {
+            None => {
+                self.commitment.remove(&slot);
+            }
+            Some(price) => {
+                let encoded =
+                    borsh::to_vec(&price).expect("oracle price serialization is infallible");
+                self.commitment.insert(slot, encoded);
+            }
         }
     }
 
@@ -793,6 +855,25 @@ impl Ledger {
                 self.htlc_locked = prev;
                 self.commit_counter(Self::HTLC_LOCKED_SLOT, prev);
             }
+            UndoOp::Vault(owner, prev) => {
+                match prev {
+                    Some(v) => {
+                        self.vaults.insert(owner, v);
+                    }
+                    None => {
+                        self.vaults.remove(&owner);
+                    }
+                }
+                self.recommit_vaults();
+            }
+            UndoOp::VaultCollateral(prev) => {
+                self.vault_collateral = prev;
+                self.commit_counter(Self::VAULT_COLLATERAL_SLOT, prev);
+            }
+            UndoOp::OraclePrice(prev) => {
+                self.oracle_price = prev;
+                self.recommit_oracle();
+            }
             UndoOp::DeshieldWindow(start, spent) => {
                 self.deshield_window = (start, spent);
                 let slot = Self::reserved_slot(Self::DESHIELD_WINDOW_SLOT);
@@ -891,11 +972,13 @@ impl Ledger {
         for account in self.accounts.values() {
             sum = sum.checked_add(account.total()?)?;
         }
-        // Value parked in the shielded pool or escrowed in an HTLC is still
-        // supply — it just lives outside account balances. Counting it makes
-        // every hold/release/refund supply-neutral.
+        // Value parked in the shielded pool, escrowed in an HTLC, or locked as CDP
+        // vault collateral is still supply — it just lives outside account
+        // balances. Counting it makes every hold/release/refund supply-neutral, so
+        // depositing XUS into a vault (or freeing it) conserves total supply.
         sum.checked_add(self.shielded_value)?
-            .checked_add(self.htlc_locked)
+            .checked_add(self.htlc_locked)?
+            .checked_add(self.vault_collateral)
     }
 
     /// The shielded pool's consensus state (read-only): note-commitment tree,
@@ -988,6 +1071,67 @@ impl Ledger {
         self.commit_counter(Self::HTLC_LOCKED_SLOT, self.htlc_locked);
         self.recommit_htlcs();
         Some(htlc)
+    }
+
+    // ── xUSD vaults + oracle: the SOV-collateralized stablecoin ───────────────
+
+    /// The CDP vault owned by `owner`, or the empty (no collateral, no debt)
+    /// vault if it holds none.
+    pub fn vault(&self, owner: &AccountId) -> crate::vault::Vault {
+        self.vaults.get(owner).cloned().unwrap_or_default()
+    }
+
+    /// Total XUS (grains) locked as vault collateral across all vaults.
+    pub fn vault_collateral(&self) -> Balance {
+        self.vault_collateral
+    }
+
+    /// The oracle's current XUS/USD price (USD per XUS, 10^8 fixed point). Falls
+    /// back to the honest launch seed until a signed update has ever landed.
+    pub fn oracle_price(&self) -> u128 {
+        self.oracle_price
+            .unwrap_or(crate::vault::SEED_XUS_USD_PRICE)
+    }
+
+    /// Whether the oracle has published at least one price (vs. the seed default).
+    pub fn oracle_is_seeded(&self) -> bool {
+        self.oracle_price.is_none()
+    }
+
+    /// Publish a new oracle price (authorization is enforced by the caller — only
+    /// the [`ORACLE_ACCOUNT`](crate::vault::ORACLE_ACCOUNT) may reach here).
+    /// Committed to the state root.
+    pub fn set_oracle_price(&mut self, price: u128) {
+        self.record(UndoOp::OraclePrice(self.oracle_price));
+        self.oracle_price = Some(price);
+        self.recommit_oracle();
+    }
+
+    /// Overwrite `owner`'s vault, adjusting the total-collateral counter by the
+    /// delta between the old and new collateral. An empty vault is pruned. Both the
+    /// vaults digest and the collateral counter are committed to the state root.
+    /// The caller is responsible for the balance/xUSD movements and the ratio
+    /// check; this only persists the position and keeps the counter in step.
+    pub fn set_vault(&mut self, owner: &AccountId, vault: crate::vault::Vault) {
+        let prev = self.vaults.get(owner).cloned();
+        let prev_collateral = prev.as_ref().map(|v| v.collateral).unwrap_or(Balance::ZERO);
+        // Keep the locked-collateral counter exactly equal to the sum of vault
+        // collateral, so total_supply stays conserved across the movement.
+        let next_total = self
+            .vault_collateral
+            .checked_sub(prev_collateral)
+            .and_then(|t| t.checked_add(vault.collateral))
+            .expect("vault collateral counter stays within total supply");
+        self.record(UndoOp::VaultCollateral(self.vault_collateral));
+        self.record(UndoOp::Vault(owner.clone(), prev));
+        self.vault_collateral = next_total;
+        self.commit_counter(Self::VAULT_COLLATERAL_SLOT, self.vault_collateral);
+        if vault.is_empty() {
+            self.vaults.remove(owner);
+        } else {
+            self.vaults.insert(owner.clone(), vault);
+        }
+        self.recommit_vaults();
     }
 
     // ── SNS names: the reserved, protocol-level NFT collection ────────────────
