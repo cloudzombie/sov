@@ -137,12 +137,17 @@ banner "Verification suite (invariants · model-check · conformance · KAT)"
 ( cd chain && cargo test -p sov-verify ) || fail "verification/KAT suite failed"
 ok "consensus invariants + cross-impl KAT vectors hold"
 
-# ── 7. wasm contracts (mirror CI) ────────────────────────────────────────────
-banner "WASM contracts (wasm32 clippy + build)"
+# ── 7. wasm contracts (mirror CI's `contracts` job exactly) ──────────────────
+# Scoped to chain/contracts — the no_std guest crate — NOT the whole workspace.
+# A workspace-wide wasm build pulls in std-only deps (getrandom without `js`) that
+# never ship in a contract; CI builds only the guest, and so do we.
+banner "WASM contracts (wasm32 clippy + release build)"
 if rustup target list --installed 2>/dev/null | grep -q wasm32-unknown-unknown; then
-  ( cd chain && cargo clippy --target wasm32-unknown-unknown -- -D warnings ) \
-    || fail "wasm clippy failed"
-  ok "wasm contracts clippy-clean"
+  ( cd chain/contracts \
+      && cargo clippy --target wasm32-unknown-unknown -- -D warnings \
+      && cargo build --target wasm32-unknown-unknown --release ) \
+    || fail "wasm contracts (clippy/build) failed"
+  ok "wasm guest contracts clippy-clean + release build"
 else
   skip "wasm32-unknown-unknown target not installed"
 fi
