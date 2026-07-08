@@ -103,10 +103,10 @@ ok "testnet pin present: ${DIM}$TESTNET_GENESIS${RST}"
 
 # ── 2. GENESIS BUILDS TO PIN (double-lock #2), byte-for-byte ─────────────────
 banner "Genesis rebuilds byte-for-byte to the pinned hashes"
-GEN_OUT="$(cargo test -p sov-rpc --release -- --nocapture --test-threads=1 \
+GEN_OUT="$( cd chain && cargo test -p sov-rpc --release -- --nocapture --test-threads=1 \
   mainnet_genesis_builds_and_is_frozen \
   testnet_1_frozen_genesis_is_byte_for_byte_deterministic \
-  genesis_hash_pin_is_enforced 2>&1)" || { echo "$GEN_OUT"; fail "frozen-genesis tests did not pass"; }
+  genesis_hash_pin_is_enforced 2>&1 )" || { echo "$GEN_OUT"; fail "frozen-genesis tests did not pass"; }
 # Belt-and-suspenders: confirm the value the test itself PRINTED equals the pin.
 PRINTED="$(printf '%s\n' "$GEN_OUT" | sed -n 's/.*MAINNET GENESIS HASH = \([0-9a-f]\{64\}\).*/\1/p' | head -1)"
 if [ -n "$PRINTED" ] && [ "$PRINTED" != "$MAINNET_GENESIS" ]; then
