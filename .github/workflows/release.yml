@@ -1,14 +1,14 @@
 name: release
 
-# Build the SOV Station desktop wallet/node app — TESTNET build (sov-testnet-1) —
-# for Windows and macOS, and attach the artifacts to a GitHub Release. Builds run
-# natively on each OS runner (RandomX's C++ library compiles cleanly there, unlike
-# a mingw cross-build from macOS), so the binaries are real, not cross-compiled.
+# Build the SOV Station desktop wallet/node app for Windows and macOS (and the
+# headless Linux node daemon), and attach the artifacts to a GitHub Release. Builds
+# run natively on each OS runner (RandomX's C++ library compiles cleanly there,
+# unlike a mingw cross-build from macOS), so the binaries are real, not cross-compiled.
 #
-# Each artifact bundles BOTH the GUI (`sov-station`) and the one-time chain-setup
-# helper (`sov-testnet`) side by side, so the app is self-contained.
+# The desktop app is self-contained: it runs a node IN-PROCESS with both the mainnet
+# and testnet chain specs embedded, and defaults to MAINNET.
 #
-# Trigger: push a tag like `v0.1.0-testnet`, or run manually from the Actions tab.
+# Trigger: push a tag like `v0.1.0`, or run manually from the Actions tab.
 
 on:
   push:
@@ -49,26 +49,22 @@ jobs:
       # Cache compiled dependencies across runs. The heavy deps (egui, halo2/orchard,
       # RandomX, the PQ crypto) dominate a cold release build; caching them turns a ~9
       # min from-scratch compile into a couple of minutes that only rebuilds OUR crates.
-      # (The first run after this is added still populates the cache.)
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             node
             chain
           cache-on-failure: true
-      - name: Build GUI + chain helper (release)
+      - name: Build GUI (release)
+        shell: bash
+        run: cargo build --release --manifest-path node/Cargo.toml
+      - name: Stage bundle
         shell: bash
         run: |
-          cargo build --release --manifest-path node/Cargo.toml
-          cargo build --release --manifest-path chain/Cargo.toml --bin sov-testnet
-      - name: Stage TESTNET bundle
-        shell: bash
-        run: |
-          mkdir -p "dist/SOV-Station-Testnet"
-          cp node/target/release/sov-station.exe "dist/SOV-Station-Testnet/"
-          cp chain/target/release/sov-testnet.exe "dist/SOV-Station-Testnet/"
-          cp .github/TESTNET-README.txt "dist/SOV-Station-Testnet/READ ME — TESTNET ONLY.txt" || true
-          cd dist && 7z a "SOV-Station-Testnet-${GITHUB_REF_NAME}-windows-x64.zip" "SOV-Station-Testnet"
+          mkdir -p "dist/SOV-Station"
+          cp node/target/release/sov-station.exe "dist/SOV-Station/"
+          cp .github/STATION-README.txt "dist/SOV-Station/READ ME.txt" || true
+          cd dist && 7z a "SOV-Station-${GITHUB_REF_NAME}-windows-x64.zip" "SOV-Station"
       - uses: actions/upload-artifact@v4
         with:
           name: windows
@@ -86,26 +82,23 @@ jobs:
             node
             chain
           cache-on-failure: true
-      - name: Build GUI + chain helper (release)
-        run: |
-          cargo build --release --manifest-path node/Cargo.toml
-          cargo build --release --manifest-path chain/Cargo.toml --bin sov-testnet
-      - name: Bundle .app + .dmg (TESTNET)
+      - name: Build GUI (release)
+        run: cargo build --release --manifest-path node/Cargo.toml
+      - name: Bundle .app + .dmg
         shell: bash
         run: |
           VER="${GITHUB_REF_NAME:-0.0.0}"
-          STAGE="dist/stage"; APP="$STAGE/SOV Station (Testnet).app"; MAC="$APP/Contents/MacOS"
+          STAGE="dist/stage"; APP="$STAGE/SOV Station.app"; MAC="$APP/Contents/MacOS"
           mkdir -p "$MAC" "$APP/Contents/Resources" dist
           cp node/target/release/sov-station "$MAC/sov-station"
-          cp chain/target/release/sov-testnet "$MAC/sov-testnet"
           chmod +x "$MAC/"*
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0"><dict>
-            <key>CFBundleName</key><string>SOV Station (Testnet)</string>
-            <key>CFBundleDisplayName</key><string>SOV Station (Testnet)</string>
-            <key>CFBundleIdentifier</key><string>sov.station.testnet</string>
+            <key>CFBundleName</key><string>SOV Station</string>
+            <key>CFBundleDisplayName</key><string>SOV Station</string>
+            <key>CFBundleIdentifier</key><string>sov.station</string>
             <key>CFBundleVersion</key><string>0.1.0</string>
             <key>CFBundleShortVersionString</key><string>${VER}</string>
             <key>CFBundleExecutable</key><string>sov-station</string>
@@ -114,10 +107,10 @@ jobs:
             <key>NSHighResolutionCapable</key><true/>
           </dict></plist>
           PLIST
-          cp .github/TESTNET-README.txt "$STAGE/READ ME — TESTNET ONLY.txt" || true
+          cp .github/STATION-README.txt "$STAGE/READ ME.txt" || true
           codesign --force --deep --sign - "$APP" || true
           ( cd "$STAGE" && ln -sf /Applications Applications )
-          hdiutil create -volname "SOV Station — TESTNET" -srcfolder "$STAGE" -ov -format UDZO "dist/SOV-Station-Testnet-${VER}-macOS.dmg"
+          hdiutil create -volname "SOV Station" -srcfolder "$STAGE" -ov -format UDZO "dist/SOV-Station-${VER}-macOS.dmg"
       - uses: actions/upload-artifact@v4
         with:
           name: macos
@@ -133,20 +126,20 @@ jobs:
         with:
           workspaces: chain
           cache-on-failure: true
-      - name: Build headless node daemon + chain helper (release)
+      - name: Build headless node daemon + operator helper (release)
         run: |
           cargo build --release --manifest-path chain/Cargo.toml --bin sov-rpcd --bin sov-testnet
       - name: Stage Linux node bundle (for VPS / server deployment)
         shell: bash
         run: |
-          STAGE="dist/SOV-Node-Testnet"
+          STAGE="dist/SOV-Node"
           mkdir -p "$STAGE"
           cp chain/target/release/sov-rpcd "$STAGE/"
           cp chain/target/release/sov-testnet "$STAGE/"
           cp chain/testnet/sov-rpcd.service "$STAGE/"
           cp chain/testnet/RUNBOOK.md "$STAGE/"
           chmod +x "$STAGE/sov-rpcd" "$STAGE/sov-testnet"
-          cd dist && tar czf "SOV-Node-Testnet-${GITHUB_REF_NAME}-linux-x64.tar.gz" "SOV-Node-Testnet"
+          cd dist && tar czf "SOV-Node-${GITHUB_REF_NAME}-linux-x64.tar.gz" "SOV-Node"
       - uses: actions/upload-artifact@v4
         with:
           name: linux
@@ -158,27 +151,30 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with: { path: artifacts }
-      - name: Publish TESTNET release
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*
-          prerelease: true
-          name: "SOV Station ${{ github.ref_name }} — TESTNET"
+          prerelease: false
+          name: "SOV Station ${{ github.ref_name }}"
           body: |
-            **⚠️ TESTNET BUILD (sov-testnet-1) — NOT MAINNET.**
+            **SOV Station — the desktop wallet + node for SOV (XUS) mainnet.**
 
-            Coins (XUS) on this network have **no value** and the chain may be reset.
-            Do not use mainnet keys or real funds.
+            The app runs a node **in-process** and opens on **Mainnet** (genesis
+            `cb0272ff…`, live since midnight July 4, 2026). Create or import a wallet,
+            hold and send XUS (transparent or shielded), and optionally mine.
 
-            - **macOS:** `SOV-Station-Testnet-*-macOS.dmg` (Apple Silicon). Unsigned —
+            SOV is a young network — live, but new and **not yet independently
+            audited**. Hold funds accordingly.
+
+            - **macOS:** `SOV-Station-*-macOS.dmg` (Apple Silicon). Unsigned —
               right-click → Open the first time (Gatekeeper).
-            - **Windows:** `SOV-Station-Testnet-*-windows-x64.zip` — unzip and run
+            - **Windows:** `SOV-Station-*-windows-x64.zip` — unzip and run
               `sov-station.exe`. Unsigned — SmartScreen → More info → Run anyway.
-            - **Linux (server / VPS):** `SOV-Node-Testnet-*-linux-x64.tar.gz` — the
-              headless `sov-rpcd` daemon + `sov-testnet` helper + a `systemd` unit and
-              runbook. Run a public **seed node** with `journalctl -u sov-rpcd -f`; see
-              `RUNBOOK.md` in the tarball.
+            - **Linux (server / VPS):** `SOV-Node-*-linux-x64.tar.gz` — the headless
+              `sov-rpcd` daemon + operator helper + a `systemd` unit and runbook. Run a
+              node with `journalctl -u sov-rpcd -f`; see `RUNBOOK.md` in the tarball.
 
-            The desktop app runs the node **in-process**; closing the app stops it. The
+            The desktop app runs the node in-process; closing the app stops it. The
             Linux daemon runs standalone under systemd (`Restart=always`, resumes from
             its fsync'd block log).

@@ -1686,7 +1686,9 @@ impl Station {
             peer_addr: read_saved_peer(),
             dark_mode: read_saved_theme(),
             lan_addr: lan_ipv4(),
-            network: Network::Testnet,
+            // Default to MAINNET — the live network (genesis cb0272ff). The top tab
+            // opens on Mainnet; Testnet is an explicit opt-in sandbox from there.
+            network: Network::Mainnet,
             wallets: Vec::new(),
             selected: 0,
             mining_account: None,
