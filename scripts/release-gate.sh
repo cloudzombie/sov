@@ -163,8 +163,10 @@ fi
 
 # ── 9. supply-chain audit ────────────────────────────────────────────────────
 banner "Supply chain (cargo-deny: advisories + bans)"
+# Mirror CI EXACTLY: `check advisories bans` against chain/Cargo.toml + chain/deny.toml.
+# (Not licenses/sources — CI does not gate on those, and neither do we.)
 if command -v cargo-deny >/dev/null; then
-  ( cd chain && cargo deny check ) || fail "cargo-deny found advisories/bans"
+  ( cd chain && cargo deny check advisories bans ) || fail "cargo-deny found advisories/bans"
   ok "no known advisories or banned deps"
 else
   skip "cargo-deny not installed"

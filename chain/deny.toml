@@ -14,11 +14,11 @@ yanked = "deny"
 # crate) still breaks CI. Each entry is justified; revisit if a maintained
 # replacement lands upstream.
 ignore = [
-    # proc-macro-error (original) and its fork proc-macro-error2 are both now
-    # unmaintained. They are TRANSITIVE, BUILD-TIME proc-macro helpers (pulled by
-    # derive macros); their code runs only at compile time and ships in NO node
-    # binary — zero runtime/consensus surface. Nothing to patch (upstream is dead).
-    "RUSTSEC-2024-0370", # proc-macro-error  — unmaintained
+    # proc-macro-error2 is unmaintained. It is a TRANSITIVE, BUILD-TIME proc-macro
+    # helper (pulled by a derive macro, `getset`); its code runs only at compile
+    # time and ships in NO node binary — zero runtime/consensus surface. Nothing to
+    # patch (upstream is dead). The original `proc-macro-error` (RUSTSEC-2024-0370)
+    # is no longer in the tree, so its waiver was removed.
     "RUSTSEC-2026-0173", # proc-macro-error2 — unmaintained
 ]
 
