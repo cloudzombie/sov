@@ -249,6 +249,14 @@ fn chain_check(args: &[String]) -> bool {
         .ok()
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    // Snapshot mined supply NOW, together with the tip — so the later reconciliation
+    // is against a consistent height. The chain is live and advances during a long
+    // walk; reading supply at the end would race ahead of where we stopped.
+    let mined_snapshot = client.call("sov_getSupply", json!({})).ok().and_then(|v| {
+        v.get("mined")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<u128>().ok())
+    });
     let pinned = match chain_id.as_str() {
         "sov-mainnet" => Some(MAINNET_GENESIS),
         "sov-testnet-1" => Some(TESTNET_GENESIS),
@@ -367,23 +375,19 @@ fn chain_check(args: &[String]) -> bool {
     println!("  \x1b[32m✓\x1b[0m {link_ok}/{n} blocks link cleanly (height · prev-hash · time)");
     println!("  \x1b[32m✓\x1b[0m {emit_ok}/{n} coinbases equal the emission schedule");
 
-    // 5. Supply: on a FULL audit (genesis→tip), the node's reported mined supply
-    // must equal the sum of coinbases we independently re-derived. A partial range
+    // 5. Supply: on a FULL audit (genesis→tip), the node's mined-supply counter —
+    // snapshotted at the START, consistent with the tip we walked — must equal the
+    // sum of coinbases we independently re-derived. (Reading supply at the end would
+    // race ahead: a live chain mines new blocks during a long walk.) A partial range
     // can't reconcile against whole-chain supply, so we only assert on a full walk.
     let full_audit = from == 0 && to == tip;
-    if let Ok(sup) = client.call("sov_getSupply", json!({})) {
-        let reported = sup
-            .get("mined")
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse::<u128>().ok());
-        if !full_audit {
-            println!("  \x1b[33m•\x1b[0m supply reconciliation skipped (partial range {from}..={to}, not genesis→tip)");
-        } else if reported == Some(mined) {
-            println!("  \x1b[32m✓\x1b[0m mined supply reconciles: node {mined} == Σ coinbases");
-        } else {
-            println!("  \x1b[31m✗\x1b[0m supply mismatch: node reports {reported:?}, Σ coinbases = {mined}");
-            ok = false;
-        }
+    if !full_audit {
+        println!("  \x1b[33m•\x1b[0m supply reconciliation skipped (partial range {from}..={to}, not genesis→tip)");
+    } else if mined_snapshot == Some(mined) {
+        println!("  \x1b[32m✓\x1b[0m mined supply reconciles: node {mined} == Σ coinbases");
+    } else {
+        println!("  \x1b[31m✗\x1b[0m supply mismatch: node snapshot {mined_snapshot:?}, Σ coinbases = {mined}");
+        ok = false;
     }
     ok
 }
