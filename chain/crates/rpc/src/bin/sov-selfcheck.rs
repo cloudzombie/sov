@@ -85,7 +85,13 @@ fn keys_check(args: &[String]) -> bool {
     let mut mnemonics: HashSet<String> = HashSet::with_capacity(count);
     let mut seeds: HashSet<[u8; 32]> = HashSet::with_capacity(count);
     let mut accounts: HashSet<String> = HashSet::with_capacity(count);
-    // Per-bit frequency over the 256-bit account id, to catch a biased RNG/derivation.
+    // The RAW ENTROPY that actually seeds each wallet, recovered from its mnemonic
+    // (BIP-39 is reversible). This — NOT any downstream hash — is where randomness
+    // must be proven: BLAKE3/PBKDF2 would whitewash a broken source into uniform
+    // output, so we test the source bytes directly with a statistical battery.
+    let mut entropy_buf: Vec<u8> = Vec::with_capacity(count * 32);
+    // Downstream account-id bit balance — a SANITY line only (post-BLAKE3, uniform
+    // by construction regardless of source), kept to catch a stuck derivation.
     let mut bit_ones = [0u64; 256];
     let mut collisions = 0usize;
 
@@ -97,6 +103,15 @@ fn keys_check(args: &[String]) -> bool {
                 return false;
             }
         };
+        // Recover the exact entropy this wallet was seeded with (before it is moved
+        // into the dedup set) and accumulate it for the battery.
+        match bip39::Mnemonic::parse(&phrase) {
+            Ok(m) => entropy_buf.extend_from_slice(&m.to_entropy()),
+            Err(e) => {
+                println!("  \x1b[31mFAIL\x1b[0m: mnemonic did not round-trip to entropy: {e}");
+                return false;
+            }
+        }
         let wallet = HdWallet::from_mnemonic(&phrase, "").expect("fresh mnemonic parses");
         let seed = wallet.derive_seed(0, 0);
         let account = wallet
@@ -143,26 +158,40 @@ fn keys_check(args: &[String]) -> bool {
         ok = false;
     }
 
-    // Entropy: every one of the 256 account-id bits should be ~50% set. A real
-    // bias (broken RNG, stuck derivation) would blow far past this loose bound.
-    let expected = count as f64 / 2.0;
-    let mut worst = 0.0f64;
-    for &ones in bit_ones.iter() {
-        let dev = ((ones as f64 - expected) / expected).abs();
-        worst = worst.max(dev);
-    }
-    if worst < 0.10 {
-        println!(
-            "  \x1b[32m✓\x1b[0m account-id bits unbiased (worst bit {:.2}% off 50/50)",
-            worst * 100.0
-        );
+    // THE REAL RANDOMNESS TEST: a statistical battery on the raw entropy that
+    // actually seeded these wallets (recovered from the mnemonics). This is where a
+    // broken/biased/stuck RNG shows up — downstream hashes cannot hide it here.
+    println!(
+        "\n  \x1b[1mentropy battery\x1b[0m — {} bytes of real wallet seed entropy:",
+        entropy_buf.len()
+    );
+    ok &= randomness_battery(&entropy_buf);
+
+    // Independently, exercise the OS CSPRNG source itself (what generate_mnemonic
+    // draws from) with a fresh 1 MiB pull through the same battery.
+    let mut raw = vec![0u8; 1 << 20];
+    if getrandom::getrandom(&mut raw).is_err() {
+        println!("  \x1b[31m✗\x1b[0m getrandom (OS entropy) is unavailable");
+        ok = false;
     } else {
         println!(
-            "  \x1b[31m✗\x1b[0m account-id bit bias {:.2}% — entropy source suspect",
-            worst * 100.0
+            "  \x1b[1mgetrandom source\x1b[0m — fresh {} bytes from the OS CSPRNG:",
+            raw.len()
         );
-        ok = false;
+        ok &= randomness_battery(&raw);
     }
+
+    // Downstream sanity only: post-BLAKE3 account-id bits stay ~50/50 (uniform by
+    // construction; this just catches a stuck/constant derivation, not source bias).
+    let expected = count as f64 / 2.0;
+    let worst = bit_ones
+        .iter()
+        .map(|&ones| ((ones as f64 - expected) / expected).abs())
+        .fold(0.0f64, f64::max);
+    println!(
+        "  \x1b[2m·\x1b[0m downstream account-id bits {:.2}% off 50/50 (sanity; whitewashed by BLAKE3)",
+        worst * 100.0
+    );
 
     // Determinism: the same mnemonic must always derive the same account.
     let sample = generate_mnemonic(words).unwrap();
@@ -228,6 +257,94 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
         *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
     }
     Some(out)
+}
+
+/// A statistical randomness battery over RAW entropy `data`. Prints each test and
+/// returns whether ALL passed. Thresholds are ~6σ, so a healthy CSPRNG never
+/// false-fails while a biased/stuck/patterned source is caught. Four independent
+/// views: bit balance, byte-value uniformity, information content, and structure.
+fn randomness_battery(data: &[u8]) -> bool {
+    let n = data.len();
+    if n < 4096 {
+        println!("    \x1b[33m•\x1b[0m battery skipped: need ≥4096 bytes, got {n}");
+        return true;
+    }
+    let mut ok = true;
+
+    // 1. Monobit — the fraction of 1-bits must be ~0.5 (Frequency test).
+    let ones: u64 = data.iter().map(|b| b.count_ones() as u64).sum();
+    let nbits = n as f64 * 8.0;
+    let z = (ones as f64 - nbits / 2.0) / (nbits.sqrt() / 2.0);
+    let mono = z.abs() <= 6.0;
+    line(
+        mono,
+        &format!(
+            "monobit: {:.4}% ones (z={z:+.2}, |z|≤6)",
+            ones as f64 / nbits * 100.0
+        ),
+    );
+    ok &= mono;
+
+    // 2. Byte uniformity — χ² over 256 values (255 dof; mean 255, sd ≈22.6). Every
+    //    value must appear (a missing symbol means a constrained/broken source).
+    let mut counts = [0u64; 256];
+    for &b in data {
+        counts[b as usize] += 1;
+    }
+    let exp = n as f64 / 256.0;
+    let chi: f64 = counts.iter().map(|&c| (c as f64 - exp).powi(2) / exp).sum();
+    let missing = counts.iter().filter(|&&c| c == 0).count();
+    let chi_ok = (120.0..=390.0).contains(&chi) && missing == 0;
+    line(
+        chi_ok,
+        &format!("byte χ²: {chi:.1} (expect ~255±23; {missing} of 256 values unseen)"),
+    );
+    ok &= chi_ok;
+
+    // 3. Shannon entropy per byte — must be ~8.0 bits (near-maximal information).
+    let h: f64 = counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / n as f64;
+            -p * p.log2()
+        })
+        .sum();
+    let h_ok = h >= 7.90;
+    line(
+        h_ok,
+        &format!("Shannon entropy: {h:.4} bits/byte (ideal 8.0, ≥7.90)"),
+    );
+    ok &= h_ok;
+
+    // 4. Serial (lag-1) correlation — consecutive bytes must be uncorrelated, so a
+    //    counter/LFSR/structured stream (which passes 1–3) is still caught here.
+    let mean = data.iter().map(|&b| b as f64).sum::<f64>() / n as f64;
+    let (mut num, mut den) = (0.0f64, 0.0f64);
+    for i in 0..n {
+        let d = data[i] as f64 - mean;
+        den += d * d;
+        if i + 1 < n {
+            num += d * (data[i + 1] as f64 - mean);
+        }
+    }
+    let r = if den > 0.0 { num / den } else { 1.0 };
+    let corr_ok = r.abs() <= 0.05;
+    line(
+        corr_ok,
+        &format!("lag-1 correlation: {r:+.4} (ideal 0, |r|≤0.05)"),
+    );
+    ok &= corr_ok;
+
+    ok
+}
+
+fn line(pass: bool, msg: &str) {
+    if pass {
+        println!("    \x1b[32m✓\x1b[0m {msg}");
+    } else {
+        println!("    \x1b[31m✗\x1b[0m {msg}");
+    }
 }
 
 // ── chain: structural self-consistency against a live node ────────────────────

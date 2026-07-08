@@ -137,6 +137,16 @@ banner "Verification suite (invariants · model-check · conformance · KAT)"
 ( cd chain && cargo test -p sov-verify ) || fail "verification/KAT suite failed"
 ok "consensus invariants + cross-impl KAT vectors hold"
 
+# ── 6b. key-generation collisions + randomness ───────────────────────────────
+# Runs the wallet pipeline (OS entropy → BIP-39 → seed → hybrid key → account) for
+# a batch of fresh wallets and proves ZERO collisions plus a statistical randomness
+# battery (monobit · byte χ² · Shannon entropy · serial correlation) on the RAW
+# entropy that seeds them — so a biased/stuck RNG can never ship in a release.
+banner "Key pipeline (collision-free + randomness battery)"
+( cd chain && cargo run --quiet -p sov-rpc --bin sov-selfcheck -- keys --count 3000 ) \
+  || fail "key-generation self-check failed (collision or randomness battery)"
+ok "wallet keys: zero collisions + entropy battery passed"
+
 # ── 7. wasm contracts (mirror CI's `contracts` job exactly) ──────────────────
 # Scoped to chain/contracts — the no_std guest crate — NOT the whole workspace.
 # A workspace-wide wasm build pulls in std-only deps (getrandom without `js`) that
