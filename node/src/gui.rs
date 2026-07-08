@@ -535,6 +535,182 @@ fn named_color(named: bool) -> egui::Color32 {
     }
 }
 
+/// A deterministic, good-looking badge color for a token/asset/collectible,
+/// derived from a stable key (its asset id or symbol) — so the same asset always
+/// wears the same color, the wallet-UI stand-in for a token logo.
+fn avatar_color(key: &str) -> egui::Color32 {
+    const HUES: [(u8, u8, u8); 12] = [
+        (99, 102, 241), // indigo
+        (236, 72, 153), // pink
+        (34, 197, 94),  // green
+        (249, 115, 22), // orange
+        (14, 165, 233), // sky
+        (168, 85, 247), // purple
+        (234, 179, 8),  // amber
+        (20, 184, 166), // teal
+        (239, 68, 68),  // red
+        (59, 130, 246), // blue
+        (132, 204, 22), // lime
+        (217, 70, 239), // fuchsia
+    ];
+    // FNV-1a over the key: stable across runs, well-spread across the palette.
+    let mut h: u32 = 2_166_136_261;
+    for b in key.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(16_777_619);
+    }
+    let (r, g, b) = HUES[(h as usize) % HUES.len()];
+    egui::Color32::from_rgb(r, g, b)
+}
+
+/// The 1–2 letter initials shown inside a badge (uppercase alphanumerics).
+fn initials_of(s: &str) -> String {
+    let it: String = s
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .take(2)
+        .collect::<String>()
+        .to_uppercase();
+    if it.is_empty() {
+        "?".to_string()
+    } else {
+        it
+    }
+}
+
+/// Draw a circular token badge (a colored disc with the asset's initials).
+fn token_avatar(ui: &mut egui::Ui, key: &str, symbol: &str, diameter: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
+    let color = avatar_color(key);
+    let painter = ui.painter();
+    painter.circle_filled(rect.center(), diameter / 2.0, color);
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        initials_of(symbol),
+        egui::FontId::proportional(diameter * 0.42),
+        egui::Color32::WHITE,
+    );
+}
+
+/// One token holding as a Phantom-style row: colored badge, symbol + short asset
+/// id, and the balance right-aligned. Fills the available width.
+fn token_card(ui: &mut egui::Ui, asset: &str, symbol: &str, balance_grains: &str) {
+    egui::Frame::none()
+        .fill(palette::surface())
+        .rounding(10.0)
+        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+        .show(ui, |ui| {
+            let w = ui.available_width();
+            ui.set_width(w);
+            ui.horizontal(|ui| {
+                token_avatar(ui, asset, symbol, 34.0);
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(symbol).strong().size(15.0));
+                    ui.label(
+                        egui::RichText::new(short_id(asset))
+                            .color(palette::text_dim())
+                            .monospace()
+                            .small(),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(xus(balance_grains)).strong().size(15.0));
+                });
+            });
+        });
+}
+
+/// One registry entry as a row: badge, symbol + issuer, total supply right-aligned.
+fn registry_card(ui: &mut egui::Ui, asset: &str, symbol: &str, issuer: &str, supply: &str) {
+    egui::Frame::none()
+        .fill(palette::surface())
+        .rounding(10.0)
+        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+        .show(ui, |ui| {
+            let w = ui.available_width();
+            ui.set_width(w);
+            ui.horizontal(|ui| {
+                token_avatar(ui, asset, symbol, 30.0);
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(symbol).strong());
+                    ui.label(
+                        egui::RichText::new(format!("issuer {}", short_id(issuer)))
+                            .color(palette::text_dim())
+                            .monospace()
+                            .small(),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{} supply", xus(supply))).strong());
+                });
+            });
+        });
+}
+
+/// A collectible tile (NFT / SNS name): a colored thumbnail with initials and a
+/// caption. Returns a click response so the grid can wire "send".
+fn nft_tile(ui: &mut egui::Ui, display: &str, is_sns: bool, coll: &str) -> egui::Response {
+    let tile = 132.0;
+    let resp = egui::Frame::none()
+        .fill(palette::surface())
+        .rounding(10.0)
+        .inner_margin(egui::Margin::same(10.0))
+        .show(ui, |ui| {
+            ui.set_width(tile);
+            ui.vertical_centered(|ui| {
+                let side = tile - 20.0;
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+                let color = avatar_color(if is_sns { display } else { coll });
+                let painter = ui.painter();
+                painter.rect_filled(rect, 8.0, color);
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    initials_of(display),
+                    egui::FontId::proportional(28.0),
+                    egui::Color32::WHITE,
+                );
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(short_id(display)).strong().small());
+                if is_sns {
+                    ui.label(
+                        egui::RichText::new("SNS name")
+                            .color(palette::success())
+                            .small(),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new("NFT")
+                            .color(palette::text_dim())
+                            .small(),
+                    );
+                }
+            });
+        })
+        .response;
+    resp.interact(egui::Sense::click())
+}
+
+/// A soft empty-state card: a bold title and a dim one-line explanation.
+fn empty_hint(ui: &mut egui::Ui, title: &str, body: &str) {
+    egui::Frame::none()
+        .fill(palette::surface())
+        .rounding(10.0)
+        .inner_margin(egui::Margin::same(14.0))
+        .show(ui, |ui| {
+            let w = ui.available_width();
+            ui.set_width(w);
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new(title).strong());
+                ui.label(egui::RichText::new(body).color(palette::text_dim()).small());
+            });
+        });
+}
+
 /// Render `data` as a QR code, drawn directly with the egui painter (no image
 /// backend) at roughly `size` pixels square, with a white quiet-zone border.
 fn qr_widget(ui: &mut egui::Ui, data: &str, size: f32) {
@@ -4502,7 +4678,6 @@ impl Station {
             ui.label(egui::RichText::new("create or open a wallet to use tokens").weak());
             return;
         };
-        ui.label(egui::RichText::new(format!("acting as {signer}")).weak());
         let tv = self
             .tokens_view
             .lock()
@@ -4514,191 +4689,194 @@ impl Station {
         let mut do_prev = false;
         let mut do_next = false;
 
-        // Your token balances.
-        ui.separator();
+        // Header: a dim "holdings for <you>" line + a refresh affordance.
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Your token balances").strong());
-            if tv.loading {
-                ui.spinner();
-            } else if ui.button("Refresh").clicked() {
-                do_refresh = true;
+            ui.label(
+                egui::RichText::new(format!("holdings for {}", short_id(&signer)))
+                    .color(palette::text_dim())
+                    .small(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if tv.loading {
+                    ui.spinner();
+                } else if ui.button("⟳ Refresh").clicked() {
+                    do_refresh = true;
+                }
+            });
+        });
+        ui.add_space(8.0);
+
+        // Your token holdings, as Phantom-style cards.
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Your tokens").strong());
+            if tv.account == signer && !tv.holdings.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!("· {}", tv.holdings.len()))
+                        .color(palette::text_dim()),
+                );
             }
         });
+        ui.add_space(4.0);
         if tv.account == signer && !tv.holdings.is_empty() {
-            egui::Grid::new("tok_holdings")
-                .num_columns(3)
-                .striped(true)
-                .spacing([18.0, 4.0])
-                .show(ui, |ui| {
-                    for h in ["Symbol", "Asset", "Balance"] {
-                        ui.label(egui::RichText::new(h).weak());
-                    }
-                    ui.end_row();
-                    for (asset, symbol, bal) in &tv.holdings {
-                        ui.monospace(symbol);
-                        ui.monospace(short_id(asset));
-                        ui.monospace(xus(bal));
-                        ui.end_row();
-                    }
-                });
+            for (asset, symbol, bal) in &tv.holdings {
+                token_card(ui, asset, symbol, bal);
+                ui.add_space(6.0);
+            }
         } else {
-            ui.label(egui::RichText::new("none — Refresh to scan").weak());
+            empty_hint(
+                ui,
+                "No tokens yet",
+                "Tokens you hold appear here as cards. Issue one below, or Refresh to scan.",
+            );
         }
 
-        // Your NFTs (non-fungible). SNS names ARE NFTs (reserved collection), so a
-        // registered name shows here as a collectible alongside any other NFTs —
-        // and can be SENT (transferring an SNS name re-points it to the recipient).
-        ui.separator();
-        ui.label(egui::RichText::new("Your NFTs & names").strong());
+        // Collectibles & names, as a wrapped grid of tiles. SNS names ARE NFTs, so a
+        // registered name shows here and can be SENT (which re-points it).
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("Collectibles & names").strong());
+        ui.add_space(4.0);
         let mut send_nft: Option<(String, bool, String, String)> = None;
         if tv.account == signer && !tv.nfts.is_empty() {
+            let busy = self.action.lock().map(|a| a.busy).unwrap_or(false);
+            let has_to = !self.nft_send_to.trim().is_empty();
+            ui.horizontal_wrapped(|ui| {
+                for (display, is_sns, coll, tid) in &tv.nfts {
+                    let resp = nft_tile(ui, display, *is_sns, coll).on_hover_text(if has_to {
+                        "Click to send to the recipient below"
+                    } else {
+                        "Enter a recipient below, then click to send"
+                    });
+                    if resp.clicked() && !busy && has_to {
+                        send_nft = Some((display.clone(), *is_sns, coll.clone(), tid.clone()));
+                    }
+                    ui.add_space(6.0);
+                }
+            });
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label("send to");
+                ui.label(egui::RichText::new("send to").color(palette::text_dim()));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.nft_send_to)
                         .hint_text("recipient account id or a .sov name")
-                        .desired_width(300.0),
+                        .desired_width(280.0),
+                );
+                ui.label(
+                    egui::RichText::new("then click a collectible")
+                        .color(palette::text_dim())
+                        .small(),
                 );
             });
-            let busy = self.action.lock().map(|a| a.busy).unwrap_or(false);
-            let has_to = !self.nft_send_to.trim().is_empty();
-            egui::Grid::new("tok_nfts")
-                .num_columns(3)
-                .striped(true)
-                .spacing([18.0, 6.0])
-                .show(ui, |ui| {
-                    for h in ["Item", "Kind", ""] {
-                        ui.label(egui::RichText::new(h).weak());
-                    }
-                    ui.end_row();
-                    for (display, is_sns, coll, tid) in &tv.nfts {
-                        ui.monospace(display);
-                        if *is_sns {
-                            ui.colored_label(named_color(true), "SNS name · NFT");
-                        } else {
-                            ui.label(egui::RichText::new("NFT").weak());
-                        }
-                        ui.add_enabled_ui(!busy && has_to, |ui| {
-                            if ui
-                                .button("Send")
-                                .on_hover_text("Transfer this NFT to the recipient above")
-                                .clicked()
-                            {
-                                send_nft =
-                                    Some((display.clone(), *is_sns, coll.clone(), tid.clone()));
-                            }
-                        });
-                        ui.end_row();
-                    }
-                });
-            ui.label(
-                egui::RichText::new(
-                    "Sending an SNS name transfers ownership — it then resolves to the recipient.",
-                )
-                .weak()
-                .small(),
-            );
         } else {
-            ui.label(egui::RichText::new("none — Refresh to scan").weak());
+            empty_hint(
+                ui,
+                "No collectibles",
+                "NFTs and .sov names you own show here. A name is an NFT — sending it re-points it.",
+            );
         }
         if let Some((display, is_sns, coll, tid)) = send_nft {
             self.send_nft(ui.ctx(), signer.clone(), seed, display, is_sns, coll, tid);
         }
 
-        // The chain's token registry — paged, never the whole set (scales to any
-        // number of assets).
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Token registry (paged)").strong());
-            ui.add_enabled_ui(tv.offset > 0, |ui| {
-                if ui.button("‹ Prev").clicked() {
-                    do_prev = true;
-                }
-            });
-            ui.label(
-                egui::RichText::new(format!(
-                    "showing {}–{}",
-                    if tv.registry.is_empty() {
-                        0
-                    } else {
-                        tv.offset + 1
-                    },
-                    tv.offset + tv.registry.len()
-                ))
-                .weak(),
-            );
-            ui.add_enabled_ui(tv.has_more, |ui| {
-                if ui.button("Next ›").clicked() {
-                    do_next = true;
-                }
-            });
-        });
-        if !tv.registry.is_empty() {
-            egui::Grid::new("tok_registry")
-                .num_columns(4)
-                .striped(true)
-                .spacing([18.0, 4.0])
-                .show(ui, |ui| {
-                    for h in ["Symbol", "Asset", "Issuer", "Supply"] {
-                        ui.label(egui::RichText::new(h).weak());
-                    }
-                    ui.end_row();
-                    for (asset, symbol, issuer, supply) in &tv.registry {
-                        ui.monospace(symbol);
-                        ui.monospace(short_id(asset));
-                        ui.monospace(short_id(issuer));
-                        ui.monospace(xus(supply));
-                        ui.end_row();
+        // Issue / send + the chain's registry — tucked behind collapsibles so the
+        // default view stays a clean, visual portfolio.
+        ui.add_space(12.0);
+        egui::CollapsingHeader::new(egui::RichText::new("Issue or send a token").strong())
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("Issue a new token (creates it on first issue)")
+                        .color(palette::text_dim())
+                        .small(),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Symbol");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.tok_symbol)
+                            .hint_text("USD1")
+                            .desired_width(90.0),
+                    );
+                    ui.label("Amount");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.tok_issue_amount).desired_width(110.0),
+                    );
+                    ui.label("To");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.tok_issue_to)
+                            .hint_text("recipient (default: you)")
+                            .desired_width(160.0),
+                    );
+                    if ui.button("Issue").clicked() {
+                        do_issue = true;
                     }
                 });
-        } else {
-            ui.label(egui::RichText::new("none on this page — Refresh to load").weak());
-        }
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new("Send an existing token")
+                        .color(palette::text_dim())
+                        .small(),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Asset");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.tok_xfer_asset)
+                            .hint_text("asset id (hex)")
+                            .desired_width(200.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("To");
+                    ui.add(egui::TextEdit::singleline(&mut self.tok_xfer_to).desired_width(200.0));
+                    ui.label("Amount");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.tok_xfer_amount).desired_width(110.0),
+                    );
+                    if ui.button("Send token").clicked() {
+                        do_transfer = true;
+                    }
+                });
+            });
 
-        // Issue a token (creates the asset on first issue; mints more after).
-        ui.separator();
-        ui.label(egui::RichText::new("Issue a token").strong());
-        ui.horizontal(|ui| {
-            ui.label("Symbol");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.tok_symbol)
-                    .hint_text("USD1")
-                    .desired_width(90.0),
-            );
-            ui.label("Amount");
-            ui.add(egui::TextEdit::singleline(&mut self.tok_issue_amount).desired_width(110.0));
-            ui.label("To");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.tok_issue_to)
-                    .hint_text("recipient (default: you)")
-                    .desired_width(180.0),
-            );
-            if ui.button("Issue").clicked() {
-                do_issue = true;
-            }
-        });
+        egui::CollapsingHeader::new(egui::RichText::new("Token registry").strong())
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(tv.offset > 0, |ui| {
+                        if ui.button("‹ Prev").clicked() {
+                            do_prev = true;
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "showing {}–{}",
+                            if tv.registry.is_empty() {
+                                0
+                            } else {
+                                tv.offset + 1
+                            },
+                            tv.offset + tv.registry.len()
+                        ))
+                        .color(palette::text_dim()),
+                    );
+                    ui.add_enabled_ui(tv.has_more, |ui| {
+                        if ui.button("Next ›").clicked() {
+                            do_next = true;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                if !tv.registry.is_empty() {
+                    for (asset, symbol, issuer, supply) in &tv.registry {
+                        registry_card(ui, asset, symbol, issuer, supply);
+                        ui.add_space(6.0);
+                    }
+                } else {
+                    ui.label(egui::RichText::new("none on this page — Refresh to load").weak());
+                }
+            });
 
-        // Transfer an existing token.
-        ui.separator();
-        ui.label(egui::RichText::new("Transfer a token").strong());
-        ui.horizontal(|ui| {
-            ui.label("Asset");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.tok_xfer_asset)
-                    .hint_text("asset id (hex)")
-                    .desired_width(200.0),
-            );
-        });
-        ui.horizontal(|ui| {
-            ui.label("To");
-            ui.add(egui::TextEdit::singleline(&mut self.tok_xfer_to).desired_width(200.0));
-            ui.label("Amount");
-            ui.add(egui::TextEdit::singleline(&mut self.tok_xfer_amount).desired_width(110.0));
-            if ui.button("Send token").clicked() {
-                do_transfer = true;
-            }
-        });
         if !tv.message.is_empty() {
+            ui.add_space(6.0);
             status_label(ui, &tv.message);
         }
 
