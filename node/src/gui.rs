@@ -4061,6 +4061,9 @@ impl eframe::App for Station {
             }
         });
 
+        // ── Live node HEARTBEAT — floats bottom-right over every tab. ──
+        self.draw_heartbeat(ctx, &snap);
+
         // ── Warn on quit if wallets aren't saved ──
         if ctx.input(|i| i.viewport().close_requested())
             && self.wallets_dirty
@@ -4669,6 +4672,132 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
 }
 
 impl Station {
+    /// The live node **HEARTBEAT** — floated bottom-right over every tab. A colored
+    /// "lub-dub" orb with an expanding sonar ring, the peer count, sync state, and
+    /// height. Everything is driven by REAL node telemetry:
+    ///   • colour = health — green SYNCED · cyan SOLO · amber SYNCING · red OFFLINE
+    ///   • beat RATE = how alive it is — calm 60bpm synced, racing while syncing,
+    ///     flatlined when there is no node
+    ///   • a bright thump on every beat, a sonar ring rippling outward, a mining spark.
+    fn draw_heartbeat(&self, ctx: &egui::Context, snap: &Snapshot) {
+        use egui::{Align2, Color32, Id, Order, Sense, Stroke, Vec2};
+
+        let peers = snap.peers.unwrap_or(0);
+        let online = snap.online;
+        let mining = snap.local_hashrate > 0;
+
+        // State → (colour, label, beats-per-minute). More "alive" ⇒ faster heart.
+        let (color, label, bpm) = if !online {
+            (Color32::from_rgb(196, 72, 66), "OFFLINE", 0.0) // flatline
+        } else if snap.syncing {
+            (Color32::from_rgb(240, 190, 70), "SYNCING", 132.0) // racing to catch up
+        } else if peers == 0 {
+            (Color32::from_rgb(88, 200, 232), "SOLO", 80.0) // alive, but alone
+        } else {
+            (Color32::from_rgb(80, 220, 140), "SYNCED", 60.0) // calm & healthy
+        };
+
+        // Heartbeat waveform: a "lub-dub" double-thump each period, then a rest — the
+        // sum of two narrow Gaussians. `ring_phase` sweeps 0→1 over the period to drive
+        // the outward sonar ripple.
+        let t = ctx.input(|i| i.time);
+        let (pulse, ring_phase) = if bpm <= 0.0 {
+            (0.0f32, 1.0f32)
+        } else {
+            let period = 60.0 / bpm;
+            let p = (t % period) / period;
+            let g = |c: f64, w: f64| (-(((p - c) / w).powi(2))).exp() as f32;
+            ((g(0.0, 0.045) + 0.6 * g(0.17, 0.045)).min(1.0), p as f32)
+        };
+
+        egui::Area::new(Id::new("node_heartbeat"))
+            .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-16.0, -16.0))
+            .order(Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(Color32::from_rgba_unmultiplied(16, 20, 26, 225))
+                    .rounding(egui::Rounding::same(14.0))
+                    .stroke(Stroke::new(1.0, palette::tint(color, 90)))
+                    .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            // text stack, left of the orb
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new(label).strong().size(12.0).color(color),
+                                );
+                                let sub = if online {
+                                    let h = snap
+                                        .height
+                                        .map(|h| format!("#{h}"))
+                                        .unwrap_or_else(|| "—".into());
+                                    format!(
+                                        "{peers} peer{} · {h}",
+                                        if peers == 1 { "" } else { "s" }
+                                    )
+                                } else {
+                                    "no local node".to_string()
+                                };
+                                ui.label(
+                                    egui::RichText::new(sub).size(10.5).color(palette::text_dim()),
+                                );
+                            });
+
+                            // the orb + sonar ring
+                            let (rect, resp) =
+                                ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
+                            let painter = ui.painter();
+                            let center = rect.center();
+                            let base_r = 5.5;
+
+                            if bpm > 0.0 {
+                                // sonar ripple — a ring expanding out each beat, fading
+                                let rr = base_r + ring_phase * 11.0;
+                                let a = ((1.0 - ring_phase) * 110.0) as u8;
+                                painter
+                                    .circle_stroke(center, rr, Stroke::new(1.5, palette::tint(color, a)));
+                                // soft glow halo, swelling on the thump
+                                let glow_r = base_r + 3.0 + pulse * 6.0;
+                                painter.circle_filled(
+                                    center,
+                                    glow_r,
+                                    palette::tint(color, (36.0 + pulse * 64.0) as u8),
+                                );
+                            }
+                            // the core orb, brightened toward white on each beat
+                            painter.circle_filled(center, base_r + pulse * 2.2, color);
+                            painter.circle_filled(
+                                center,
+                                (base_r - 1.0) + pulse * 2.2,
+                                palette::tint(Color32::WHITE, (pulse * 190.0) as u8),
+                            );
+                            // a mining spark: a small amber pip riding the orb while hashing
+                            if mining {
+                                painter.circle_filled(
+                                    center + Vec2::new(base_r + 3.0, -(base_r + 3.0)),
+                                    1.8,
+                                    Color32::from_rgb(240, 190, 70),
+                                );
+                            }
+
+                            resp.on_hover_text(format!(
+                                "{label}\npeers: {peers}\nheight: {}\nbest peer: {}\nhashrate: {} H/s{}\nchain: {}",
+                                snap.height.map(|h| h.to_string()).unwrap_or_else(|| "—".into()),
+                                snap.best_peer_height
+                                    .map(|h| h.to_string())
+                                    .unwrap_or_else(|| "—".into()),
+                                snap.local_hashrate,
+                                if mining { "  ⛏ mining" } else { "" },
+                                snap.chain_id,
+                            ));
+                        });
+                    });
+            });
+
+        // Keep the beat animating smoothly even when the app is otherwise idle.
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    }
+
     // ── Tokens tab: view / issue / transfer native SOV tokens (real on-chain). ──
     fn tokens_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Tokens");
