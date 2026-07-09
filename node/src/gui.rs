@@ -4781,7 +4781,7 @@ impl Station {
                             }
 
                             resp.on_hover_text(format!(
-                                "{label}\npeers: {peers}\nheight: {}\nbest peer: {}\nhashrate: {} H/s{}\nchain: {}",
+                                "{label}\npeers: {peers}\nheight: {}\nbest peer: {}\nhashrate: {} H/s{}\nchain: {}\nbuild: v{}",
                                 snap.height.map(|h| h.to_string()).unwrap_or_else(|| "—".into()),
                                 snap.best_peer_height
                                     .map(|h| h.to_string())
@@ -4789,6 +4789,7 @@ impl Station {
                                 snap.local_hashrate,
                                 if mining { "  ⛏ mining" } else { "" },
                                 snap.chain_id,
+                                env!("CARGO_PKG_VERSION"),
                             ));
                         });
                     });

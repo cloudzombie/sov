@@ -25,7 +25,7 @@
 //! ```
 //!
 //! ## Methods
-//! Reads: `sov_health`, `sov_chainId`, `sov_getHeight`, `sov_getSupply`,
+//! Reads: `sov_health`, `sov_version`, `sov_chainId`, `sov_getHeight`, `sov_getSupply`,
 //! `sov_getAccount`, `sov_getBalance`, `sov_getNonce`, `sov_getBlockByHeight`,
 //! `sov_getBlockByHash`, `sov_getBlockDigest`, `sov_getHead`,
 //! `sov_getStateRoot`, `sov_getDifficulty`, `sov_estimateFee`,
@@ -518,6 +518,7 @@ fn call(
                 json!({"ok": true, "chainId": c.chain_id(), "height": c.height(), "mempool": node.mempool_len()}),
             )
         }
+        "sov_version" => Ok(json!({ "version": env!("SOV_VERSION") })),
         "sov_chainId" => Ok(json!(node.chain().chain_id())),
         "sov_getHeight" => Ok(json!(node.chain().height())),
         "sov_getSupply" => {
@@ -852,6 +853,7 @@ fn call(
                 .unwrap_or_default();
             Ok(json!({
                 "chainId": c.chain_id(),
+                "version": env!("SOV_VERSION"),
                 "genesisHash": genesis,
                 "height": c.height(),
                 "p2pEnabled": ctx.gossip.is_some(),
