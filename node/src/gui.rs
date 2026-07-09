@@ -8495,33 +8495,34 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
 // local node supervision
 // ---------------------------------------------------------------------------
 
-/// Resolve a chain binary (`sov-testnet`, `sov-rpcd`) from the repo layout
-/// (`node/` sits beside `chain/`). Picks the **most recently built** profile so a
-/// stale `release` never shadows a fresh `debug` build (or vice-versa) during
-/// development; a shipped app has only one profile, making this a no-op there.
-fn chain_bin(name: &str) -> Option<PathBuf> {
-    // Executable name carries the platform suffix (`.exe` on Windows, empty
-    // elsewhere) so the lookup is identical on every OS.
-    let exe = format!("{name}{}", std::env::consts::EXE_SUFFIX);
-
-    // SHIPPED APP: look beside the running executable first (a packaged .dmg/.exe
-    // bundles the chain helpers next to `sov-station` — on macOS in the .app's
-    // Contents/MacOS), so a distributed build is self-contained, no checkout needed.
-    if let Ok(cur) = std::env::current_exe() {
-        if let Some(beside) = cur.parent().map(|d| d.join(&exe)) {
-            if beside.exists() {
-                return Some(beside);
-            }
-        }
-    }
-
-    // DEV CHECKOUT: fall back to the repo's build output (`node/` beside `chain/`).
-    // PREFER the optimized `release` node — it is the one a station should run.
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?;
-    ["release", "debug"]
-        .iter()
-        .map(|profile| repo.join("chain").join("target").join(profile).join(&exe))
-        .find(|p| p.exists())
+/// One-time node setup, entirely IN-PROCESS: write the embedded genesis spec + a
+/// node-config into `node_dir`. NO external helper binary — a shipped app is fully
+/// self-contained. Extracted so a test can prove it needs nothing on disk but the
+/// app itself (the regression that shipped "sov-testnet not built" on mainnet).
+fn setup_node_dir(node_dir: &Path, spec_filename: &str) -> Result<(), String> {
+    let spec_text = embedded_spec(spec_filename)?;
+    std::fs::create_dir_all(node_dir.join("node-1/data"))
+        .map_err(|e| format!("create node dir: {e}"))?;
+    std::fs::write(node_dir.join(spec_filename), spec_text)
+        .map_err(|e| format!("write spec: {e}"))?;
+    let config = NodeConfig {
+        rpc_addr: "127.0.0.1:8645".to_string(),
+        rpc_workers: 4,
+        data_dir: "node-1/data".to_string(),
+        block_time_ms: 60_000,
+        mempool_capacity: 16_384,
+        max_block_txs: 4_096,
+        mine: true,
+        p2p_addr: Some("0.0.0.0:9645".to_string()),
+        bootstrap_peers: Vec::new(),
+        checkpoints: Vec::new(),
+    };
+    std::fs::write(
+        node_dir.join("node-1/node-config.json"),
+        serde_json::to_string_pretty(&config).map_err(|e| format!("serialize node-config: {e}"))?,
+    )
+    .map_err(|e| format!("write node-config: {e}"))?;
+    Ok(())
 }
 
 /// The directory the GUI's supervised local node keeps its chain + keystore in.
@@ -8771,8 +8772,6 @@ fn build_and_run_node(
     // peers can actually reach this node — otherwise discovery silently never connects.
     ensure_firewall(logs);
     let node_dir = local_node_dir(net);
-    let testnet = chain_bin("sov-testnet")
-        .ok_or("sov-testnet not built (run `cargo build --release` in chain/)")?;
 
     // Safety: never silently destroy a chain. If this chain was mined to a DIFFERENT
     // wallet, refuse rather than wiping it — the user selects that wallet, or uses
@@ -8789,34 +8788,18 @@ fn build_and_run_node(
         ));
     }
 
-    // One-time setup: wrap a local node around the frozen spec, mining to THIS
-    // wallet's implicit account (so its coinbase is claimable only by its key). The
-    // genesis spec is EMBEDDED in the binary (see `embedded_spec`), so a shipped
-    // app is self-contained — it does not depend on a source checkout or the
-    // build-machine path baked into `CARGO_MANIFEST_DIR`.
+    // One-time setup, entirely IN-PROCESS — no external helper binary, so a shipped
+    // app is TRULY self-contained. (This is exactly what broke: the app used to shell
+    // out to `sov-testnet join` for setup, but that helper was dropped from the desktop
+    // bundle, so a fresh install failed with "sov-testnet not built" — worse, on
+    // mainnet.) The genesis spec is EMBEDDED in the binary (`embedded_spec`); here we
+    // write it (the "already set up" marker), create the data dir, and write the
+    // node-config the in-process daemon reads back below. `mine: true` self-funds from
+    // this wallet's coinbase; the miner keystore is written next; peers are filled in
+    // afterward. `block_time_ms` is unused by the continuous miner (the difficulty
+    // retarget regulates cadence), so its value here is immaterial.
     if !node_dir.join(spec_filename).exists() {
-        let spec_text = embedded_spec(spec_filename)?;
-        std::fs::create_dir_all(&node_dir).map_err(|e| format!("create node dir: {e}"))?;
-        let spec_path = node_dir.join(spec_filename);
-        std::fs::write(&spec_path, spec_text).map_err(|e| format!("write spec: {e}"))?;
-        let status = Command::new(&testnet)
-            .args(["join", "--spec"])
-            .arg(&spec_path)
-            .args(["--out"])
-            .arg(&node_dir)
-            .args(["--name", account])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|e| format!("join failed to run: {e}"))?;
-        if !status.success() {
-            return Err("`sov-testnet join` failed".to_string());
-        }
-        // NOTE: block cadence is no longer a fixed sleep — the node mines CONTINUOUSLY
-        // and the per-block difficulty retarget regulates the rate to the genesis
-        // `block_time_ms` (30 s for testnet-1) for any number of miners, so the
-        // node-config `block_time_ms` is intentionally left untouched (unused by the
-        // continuous miner).
+        setup_node_dir(&node_dir, spec_filename)?;
     }
 
     // Point the node's keystore at this wallet's account+seed, so the coinbase funds a
@@ -9133,6 +9116,53 @@ fn spawn_poller(snapshot: Arc<Mutex<Snapshot>>, config: Arc<Mutex<Config>>, ctx:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REGRESSION GUARD (v0.1.78): the desktop app's node setup must be fully
+    /// SELF-CONTAINED — needing NO external helper binary — and the EMBEDDED spec
+    /// must build the FROZEN genesis, for BOTH networks. v0.1.77 shipped a mainnet
+    /// app that shelled out to a `sov-testnet` binary which had been dropped from the
+    /// bundle → "sov-testnet not built" on start. This test makes that class of bug
+    /// impossible to ship again (and it runs where no such binary exists).
+    #[test]
+    fn node_setup_is_self_contained_and_builds_frozen_genesis() {
+        for (spec, pinned) in [
+            (
+                "mainnet.json",
+                "cb0272ff88e64c18cde0257f7fae1c8236b02651f10cc7a02456fd682ee2e72d",
+            ),
+            (
+                "testnet-1.json",
+                "4d7d9123a489f4fd29486da3d66a6c20b04953cb886dee847662e11af293da15",
+            ),
+        ] {
+            let dir =
+                std::env::temp_dir().join(format!("sov-setup-test-{spec}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            // Runs entirely in-process — no external binary is consulted.
+            setup_node_dir(&dir, spec)
+                .expect("in-process node setup must not require an external binary");
+            let cfg: NodeConfig = serde_json::from_str(
+                &std::fs::read_to_string(dir.join("node-1/node-config.json")).unwrap(),
+            )
+            .expect("node-config parses");
+            assert!(cfg.mine, "the GUI node self-funds from coinbase");
+            assert!(dir.join("node-1/data").is_dir(), "data dir created");
+            // The embedded spec builds + verifies the FROZEN genesis, byte-for-byte.
+            let spec_obj =
+                ChainSpec::from_json(&std::fs::read_to_string(dir.join(spec)).unwrap()).unwrap();
+            let genesis = spec_obj
+                .to_genesis_config_verified()
+                .expect("embedded spec builds + verifies its pinned genesis")
+                .build()
+                .expect("genesis builds");
+            assert_eq!(
+                genesis.block.hash().to_hex(),
+                pinned,
+                "{spec} must build the frozen genesis"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 
     // A tiny keystore for the crypto round-trip tests below.
     fn one_wallet_keystore() -> Keystore {

@@ -147,6 +147,17 @@ banner "Key pipeline (collision-free + randomness battery)"
   || fail "key-generation self-check failed (collision or randomness battery)"
 ok "wallet keys: zero collisions + entropy battery passed"
 
+# ── 6c. the SOV Station desktop app (node/) ──────────────────────────────────
+# node/ is a SEPARATE cargo workspace — the chain-workspace fmt/clippy/test steps
+# above DO NOT touch it. That blind spot is exactly how "sov-testnet not built"
+# shipped (a broken node-start path, on mainnet). Gate the shipped app the same as
+# the chain: fmt · clippy -D · its tests (incl. the self-contained-node-setup guard).
+banner "SOV Station app (node/): fmt · clippy · tests"
+( cd node && cargo fmt --all -- --check ) || fail "node app: formatting drift — run 'cargo fmt' in node/"
+cargo clippy --manifest-path node/Cargo.toml --all-targets -- -D warnings || fail "node app: clippy issues"
+cargo test --manifest-path node/Cargo.toml || fail "node app: tests failed"
+ok "sov-station app builds, lints, and tests clean"
+
 # ── 7. wasm contracts (mirror CI's `contracts` job exactly) ──────────────────
 # Scoped to chain/contracts — the no_std guest crate — NOT the whole workspace.
 # A workspace-wide wasm build pulls in std-only deps (getrandom without `js`) that

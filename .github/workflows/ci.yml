@@ -56,6 +56,27 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+  # The SOV Station desktop app (node/) is a SEPARATE cargo workspace the `test`
+  # job above does NOT cover. This job gates it (fmt · clippy · tests) so a broken
+  # node-start path — like "sov-testnet not built" — can never ship unnoticed again.
+  station:
+    name: SOV Station app (node/)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: node
+      - name: Formatting
+        run: cd node && cargo fmt --all -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --manifest-path node/Cargo.toml --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --manifest-path node/Cargo.toml
+
   # Verification & validity assurance (Phase 7): invariants, consensus model
   # check, deterministic replay, STF conformance, KAT vectors and fault injection
   # are a named, required gate. (They also run inside the workspace tests above;
