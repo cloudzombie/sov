@@ -4163,6 +4163,7 @@ name = "sov-rpc"
 version = "0.0.0"
 dependencies = [
  "argon2",
+ "bip39",
  "borsh",
  "chacha20poly1305",
  "getrandom 0.2.17",
@@ -4238,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "sov-station"
-version = "0.1.76"
+version = "0.1.77"
 dependencies = [
  "chacha20poly1305",
  "eframe",
