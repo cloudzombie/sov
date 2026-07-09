@@ -151,8 +151,12 @@ jobs:
 
   # The coverage-guided fuzz targets must compile (fuzzing itself runs out-of-band
   # on nightly; this gates that the targets don't bit-rot).
-  fuzz-build:
-    name: fuzz targets build (nightly)
+  # Fuzzing (mirrors Bitcoin Core's fuzz jobs): BUILD every target under libFuzzer
+  # instrumentation (required), then a short RUN of each so a decoder panic on
+  # adversarial input surfaces. The run is trialed (non-blocking) until we've seen it
+  # consistently green, then it becomes required.
+  fuzz:
+    name: fuzz (build + short run)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -160,7 +164,98 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: chain
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
       - name: Build fuzz targets
         run: cargo fuzz build
+      - name: Run each target (30s)
+        continue-on-error: true
+        run: |
+          for t in $(cargo fuzz list); do
+            echo "::group::fuzz $t"
+            cargo fuzz run "$t" -- -max_total_time=30 -rss_limit_mb=4096
+            echo "::endgroup::"
+          done
+
+  # ── Hygiene lint suite (mirrors Bitcoin Core's test/lint/): shell scripts and
+  # spelling. Both validated clean, so this is REQUIRED. (rustdoc -D warnings is
+  # coming once the accumulated broken-doc-link backlog is cleared.) ──
+  hygiene:
+    name: hygiene (shellcheck · typos · rustdoc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck (release + build scripts)
+        run: shellcheck scripts/*.sh
+      - name: Spelling (typos)
+        uses: crate-ci/typos@master
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: chain
+      - name: Docs build clean (rustdoc -D warnings)
+        working-directory: chain
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps
+
+  # ── Sanitizers (mirrors Bitcoin's ASan/TSan/MSan matrix, Rust-native). Trialed
+  # non-blocking until consistently green on Linux, then promoted to required. ──
+  sanitizers:
+    name: sanitizers (ASan · Miri) [trial]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: chain
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: chain
+      - name: AddressSanitizer (consensus · crypto · network)
+        env:
+          RUSTFLAGS: "-Zsanitizer=address"
+        run: cargo +nightly test --target x86_64-unknown-linux-gnu -p sov-chain -p sov-crypto -p sov-network
+      - name: Miri (encoding UB — types · primitives)
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+        run: cargo +nightly miri test -p sov-types -p sov-primitives
+
+  # ── Binary hardening (mirrors Zcash's sec-hard + Bitcoin's check-security),
+  # tuned to what a Rust release binary provides. Trialed non-blocking; prints the
+  # full checksec/ldd report and asserts PIE (ASLR). ──
+  hardening:
+    name: hardening (checksec release binary) [trial]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: chain
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: chain
+      - name: Build release daemon
+        run: cargo build --release -p sov-rpc --bin sov-rpcd
+      - name: Install checkers
+        run: sudo apt-get update && sudo apt-get install -y checksec
+      - name: Hardening report + assert PIE/NX
+        run: |
+          BIN=target/release/sov-rpcd
+          echo "== file =="; file "$BIN"
+          echo "== checksec =="; checksec --file="$BIN" || true
+          echo "== dynamic deps =="; ldd "$BIN" || true
+          # PIE (ASLR): the most important, reliably detectable via `file`.
+          file "$BIN" | grep -q "pie executable" || { echo "FAIL: binary is not PIE"; exit 1; }
+          # NX: GNU_STACK must not be executable (RW, not RWE).
+          readelf -l "$BIN" | grep -A1 GNU_STACK | grep -q "RWE" && { echo "FAIL: executable stack"; exit 1; } || true
+          echo "OK: PIE + non-exec stack (canary/FORTIFY are report-only for Rust)"

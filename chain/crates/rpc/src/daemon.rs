@@ -118,7 +118,7 @@ pub struct ChainSpec {
     #[serde(default)]
     pub pow: Option<String>,
     /// Override the GENESIS proof-of-work difficulty, as the count of required
-    /// leading zero bits ([`Target::from_leading_zero_bits`]). `None` uses the
+    /// leading zero bits (`Target::from_leading_zero_bits`). `None` uses the
     /// policy's native difficulty. A testnet sets this LOW (e.g. `8`) so a single
     /// machine mines trivially from the start; the per-block LWMA retarget then
     /// tracks the live hashrate from there. Only the genesis difficulty is set —
@@ -597,7 +597,7 @@ const MAX_RECORD: usize = 16 * 1024 * 1024;
 ///
 /// The checksum makes corruption (bit-rot, a partial/interleaved write) DETECTABLE,
 /// not just truncation. [`append_record`] fsyncs, so a committed record survives
-/// power loss; [`read_records`] recovers the longest intact prefix and stops at the
+/// power loss; `read_records` recovers the longest intact prefix and stops at the
 /// first damaged record rather than failing the whole log — the missing tail is
 /// re-synced from peers, so corruption degrades gracefully instead of bricking a node.
 /// Write one framed record to the OS (NOT fsync'd). Callers that need durability call
@@ -647,8 +647,8 @@ fn read_records(data: &[u8]) -> Vec<&[u8]> {
 /// of re-syncing the whole chain from peers.
 pub struct BlockLog {
     file: Mutex<fs::File>,
-    /// Set when records have been written but not yet fsync'd (see [`append_unsynced`]),
-    /// so [`sync`] can skip the fsync syscall when nothing is pending.
+    /// Set when records have been written but not yet fsync'd (see `append_unsynced`),
+    /// so `sync` can skip the fsync syscall when nothing is pending.
     unsynced: AtomicBool,
 }
 
@@ -676,11 +676,11 @@ impl BlockLog {
 
     /// Append one block's record WITHOUT fsync. The write still happens under the file
     /// mutex, so when called inside the chain-commit critical section the on-disk order
-    /// matches commit order; durability is provided later by a single [`sync`]. This is
+    /// matches commit order; durability is provided later by a single `sync`. This is
     /// what turns a catch-up batch from N slow fsyncs (each a Windows `FlushFileBuffers`
     /// that, on the single P2P worker thread, stalls peer I/O and keepalives long enough
     /// to be reaped) into ONE fsync per drain. A crash before the next `sync` loses only
-    /// the un-synced tail, which [`read_records`] recovers (valid prefix kept, rest
+    /// the un-synced tail, which `read_records` recovers (valid prefix kept, rest
     /// re-synced) — the same graceful degradation as a torn write.
     pub fn append_unsynced(&self, block: &Block) -> io::Result<()> {
         let bytes = borsh::to_vec(block).expect("Borsh serialization of a Block is infallible");
@@ -694,7 +694,7 @@ impl BlockLog {
         Ok(())
     }
 
-    /// Flush + fsync any records written by [`append_unsynced`] since the last sync. A
+    /// Flush + fsync any records written by `append_unsynced` since the last sync. A
     /// cheap no-op when nothing is pending, so it is safe to call every worker poll.
     pub fn sync(&self) -> io::Result<()> {
         if !self.unsynced.swap(false, Ordering::Relaxed) {
@@ -1137,7 +1137,7 @@ impl Daemon {
     }
 
     /// The block log this daemon persists committed blocks to. Share it with a
-    /// [`P2p`](crate::p2p::P2p) engine via [`P2p::with_block_log`] so blocks received
+    /// [`P2p`](crate::p2p::P2p) engine via `P2p::with_block_log` so blocks received
     /// from peers are persisted too, and a follower can replay its own log on restart
     /// instead of re-syncing the whole chain.
     pub fn block_log(&self) -> Arc<BlockLog> {

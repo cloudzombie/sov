@@ -1,0 +1,24 @@
+# Spelling allowlist for the `typos` linter (CI `hygiene` job). Mirrors the
+# codespell ignore list Bitcoin Core / Zcash keep: exclude generated artifacts and
+# allow domain vocabulary that isn't a misspelling.
+[files]
+extend-exclude = [
+  "target/",
+  "**/target/",
+  "node_modules/",
+  "**/node_modules/",
+  "*.log",
+  "**/*.log",
+  "chain/simnet/",
+  "chain/fuzz/corpus/",
+  "sdk/vectors/",
+  "*.lock",
+]
+
+[default.extend-words]
+ser = "ser"            # BIP-32 ser32(i) / serP() serialization primitives
+mis = "mis"            # "mis-" prefixes in prose comments
+captable = "captable"  # the removed cap-table crate, referenced in historical docs
+Thm = "Thm"            # "Theorem" abbreviation in the proofs
+unparseable = "unparseable"
+clen = "clen"          # content-length local in the framed transport

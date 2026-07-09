@@ -129,7 +129,7 @@ impl Node {
     }
 
     /// Build an **unsealed** candidate block over an executable mempool batch.
-    /// The caller grinds it via [`Candidate::into_sealed_block`] (off any lock —
+    /// The caller grinds it via `Candidate::into_sealed_block` (off any lock —
     /// it touches no node state) and commits the result with
     /// [`commit_mined`](Self::commit_mined). This is the path the mining daemon
     /// uses to keep its JSON-RPC responsive while mining.

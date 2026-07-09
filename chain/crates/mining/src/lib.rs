@@ -8,7 +8,7 @@
 //!    proof-of-work seal ([`PowAlgo`] — RandomX on mainnet, SHA-256d for tests)
 //!    meets the live target (`sov-chain`); fork choice picks the chain with the
 //!    most cumulative [`Work`].
-//! 2. **A diminishing, budgeted coinbase.** [`MiningPolicy::reward`] halves the
+//! 2. **A diminishing, budgeted coinbase.** [`MiningPolicy::reward_at`] halves the
 //!    reward as *mined* supply grows and clamps every reward to the room left in
 //!    the **mining budget** (`mining_budget_grains`) — the portion of the 21M cap
 //!    reserved for proof-of-work issuance, independent of genesis allocation.

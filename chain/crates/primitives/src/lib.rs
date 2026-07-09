@@ -4,7 +4,7 @@
 //! other crate is built from. These types are deliberately small, total, and
 //! self-validating:
 //!
-//! - [`Hash`] — a 32-byte Blake3 digest identifying blocks, transactions, and
+//! - [`Hash`](struct@Hash) — a 32-byte Blake3 digest identifying blocks, transactions, and
 //!   state roots.
 //! - [`AccountId`] — a validated human-readable account identifier.
 //! - [`Balance`] — an exact, checked token amount in grains, aware of the

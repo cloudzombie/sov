@@ -210,7 +210,7 @@ impl NoteStore {
     /// `height + 1`, so an orphaned branch's notes/spends are cleanly undone.
     ///
     /// `height >= scanned_height` is a no-op success. Returns `false` if `height`
-    /// predates every retained checkpoint (a reorg deeper than [`REORG_HORIZON`],
+    /// predates every retained checkpoint (a reorg deeper than `REORG_HORIZON`,
     /// or not a checkpointed height) — the caller must rebuild from the birthday.
     pub fn rollback_to(&mut self, height: u64) -> bool {
         if height >= self.data.scanned_height {

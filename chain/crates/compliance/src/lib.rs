@@ -13,7 +13,7 @@
 //!   deny-list [counterparty control](controls::TransferControl), and a rolling
 //!   [spend-velocity limit](controls::SpendLimit). [`CompliancePolicy::check_transfer`]
 //!   is a pure decision function returning either a specific
-//!   [`ComplianceError`](controls::ComplianceError) or the updated spend window.
+//!   [`ComplianceError`] or the updated spend window.
 //!
 //! These are authorization/policy primitives: they decide *whether* value may
 //! move. Enforcing them inside the runtime's transfer path — and storing each

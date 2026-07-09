@@ -72,8 +72,8 @@ fn id(s: &str) -> AccountId {
     AccountId::new(s).unwrap()
 }
 
-/// A fresh test chain: one miner (`val01`, key seed [1]) and a funded account
-/// (`usa.reserve.sov`, seed [2], 1000 SOV). Test mining policy = SHA-256d at low
+/// A fresh test chain: one miner (`val01`, key seed `[1; 32]`) and a funded account
+/// (`usa.reserve.sov`, seed `[2; 32]`, 1000 SOV). Test mining policy = SHA-256d at low
 /// difficulty, so blocks mine in milliseconds.
 fn fresh_chain() -> Blockchain {
     let config = GenesisConfig {

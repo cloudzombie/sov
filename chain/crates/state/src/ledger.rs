@@ -191,7 +191,7 @@ pub fn nft_class_id(issuer: &AccountId, symbol: &str) -> Hash {
 
 /// The reserved, protocol-level NFT collection that holds **SNS names**. Not
 /// issuer-bound (no account can generic-`NftMint` into it — names are minted only
-/// via [`Action::RegisterName`], which enforces the `.sov`/fee/first-come rules).
+/// via `Action::RegisterName`, which enforces the `.sov`/fee/first-come rules).
 /// `Blake3("sov:sns:v1")`.
 pub fn sns_class() -> Hash {
     Hash::digest(b"sov:sns:v1")

@@ -1,4 +1,4 @@
-//! Binary Merkle trees over [`Hash`] leaves.
+//! Binary Merkle trees over [`Hash`](struct@Hash) leaves.
 //!
 //! Used to commit to ordered collections — the transactions in a block, the
 //! receipts they produce — with a single root hash. Two design choices follow

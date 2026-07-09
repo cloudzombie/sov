@@ -1,6 +1,6 @@
 //! Cryptographic hashing for the SOV protocol.
 //!
-//! Every block, transaction, and state root is identified by a [`Hash`]: a
+//! Every block, transaction, and state root is identified by a [`Hash`](struct@Hash): a
 //! 32-byte Blake3 digest. Blake3 is chosen for its speed, parallelism, and
 //! 256-bit security — appropriate for a high-throughput, sharded chain.
 
@@ -91,7 +91,7 @@ impl<'de> Deserialize<'de> for Hash {
     }
 }
 
-/// Error returned when parsing a [`Hash`] from a hex string.
+/// Error returned when parsing a [`Hash`](struct@Hash) from a hex string.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum HashParseError {
     /// The string was not valid hexadecimal.

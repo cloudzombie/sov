@@ -3,7 +3,7 @@
 //! Genesis establishes the **supply cap** — and, on mainnet, allocates
 //! **nothing**: [`GenesisConfig::build`] sums every initial balance (liquid +
 //! vesting-locked) plus the entire mining budget and refuses to proceed if the
-//! total exceeds [`MAX_SUPPLY_GRAINS`](sov_primitives::MAX_SUPPLY_GRAINS).
+//! total exceeds [`MAX_SUPPLY_GRAINS`].
 //! Under the mainnet policy the mining budget IS the full cap, so **any genesis
 //! balance whatsoever fails this check — no pre-mine is arithmetically
 //! possible**. Every coin that will ever exist enters through a block coinbase

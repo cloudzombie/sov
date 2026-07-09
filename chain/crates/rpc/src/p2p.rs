@@ -179,7 +179,7 @@ impl P2p {
     }
 
     /// Persist blocks received from peers to `log` (typically shared with a
-    /// [`Daemon`](crate::Daemon) via [`Daemon::block_log`]), so a follower replays
+    /// [`Daemon`](crate::Daemon) via `Daemon::block_log`), so a follower replays
     /// its own block log on restart instead of re-syncing the entire chain.
     pub fn with_block_log(mut self, log: Arc<BlockLog>) -> Self {
         self.block_log = Some(log);

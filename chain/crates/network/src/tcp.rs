@@ -157,7 +157,7 @@ const BAN_DURATION: Duration = Duration::from_secs(300);
 /// Discovery hygiene: process at most this many addresses from ONE `Peers` gossip
 /// message. An honest node advertises a handful; a malicious one could pack ~100k
 /// `host:port` strings into a single 8 MiB frame, and since each unknown address is
-/// dialed with a [`CONNECT_TIMEOUT`] (5 s) on the single dial thread, an unbounded
+/// dialed with a `CONNECT_TIMEOUT` (5 s) on the single dial thread, an unbounded
 /// list would wedge bootstrap/discovery for the node's lifetime and bloat `known`.
 /// An oversized list is penalized (it is a protocol violation, not mere volume — the
 /// per-IP token bucket never trips on a single message) and only this prefix is used.
@@ -210,7 +210,7 @@ struct Shared {
     /// can be cleanly shut down and its address rebound (e.g. an in-process restart).
     shutdown: AtomicBool,
     /// Addresses that authenticated as OUR OWN node identity — a peer gossiped our
-    /// public address back and we connected to ourselves. Skipped by [`attempt_dial`]
+    /// public address back and we connected to ourselves. Skipped by `attempt_dial`
     /// so the pointless self-link isn't reopened every discovery pass. Populated by the
     /// app layer via [`TcpNode::mark_self_addr`] when it sees a `Hello` whose account is
     /// ours (the network layer can't see the signed app-level identity itself).
@@ -440,12 +440,12 @@ impl TcpNode {
     /// visible to the operator — the cure for "the seed-peer box does nothing":
     /// every dial now logs `dialing X` → `tcp connected to X` / `dial to X failed`,
     /// and each handshake logs `link up` / `handshake failed`. Idempotent; safe to
-    /// call after [`bind`](Self::bind) and before [`enable_lan_discovery`].
+    /// call after [`bind`](Self::bind) and before `enable_lan_discovery`.
     pub fn set_log_sink(&self, sink: Arc<Mutex<Vec<String>>>) {
         *self.shared.log.lock().unwrap() = Some(sink);
     }
 
-    /// Dial a peer now (blocking up to [`CONNECT_TIMEOUT`]). Tolerant of how the
+    /// Dial a peer now (blocking up to `CONNECT_TIMEOUT`). Tolerant of how the
     /// address is written — `ip:port`, `host:port`, or a BARE ip / hostname (the
     /// [`DEFAULT_P2P_PORT`] is appended) — and resolves hostnames via DNS, trying
     /// each resolved target until one connects. A no-op if already connected or a
@@ -597,7 +597,7 @@ impl TcpNode {
     /// Drop the live connection to `peer` now: remove it from the peer set and shut
     /// its socket down (its reader thread then unblocks and exits). A no-op if not
     /// connected. Unlike a ban, this does not bar reconnection — it is used both by
-    /// [`penalize_peer`] (after a ban) and to reclaim a slot from a connection that
+    /// `penalize_peer` (after a ban) and to reclaim a slot from a connection that
     /// never authenticated.
     pub fn disconnect(&self, peer: &SocketAddr) {
         let writer = self.shared.peers.lock().unwrap().remove(peer);
@@ -610,7 +610,7 @@ impl TcpNode {
 
     /// Record `addr` as one of OUR OWN reachable addresses: the app layer authenticated
     /// a connection to it whose `Hello` account is ours — i.e. we dialed ourselves after
-    /// a peer gossiped our public address back. Future [`attempt_dial`]s to it are
+    /// a peer gossiped our public address back. Future `attempt_dial`s to it are
     /// skipped, and it's forgotten from the discovery set so we don't re-gossip it.
     pub fn mark_self_addr(&self, addr: SocketAddr) {
         self.shared.self_addrs.lock().unwrap().insert(addr);

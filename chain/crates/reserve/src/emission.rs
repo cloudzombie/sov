@@ -6,8 +6,8 @@
 //!
 //! - **Mined supply** is a pure function of the [`MiningPolicy`] and the block
 //!   count: at every block exactly one coinbase mints
-//!   [`MiningPolicy::reward`]`(current_supply)`, which advances the supply. This
-//!   is protocol mechanics — provenance [`Source::Protocol`]. It is computed by
+//!   `MiningPolicy::reward_at``(current_supply)`, which advances the supply. This
+//!   is protocol mechanics — provenance `Source::Protocol`. It is computed by
 //!   walking halving epochs (within which the reward is constant), which
 //!   reproduces block-by-block iteration of the real `reward` exactly while
 //!   staying efficient over large ranges.
@@ -79,7 +79,7 @@ pub struct EmissionPoint {
     /// The height this point describes.
     pub height: BlockHeight,
     /// Cumulative **mined** supply at `height` — protocol mechanics
-    /// ([`Source::Protocol`](crate::Source::Protocol)), and the total emission
+    /// (`Source::Protocol`(crate::Source::Protocol)), and the total emission
     /// (mining is the only source). Cap-bounded by construction.
     pub mined: Sourced<Balance>,
 }

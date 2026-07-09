@@ -89,7 +89,7 @@ pub struct Mempool {
 
 impl Mempool {
     /// Create a pool holding at most `capacity` transactions, with a per-sender
-    /// cap derived from capacity ([`default_per_sender`]).
+    /// cap derived from capacity (`default_per_sender`).
     pub fn new(capacity: usize) -> Self {
         Self::with_limits(capacity, default_per_sender(capacity))
     }

@@ -7,7 +7,7 @@
 //!   records HOW MANY BLOCKS behind the best authenticated peer we are, the highest
 //!   peer height it has seen, and how many peers are authenticated;
 //! * the **block-production loop** ([`crate::Daemon::run`]) *reads* it to GATE mining
-//!   ONLY during a real initial download (far behind), via [`should_gate_mining`];
+//!   ONLY during a real initial download (far behind), via `should_gate_mining`;
 //! * a co-located **UI** (the desktop app) *reads* it for a rolling status display
 //!   ("syncing 1208/8400" → "synced").
 //!
@@ -89,7 +89,7 @@ impl SyncShared {
     }
 
     /// Whether we are strictly behind the tip at all (any amount). For UI nuance only —
-    /// the *gate* uses [`should_gate_mining`].
+    /// the *gate* uses `should_gate_mining`.
     pub fn is_behind(&self) -> bool {
         self.behind_blocks() > 0
     }

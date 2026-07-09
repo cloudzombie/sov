@@ -326,7 +326,7 @@ fn canonical_target(target: Target) -> Target {
 /// The elastic block-size cap from a window of recent block sizes: `BLOCK_SIZE_GROWTH ×`
 /// the integer median, clamped to `[BLOCK_SIZE_FLOOR, BLOCK_SIZE_CEILING]`. Pure and
 /// deterministic (integer-only, single upper-median pick for even counts). `sizes` must
-/// be non-empty. Kept separate from [`Blockchain::block_size_limit`] so the arithmetic
+/// be non-empty. Kept separate from `Blockchain::block_size_limit` so the arithmetic
 /// is unit-testable without constructing a chain.
 fn elastic_block_cap(mut sizes: Vec<usize>) -> usize {
     debug_assert!(
@@ -420,7 +420,7 @@ impl Blockchain {
 
     /// Install trusted weak-subjectivity checkpoints (`(height, block hash)`),
     /// replacing any previously set. Blocks imported at a checkpoint height must
-    /// match the pinned hash. See [`checkpoints`](Self::checkpoints).
+    /// match the pinned hash. See `checkpoints`.
     pub fn set_checkpoints(&mut self, checkpoints: impl IntoIterator<Item = (u64, Hash)>) {
         self.checkpoints = checkpoints.into_iter().collect();
     }
@@ -796,7 +796,7 @@ impl Blockchain {
     /// (`bits`) — **without** grinding the proof of work.
     ///
     /// The PoW grind is the only expensive step and it touches **no chain
-    /// state**, so a node grinds the returned [`Candidate`] off the chain lock
+    /// state**, so a node grinds the returned `Candidate` off the chain lock
     /// (keeping its RPC responsive while mining) and then commits the sealed
     /// block through the normal validated [`import_block`](Self::import_block)
     /// path. If a peer block advanced the head during the grind, the sealed block
@@ -1186,7 +1186,7 @@ impl Blockchain {
     /// (no per-block clone) and skips the per-block state-root recompute/compare, so
     /// resuming a long chain takes seconds instead of minutes. Blocks must arrive in
     /// order, each extending the head (true for a sequential log). The caller verifies
-    /// the final state root ONCE via [`replayed_state_matches_head`]. This is for local
+    /// the final state root ONCE via `replayed_state_matches_head`. This is for local
     /// replay only — network blocks always go through the fully-verified `import_block`.
     pub fn extend_trusted(&mut self, block: Block) -> Result<(), ChainError> {
         if block.header.prev_hash != self.head {
@@ -1248,7 +1248,7 @@ impl Blockchain {
     /// than re-running fork choice block-by-block (each reorg replays from genesis —
     /// O(reorgs × n), the source of minute-long startups), this first reconstructs
     /// the **heaviest chain** by cumulative work, then trusted-replays just that
-    /// linear chain ([`extend_trusted`]). Returns `true` if the result matches the
+    /// linear chain (`extend_trusted`). Returns `true` if the result matches the
     /// committed head state; on `false` (or `Err`) the caller rebuilds with the
     /// fully-verified path. Local log only — network blocks use `import_block`.
     pub fn replay_log_trusted(
@@ -1273,9 +1273,9 @@ impl Blockchain {
     }
 
     /// **Last-resort FULLY-VALIDATED replay** of a persisted log — used only when the
-    /// trusted fast-replay's final state root does not verify. Like [`replay_log_trusted`]
+    /// trusted fast-replay's final state root does not verify. Like `replay_log_trusted`
     /// it first reconstructs the **heaviest chain**, then imports each block IN
-    /// ACTIVE-CHAIN ORDER through the normal validated [`import_block`] path. The key
+    /// ACTIVE-CHAIN ORDER through the normal validated `import_block` path. The key
     /// point: because the blocks arrive in order, each one *fast-path extends the head*
     /// (no reorg), so this is **O(N) fully-validated** — NOT the O(reorgs × N) of
     /// importing the RAW log, where every historical fork re-triggers a from-genesis
@@ -1300,7 +1300,7 @@ impl Blockchain {
     }
 
     /// The active-chain receipt index as a serializable list, for inclusion in a
-    /// chainstate snapshot (pairs with [`resume_from_snapshot`]).
+    /// chainstate snapshot (pairs with `resume_from_snapshot`).
     pub fn active_receipts_snapshot(&self) -> Vec<(u64, Vec<Receipt>)> {
         self.active_receipts
             .iter()
@@ -1929,7 +1929,7 @@ pub enum ChainError {
     BlockTooLarge {
         /// The block's canonical serialized size, in bytes.
         size: usize,
-        /// The elastic cap for this height (see [`Blockchain::block_size_limit`]).
+        /// The elastic cap for this height (see `Blockchain::block_size_limit`).
         limit: usize,
     },
     /// The block's timestamp went backwards.

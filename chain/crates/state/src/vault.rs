@@ -33,7 +33,7 @@ use crate::ledger::token_asset_id;
 pub const SCALE: u128 = 100_000_000;
 
 /// The launch oracle seed: XUS = $1.00 — low and honest. Until a signed
-/// [`OracleUpdate`](sov_types) lands, every vault prices XUS at exactly this.
+/// `OracleUpdate` lands, every vault prices XUS at exactly this.
 /// USD per 1 XUS, in 10^8 fixed point.
 pub const SEED_XUS_USD_PRICE: u128 = 100_000_000; // $1.00
 
