@@ -193,6 +193,17 @@ else
   skip "cargo-deny not installed"
 fi
 
+# ── 9b. cargo-audit (RustSec) — audit SOV-M004 ───────────────────────────────
+# The documented advisory policy is `cargo audit --deny warnings`; run it ALONGSIDE
+# cargo-deny so the two advisory gates can never silently disagree again. cargo-audit
+# honors chain/.cargo/audit.toml for the reviewed unmaintained-crate waivers.
+banner "Dependency advisories (cargo-audit --deny warnings)"
+if ! command -v cargo-audit >/dev/null; then
+  cargo install cargo-audit --locked >/dev/null 2>&1 || fail "could not install cargo-audit"
+fi
+( cd chain && cargo audit --deny warnings ) || fail "cargo-audit found advisories (see chain/.cargo/audit.toml)"
+ok "cargo-audit: clean under the reviewed waiver set"
+
 # ── cleared ──────────────────────────────────────────────────────────────────
 echo
 echo "${GRN}${BOLD}══════════════════════════════════════════════════════════════${RST}"

@@ -229,20 +229,54 @@ impl ChainSpec {
     /// bind to the genesis hash in the handshake, so a wrong hash finds nobody with no
     /// diagnostic). Every node bring-up should use this rather than
     /// [`to_genesis_config`](Self::to_genesis_config) directly.
+    /// Frozen genesis block hash of **mainnet**, hardcoded into the binary as a
+    /// consensus constant (Bitcoin's `hashGenesisBlock` model). A node claiming to be
+    /// `sov-mainnet` MUST reproduce this hash or refuse to start — the network identity
+    /// is a property of the software, not an editable data file.
+    pub const MAINNET_GENESIS_HASH: &'static str =
+        "cb0272ff88e64c18cde0257f7fae1c8236b02651f10cc7a02456fd682ee2e72d";
+    /// Frozen genesis block hash of **testnet-1**, hardcoded as above.
+    pub const TESTNET_GENESIS_HASH: &'static str =
+        "4d7d9123a489f4fd29486da3d66a6c20b04953cb886dee847662e11af293da15";
+
+    /// The binary-hardcoded genesis pin for a canonical chain-id, if it is one. Dev /
+    /// sandbox chains are unrecognized and keep their spec-defined identity.
+    pub fn hardcoded_genesis_pin(chain_id: &str) -> Option<&'static str> {
+        match chain_id {
+            "sov-mainnet" => Some(Self::MAINNET_GENESIS_HASH),
+            "sov-testnet-1" => Some(Self::TESTNET_GENESIS_HASH),
+            _ => None,
+        }
+    }
+
+    /// Build the genesis config, refusing if the produced genesis block does not match
+    /// the frozen network identity. The identity is enforced from TWO independent
+    /// sources that must both agree: the **binary-hardcoded** constant for a canonical
+    /// chain-id (so editing or omitting the spec's pin cannot redefine `sov-mainnet`),
+    /// AND any pin the spec itself carries. Either mismatch fails the boot loudly.
     pub fn to_genesis_config_verified(&self) -> Result<GenesisConfig, DaemonError> {
         let cfg = self.to_genesis_config()?;
-        if let Some(expected) = &self.expected_genesis_hash {
-            let genesis = cfg
+        let hard = Self::hardcoded_genesis_pin(&self.chain_id);
+        let spec_pin = self.expected_genesis_hash.as_deref();
+        if hard.is_some() || spec_pin.is_some() {
+            let actual = cfg
                 .build()
-                .map_err(|e| DaemonError::config(format!("genesis build: {e}")))?;
-            let actual = genesis.block.hash().to_hex();
-            if actual != *expected {
-                return Err(DaemonError::config(format!(
-                    "genesis hash mismatch for {}: spec pins {expected} but this build produces \
-                     {actual}. The chain spec has drifted from the frozen network identity — \
-                     refusing to start (it would fork off the real chain and peer with nobody).",
-                    self.chain_id
-                )));
+                .map_err(|e| DaemonError::config(format!("genesis build: {e}")))?
+                .block
+                .hash()
+                .to_hex();
+            for (source, expected) in [("binary constant", hard), ("chain spec", spec_pin)] {
+                if let Some(expected) = expected {
+                    if actual != expected {
+                        return Err(DaemonError::config(format!(
+                            "genesis hash mismatch for {}: the {source} pins {expected} but this \
+                             build produces {actual}. The frozen network identity has drifted — \
+                             refusing to start (it would fork off the real chain and peer with \
+                             nobody).",
+                            self.chain_id
+                        )));
+                    }
+                }
             }
         }
         Ok(cfg)
@@ -927,6 +961,10 @@ pub struct Daemon {
     /// (mined a block, paused to sync, or could not build a candidate) — observability
     /// for an operator instead of a silent mining thread.
     log: Option<Arc<Mutex<Vec<String>>>>,
+    /// `Some(reason)` if this node's configured coinbase is NOT provably controlled by
+    /// its miner key — mining is then refused in [`run`](Daemon::run) (audit SOV-C001).
+    /// `None` for a safe (implicit or key-bound) coinbase, or no miner key at all.
+    coinbase_binding_error: Option<String>,
 }
 
 /// A running daemon's RPC + block-production threads, with graceful shutdown.
@@ -1051,8 +1089,25 @@ impl Daemon {
         // their coinbase there (Nakamoto consensus — the header `proposer` names
         // whom the PoW pays). Consensus is pure proof-of-work; the keystore is
         // simply the keys this node can mine to and sign with.
-        if let Some((account, _)) = miner_keys.first() {
+        let mut coinbase_binding_error = None;
+        if let Some((account, keypair)) = miner_keys.first() {
             node.set_coinbase(account.clone());
+            // Audit SOV-C001: record whether this coinbase is provably controlled by the
+            // miner key — its own implicit account, or an account already bound to
+            // exactly this key. If not, it is a keyless human name that the first
+            // `RotateKey` can claim (stealing the reward). Only ENFORCED when mining is
+            // enabled (see `run`), so a non-mining relay with a named account still boots.
+            let key = keypair.public_key();
+            let implicit = key.implicit_account_id();
+            let bound_to_me = node.chain().ledger().account(account).key == Some(key);
+            if *account != implicit && !bound_to_me {
+                coinbase_binding_error = Some(format!(
+                    "refusing to mine to `{account}`: it is neither this key's implicit account \
+                     ({implicit}) nor an account already bound to this key. Mining to an unbound \
+                     name lets the first RotateKey claimant steal the coinbase (audit SOV-C001). \
+                     Point the coinbase at your key's implicit account or a pre-bound account."
+                ));
+            }
         }
 
         Ok(Daemon {
@@ -1064,6 +1119,7 @@ impl Daemon {
             resumed_fast,
             sync_status: None,
             log: None,
+            coinbase_binding_error,
         })
     }
 
@@ -1229,6 +1285,14 @@ impl Daemon {
         block_time_ms: u64,
         mine: bool,
     ) -> Result<DaemonHandle, DaemonError> {
+        // Only a MINING node produces a coinbase — gate the C001 binding check on it so
+        // a relay (mine=false) with a named account still starts normally. The check was
+        // computed at construction, when the miner keys + chain were in hand.
+        if mine {
+            if let Some(err) = &self.coinbase_binding_error {
+                return Err(DaemonError::config(err.clone()));
+            }
+        }
         let rpc = self.serve_rpc(addr, workers)?;
         let rpc_addr = rpc.local_addr();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1264,6 +1328,11 @@ impl Daemon {
             // operator can confirm that multi-miner block shares track hashpower).
             let mut hashes_acc = 0u64;
             let mut rate_clock = Instant::now();
+            // Enriched mining telemetry (additive logging only): the last published
+            // hashrate and when we last FOUND a block, so heartbeats and block-finds can
+            // report H/s and the inter-block gap without changing any mining behavior.
+            let mut last_hps = 0u64;
+            let mut last_block_at = Instant::now();
             // CONTINUOUS MINING (the Monero/Zcash/Bitcoin model, not "sleep then mine"):
             // the node grinds proof of work on a template built on the CURRENT tip,
             // batch after batch, abandoning the template the instant a better tip arrives.
@@ -1453,26 +1522,42 @@ impl Daemon {
                     // Publish the measured hashrate ~1×/s (H/s = hashes / elapsed).
                     if rate_clock.elapsed() >= Duration::from_secs(1) {
                         let ms = rate_clock.elapsed().as_millis().max(1) as u64;
+                        last_hps = hashes_acc.saturating_mul(1000) / ms;
                         if let Some(ss) = sync_status.as_ref() {
-                            ss.set_local_hashrate(hashes_acc.saturating_mul(1000) / ms);
+                            ss.set_local_hashrate(last_hps);
                         }
                         hashes_acc = 0;
                         rate_clock = Instant::now();
                     }
-                    // Liveness heartbeat so the operator sees active mining between blocks.
+                    // Liveness heartbeat so the operator sees active mining between blocks —
+                    // now with live hashrate, template tx count, and the gap since the last
+                    // block found (so a slow block reads as "still grinding", not a stall).
                     if last_beat.elapsed() >= MINING_HEARTBEAT {
                         daemon_log(
                             &log,
                             format!(
-                                "⛏ mining block {mining_height} — searching for proof of work ({}s)",
-                                grind_started.elapsed().as_secs()
+                                "⛏ grinding block {mining_height} · {} H/s · {} tx in template · {}s on this template · {}s since last block",
+                                last_hps,
+                                candidate.block().transactions.len(),
+                                grind_started.elapsed().as_secs(),
+                                last_block_at.elapsed().as_secs(),
                             ),
                         );
                         last_beat = Instant::now();
                     }
                     // A new tip? `try_lock` so a momentarily-busy node never stalls the grind.
                     if let Ok(n) = node.try_lock() {
-                        if n.chain().height() != tip_height {
+                        let h = n.chain().height();
+                        drop(n);
+                        if h != tip_height {
+                            // Say WHY the grind restarts (adopted a peer's block), so an
+                            // operator sees healthy competition rather than a silent reset.
+                            daemon_log(
+                                &log,
+                                format!(
+                                    "↻ tip advanced {tip_height}→{h} while grinding block {mining_height} — rebuilding on the new tip"
+                                ),
+                            );
                             break; // rebuild on the new tip
                         }
                     }
@@ -1488,9 +1573,38 @@ impl Daemon {
                     match n.commit_mined(sealed) {
                         Ok(produced) => {
                             let height = produced.block.header.height.get();
-                            let _ = block_log.append(&produced.block);
+                            // Audit SOV-H001: durability is part of the commit contract.
+                            // If the block cannot be appended+fsynced to the log, the
+                            // in-memory chain is now AHEAD of durable history — a restart
+                            // would silently lose this block, its coinbase, and its txs,
+                            // then resume from a different prefix. Do NOT gossip a block
+                            // we can't persist; halt mining and surface a fatal state so
+                            // storage is fixed before the divergence grows.
+                            if let Err(e) = block_log.append(&produced.block) {
+                                drop(n);
+                                daemon_log(
+                                    &log,
+                                    format!(
+                                        "FATAL: block {height} committed but log append/fsync \
+                                         failed ({e}); halting mining to avoid durable \
+                                         divergence — fix storage and restart"
+                                    ),
+                                );
+                                break;
+                            }
                             drop(n);
-                            daemon_log(&log, format!("⛏ mined block {height}"));
+                            // Rich block-found line: how many txs, how long the search took,
+                            // the hashrate, and the difficulty (nBits) it was mined against.
+                            let ntx = produced.block.transactions.len();
+                            let found_s = grind_started.elapsed().as_secs();
+                            let bits = produced.block.header.bits;
+                            daemon_log(
+                                &log,
+                                format!(
+                                    "⛏ MINED block {height} · {ntx} tx · found in {found_s}s · {last_hps} H/s · nBits {bits:#010x}"
+                                ),
+                            );
+                            last_block_at = Instant::now();
                             if let Some(tcp) = &gossip {
                                 tcp.broadcast(&NetMessage::NewBlock(produced.block.clone()));
                             }
@@ -1591,9 +1705,32 @@ mod tests {
             "mismatch must fail loudly, got: {err}"
         );
 
-        // No pin ⇒ no check (back-compat: specs sealed before this field still build).
+        // No spec pin ⇒ the binary constant still enforces the canonical genesis. The
+        // real mainnet spec builds cb0272ff, which matches the constant, so it verifies.
         spec.expected_genesis_hash = None;
         assert!(spec.to_genesis_config_verified().is_ok());
+    }
+
+    #[test]
+    fn hardcoded_genesis_constant_is_authoritative_for_mainnet() {
+        // Even with NO spec-level pin, a spec claiming to be `sov-mainnet` must build the
+        // binary-hardcoded genesis or be refused — the network identity lives in the
+        // software, not an editable data file (Bitcoin's hashGenesisBlock model).
+        let mut spec = ChainSpec::from_json(MAINNET_SPEC).expect("mainnet spec parses");
+        assert_eq!(spec.chain_id, "sov-mainnet");
+        spec.expected_genesis_hash = None; // strip the spec pin entirely
+                                           // Unmodified, it still builds cb0272ff, which matches the binary constant.
+        assert!(spec.to_genesis_config_verified().is_ok());
+
+        // Tamper a consensus-affecting genesis field — the binary constant catches it
+        // despite there being no spec pin at all.
+        spec.timestamp_ms += 1;
+        let msg = format!("{}", spec.to_genesis_config_verified().unwrap_err());
+        assert!(
+            msg.contains("binary constant"),
+            "must cite the hardcoded pin, got: {msg}"
+        );
+        assert!(msg.contains(ChainSpec::MAINNET_GENESIS_HASH));
     }
 
     #[test]

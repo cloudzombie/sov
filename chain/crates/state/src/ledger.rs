@@ -1690,6 +1690,14 @@ impl Ledger {
             .iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect();
+        // xUSD CDP + oracle state (audit SOV-H004): these ARE committed ledger state,
+        // so the snapshot MUST carry them or a restored ledger's state-root diverges.
+        // Grouped as one nested tuple to stay within borsh's 20-element tuple impls.
+        let vaults: Vec<VaultEntry> = self
+            .vaults
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         borsh::to_vec(&(
             accounts,
             storage,
@@ -1709,6 +1717,7 @@ impl Ledger {
             nfts,
             multisig,
             proposals,
+            (vaults, self.vault_collateral, self.oracle_price),
         ))
         .expect("ledger snapshot serialization is infallible")
     }
@@ -1743,6 +1752,7 @@ impl Ledger {
             nfts,
             multisig,
             proposals,
+            vault_state,
         ): (
             Vec<AccountEntry>,
             Vec<ContractEntry>,
@@ -1762,6 +1772,7 @@ impl Ledger {
             Vec<NftEntry>,
             Vec<MultisigEntry>,
             Vec<ProposalEntry>,
+            (Vec<VaultEntry>, Balance, Option<u128>),
         ) = borsh::from_slice(bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let mut ledger = Ledger::new();
@@ -1807,6 +1818,15 @@ impl Ledger {
         ledger.recommit_multisig();
         ledger.proposals = proposals.into_iter().collect();
         ledger.recommit_proposals();
+        // xUSD CDP + oracle state (audit SOV-H004): restore + recommit so the loaded
+        // ledger reproduces the exact state-root the snapshot was taken at.
+        let (vaults, vault_collateral, oracle_price) = vault_state;
+        ledger.vaults = vaults.into_iter().collect();
+        ledger.recommit_vaults();
+        ledger.vault_collateral = vault_collateral;
+        ledger.commit_counter(Self::VAULT_COLLATERAL_SLOT, vault_collateral);
+        ledger.oracle_price = oracle_price;
+        ledger.recommit_oracle();
         Ok(ledger)
     }
 }
@@ -1817,6 +1837,41 @@ mod tests {
 
     fn id(s: &str) -> AccountId {
         AccountId::new(s).unwrap()
+    }
+
+    #[test]
+    fn snapshot_round_trips_vault_and_oracle_state() {
+        // Audit SOV-H004: vault collateral/debt + the oracle price are committed
+        // ledger state, so a snapshot MUST restore them to the identical state-root.
+        // (Before the fix these three fields were dropped, so any snapshot taken with
+        // a non-empty CDP/oracle silently diverged and only the root-check saved it.)
+        let mut l = Ledger::new();
+        l.add_mined_emitted(Balance::from_sov(1000).unwrap())
+            .unwrap();
+        l.set_oracle_price(100_000_000); // $1.00 in 1e8 fixed point
+        l.set_vault(
+            &id("alice.sov"),
+            crate::vault::Vault {
+                collateral: Balance::from_sov(300).unwrap(),
+                debt: Balance::from_sov(100).unwrap(),
+            },
+        );
+        let root0 = l.state_root();
+
+        let restored = Ledger::from_snapshot_bytes(&l.to_snapshot_bytes()).unwrap();
+        assert_eq!(
+            restored.state_root(),
+            root0,
+            "vault/oracle state must survive a snapshot round-trip"
+        );
+        assert_eq!(
+            restored.vault(&id("alice.sov")).collateral,
+            Balance::from_sov(300).unwrap()
+        );
+        assert_eq!(
+            restored.vault(&id("alice.sov")).debt,
+            Balance::from_sov(100).unwrap()
+        );
     }
 
     #[test]

@@ -532,7 +532,18 @@ impl SyncState {
     /// blocks were written.
     fn sync_log(&self) {
         if let Some(log) = &self.block_log {
-            let _ = log.sync();
+            if let Err(e) = log.sync() {
+                // Audit SOV-H001: an fsync failure means the just-imported batch is not
+                // durable — make it visible rather than continuing to advertise a
+                // healthy, fully-synced node.
+                p2p_log(
+                    &self.log,
+                    format!(
+                        "⚠ DURABILITY: block-log fsync failed ({e}) — recently imported \
+                         blocks are not durable; fix storage"
+                    ),
+                );
+            }
         }
     }
 
@@ -575,7 +586,21 @@ impl SyncState {
         // peer I/O + keepalives across a 256-block batch and gets the node reaped; one
         // fsync per drain keeps the thread responsive while preserving durability.
         if let Some(log) = &self.block_log {
-            let _ = log.append_unsynced(&block);
+            if let Err(e) = log.append_unsynced(&block) {
+                // Audit SOV-H001: a committed peer block that fails to persist leaves
+                // durable history BEHIND the in-memory chain. Surface it loudly instead
+                // of dropping the error — a restart would otherwise silently replay a
+                // shorter prefix and diverge.
+                p2p_log(
+                    &self.log,
+                    format!(
+                        "⚠ DURABILITY: peer block {}@{} committed but log append failed ({e}) \
+                         — on-disk history is behind memory; fix storage",
+                        short_hash(&block.hash()),
+                        block.header.height.get(),
+                    ),
+                );
+            }
         }
         let lock_ms = started.elapsed().as_millis();
         drop(n);

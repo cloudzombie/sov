@@ -6,10 +6,12 @@ bounty, and the scope of external audits. It is the engineering-readiness half o
 Phase 7 item **p7-i9** — the public invariant dashboard is the other half (see
 `dashboard/index.html`, the *Verification & Validity* panel).
 
-> **Honest status:** No third-party security audit has been performed yet, and no
-> bug-bounty payouts are live. This policy defines the program and scope so an
-> audit/bounty can begin; it does **not** claim either has happened. Mainnet is
-> gated on a completed external audit (see the roadmap).
+> **Honest status:** Mainnet is **live** (fair-launched 2026-07-04) and has **not**
+> had a third-party security audit; no bug-bounty payouts are live. The current
+> assessment of record is the internal `Luna` audit (2026-07-09). This policy defines
+> the program and scope so an external audit/bounty can begin; it does **not** claim
+> either has happened. Run a node and hold value at your own risk until an external
+> audit is completed (see the roadmap).
 
 ## Reporting a vulnerability
 
@@ -33,13 +35,14 @@ A break in any of these is critical. They are specified in
 [`chain/docs/state-transition.md`](chain/docs/state-transition.md) and
 continuously checked by the [`sov-verify`](chain/crates/verify) suite:
 
-- **Supply cap** — total supply never exceeds 21,000,000 SOV; mining and staking
-  emission never exceed their budgets.
+- **Supply cap** — total supply never exceeds 21,000,000 SOV; the mining coinbase
+  never exceeds its scheduled budget.
 - **Value conservation / no unauthorized mint** — every block satisfies
-  `Δsupply == Δmined + Δstaked`.
+  `Δsupply == Δmined` (the coinbase is the only issuance; there is no staking).
 - **No double-spend** — nonce-enforced; replay is impossible.
-- **Consensus safety** — no two conflicting blocks finalize under `< 1/3`
-  byzantine stake; equivocation is provable and slashed.
+- **Consensus safety** — pure proof-of-work under heaviest-cumulative-work fork
+  choice, with probabilistic finality at a confirmation depth (Nakamoto). There is
+  **no stake, no slashing, and no BFT committee** — hashpower is the only vote.
 - **Determinism** — identical blocks reproduce identical state roots on every
   node.
 
@@ -52,8 +55,11 @@ crates (ed25519-dalek, blake3, sha2, randomx-rs (RandomX reference), fips204
 (ML-DSA), fips203 (ML-KEM), chacha20poly1305, wasmi); SOV's job is correct
 composition, which is what an audit should target.
 
-Out of scope (until built): live P2P/daemon (Phase 8) and the block explorer
-(Phase 9).
+Now **live and in scope** (fair-launched mainnet, 2026-07-04): the P2P transport +
+daemon (`chain/crates/network`, `chain/crates/rpc`) and SOV Station (`node/`). These
+have **not** had a third-party audit; the internal `Luna` audit (2026-07-09) is the
+current assessment of record. The block explorer is a separate application in the
+`cloudzombie/sov-explorer` repository and must be audited there.
 
 ## Bug bounty (planned)
 
