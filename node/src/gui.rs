@@ -7927,7 +7927,7 @@ fn scan_earnings(
             grains,
         })
         .collect();
-    rows.sort_by(|a, b| b.grains.cmp(&a.grains));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.grains));
     Ok((total, head, rows))
 }
 
@@ -8912,7 +8912,7 @@ fn build_and_run_node(
         miner_keys,
         &mut |done, total| {
             // One line per ~percent so it streams visibly without flooding.
-            let pct = if total == 0 { 100 } else { done * 100 / total };
+            let pct = (done * 100).checked_div(total).unwrap_or(100);
             if pct != last_pct {
                 last_pct = pct;
                 push_log(logs, format!("  indexing… {done}/{total} blocks ({pct}%)"));
