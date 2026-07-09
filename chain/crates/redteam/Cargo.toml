@@ -1,0 +1,18 @@
+[package]
+name = "sov-redteam"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone adversarial red-team harness: throws theoretical attacks (timewarp, forgery, post-quantum, low-hashpower reorg, supply) at the real SOV consensus code and reports which defenses held."
+
+[[bin]]
+name = "sov-redteam"
+path = "src/main.rs"
+
+[dependencies]
+sov-primitives = { path = "../primitives" }
+sov-crypto = { path = "../crypto" }
+sov-types = { path = "../types" }
+sov-state = { path = "../state" }
+sov-mining = { path = "../mining" }
+sov-verify = { path = "../verify" }
+sov-chain = { path = "../chain" }
