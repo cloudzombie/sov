@@ -263,6 +263,21 @@ function writeAction(w: BorshWriter, action: Action): void {
     case "cancel_multisig":
       w.u8(24).string(action.account).fixed(hexToBytes(action.proposal), 32);
       break;
+    case "vault_deposit":
+      w.u8(25).u128(BigInt(action.amount));
+      break;
+    case "vault_mint":
+      w.u8(26).u128(BigInt(action.amount));
+      break;
+    case "vault_burn":
+      w.u8(27).u128(BigInt(action.amount));
+      break;
+    case "vault_withdraw":
+      w.u8(28).u128(BigInt(action.amount));
+      break;
+    case "oracle_update":
+      w.u8(29).u128(BigInt(action.price));
+      break;
     default: {
       const _never: never = action;
       throw new BorshError(`unknown action: ${JSON.stringify(_never)}`);

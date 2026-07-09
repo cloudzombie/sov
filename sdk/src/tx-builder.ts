@@ -69,6 +69,16 @@ function validateAction(action: Action): void {
     case "cancel_multisig":
       assertValidAccountId(action.account);
       break;
+    // Vault collateral is XUS (SOV-capped); mint/burn are xUSD (own denomination);
+    // the node enforces the collateral ratio, oracle authorization, and limits.
+    case "vault_deposit":
+    case "vault_withdraw":
+      assertWithinCap(BigInt(action.amount));
+      break;
+    case "vault_mint":
+    case "vault_burn":
+    case "oracle_update":
+      break;
     case "deploy":
     case "claim_vesting":
     // Opaque or node-verified payloads (bundles, ids, policies, intents, keys, names).

@@ -142,6 +142,19 @@ export class HybridPublicKey {
       return false;
     }
   }
+
+  /**
+   * This key's **implicit account id**: lowercase hex of `blake3` over the V2
+   * public-key encoding (`0x01 ‖ ed25519 ‖ ml_dsa`). Matches Rust
+   * `PublicKey::implicit_account_id` — the account a hybrid key controls.
+   */
+  accountId(): string {
+    const enc = new Uint8Array(1 + this.ed25519.length + this.mlDsa.length);
+    enc[0] = 1; // V2 (hybrid) discriminant
+    enc.set(this.ed25519, 1);
+    enc.set(this.mlDsa, 1 + this.ed25519.length);
+    return toHex(blake3(enc));
+  }
 }
 
 /**

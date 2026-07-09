@@ -295,9 +295,40 @@ export interface CancelMultisigAction {
   proposal: HashHex;
 }
 
+/** Lock `amount` XUS collateral into the signer's xUSD vault. */
+export interface VaultDepositAction {
+  type: "vault_deposit";
+  amount: GrainString;
+}
+
+/** Mint `amount` xUSD against the signer's vault collateral (≤ the 150% min ratio). */
+export interface VaultMintAction {
+  type: "vault_mint";
+  amount: GrainString;
+}
+
+/** Burn `amount` xUSD to repay the signer's vault debt. */
+export interface VaultBurnAction {
+  type: "vault_burn";
+  amount: GrainString;
+}
+
+/** Withdraw `amount` XUS collateral from the vault, staying over-collateralized. */
+export interface VaultWithdrawAction {
+  type: "vault_withdraw";
+  amount: GrainString;
+}
+
+/** Publish an XUS/USD oracle price (authorized feed only). `price` is USD per XUS
+ *  in 10^8 fixed point, as a decimal string. */
+export interface OracleUpdateAction {
+  type: "oracle_update";
+  price: string;
+}
+
 /**
- * The closed set of transaction actions. Mirrors `types::Action` — all 25
- * variants, in Borsh-discriminant order (Transfer=0 … CancelMultisig=24).
+ * The closed set of transaction actions. Mirrors `types::Action` — all 30
+ * variants, in Borsh-discriminant order (Transfer=0 … OracleUpdate=29).
  *
  * Issuance is NOT an action: under Nakamoto consensus the block coinbase mints
  * the scheduled reward to the block's miner (the pre-Nakamoto Mine/MineShielded
@@ -328,7 +359,12 @@ export type Action =
   | MultisigExecAction
   | ProposeMultisigAction
   | ApproveMultisigAction
-  | CancelMultisigAction;
+  | CancelMultisigAction
+  | VaultDepositAction
+  | VaultMintAction
+  | VaultBurnAction
+  | VaultWithdrawAction
+  | OracleUpdateAction;
 
 /** The unsigned body of a transaction. Mirrors `types::Transaction`. */
 export interface Transaction {
