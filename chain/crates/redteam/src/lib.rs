@@ -23,6 +23,10 @@ use sov_mining::MiningPolicy;
 use sov_primitives::{AccountId, Balance};
 use sov_types::{Action, Block, SignedTransaction, Transaction};
 
+/// Live-fire front-door probe: attack a REAL running node over JSON-RPC.
+pub mod live;
+pub use live::{any_vulnerable as live_any_vulnerable, probe_frontdoor, LiveReport};
+
 // ── attack framework ─────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]

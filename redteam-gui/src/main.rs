@@ -33,11 +33,28 @@ fn alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
-#[derive(Default)]
 struct RedTeamApp {
+    // In-process battery: attack a private replica of consensus.
     results: Arc<Mutex<Option<Vec<sov_redteam::Outcome>>>>,
     running: Arc<AtomicBool>,
+    // Live front-door probe: submit adversarial txs to a REAL node's RPC.
+    target: String,
+    live_report: Arc<Mutex<Option<sov_redteam::LiveReport>>>,
+    live_running: Arc<AtomicBool>,
     themed: bool,
+}
+
+impl Default for RedTeamApp {
+    fn default() -> Self {
+        Self {
+            results: Arc::new(Mutex::new(None)),
+            running: Arc::new(AtomicBool::new(false)),
+            target: "127.0.0.1:8645".to_string(),
+            live_report: Arc::new(Mutex::new(None)),
+            live_running: Arc::new(AtomicBool::new(false)),
+            themed: false,
+        }
+    }
 }
 
 impl RedTeamApp {
@@ -55,6 +72,56 @@ impl RedTeamApp {
             }
             running.store(false, Ordering::SeqCst);
         });
+    }
+
+    /// Fire the live front-door probe at `self.target`, off the UI thread.
+    fn run_live(&self) {
+        if self.live_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let target = self.target.clone();
+        let report = Arc::clone(&self.live_report);
+        let running = Arc::clone(&self.live_running);
+        std::thread::spawn(move || {
+            let r = sov_redteam::probe_frontdoor(&target);
+            if let Ok(mut slot) = report.lock() {
+                *slot = Some(r);
+            }
+            running.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// One attack card: left accent, name + detail, and a verdict chip on the right.
+    fn outcome_row(
+        ui: &mut egui::Ui,
+        name: &str,
+        verdict: sov_redteam::Verdict,
+        detail: &str,
+        accent: Color32,
+    ) {
+        let (chip, chip_c) = match verdict {
+            sov_redteam::Verdict::Defended => ("✓ DEFENDED", HOLD),
+            sov_redteam::Verdict::Vulnerable => ("✗ VULNERABLE", THREAT),
+            sov_redteam::Verdict::Info => ("• INFO", GOLD),
+        };
+        egui::Frame::none()
+            .fill(PANEL)
+            .rounding(Rounding::same(8.0))
+            .stroke(Stroke::new(1.0, BORDER))
+            .inner_margin(Margin::symmetric(13.0, 10.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("▎").size(22.0).color(accent));
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(name).strong().monospace().size(13.5));
+                        ui.label(RichText::new(detail).size(11.5).color(MUTED));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(chip).size(11.0).strong().monospace().color(chip_c));
+                    });
+                });
+            });
+        ui.add_space(5.0);
     }
 
     fn theme(&mut self, ctx: &egui::Context) {
@@ -254,6 +321,132 @@ impl RedTeamApp {
             .color(MUTED)
             .italics(),
         );
+
+        ui.add_space(20.0);
+        ui.separator();
+        ui.add_space(12.0);
+        self.live_section(ui);
+    }
+
+    /// The live front-door probe: point at a running node and submit adversarial txs
+    /// that are rejected at admission (nothing lands on the chain).
+    fn live_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("⌁ Live front-door probe").size(19.0).strong().color(PQ));
+        ui.label(
+            RichText::new(
+                "Attack a REAL running node the only way an outsider can — through \
+                 sov_submitTransaction. Every probe is designed to be REJECTED at admission, \
+                 so nothing lands in the mempool: no tx, no fee, no state change.",
+            )
+            .size(12.0)
+            .color(MUTED),
+        );
+        ui.add_space(10.0);
+
+        let live_running = self.live_running.load(Ordering::SeqCst);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("node RPC").size(12.0).color(MUTED));
+            ui.add_enabled(
+                !live_running,
+                egui::TextEdit::singleline(&mut self.target)
+                    .desired_width(210.0)
+                    .hint_text("host:port"),
+            );
+            let label = if live_running { "⌁ probing…" } else { "⌁ Probe front door" };
+            let btn = egui::Button::new(RichText::new(label).strong().color(Color32::from_rgb(17, 16, 13)))
+                .fill(PQ)
+                .min_size(egui::vec2(150.0, 30.0));
+            if ui.add_enabled(!live_running, btn).clicked() {
+                self.run_live();
+            }
+            if live_running {
+                ui.spinner();
+            }
+        });
+        if live_running {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+        }
+        ui.add_space(12.0);
+
+        let Ok(guard) = self.live_report.lock() else {
+            return;
+        };
+        let Some(report) = guard.as_ref() else {
+            if !live_running {
+                ui.label(
+                    RichText::new("Enter a node's RPC address and probe its front door.")
+                        .color(MUTED)
+                        .italics(),
+                );
+            }
+            return;
+        };
+
+        if !report.reachable {
+            egui::Frame::none()
+                .fill(SURFACE)
+                .rounding(Rounding::same(10.0))
+                .stroke(Stroke::new(1.0, alpha(THREAT, 120)))
+                .inner_margin(Margin::symmetric(16.0, 13.0))
+                .show(ui, |ui| {
+                    ui.label(RichText::new("UNREACHABLE").size(16.0).strong().color(THREAT));
+                    ui.label(
+                        RichText::new(format!(
+                            "Could not reach {} — is the node running with RPC exposed?",
+                            report.target
+                        ))
+                        .size(12.0)
+                        .color(MUTED),
+                    );
+                });
+            return;
+        }
+
+        // connectivity + identity banner
+        let chain = report.chain_id.as_deref().unwrap_or("unknown");
+        let height = report.height.map(|h| h.to_string()).unwrap_or_else(|| "?".into());
+        egui::Frame::none()
+            .fill(SURFACE)
+            .rounding(Rounding::same(10.0))
+            .stroke(Stroke::new(1.0, alpha(if report.is_mainnet { GOLD } else { PQ }, 120)))
+            .inner_margin(Margin::symmetric(16.0, 12.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("● connected").size(12.0).strong().color(HOLD));
+                    ui.add_space(14.0);
+                    ui.label(RichText::new(&report.target).size(12.0).monospace().color(INK));
+                    ui.add_space(14.0);
+                    if report.is_mainnet {
+                        ui.label(RichText::new("LIVE MAINNET").size(12.0).strong().monospace().color(GOLD));
+                    } else {
+                        ui.label(RichText::new(chain).size(12.0).monospace().color(PQ));
+                    }
+                    ui.add_space(14.0);
+                    ui.label(RichText::new(format!("height {height}")).size(12.0).monospace().color(MUTED));
+                });
+            });
+        ui.add_space(10.0);
+
+        let admitted = report
+            .outcomes
+            .iter()
+            .filter(|o| o.verdict == sov_redteam::Verdict::Vulnerable)
+            .count();
+        ui.label(
+            RichText::new(if admitted == 0 {
+                "FRONT DOOR HELD — every adversarial tx rejected before admission"
+            } else {
+                "AN ADVERSARIAL TX WAS ADMITTED"
+            })
+            .size(14.0)
+            .strong()
+            .color(if admitted == 0 { HOLD } else { THREAT }),
+        );
+        ui.add_space(8.0);
+
+        for o in &report.outcomes {
+            Self::outcome_row(ui, o.name, o.verdict, &o.detail, PQ);
+        }
     }
 }
 
