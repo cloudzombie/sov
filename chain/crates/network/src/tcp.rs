@@ -215,6 +215,10 @@ struct Shared {
     /// app layer via [`TcpNode::mark_self_addr`] when it sees a `Hello` whose account is
     /// ours (the network layer can't see the signed app-level identity itself).
     self_addrs: Mutex<HashSet<SocketAddr>>,
+    /// Addresses that explicitly presented a wrong-chain/genesis or invalid signed
+    /// Hello. Do not churn by reconnecting them every bootstrap interval; a process
+    /// restart clears the quarantine after an operator fixes/replaces that endpoint.
+    incompatible: Mutex<HashSet<SocketAddr>>,
 }
 
 /// Per-IP connection health. Both the rate bucket and the misbehavior score are
@@ -302,6 +306,7 @@ impl TcpNode {
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             self_addrs: Mutex::new(HashSet::new()),
+            incompatible: Mutex::new(HashSet::new()),
         });
 
         // Accept inbound connections (we are the Noise *responder*). Non-blocking so
@@ -371,11 +376,21 @@ impl TcpNode {
     /// Enable **mDNS-style LAN auto-discovery**: periodically announce this node on
     /// the local network and dial any same-chain peer that announces itself — so two
     /// machines on the same LAN join one network with **zero configuration** (no
-    /// seed address needed). Best-effort: if the multicast socket can't bind, it is
-    /// silently skipped. The thread stops with the node (shared shutdown flag). The
+    /// seed address needed). Returns an error if the multicast socket cannot bind or
+    /// join, so callers never claim LAN discovery is active when it is not. The thread
+    /// stops with the node (shared shutdown flag). The
     /// beacon advertises only the chain id + P2P port; the dial-able IP is the
     /// packet's source address, so no node needs to know its own IP.
-    pub fn enable_lan_discovery(&self, chain_id: &str) {
+    pub fn enable_lan_discovery(&self, chain_id: &str) -> io::Result<()> {
+        // Establish the socket synchronously so startup telemetry is truthful. The
+        // receive/announce loop itself remains background work.
+        let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, LAN_DISCO_PORT))?;
+        sock.join_multicast_v4(&LAN_DISCO_GROUP, &Ipv4Addr::UNSPECIFIED)?;
+        sock.set_read_timeout(Some(Duration::from_millis(500)))?;
+        // The nonce below also filters self-beacons, so failure to disable loopback is
+        // harmless; keep discovery available on platforms that reject this option.
+        let _ = sock.set_multicast_loop_v4(false);
+
         let shared = Arc::clone(&self.shared);
         let chain_id = chain_id.to_string();
         let p2p_port = self.shared.local_addr.port();
@@ -384,21 +399,6 @@ impl TcpNode {
         // a node from dialing itself (the "ghost self-peer").
         let nonce = node_nonce();
         thread::spawn(move || {
-            // Bind the discovery port and join the multicast group. Reuse is fine —
-            // one node per machine; failure just disables discovery (best-effort).
-            let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, LAN_DISCO_PORT)) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            if sock
-                .join_multicast_v4(&LAN_DISCO_GROUP, &Ipv4Addr::UNSPECIFIED)
-                .is_err()
-            {
-                return;
-            }
-            // Don't loop our own announcements back to ourselves (no self-dial).
-            let _ = sock.set_multicast_loop_v4(false);
-            let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
             let beacon = format!("{LAN_DISCO_TAG}|{chain_id}|{p2p_port}|{nonce}");
             // Startup burst: UDP multicast is lossy, so fire a few beacons up front
             // (briefly spaced) rather than betting first contact on a single packet —
@@ -429,6 +429,7 @@ impl TcpNode {
                 }
             }
         });
+        Ok(())
     }
 
     /// The address this node is listening on.
@@ -617,6 +618,17 @@ impl TcpNode {
         self.shared.known.lock().unwrap().remove(&addr);
     }
 
+    /// Quarantine a connection address whose application Hello cannot authenticate
+    /// for this chain. This is not a network-wide/IP ban (an operator may run another
+    /// valid node on the same host); it only suppresses reconnect churn to this exact
+    /// endpoint for the life of this process.
+    pub fn mark_incompatible(&self, addr: SocketAddr) {
+        self.shared.incompatible.lock().unwrap().insert(addr);
+        self.shared.known.lock().unwrap().remove(&addr);
+        self.shared.dialing.lock().unwrap().remove(&addr);
+        self.disconnect(&addr);
+    }
+
     /// The Noise handshake hash for the connection to `peer` (its channel
     /// fingerprint), or `None` if not connected. Used to bind the signed `Hello`.
     pub fn peer_handshake_hash(&self, peer: &SocketAddr) -> Option<Vec<u8>> {
@@ -724,6 +736,9 @@ fn attempt_dial(shared: &Arc<Shared>, addr: SocketAddr) -> std::io::Result<()> {
     // catches our bind address (e.g. 0.0.0.0:9645), not our reachable public address, so
     // without this the self-link is reopened every discovery pass — pure churn.
     if shared.self_addrs.lock().unwrap().contains(&addr) {
+        return Ok(());
+    }
+    if shared.incompatible.lock().unwrap().contains(&addr) {
         return Ok(());
     }
     // Never (re)dial a banned IP — a ban must stop us reconnecting outbound too, not
@@ -1775,6 +1790,7 @@ mod tests {
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             self_addrs: Mutex::new(HashSet::new()),
+            incompatible: Mutex::new(HashSet::new()),
         };
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
 
@@ -1812,6 +1828,7 @@ mod tests {
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             self_addrs: Mutex::new(HashSet::new()),
+            incompatible: Mutex::new(HashSet::new()),
         };
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
 
@@ -1943,6 +1960,7 @@ mod tests {
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             self_addrs: Mutex::new(HashSet::new()),
+            incompatible: Mutex::new(HashSet::new()),
         };
         // Same host, its advertised LISTEN port → duplicate (matched by IP).
         assert!(dial_would_duplicate(

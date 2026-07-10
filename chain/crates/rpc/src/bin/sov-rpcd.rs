@@ -194,9 +194,22 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
                     ),
                 }
             }
-            // mDNS-style LAN auto-discovery: harmless on a public host (no multicast peers),
-            // and it lets co-located nodes find each other with zero configuration.
-            p2p.tcp().enable_lan_discovery(&genesis.chain_id);
+            // mDNS-style LAN auto-discovery: harmless on a public host (no multicast
+            // peers), and co-located nodes find one another with zero configuration.
+            // Log the real bind/join result instead of claiming discovery is active
+            // after a silent OS/network failure.
+            match p2p.tcp().enable_lan_discovery(&genesis.chain_id) {
+                Ok(()) => log(
+                    &logs,
+                    "LAN discovery active on 239.255.90.45:9646 (same-chain peers only)",
+                ),
+                Err(e) => log(
+                    &logs,
+                    format!(
+                        "LAN discovery unavailable ({e}); bootstrap/gossip peering remains active"
+                    ),
+                ),
+            }
             daemon = daemon.with_gossip(p2p.tcp());
             Some(p2p.start())
         }

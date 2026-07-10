@@ -655,6 +655,39 @@ impl SyncState {
             msg.authenticated_account(&config.chain_id, &config.genesis_hash, b)
                 .cloned()
         });
+        if authed_account.is_none() {
+            if let NetMessage::Hello {
+                chain_id,
+                genesis_hash,
+                ..
+            } = &msg
+            {
+                let reason = if chain_id != &config.chain_id {
+                    format!("wrong chain id {chain_id}")
+                } else if genesis_hash != &config.genesis_hash {
+                    "wrong genesis hash".to_string()
+                } else {
+                    "invalid key signature or encrypted-channel binding".to_string()
+                };
+                // A peer that explicitly presents an invalid/wrong-network Hello can
+                // never become trusted on this connection. Drop it immediately instead
+                // of retaining a useless encrypted socket until the generic 30s zombie
+                // sweep (and repeatedly presenting it as a raw TCP link to operators).
+                tcp.mark_incompatible(peer);
+                self.authenticated.remove(&peer);
+                self.identity.remove(&peer);
+                self.peer_status.remove(&peer);
+                self.sync_next.remove(&peer);
+                self.bt_step.remove(&peer);
+                self.last_recv.remove(&peer);
+                self.first_seen.remove(&peer);
+                p2p_log(
+                    &self.log,
+                    format!("✗ rejected {} Hello: {reason}", short_peer(&peer)),
+                );
+                return;
+            }
+        }
         if let Some(account) = authed_account {
             // Self-connection: a peer gossiped OUR OWN public address back and we dialed
             // ourselves, so the authenticated Hello carries our own account. There is

@@ -18,7 +18,7 @@ Fair-launch genesis at **midnight, July 4 2026 CDT** (America's 250th birthday).
 
 | Service | URL / address | Host |
 |---|---|---|
-| **Mainnet seed** (relay-only) | `64.225.10.34:9645` (P2P) · `:8645` (RPC) | DO droplet `582172987`, s-1vcpu-2gb |
+| **Mainnet seeds** (relay-only) | NY `64.225.10.34:9645` · SF `137.184.83.91:9645` (RPC `:8645`) | Two DO droplets / independent relay paths |
 | **Testnet seed** | `159.203.109.204:9645` · `:8645` | DO droplet `581931537` |
 | **Block explorer** | **https://sovxus.org** (testnet + mainnet) | DO droplet `581936353`, nginx + Let's Encrypt |
 | **Gotomarket site** | **https://sovxus.com** | Vercel (repo `cloudzombie/gotomarket`) |

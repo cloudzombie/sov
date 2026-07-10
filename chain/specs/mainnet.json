@@ -4,7 +4,7 @@
   "policy": "mainnet_like",
   "difficulty_leading_zeros": 16,
   "deshield_limit_sov": 21000000,
-  "seeds": ["64.225.10.34:9645"],
+  "seeds": ["64.225.10.34:9645", "137.184.83.91:9645"],
   "expected_genesis_hash": "cb0272ff88e64c18cde0257f7fae1c8236b02651f10cc7a02456fd682ee2e72d",
   "accounts": []
 }

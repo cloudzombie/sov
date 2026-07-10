@@ -1683,7 +1683,7 @@ impl Station {
             log_prev_authed: None,
             log_prev_syncing: None,
             log_prev_best: None,
-            peer_addr: read_saved_peer(),
+            peer_addr: read_saved_peer(Network::Mainnet),
             dark_mode: read_saved_theme(),
             lan_addr: lan_ipv4(),
             // Default to MAINNET — the live network (genesis cb0272ff). The top tab
@@ -3537,20 +3537,19 @@ impl Station {
     /// rest of the network from there. Also shows the live peer count and this
     /// machine's own dial-able address so the other node can seed back to it.
     fn node_peering_ui(&mut self, ui: &mut egui::Ui) {
-        if !self.network.is_sandbox() {
-            return;
-        }
         ui.add_space(12.0);
         ui.separator();
         ui.heading("Peering");
-        ui.label(
-            egui::RichText::new(
-                "Join other machines to this network. Enter one peer's address — it is saved \
-                 and auto-dialed every start, then the rest of the network is discovered \
-                 automatically (gossip). Solo mining works with zero peers.",
-            )
-            .weak(),
-        );
+        let help = if self.network.is_sandbox() {
+            "Join other machines to this test network. Enter one peer's address — it is \
+             saved for TESTNET only and auto-dialed every start. LAN discovery and peer \
+             gossip find the rest automatically."
+        } else {
+            "Mainnet automatically dials both public relays and discovers same-LAN nodes. \
+             Add a miner's address here for a direct link; it is saved for MAINNET only. \
+             A peer counts only after matching mainnet's chain id and frozen genesis."
+        };
+        ui.label(egui::RichText::new(help).weak());
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("Seed peer");
@@ -3566,7 +3565,7 @@ impl Station {
             {
                 let p = self.peer_addr.trim().to_string();
                 self.peer_addr = p.clone();
-                save_peer(&p);
+                save_peer(self.network, &p);
                 if p.is_empty() {
                     self.node_status = "seed peer cleared".into();
                     push_log(&self.node_logs, "seed peer cleared".to_string());
@@ -3623,7 +3622,7 @@ impl Station {
         });
         // Live peer count, read straight from the in-process transport.
         let peers = match &*self.node_run.lock().unwrap() {
-            NodeRun::Running(node) => Some(node.peer_count()),
+            NodeRun::Running(node) => Some(node.sync_view().peers),
             _ => None,
         };
         match peers {
@@ -3693,6 +3692,7 @@ impl Station {
         }
         self.stop_local_node();
         self.network = to;
+        self.peer_addr = read_saved_peer(to);
         let rpc = to.default_rpc().to_string();
         if let Ok(mut c) = self.config.lock() {
             c.rpc = rpc.clone();
@@ -4680,7 +4680,7 @@ impl Station {
     ///     flatlined when there is no node
     ///   • a bright thump on every beat, a sonar ring rippling outward, a mining spark.
     fn draw_heartbeat(&self, ctx: &egui::Context, snap: &Snapshot) {
-        use egui::{Align2, Color32, Id, Order, Sense, Stroke, Vec2};
+        use egui::{Align2, Color32, Id, Order, Sense, Shadow, Stroke, Vec2};
 
         let peers = snap.peers.unwrap_or(0);
         let online = snap.online;
@@ -4688,13 +4688,13 @@ impl Station {
 
         // State → (colour, label, beats-per-minute). More "alive" ⇒ faster heart.
         let (color, label, bpm) = if !online {
-            (Color32::from_rgb(196, 72, 66), "OFFLINE", 0.0) // flatline
+            (palette::error(), "OFFLINE", 0.0) // flatline
         } else if snap.syncing {
-            (Color32::from_rgb(240, 190, 70), "SYNCING", 132.0) // racing to catch up
+            (palette::warning(), "SYNCING", 132.0) // racing to catch up
         } else if peers == 0 {
-            (Color32::from_rgb(88, 200, 232), "SOLO", 80.0) // alive, but alone
+            (palette::link(), "SOLO", 80.0) // alive, but alone
         } else {
-            (Color32::from_rgb(80, 220, 140), "SYNCED", 60.0) // calm & healthy
+            (palette::success(), "SYNCED", 60.0) // calm & healthy
         };
 
         // Heartbeat waveform: a "lub-dub" double-thump each period, then a rest — the
@@ -4710,75 +4710,110 @@ impl Station {
             ((g(0.0, 0.045) + 0.6 * g(0.17, 0.045)).min(1.0), p as f32)
         };
 
+        let panel = palette::panel();
+        let chip_fill = Color32::from_rgba_unmultiplied(
+            panel.r(),
+            panel.g(),
+            panel.b(),
+            if palette::is_dark() { 246 } else { 252 },
+        );
+        let shadow = Shadow {
+            offset: Vec2::new(0.0, 4.0),
+            blur: 14.0,
+            spread: 0.0,
+            color: Color32::from_black_alpha(if palette::is_dark() { 105 } else { 42 }),
+        };
+
         egui::Area::new(Id::new("node_heartbeat"))
-            .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-16.0, -16.0))
+            // Clear the footer instead of covering its version/network text.
+            .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-18.0, -42.0))
             .order(Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::none()
-                    .fill(Color32::from_rgba_unmultiplied(16, 20, 26, 225))
-                    .rounding(egui::Rounding::same(14.0))
-                    .stroke(Stroke::new(1.0, palette::tint(color, 90)))
-                    .inner_margin(egui::Margin::symmetric(12.0, 9.0))
+                    .fill(chip_fill)
+                    .rounding(egui::Rounding::same(12.0))
+                    .shadow(shadow)
+                    .stroke(Stroke::new(1.0, palette::tint(color, 92)))
+                    .inner_margin(egui::Margin::symmetric(11.0, 8.0))
                     .show(ui, |ui| {
+                        ui.set_min_width(164.0);
+                        ui.spacing_mut().item_spacing.x = 10.0;
                         ui.horizontal(|ui| {
-                            // text stack, left of the orb
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    egui::RichText::new(label).strong().size(12.0).color(color),
-                                );
-                                let sub = if online {
-                                    let h = snap
-                                        .height
-                                        .map(|h| format!("#{h}"))
-                                        .unwrap_or_else(|| "—".into());
-                                    format!(
-                                        "{peers} peer{} · {h}",
-                                        if peers == 1 { "" } else { "s" }
-                                    )
-                                } else {
-                                    "no local node".to_string()
-                                };
-                                ui.label(
-                                    egui::RichText::new(sub).size(10.5).color(palette::text_dim()),
-                                );
-                            });
-
-                            // the orb + sonar ring
+                            // A contained heartbeat sits first, so the chip reads like a
+                            // status instrument instead of a label with a loose decoration.
                             let (rect, resp) =
-                                ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
+                                ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
                             let painter = ui.painter();
                             let center = rect.center();
-                            let base_r = 5.5;
+                            let base_r = 5.0;
 
                             if bpm > 0.0 {
-                                // sonar ripple — a ring expanding out each beat, fading
-                                let rr = base_r + ring_phase * 11.0;
-                                let a = ((1.0 - ring_phase) * 110.0) as u8;
-                                painter
-                                    .circle_stroke(center, rr, Stroke::new(1.5, palette::tint(color, a)));
-                                // soft glow halo, swelling on the thump
-                                let glow_r = base_r + 3.0 + pulse * 6.0;
+                                // The ripple stays within its allocation, avoiding the
+                                // clipped/overhanging ring from the previous treatment.
+                                let rr = base_r + ring_phase * 8.0;
+                                let a = ((1.0 - ring_phase) * 88.0) as u8;
+                                painter.circle_stroke(
+                                    center,
+                                    rr,
+                                    Stroke::new(1.25, palette::tint(color, a)),
+                                );
+                                let glow_r = base_r + 2.5 + pulse * 3.5;
                                 painter.circle_filled(
                                     center,
                                     glow_r,
-                                    palette::tint(color, (36.0 + pulse * 64.0) as u8),
+                                    palette::tint(color, (24.0 + pulse * 46.0) as u8),
                                 );
                             }
-                            // the core orb, brightened toward white on each beat
-                            painter.circle_filled(center, base_r + pulse * 2.2, color);
+                            painter.circle_filled(center, base_r + pulse * 1.6, color);
                             painter.circle_filled(
-                                center,
-                                (base_r - 1.0) + pulse * 2.2,
-                                palette::tint(Color32::WHITE, (pulse * 190.0) as u8),
+                                center + Vec2::new(-1.4, -1.4),
+                                1.5 + pulse * 0.6,
+                                palette::tint(Color32::WHITE, (105.0 + pulse * 105.0) as u8),
                             );
-                            // a mining spark: a small amber pip riding the orb while hashing
                             if mining {
                                 painter.circle_filled(
-                                    center + Vec2::new(base_r + 3.0, -(base_r + 3.0)),
-                                    1.8,
-                                    Color32::from_rgb(240, 190, 70),
+                                    center + Vec2::new(base_r + 2.5, -(base_r + 2.5)),
+                                    2.0,
+                                    palette::warning(),
                                 );
                             }
+
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(label)
+                                            .strong()
+                                            .size(11.5)
+                                            .color(color),
+                                    );
+                                    if mining {
+                                        ui.label(
+                                            egui::RichText::new("MINING")
+                                                .strong()
+                                                .size(8.5)
+                                                .color(palette::warning()),
+                                        );
+                                    }
+                                });
+                                let sub = if online {
+                                    let h = snap
+                                        .height
+                                        .map(|h| format!("#{}", group_thousands(h as u128)))
+                                        .unwrap_or_else(|| "#—".into());
+                                    format!(
+                                        "{h}  ·  {peers} PEER{}",
+                                        if peers == 1 { "" } else { "S" }
+                                    )
+                                } else {
+                                    "LOCAL NODE UNAVAILABLE".to_string()
+                                };
+                                ui.label(
+                                    egui::RichText::new(sub)
+                                        .monospace()
+                                        .size(9.5)
+                                        .color(palette::text_dim()),
+                                );
+                            });
 
                             resp.on_hover_text(format!(
                                 "{label}\npeers: {peers}\nheight: {}\nbest peer: {}\nhashrate: {} H/s{}\nchain: {}\nbuild: v{}",
@@ -8660,32 +8695,42 @@ fn local_node_dir(net: &str) -> PathBuf {
     std::env::temp_dir().join(format!("sov-station-node-{net}"))
 }
 
-/// Where the seed/bootstrap peer address is persisted. CRITICAL: this lives OUTSIDE the
-/// node data dir, in the user's home directory, so that "Reset local chain" (which wipes
-/// the data dir) and a fresh install NEVER lose the configured peer — peer connection
-/// must survive a reset. Falls back to the temp dir if no home is available.
-fn peer_config_path() -> PathBuf {
-    let base = std::env::var_os("HOME")
+/// Base directory for network-scoped seed/bootstrap choices. These live outside the
+/// node data dir so a testnet reset does not forget its peer, but MAINNET and TESTNET
+/// must never share one address again. Falls back to the temp dir without a home.
+fn peer_config_base() -> PathBuf {
+    std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join(".sov-station-peer")
+        .unwrap_or_else(std::env::temp_dir)
 }
 
-/// The seed/bootstrap peer the operator configured (if any), so the Peer field is
-/// pre-filled and the node auto-dials it on every launch (Bitcoin-style: configure a
-/// seed once, then it is automatic) — and, crucially, it persists across a chain reset.
-fn read_saved_peer() -> String {
-    std::fs::read_to_string(peer_config_path())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
+fn peer_config_path(network: Network) -> PathBuf {
+    peer_config_base().join(format!(".sov-station-peer-{}", network.data_subdir()))
 }
 
-/// Persist the seed/bootstrap peer outside the data dir so the operator's choice survives
-/// restarts, fresh installs, AND a "Reset local chain". (The per-launch node config still
-/// gets it via `build_and_run_node`, for the node process to dial.)
-fn save_peer(peer: &str) {
-    let _ = std::fs::write(peer_config_path(), peer.trim());
+fn legacy_peer_config_path() -> PathBuf {
+    peer_config_base().join(".sov-station-peer")
+}
+
+/// The seed/bootstrap peer configured for exactly one network. A legacy unscoped file
+/// migrates to Testnet only because that was the only screen where it could be entered.
+fn read_saved_peer(network: Network) -> String {
+    match std::fs::read_to_string(peer_config_path(network)) {
+        Ok(peer) => peer.trim().to_string(),
+        // The legacy field was only exposed on the Testnet screen. Migrate it there;
+        // never carry a testnet address into mainnet again.
+        Err(_) if network == Network::Testnet => std::fs::read_to_string(legacy_peer_config_path())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
+/// Persist one network's operator peer outside the data dir. The per-launch node config
+/// gets only this network's value via `build_and_run_node`.
+fn save_peer(network: Network, peer: &str) {
+    let _ = std::fs::write(peer_config_path(network), peer.trim());
 }
 
 /// Where the UI theme choice is persisted (next to the peer file, outside the data dir).
@@ -8982,20 +9027,26 @@ fn build_and_run_node(
     } else if let Some(port) = config.rpc_addr.strip_prefix("localhost:") {
         config.rpc_addr = format!("0.0.0.0:{port}");
     }
-    // Seed/bootstrap peer (Bitcoin `addnode` style): auto-dial it on startup and
-    // gossip-discover the rest. Persist it into the node config so it is automatic
-    // on every future launch — configure a seed once, then it just works.
+    // Seed/bootstrap peer (Bitcoin `addnode` style), scoped to THIS network. Replace
+    // the persisted operator list on every start—even when empty—so a legacy testnet
+    // peer can never survive in the mainnet node config. Stable spec seeds are merged
+    // into the in-memory list below.
     let peer = peer.trim();
-    if !peer.is_empty() {
-        config.bootstrap_peers = vec![peer.to_string()];
-        let cfg_path = node_dir.join("node-1/node-config.json");
-        if let Ok(text) = std::fs::read_to_string(&cfg_path) {
-            if let Ok(mut v) = serde_json::from_str::<Value>(&text) {
-                v["bootstrap_peers"] = json!([peer]);
-                let _ = std::fs::write(&cfg_path, v.to_string());
-            }
-        }
-    }
+    config.bootstrap_peers = if peer.is_empty() {
+        Vec::new()
+    } else {
+        vec![peer.to_string()]
+    };
+    let cfg_path = node_dir.join("node-1/node-config.json");
+    let mut persisted: Value = serde_json::from_str(&read(&cfg_path)?)
+        .map_err(|e| format!("node-config persistence: {e}"))?;
+    persisted["bootstrap_peers"] = json!(config.bootstrap_peers.clone());
+    std::fs::write(
+        &cfg_path,
+        serde_json::to_string_pretty(&persisted)
+            .map_err(|e| format!("serialize node-config: {e}"))?,
+    )
+    .map_err(|e| format!("persist network-scoped peers: {e}"))?;
     // Always refresh chain-spec.json from the EMBEDDED spec, so a new build's spec
     // changes take effect on an EXISTING chain instead of being frozen at first-run.
     // testnet-1's genesis is frozen (hash 5e9f3cc5…) and the de-shield limiter params
@@ -9126,13 +9177,22 @@ fn build_and_run_node(
             }
             let bound = p2p.local_addr();
             // mDNS-style LAN auto-discovery: find + dial same-chain peers on the
-            // local network with zero configuration (no seed address needed).
-            p2p.tcp().enable_lan_discovery(&genesis.chain_id);
+            // local network with zero configuration. Report the real socket/join
+            // result; never print "on" when the OS/firewall prevented activation.
+            match p2p.tcp().enable_lan_discovery(&genesis.chain_id) {
+                Ok(()) => push_log(
+                    logs,
+                    "LAN discovery active on 239.255.90.45:9646 (same-chain peers only)",
+                ),
+                Err(e) => push_log(
+                    logs,
+                    format!(
+                        "⚠ LAN discovery unavailable ({e}) — relay/manual peering remains active"
+                    ),
+                ),
+            }
             daemon = daemon.with_gossip(p2p.tcp());
-            push_log(
-                logs,
-                format!("P2P on {bound} — LAN auto-discovery on (peers welcome)"),
-            );
+            push_log(logs, format!("P2P listening on {bound} (peers welcome)"));
             Some(p2p.start())
         }
         None => {
@@ -9292,6 +9352,34 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn mainnet_embeds_both_independent_relay_seeds() {
+        let spec = ChainSpec::from_json(MAINNET_SPEC).expect("mainnet spec parses");
+        assert_eq!(
+            spec.seeds,
+            vec!["64.225.10.34:9645", "137.184.83.91:9645"],
+            "every updated mainnet node must bootstrap through both relay hosts"
+        );
+        let genesis = spec
+            .to_genesis_config_verified()
+            .expect("non-consensus seed changes preserve the frozen genesis")
+            .build()
+            .expect("genesis builds");
+        assert_eq!(
+            genesis.block.hash().to_hex(),
+            ChainSpec::MAINNET_GENESIS_HASH
+        );
+    }
+
+    #[test]
+    fn operator_peer_storage_is_scoped_per_network() {
+        let mainnet = peer_config_path(Network::Mainnet);
+        let testnet = peer_config_path(Network::Testnet);
+        assert_ne!(mainnet, testnet);
+        assert!(mainnet.ends_with(".sov-station-peer-mainnet"));
+        assert!(testnet.ends_with(".sov-station-peer-testnet"));
     }
 
     // A tiny keystore for the crypto round-trip tests below.
