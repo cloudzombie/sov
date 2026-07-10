@@ -360,6 +360,257 @@ fn tamper_signature(sig: Signature, half: Half) -> Signature {
 
 // ── runner ───────────────────────────────────────────────────────────────────
 
+// ── forged / malicious transactions ─────────────────────────────────────────
+
+/// A signed transfer from `signer` (an account bound to key seed `seed`) at `nonce`,
+/// moving `amount` to `to`, signed by the account's own key.
+fn transfer(signer: &str, seed: u8, nonce: u64, to: &str, amount: Balance) -> SignedTransaction {
+    let kp = Keypair::from_seed([seed; 32]);
+    let tx = Transaction {
+        signer: id(signer),
+        public_key: kp.public_key(),
+        nonce,
+        action: Action::Transfer { to: id(to), amount },
+    };
+    SignedTransaction::sign(tx, &kp).unwrap()
+}
+
+/// True if the chain REFUSES to commit `tx` in a valid block — it is excluded during
+/// block selection, or the block that includes it fails strict import. This is the bar
+/// every fudged transaction must clear.
+fn tx_refused(tx: SignedTransaction) -> bool {
+    let mut chain = fresh_chain();
+    advance(&mut chain, 3);
+    let Ok(block) = chain.produce_block(vec![tx.clone()], 100_000) else {
+        return true;
+    };
+    let landed = block.transactions.iter().any(|t| t.id() == tx.id());
+    !landed || chain.import_block(block).is_err()
+}
+
+/// True if, after mining + importing a block containing `tx`, `recipient`'s balance is
+/// UNCHANGED — i.e. the transfer created no value. A failed transfer (overspend,
+/// overflow) is mined but reverts (Ethereum-style: nonce consumed, state untouched), so
+/// the correct defense to check is that no funds actually moved, not that the tx was
+/// kept out of the block.
+fn value_did_not_move(tx: SignedTransaction, recipient: &AccountId) -> bool {
+    let mut chain = fresh_chain();
+    advance(&mut chain, 3);
+    let before = chain.ledger().account(recipient).balance.grains();
+    let Ok(block) = chain.produce_block(vec![tx], 100_000) else {
+        return true;
+    };
+    if chain.import_block(block).is_err() {
+        return true;
+    }
+    chain.ledger().account(recipient).balance.grains() == before
+}
+
+/// A tx from `usa.reserve.sov` (1000 SOV) transferring `amount` to a fresh sink account
+/// (balance 0, never the coinbase), for value-movement checks.
+fn overspend_tx(amount: Balance) -> (SignedTransaction, AccountId) {
+    let sink = Keypair::from_seed([7; 32])
+        .public_key()
+        .implicit_account_id();
+    let kp = Keypair::from_seed([2; 32]);
+    let tx = Transaction {
+        signer: id("usa.reserve.sov"),
+        public_key: kp.public_key(),
+        nonce: 0,
+        action: Action::Transfer {
+            to: sink.clone(),
+            amount,
+        },
+    };
+    (SignedTransaction::sign(tx, &kp).unwrap(), sink)
+}
+
+/// FORGERY: spend more than the account holds. A failed transfer is still mined but
+/// reverts — the defense is that no funds move.
+fn atk_tx_overspend() -> Outcome {
+    let c = "forgery";
+    let (tx, sink) = overspend_tx(Balance::from_sov(10_000).unwrap()); // holds 1000
+    if value_did_not_move(tx, &sink) {
+        Outcome::defended(
+            c,
+            "overspend (send > balance)",
+            "transfer FAILED — no funds moved (nonce consumed, reverted)",
+        )
+    } else {
+        Outcome::vulnerable(
+            c,
+            "overspend (send > balance)",
+            "over-balance funds were actually credited",
+        )
+    }
+}
+
+/// FORGERY: an astronomically large amount (~u128::MAX) to probe integer overflow in
+/// the balance/fee arithmetic.
+fn atk_tx_overflow() -> Outcome {
+    let c = "forgery";
+    let (tx, sink) = overspend_tx(Balance::from_grains(u128::MAX));
+    if value_did_not_move(tx, &sink) {
+        Outcome::defended(
+            c,
+            "amount overflow (~u128::MAX)",
+            "checked arithmetic — transfer failed, no funds moved",
+        )
+    } else {
+        Outcome::vulnerable(
+            c,
+            "amount overflow (~u128::MAX)",
+            "an overflowing transfer credited the recipient",
+        )
+    }
+}
+
+/// FORGERY: impersonate an account by signing with a key that is not its own.
+fn atk_tx_wrong_key() -> Outcome {
+    let c = "forgery";
+    let attacker = Keypair::from_seed([9; 32]); // NOT usa.reserve.sov's key (seed 2)
+    let tx = Transaction {
+        signer: id("usa.reserve.sov"),
+        public_key: attacker.public_key(),
+        nonce: 0,
+        action: Action::Transfer {
+            to: id("val01.node.sov"),
+            amount: Balance::from_sov(1).unwrap(),
+        },
+    };
+    let stx = SignedTransaction::sign(tx, &attacker).unwrap();
+    if tx_refused(stx) {
+        Outcome::defended(
+            c,
+            "impersonation (wrong signing key)",
+            "excluded — key is not the account's",
+        )
+    } else {
+        Outcome::vulnerable(
+            c,
+            "impersonation (wrong signing key)",
+            "a spend by the wrong key was committed",
+        )
+    }
+}
+
+/// FORGERY: edit the amount AFTER signing (signature malleability).
+fn atk_tx_malleability() -> Outcome {
+    let c = "forgery";
+    let mut stx = transfer(
+        "usa.reserve.sov",
+        2,
+        0,
+        "val01.node.sov",
+        Balance::from_sov(1).unwrap(),
+    );
+    stx.transaction.action = Action::Transfer {
+        to: id("val01.node.sov"),
+        amount: Balance::from_sov(500).unwrap(), // bumped 1 -> 500 after signing
+    };
+    if !stx.verify_signature() {
+        Outcome::defended(
+            c,
+            "malleability (edit amount after sign)",
+            "failed closed — the signature binds the amount",
+        )
+    } else {
+        Outcome::vulnerable(
+            c,
+            "malleability (edit amount after sign)",
+            "a post-signing edit still verified",
+        )
+    }
+}
+
+/// REPLAY: re-submit an already-mined transaction (its nonce is spent).
+fn atk_tx_replay() -> Outcome {
+    let c = "replay";
+    let mut chain = fresh_chain();
+    advance(&mut chain, 3);
+    let tx = transfer(
+        "usa.reserve.sov",
+        2,
+        0,
+        "val01.node.sov",
+        Balance::from_sov(1).unwrap(),
+    );
+    if let Ok(b) = chain.produce_block(vec![tx.clone()], 100_000) {
+        let _ = chain.import_block(b); // nonce 0 now spent
+    }
+    let Ok(b2) = chain.produce_block(vec![tx.clone()], 200_000) else {
+        return Outcome::defended(
+            c,
+            "transaction replay (reuse spent nonce)",
+            "producer refused to rebuild with it",
+        );
+    };
+    let landed = b2.transactions.iter().any(|t| t.id() == tx.id());
+    if !landed {
+        Outcome::defended(
+            c,
+            "transaction replay (reuse spent nonce)",
+            "excluded — nonce is enforced",
+        )
+    } else {
+        Outcome::vulnerable(
+            c,
+            "transaction replay (reuse spent nonce)",
+            "a spent transaction was mined twice",
+        )
+    }
+}
+
+/// FLOOD: submit a huge batch of valid transactions; the elastic block-size cap must
+/// bound the block regardless of demand (a flood can't create an unbounded block).
+fn atk_tx_flood() -> Outcome {
+    let c = "flood";
+    let mut chain = fresh_chain();
+    advance(&mut chain, 3);
+    let flood: Vec<SignedTransaction> = (0..20_000u64)
+        .map(|n| {
+            transfer(
+                "usa.reserve.sov",
+                2,
+                n,
+                "val01.node.sov",
+                Balance::from_grains(1),
+            )
+        })
+        .collect();
+    let submitted = flood.len();
+    let Ok(block) = chain.produce_block(flood, 100_000) else {
+        return Outcome::defended(
+            c,
+            "mempool tx flood (20k txs)",
+            "producer refused to build under the flood",
+        );
+    };
+    let included = block.transactions.len();
+    let valid = chain.import_block(block).is_ok();
+    if included < submitted && valid {
+        Outcome::defended(
+            c,
+            "mempool tx flood (20k txs)",
+            format!(
+                "block capped at {included}/{submitted} txs — elastic size cap held; block valid"
+            ),
+        )
+    } else if !valid {
+        Outcome::defended(
+            c,
+            "mempool tx flood (20k txs)",
+            "an over-full block was rejected on import",
+        )
+    } else {
+        Outcome::vulnerable(
+            c,
+            "mempool tx flood (20k txs)",
+            format!("all {submitted} txs entered one block — no cap"),
+        )
+    }
+}
+
 /// Run the full adversarial battery against a fresh in-process chain and return
 /// every attack's [`Outcome`], grouped by class in a stable order. Pure + in-process:
 /// a GUI (SOV Station's Red Team tab) or the CLI can both call this and render the
@@ -387,10 +638,21 @@ pub fn run_all() -> Vec<Outcome> {
             b.header.prev_hash = flip_hash(b.header.prev_hash)
         }),
         atk_coinbase_redirect(),
+        // forgery — fudged transactions
         atk_forged_tx_signature(),
+        atk_tx_malleability(),
+        atk_tx_wrong_key(),
+        atk_tx_overspend(),
+        atk_tx_overflow(),
+        // post-quantum
         atk_hybrid_pq_conjunction(),
+        // replay
         atk_duplicate_block(),
+        atk_tx_replay(),
+        // consensus
         atk_equal_work_tiebreak(),
+        // flood / DoS
+        atk_tx_flood(),
     ]
 }
 
