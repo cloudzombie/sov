@@ -1,0 +1,15 @@
+[package]
+name = "sov-redteam-gui"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "SOV Red Team — a STANDALONE desktop application for the adversarial harness. Separate from the wallet/daemon; reuses the sov-redteam engine library."
+
+[[bin]]
+name = "sov-redteam-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.29"
+sov-redteam = { path = "../chain/crates/redteam" }

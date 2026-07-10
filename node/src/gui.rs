@@ -1427,11 +1427,6 @@ pub struct Station {
     pending_send: Option<PendingSend>, // a send awaiting confirmation (review modal)
     block_detail: Option<u64>,      // height of the block open in the detail view
     vault_ui: VaultUi,              // all state for the Vault (multisig) tab; isolated
-    // Red Team tab: the adversarial harness runs OFF the UI thread (it builds a real
-    // in-process chain + mines), publishing its outcomes here; `redteam_running` gates
-    // the button + shows a live "attacking…" state.
-    redteam_results: Arc<Mutex<Option<Vec<sov_redteam::Outcome>>>>,
-    redteam_running: Arc<std::sync::atomic::AtomicBool>,
     wallets_dirty: bool, // wallets exist that aren't saved to the keystore
     confirm_quit: bool,  // quit requested with unsaved wallets — show guard
     gen_name: String,
@@ -1535,7 +1530,6 @@ enum Tab {
     Vault,
     Blocks,
     Activity,
-    RedTeam,
 }
 
 /// All transient UI state for the Vault (treasury multisig) tab — grouped in ONE
@@ -1706,8 +1700,6 @@ impl Station {
             pending_send: None,
             block_detail: None,
             vault_ui: VaultUi::default(),
-            redteam_results: Arc::new(Mutex::new(None)),
-            redteam_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             wallets_dirty: false,
             confirm_quit: false,
             gen_name: "my-wallet".to_string(),
@@ -3971,7 +3963,6 @@ impl eframe::App for Station {
                 self.tab_button(ui, Tab::Vault, "🛡", "Vault");
                 self.tab_button(ui, Tab::Blocks, "▦", "Blocks");
                 self.tab_button(ui, Tab::Activity, "◷", "Activity");
-                self.tab_button(ui, Tab::RedTeam, "⚔", "Red Team");
             });
             ui.add_space(4.0);
             ui.separator();
@@ -4066,11 +4057,6 @@ impl eframe::App for Station {
                     egui::ScrollArea::vertical()
                         .id_salt("scroll_activity")
                         .show(ui, |ui| self.activity_panel(ui));
-                }
-                Tab::RedTeam => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("scroll_redteam")
-                        .show(ui, |ui| self.redteam_panel(ui));
                 }
             }
         });
@@ -4686,215 +4672,6 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
 }
 
 impl Station {
-    /// Spawn the adversarial harness OFF the UI thread (it builds a real in-process
-    /// chain and mines) and publish its outcomes when done. Idempotent while running.
-    fn run_redteam(&self) {
-        use std::sync::atomic::Ordering;
-        if self.redteam_running.swap(true, Ordering::SeqCst) {
-            return; // a run is already in flight
-        }
-        let results = Arc::clone(&self.redteam_results);
-        let running = Arc::clone(&self.redteam_running);
-        std::thread::spawn(move || {
-            let outcomes = sov_redteam::run_all();
-            if let Ok(mut slot) = results.lock() {
-                *slot = Some(outcomes);
-            }
-            running.store(false, Ordering::SeqCst);
-        });
-    }
-
-    /// The **Red Team** tab — runs `sov-redteam` (the exact 13 attacks the CLI runs)
-    /// live, in-process, and renders them as a security console: a verdict banner, then
-    /// each attack grouped by class with a DEFENDED (green) / VULNERABLE (red) chip.
-    fn redteam_panel(&mut self, ui: &mut egui::Ui) {
-        use egui::{Color32, Margin, RichText, Rounding, Stroke};
-        use std::sync::atomic::Ordering;
-        let gold = Color32::from_rgb(230, 189, 84);
-        let hold = Color32::from_rgb(99, 211, 154);
-        let threat = Color32::from_rgb(232, 98, 74);
-        let pq = Color32::from_rgb(125, 176, 244);
-        let muted = palette::text_dim();
-
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.heading(RichText::new("⚔ Red Team").color(gold));
-            ui.label(
-                RichText::new("adversarial harness · attacks the real consensus code")
-                    .size(12.0)
-                    .color(muted),
-            );
-        });
-        ui.label(
-            RichText::new(
-                "Builds a real in-process chain and throws 13 attacks at produce_block / \
-                 import_block — the same path a node runs. Each is judged DEFENDED or VULNERABLE.",
-            )
-            .size(12.5)
-            .color(muted),
-        );
-        ui.add_space(8.0);
-
-        let running = self.redteam_running.load(Ordering::SeqCst);
-        ui.horizontal(|ui| {
-            let label = if running {
-                "⚔ attacking consensus…"
-            } else {
-                "⚔ Run red team"
-            };
-            if ui
-                .add_enabled(!running, egui::Button::new(RichText::new(label).strong()))
-                .clicked()
-            {
-                self.run_redteam();
-            }
-            if running {
-                ui.spinner();
-            }
-        });
-        if running {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(120));
-        }
-        ui.add_space(10.0);
-
-        // Snapshot the outcomes into owned tuples so we don't hold the lock while drawing.
-        let results: Option<Vec<(&'static str, &'static str, sov_redteam::Verdict, String)>> =
-            self.redteam_results.lock().ok().and_then(|g| {
-                g.as_ref().map(|v| {
-                    v.iter()
-                        .map(|o| (o.category, o.name, o.verdict, o.detail.clone()))
-                        .collect()
-                })
-            });
-        let Some(results) = results else {
-            if !running {
-                ui.label(
-                    RichText::new("Click “Run red team” to attack the chain live.")
-                        .color(muted)
-                        .italics(),
-                );
-            }
-            return;
-        };
-
-        let total = results.len();
-        let defended = results
-            .iter()
-            .filter(|(_, _, v, _)| *v == sov_redteam::Verdict::Defended)
-            .count();
-        let vulnerable = results
-            .iter()
-            .filter(|(_, _, v, _)| *v == sov_redteam::Verdict::Vulnerable)
-            .count();
-        let clear = vulnerable == 0;
-
-        // Verdict banner.
-        egui::Frame::none()
-            .fill(palette::surface())
-            .rounding(Rounding::same(12.0))
-            .stroke(Stroke::new(
-                1.0,
-                palette::tint(if clear { hold } else { threat }, 90),
-            ))
-            .inner_margin(Margin::symmetric(16.0, 14.0))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new(if clear {
-                        "EVERY DEFENSE HELD"
-                    } else {
-                        "VULNERABILITIES FOUND"
-                    })
-                    .size(22.0)
-                    .strong()
-                    .color(if clear { hold } else { threat }),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let stat = |ui: &mut egui::Ui, n: usize, label: &str, c: Color32| {
-                        ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new(n.to_string())
-                                    .size(24.0)
-                                    .strong()
-                                    .monospace()
-                                    .color(c),
-                            );
-                            ui.label(RichText::new(label).size(10.0).color(muted));
-                        });
-                    };
-                    stat(ui, total, "ATTACKS", gold);
-                    ui.add_space(18.0);
-                    stat(ui, defended, "DEFENDED", hold);
-                    ui.add_space(18.0);
-                    stat(ui, vulnerable, "VULNERABLE", threat);
-                });
-            });
-        ui.add_space(12.0);
-
-        // Attack rows, grouped by class.
-        let mut last_cat = "";
-        for (cat, name, verdict, detail) in &results {
-            if *cat != last_cat {
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(cat.to_uppercase())
-                        .size(11.0)
-                        .strong()
-                        .monospace()
-                        .color(gold),
-                );
-                last_cat = cat;
-            }
-            let is_pq = *cat == "post-quantum";
-            let (chip, chip_c) = match verdict {
-                sov_redteam::Verdict::Defended => ("✓ DEFENDED", hold),
-                sov_redteam::Verdict::Vulnerable => ("✗ VULNERABLE", threat),
-                sov_redteam::Verdict::Info => ("• INFO", gold),
-            };
-            egui::Frame::none()
-                .fill(palette::panel())
-                .rounding(Rounding::same(8.0))
-                .stroke(Stroke::new(1.0, palette::border()))
-                .inner_margin(Margin::symmetric(12.0, 9.0))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("▎").size(22.0).color(if is_pq {
-                            pq
-                        } else {
-                            threat
-                        }));
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(*name).strong().monospace().size(13.0));
-                            ui.label(RichText::new(detail).size(11.5).color(muted));
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(chip)
-                                    .size(11.0)
-                                    .strong()
-                                    .monospace()
-                                    .color(chip_c),
-                            );
-                        });
-                    });
-                });
-            ui.add_space(4.0);
-        }
-
-        ui.add_space(10.0);
-        ui.label(
-            RichText::new(
-                "Honest scope: we can't run Shor's / Grover's or forge BLAKE3 — this proves the \
-                 chain fails CLOSED. The hybrid signature needs BOTH halves, so a future break of \
-                 Ed25519 alone still leaves ML-DSA-65 (FIPS-204) stopping the forgery.",
-            )
-            .size(11.0)
-            .color(muted)
-            .italics(),
-        );
-    }
-
     /// The live node **HEARTBEAT** — floated bottom-right over every tab. A colored
     /// "lub-dub" orb with an expanding sonar ring, the peer count, sync state, and
     /// height. Everything is driven by REAL node telemetry:
