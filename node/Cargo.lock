@@ -4159,6 +4159,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sov-redteam"
+version = "0.1.0"
+dependencies = [
+ "sov-chain",
+ "sov-crypto",
+ "sov-mining",
+ "sov-primitives",
+ "sov-state",
+ "sov-types",
+ "sov-verify",
+]
+
+[[package]]
 name = "sov-rpc"
 version = "0.0.0"
 dependencies = [
@@ -4250,6 +4263,7 @@ dependencies = [
  "sha2 0.10.9",
  "sov-crypto",
  "sov-primitives",
+ "sov-redteam",
  "sov-rpc",
  "sov-shielded",
  "sov-types",

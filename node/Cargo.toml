@@ -9,6 +9,7 @@ description = "Native SOV wallet and mining-node operator station."
 [dependencies]
 sov-primitives = { path = "../chain/crates/primitives" }
 sov-rpc = { path = "../chain/crates/rpc" }
+sov-redteam = { path = "../chain/crates/redteam" }
 sov-crypto = { path = "../chain/crates/crypto" }
 sov-wallet = { path = "../chain/crates/wallet" }
 sov-shielded = { path = "../chain/crates/shielded" }
