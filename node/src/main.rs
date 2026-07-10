@@ -1,4 +1,10 @@
 #![forbid(unsafe_code)]
+// egui's API is uniformly `f32`, so float literals passed to it (`1.0`, colors, sizes)
+// intentionally take the f32 fallback. rustc 1.97 added `float_literal_f32_fallback`,
+// which flags that as surprising — it isn't here. Allow it crate-wide; `unknown_lints`
+// keeps the allow harmless on older toolchains that don't know the lint yet.
+#![allow(unknown_lints)]
+#![allow(float_literal_f32_fallback)]
 
 use std::env;
 use std::fmt::Display;
