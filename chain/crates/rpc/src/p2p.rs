@@ -1371,7 +1371,11 @@ mod tests {
         // Retry rather than flake; HELLO_TIMEOUT (30s) is far longer than this wait, so a
         // freshly-recorded peer is never dropped here.
         let mut recorded = false;
-        for _ in 0..500 {
+        // 30s (matching the connect loop above): under the release gate's saturated CPU,
+        // the peer's Noise+ML-KEM (post-quantum) handshake — which is what makes it appear
+        // in connected_peers() and thus get a first_seen stamp — can take well over the
+        // old 10s window. HELLO_TIMEOUT (30s) still guarantees it isn't dropped meanwhile.
+        for _ in 0..1500 {
             state.sweep_unauthenticated(&server);
             if state.first_seen.len() == 1 {
                 recorded = true;
