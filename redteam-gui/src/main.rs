@@ -442,9 +442,30 @@ impl RedTeamApp {
             .strong()
             .color(if admitted == 0 { HOLD } else { THREAT }),
         );
+
+        // No-residue proof: the mempool must be unchanged if nothing was admitted.
+        if let (Some(b), Some(a)) = (report.mempool_before, report.mempool_after) {
+            let ok = report.no_residue();
+            ui.label(
+                RichText::new(format!(
+                    "mempool {b} → {a}  ·  {}",
+                    if ok { "no residue — nothing landed" } else { "RESIDUE — a tx was admitted!" }
+                ))
+                .size(11.5)
+                .monospace()
+                .color(if ok { HOLD } else { THREAT }),
+            );
+        }
         ui.add_space(8.0);
 
+        // Group the probes by class (crypto / authz / encoding / rpc).
+        let mut last = "";
         for o in &report.outcomes {
+            if o.category != last {
+                ui.add_space(7.0);
+                ui.label(RichText::new(o.category.to_uppercase()).size(11.0).strong().monospace().color(PQ));
+                last = o.category;
+            }
             Self::outcome_row(ui, o.name, o.verdict, &o.detail, PQ);
         }
     }

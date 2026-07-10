@@ -81,16 +81,31 @@ fn live_mode(addr: &str) {
     let height = report.height.map(|h| h.to_string()).unwrap_or_else(|| "?".into());
     let banner = if report.is_mainnet { "\x1b[33mLIVE MAINNET\x1b[0m" } else { chain };
     println!("  target {}  ·  chain {}  ·  height {}\n", report.target, banner, height);
-    println!("  ── LIVE FRONT-DOOR ──");
 
     let (mut defended, mut vulnerable, mut info) = (0u32, 0u32, 0u32);
+    let mut last_cat = "";
     for o in &report.outcomes {
+        if o.category != last_cat {
+            println!("  ── {} ──", o.category.to_uppercase());
+            last_cat = o.category;
+        }
         let (tag, mark) = mark_of(o.verdict, &mut defended, &mut vulnerable, &mut info);
-        println!("   {mark} [{tag:<10}] {:<42} {}", o.name, o.detail);
+        println!("   {mark} [{tag:<10}] {:<48} {}", o.name, o.detail);
+    }
+
+    // No-residue proof: the mempool must be unchanged if every attack was rejected
+    // before admission.
+    if let (Some(b), Some(a)) = (report.mempool_before, report.mempool_after) {
+        let verdict = if report.no_residue() {
+            "\x1b[32mno residue — nothing landed\x1b[0m"
+        } else {
+            "\x1b[31mRESIDUE — a tx was admitted!\x1b[0m"
+        };
+        println!("\n  mempool {b} → {a}  ·  {verdict}");
     }
 
     println!(
-        "\n  {} probes · \x1b[32m{defended} defended\x1b[0m · \x1b[31m{vulnerable} vulnerable\x1b[0m · {info} info",
+        "  {} probes · \x1b[32m{defended} defended\x1b[0m · \x1b[31m{vulnerable} vulnerable\x1b[0m · {info} info",
         report.outcomes.len()
     );
     if live_any_vulnerable(&report) {
