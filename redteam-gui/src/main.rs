@@ -96,6 +96,20 @@ impl RedTeamApp {
         });
     }
 
+    /// Clear every result panel so the app returns to its initial state. Disabled while
+    /// any probe is running (we don't interrupt a live attack mid-flight).
+    fn reset(&self) {
+        if let Ok(mut r) = self.results.lock() {
+            *r = None;
+        }
+        if let Ok(mut r) = self.live_report.lock() {
+            *r = None;
+        }
+        if let Ok(mut r) = self.backdoor_report.lock() {
+            *r = None;
+        }
+    }
+
     /// Fire the live back-door probe at `self.target`, off the UI thread.
     fn run_backdoor(&self) {
         if self.backdoor_running.swap(true, Ordering::SeqCst) {
@@ -178,6 +192,18 @@ impl RedTeamApp {
         // ── masthead ──
         ui.horizontal(|ui| {
             ui.label(RichText::new("⚔ SOV Red Team").size(26.0).strong().color(GOLD));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let any_busy = self.running.load(Ordering::SeqCst)
+                    || self.live_running.load(Ordering::SeqCst)
+                    || self.backdoor_running.load(Ordering::SeqCst);
+                let btn = egui::Button::new(RichText::new("↺ Reset").size(13.0).color(INK))
+                    .fill(SURFACE)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .min_size(egui::vec2(78.0, 26.0));
+                if ui.add_enabled(!any_busy, btn).on_hover_text("Clear all results and start over").clicked() {
+                    self.reset();
+                }
+            });
         });
         ui.label(
             RichText::new("adversarial harness · attacks the real consensus code, in-process")
