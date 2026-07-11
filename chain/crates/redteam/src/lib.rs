@@ -27,6 +27,10 @@ use sov_types::{Action, Block, SignedTransaction, Transaction};
 pub mod live;
 pub use live::{any_vulnerable as live_any_vulnerable, probe_frontdoor, LiveReport};
 
+/// Live-fire back-door probe: join the P2P network as a hostile peer and gossip forgeries.
+pub mod backdoor;
+pub use backdoor::{any_vulnerable as backdoor_any_vulnerable, probe_backdoor, P2pReport};
+
 // ── attack framework ─────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]

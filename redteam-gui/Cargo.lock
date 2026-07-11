@@ -4128,6 +4128,7 @@ dependencies = [
  "sov-chain",
  "sov-crypto",
  "sov-mining",
+ "sov-network",
  "sov-primitives",
  "sov-rpc",
  "sov-state",

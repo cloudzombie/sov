@@ -10,16 +10,20 @@
 //! The live-fire probe is side-effect-free — every tx it sends is rejected at admission,
 //! so nothing lands in the target's mempool.
 
-use sov_redteam::{live_any_vulnerable, probe_frontdoor, run_all, Verdict};
+use sov_redteam::{
+    backdoor_any_vulnerable, live_any_vulnerable, probe_backdoor, probe_frontdoor, run_all, Verdict,
+};
 
 fn main() {
-    // `--target <addr>` (or `--target=<addr>`) switches to the live front-door probe.
+    // `--target <addr>` switches to a live probe; add `--p2p` for the back-door probe.
     let args: Vec<String> = std::env::args().skip(1).collect();
     let target = parse_target(&args);
+    let p2p = args.iter().any(|a| a == "--p2p" || a == "--backdoor");
 
-    match target {
-        Some(addr) => live_mode(&addr),
-        None => in_process_mode(),
+    match (target, p2p) {
+        (Some(addr), true) => backdoor_mode(&addr),
+        (Some(addr), false) => live_mode(&addr),
+        (None, _) => in_process_mode(),
     }
 }
 
@@ -113,6 +117,60 @@ fn live_mode(addr: &str) {
         std::process::exit(1);
     } else {
         println!("  the front door held — every adversarial tx was rejected before admission.\n");
+    }
+}
+
+fn backdoor_mode(addr: &str) {
+    println!("\n  sov-redteam — LIVE BACK-DOOR probe (P2P peer)");
+    println!("  joining the network as a hostile peer and gossiping forged blocks/txs over the wire…\n");
+
+    let report = probe_backdoor(addr);
+
+    if let Some(err) = &report.error {
+        println!("  \x1b[31mcould not run: {err}\x1b[0m\n");
+        std::process::exit(2);
+    }
+
+    let chain = report.chain_id.as_deref().unwrap_or("unknown");
+    let banner = if report.is_mainnet { "\x1b[33mLIVE MAINNET\x1b[0m" } else { chain };
+    let auth = if report.authenticated { "\x1b[32mauthenticated\x1b[0m" } else { "\x1b[31mNOT authenticated\x1b[0m" };
+    println!("  p2p {}  ·  chain {}  ·  hostile peer {}", report.p2p_target, banner, auth);
+    if let Some((h, hash)) = &report.head_before {
+        println!("  head before: height {h}  {}", &hash[..16.min(hash.len())]);
+    }
+    println!();
+
+    let (mut defended, mut vulnerable, mut info) = (0u32, 0u32, 0u32);
+    let mut last_cat = "";
+    for o in &report.outcomes {
+        if o.category != last_cat {
+            println!("  ── {} ──", o.category.to_uppercase());
+            last_cat = o.category;
+        }
+        let (tag, mark) = mark_of(o.verdict, &mut defended, &mut vulnerable, &mut info);
+        println!("   {mark} [{tag:<10}] {:<44} {}", o.name, o.detail);
+    }
+
+    // Tip-held proof + ejection.
+    if let (Some((hb, _)), Some((ha, _))) = (&report.head_before, &report.head_after) {
+        let moved = ha != hb;
+        println!(
+            "\n  head after: height {ha}  ·  {}",
+            if moved { "advanced by the node's OWN honest mining (no forged hash adopted)" } else { "unmoved" }
+        );
+    }
+    if report.ejected {
+        println!("  \x1b[32mthe node BANNED our peer — the attacker was ejected\x1b[0m");
+    }
+    println!(
+        "  {} probes · \x1b[32m{defended} defended\x1b[0m · \x1b[31m{vulnerable} vulnerable\x1b[0m · {info} info",
+        report.outcomes.len()
+    );
+    if backdoor_any_vulnerable(&report) {
+        println!("  \x1b[31mA FORGED BLOCK/TX WAS ACCEPTED — see ✗ above.\x1b[0m\n");
+        std::process::exit(1);
+    } else {
+        println!("  the back door held — no forged block was adopted, no forged tx admitted.\n");
     }
 }
 

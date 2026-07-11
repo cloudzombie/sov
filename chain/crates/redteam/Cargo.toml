@@ -19,4 +19,7 @@ sov-chain = { path = "../chain" }
 # Live-fire front-door probe: talk to a REAL running node over JSON-RPC. `sov-rpc`
 # ships a std-only HTTP client (no extra transport deps), so this stays lightweight.
 sov-rpc = { path = "../rpc" }
+# Live-fire BACK-DOOR probe: join the P2P network as a real (hostile) peer and
+# gossip forged blocks/txs over the encrypted Noise-XX + ML-KEM wire.
+sov-network = { path = "../network" }
 serde_json = "1"

@@ -41,6 +41,9 @@ struct RedTeamApp {
     target: String,
     live_report: Arc<Mutex<Option<sov_redteam::LiveReport>>>,
     live_running: Arc<AtomicBool>,
+    // Live back-door probe: join P2P as a hostile peer and gossip forged blocks/txs.
+    backdoor_report: Arc<Mutex<Option<sov_redteam::P2pReport>>>,
+    backdoor_running: Arc<AtomicBool>,
     themed: bool,
 }
 
@@ -52,6 +55,8 @@ impl Default for RedTeamApp {
             target: "127.0.0.1:8645".to_string(),
             live_report: Arc::new(Mutex::new(None)),
             live_running: Arc::new(AtomicBool::new(false)),
+            backdoor_report: Arc::new(Mutex::new(None)),
+            backdoor_running: Arc::new(AtomicBool::new(false)),
             themed: false,
         }
     }
@@ -84,6 +89,23 @@ impl RedTeamApp {
         let running = Arc::clone(&self.live_running);
         std::thread::spawn(move || {
             let r = sov_redteam::probe_frontdoor(&target);
+            if let Ok(mut slot) = report.lock() {
+                *slot = Some(r);
+            }
+            running.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Fire the live back-door probe at `self.target`, off the UI thread.
+    fn run_backdoor(&self) {
+        if self.backdoor_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let target = self.target.clone();
+        let report = Arc::clone(&self.backdoor_report);
+        let running = Arc::clone(&self.backdoor_running);
+        std::thread::spawn(move || {
+            let r = sov_redteam::probe_backdoor(&target);
             if let Ok(mut slot) = report.lock() {
                 *slot = Some(r);
             }
@@ -467,6 +489,128 @@ impl RedTeamApp {
                 last = o.category;
             }
             Self::outcome_row(ui, o.name, o.verdict, &o.detail, PQ);
+        }
+
+        drop(guard);
+        ui.add_space(20.0);
+        ui.separator();
+        ui.add_space(12.0);
+        self.backdoor_section(ui);
+    }
+
+    /// The live back-door probe: join the P2P network as a hostile peer and gossip forged
+    /// blocks/txs over the encrypted wire, proving the node's tip never adopts them.
+    fn backdoor_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("⛒ Live back-door probe").size(19.0).strong().color(THREAT));
+        ui.label(
+            RichText::new(
+                "Join the P2P network as a HOSTILE peer and gossip forged blocks + txs over the \
+                 encrypted Noise-XX + ML-KEM wire — the nation-state surface. No wire-forged block \
+                 can carry valid RandomX PoW, so each is rejected at the seal or parent gate and the \
+                 tip never moves; after a few the node BANS us. Nothing lands.",
+            )
+            .size(12.0)
+            .color(MUTED),
+        );
+        ui.add_space(10.0);
+
+        let running = self.backdoor_running.load(Ordering::SeqCst);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("node").size(12.0).color(MUTED));
+            ui.add_enabled(
+                !running,
+                egui::TextEdit::singleline(&mut self.target).desired_width(210.0).hint_text("host:port (RPC)"),
+            );
+            let label = if running { "⛒ attacking P2P…" } else { "⛒ Probe back door" };
+            let btn = egui::Button::new(RichText::new(label).strong().color(Color32::from_rgb(17, 16, 13)))
+                .fill(THREAT)
+                .min_size(egui::vec2(150.0, 30.0));
+            if ui.add_enabled(!running, btn).clicked() {
+                self.run_backdoor();
+            }
+            if running {
+                ui.spinner();
+            }
+        });
+        if running {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        ui.add_space(12.0);
+
+        let Ok(guard) = self.backdoor_report.lock() else {
+            return;
+        };
+        let Some(report) = guard.as_ref() else {
+            if !running {
+                ui.label(
+                    RichText::new("Point it at a node to gossip forged blocks over the real wire.")
+                        .color(MUTED)
+                        .italics(),
+                );
+            }
+            return;
+        };
+
+        if let Some(err) = &report.error {
+            egui::Frame::none()
+                .fill(SURFACE)
+                .rounding(Rounding::same(10.0))
+                .stroke(Stroke::new(1.0, alpha(GOLD, 120)))
+                .inner_margin(Margin::symmetric(16.0, 12.0))
+                .show(ui, |ui| {
+                    ui.label(RichText::new("could not run").size(14.0).strong().color(GOLD));
+                    ui.label(RichText::new(err).size(12.0).color(MUTED));
+                });
+            return;
+        }
+
+        // connectivity + identity banner
+        egui::Frame::none()
+            .fill(SURFACE)
+            .rounding(Rounding::same(10.0))
+            .stroke(Stroke::new(1.0, alpha(if report.is_mainnet { GOLD } else { THREAT }, 120)))
+            .inner_margin(Margin::symmetric(16.0, 12.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (txt, col) = if report.authenticated {
+                        ("● hostile peer authenticated", HOLD)
+                    } else {
+                        ("○ not authenticated", THREAT)
+                    };
+                    ui.label(RichText::new(txt).size(12.0).strong().color(col));
+                    ui.add_space(12.0);
+                    ui.label(RichText::new(&report.p2p_target).size(12.0).monospace().color(INK));
+                    ui.add_space(12.0);
+                    if report.is_mainnet {
+                        ui.label(RichText::new("LIVE MAINNET").size(12.0).strong().monospace().color(GOLD));
+                    }
+                });
+                if let (Some((hb, _)), Some((ha, _))) = (&report.head_before, &report.head_after) {
+                    let moved = ha != hb;
+                    ui.label(
+                        RichText::new(format!(
+                            "head {hb} → {ha}  ·  {}",
+                            if moved { "advanced only by the node's own honest mining" } else { "tip unmoved" }
+                        ))
+                        .size(11.5)
+                        .monospace()
+                        .color(HOLD),
+                    );
+                }
+                if report.ejected {
+                    ui.label(RichText::new("the node BANNED our peer — attacker ejected").size(11.5).strong().color(HOLD));
+                }
+            });
+        ui.add_space(10.0);
+
+        let mut last = "";
+        for o in &report.outcomes {
+            if o.category != last {
+                ui.add_space(7.0);
+                ui.label(RichText::new(o.category.to_uppercase()).size(11.0).strong().monospace().color(THREAT));
+                last = o.category;
+            }
+            Self::outcome_row(ui, o.name, o.verdict, &o.detail, THREAT);
         }
     }
 }
