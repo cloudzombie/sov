@@ -13,3 +13,7 @@ path = "src/main.rs"
 [dependencies]
 eframe = "0.29"
 sov-redteam = { path = "../chain/crates/redteam" }
+# Reconstruct the funded keypair from the seed the operator pastes (held in memory only).
+sov-crypto = { path = "../chain/crates/crypto" }
+# Wipe the pasted secret + derived seed from memory when done.
+zeroize = "1"

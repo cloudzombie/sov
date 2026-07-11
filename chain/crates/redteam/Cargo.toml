@@ -22,4 +22,8 @@ sov-rpc = { path = "../rpc" }
 # Live-fire BACK-DOOR probe: join the P2P network as a real (hostile) peer and
 # gossip forged blocks/txs over the encrypted Noise-XX + ML-KEM wire.
 sov-network = { path = "../network" }
+# Funded-adversary probe: derive the REAL funded keypair from a mnemonic (BIP-39 +
+# SLIP-0010, the same derivation sov-station uses) or a raw hex seed.
+sov-wallet = { path = "../wallet" }
+hex = "0.4"
 serde_json = "1"

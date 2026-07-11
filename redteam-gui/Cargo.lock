@@ -4124,6 +4124,7 @@ dependencies = [
 name = "sov-redteam"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "serde_json",
  "sov-chain",
  "sov-crypto",
@@ -4134,6 +4135,7 @@ dependencies = [
  "sov-state",
  "sov-types",
  "sov-verify",
+ "sov-wallet",
 ]
 
 [[package]]
@@ -4141,7 +4143,9 @@ name = "sov-redteam-gui"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "sov-crypto",
  "sov-redteam",
+ "zeroize",
 ]
 
 [[package]]

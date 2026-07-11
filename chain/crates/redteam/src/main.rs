@@ -11,20 +11,72 @@
 //! so nothing lands in the target's mempool.
 
 use sov_redteam::{
-    backdoor_any_vulnerable, live_any_vulnerable, probe_backdoor, probe_frontdoor, run_all, Verdict,
+    backdoor_any_vulnerable, funded_any_vulnerable, keypair_from_secret, live_any_vulnerable,
+    probe_backdoor, probe_frontdoor, probe_funded, run_all, Verdict,
 };
 
 fn main() {
-    // `--target <addr>` switches to a live probe; add `--p2p` for the back-door probe.
+    // `--target <addr>` switches to a live probe; add `--p2p` for the back-door probe, or
+    // `--funded` for the funded-adversary probe (key from the SOV_REDTEAM_KEY env var, so
+    // the secret is never on the command line).
     let args: Vec<String> = std::env::args().skip(1).collect();
     let target = parse_target(&args);
     let p2p = args.iter().any(|a| a == "--p2p" || a == "--backdoor");
+    let funded = args.iter().any(|a| a == "--funded");
 
-    match (target, p2p) {
-        (Some(addr), true) => backdoor_mode(&addr),
-        (Some(addr), false) => live_mode(&addr),
-        (None, _) => in_process_mode(),
+    match target {
+        Some(addr) if funded => funded_mode(&addr),
+        Some(addr) if p2p => backdoor_mode(&addr),
+        Some(addr) => live_mode(&addr),
+        None => in_process_mode(),
     }
+}
+
+fn funded_mode(addr: &str) {
+    println!("\n  sov-redteam — FUNDED-ADVERSARY probe");
+    let secret = match std::env::var("SOV_REDTEAM_KEY") {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => {
+            println!("  \x1b[31mset SOV_REDTEAM_KEY to the funded account's mnemonic or 32-byte hex seed\x1b[0m\n");
+            std::process::exit(2);
+        }
+    };
+    let kp = match keypair_from_secret(&secret) {
+        Ok(kp) => kp,
+        Err(e) => {
+            println!("  \x1b[31m{e}\x1b[0m\n");
+            std::process::exit(2);
+        }
+    };
+    println!("  attacking AS a real funded account — attempting a double-spend of its own XUS…\n");
+    let report = probe_funded(addr, &kp, 100_000);
+    if let Some(err) = &report.error {
+        println!("  \x1b[31m{err}\x1b[0m\n");
+        std::process::exit(2);
+    }
+    let banner = if report.is_mainnet { "\x1b[33mLIVE MAINNET\x1b[0m" } else { report.chain_id.as_deref().unwrap_or("unknown") };
+    println!("  account {}  ·  balance {}  ·  nonce {}  ·  {}", short(&report.account), report.balance, report.nonce, banner);
+    println!();
+
+    let (mut defended, mut vulnerable, mut info) = (0u32, 0u32, 0u32);
+    for o in &report.outcomes {
+        let (tag, mark) = mark_of(o.verdict, &mut defended, &mut vulnerable, &mut info);
+        println!("   {mark} [{tag:<10}] {:<44} {}", o.name, o.detail);
+    }
+    println!(
+        "\n  {} steps · \x1b[32m{defended} defended\x1b[0m · \x1b[31m{vulnerable} vulnerable\x1b[0m · {info} info",
+        report.outcomes.len()
+    );
+    if funded_any_vulnerable(&report) {
+        println!("  \x1b[31mA DOUBLE-SPEND OR REPLAY WAS ADMITTED — see ✗ above.\x1b[0m\n");
+        std::process::exit(1);
+    } else {
+        println!("  the chain refused to spend the same coin twice.\n");
+    }
+}
+
+fn short(s: &str) -> String {
+    s.chars().take(16).collect()
 }
 
 /// Pull the value of `--target <addr>` / `--target=<addr>` out of the args, if present.

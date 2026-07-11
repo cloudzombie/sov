@@ -44,6 +44,13 @@ struct RedTeamApp {
     // Live back-door probe: join P2P as a hostile peer and gossip forged blocks/txs.
     backdoor_report: Arc<Mutex<Option<sov_redteam::P2pReport>>>,
     backdoor_running: Arc<AtomicBool>,
+    // Funded-adversary probe: attack AS a real funded account (key pasted at runtime).
+    funded_key_input: String,
+    funded_seed: Option<[u8; 32]>,
+    funded_account: String,
+    funded_status: String,
+    funded_report: Arc<Mutex<Option<sov_redteam::FundedReport>>>,
+    funded_running: Arc<AtomicBool>,
     themed: bool,
 }
 
@@ -57,6 +64,12 @@ impl Default for RedTeamApp {
             live_running: Arc::new(AtomicBool::new(false)),
             backdoor_report: Arc::new(Mutex::new(None)),
             backdoor_running: Arc::new(AtomicBool::new(false)),
+            funded_key_input: String::new(),
+            funded_seed: None,
+            funded_account: String::new(),
+            funded_status: String::new(),
+            funded_report: Arc::new(Mutex::new(None)),
+            funded_running: Arc::new(AtomicBool::new(false)),
             themed: false,
         }
     }
@@ -108,6 +121,53 @@ impl RedTeamApp {
         if let Ok(mut r) = self.backdoor_report.lock() {
             *r = None;
         }
+        if let Ok(mut r) = self.funded_report.lock() {
+            *r = None;
+        }
+    }
+
+    /// Load the funded key the operator pasted: derive the seed (mnemonic or hex),
+    /// remember it in memory, show which account it controls, and scrub the input.
+    fn load_funded(&mut self) {
+        use zeroize::Zeroize;
+        match sov_redteam::seed_from_secret(&self.funded_key_input) {
+            Ok(seed) => {
+                let kp = sov_crypto::Keypair::hybrid_from_seed(seed);
+                self.funded_account = sov_redteam::account_of(&kp).to_string();
+                self.funded_seed = Some(seed);
+                self.funded_status = "key loaded — held in memory only".to_string();
+            }
+            Err(e) => {
+                self.funded_seed = None;
+                self.funded_account.clear();
+                self.funded_status = e;
+            }
+        }
+        // Scrub the pasted secret from the text field's buffer.
+        self.funded_key_input.zeroize();
+        self.funded_key_input.clear();
+    }
+
+    /// Run the funded-adversary probe with the loaded seed, off the UI thread.
+    fn run_funded(&self) {
+        let Some(seed) = self.funded_seed else {
+            return;
+        };
+        if self.funded_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let target = self.target.clone();
+        let report = Arc::clone(&self.funded_report);
+        let running = Arc::clone(&self.funded_running);
+        std::thread::spawn(move || {
+            let kp = sov_crypto::Keypair::hybrid_from_seed(seed);
+            // Leg 1 moves 0.001 XUS to itself (net-zero); a tiny fee is the only cost.
+            let r = sov_redteam::probe_funded(&target, &kp, 100_000);
+            if let Ok(mut slot) = report.lock() {
+                *slot = Some(r);
+            }
+            running.store(false, Ordering::SeqCst);
+        });
     }
 
     /// Fire the live back-door probe at `self.target`, off the UI thread.
@@ -637,6 +697,108 @@ impl RedTeamApp {
                 last = o.category;
             }
             Self::outcome_row(ui, o.name, o.verdict, &o.detail, THREAT);
+        }
+
+        drop(guard);
+        ui.add_space(20.0);
+        ui.separator();
+        ui.add_space(12.0);
+        self.funded_section(ui);
+    }
+
+    /// The funded-adversary probe: attack AS a REAL funded account. The operator pastes
+    /// the key (held in memory only); the probe attempts a double-spend of that account's
+    /// own XUS and proves the chain refuses it.
+    fn funded_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("₿ Funded adversary").size(19.0).strong().color(GOLD));
+        ui.label(
+            RichText::new(
+                "Attack as a REAL, funded account. Paste its key (mnemonic or 32-byte hex seed) — \
+                 held in memory only, never written to disk. The probe tries to DOUBLE-SPEND the \
+                 account's own XUS: an honest net-zero self-transfer races a conflicting spend on \
+                 the same nonce. The chain must keep only one. This spends a real fee on leg 1.",
+            )
+            .size(12.0)
+            .color(MUTED),
+        );
+        ui.add_space(10.0);
+
+        // Key entry (password-style) + Load.
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("funded key").size(12.0).color(MUTED));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.funded_key_input)
+                    .password(true)
+                    .desired_width(260.0)
+                    .hint_text("mnemonic  or  32-byte hex seed"),
+            );
+            if ui.button(RichText::new("Load").strong()).clicked() {
+                self.load_funded();
+            }
+        });
+        if !self.funded_account.is_empty() {
+            ui.label(RichText::new(format!("account  {}", self.funded_account)).size(11.5).monospace().color(HOLD));
+        }
+        if !self.funded_status.is_empty() {
+            let ok = self.funded_seed.is_some();
+            ui.label(RichText::new(&self.funded_status).size(11.0).color(if ok { MUTED } else { THREAT }));
+        }
+        ui.add_space(8.0);
+
+        // Run.
+        let running = self.funded_running.load(Ordering::SeqCst);
+        let has_key = self.funded_seed.is_some();
+        let btn = egui::Button::new(
+            RichText::new(if running { "₿ attacking…" } else { "₿ Run funded double-spend (spends a real fee)" })
+                .strong()
+                .color(Color32::from_rgb(17, 16, 13)),
+        )
+        .fill(GOLD)
+        .min_size(egui::vec2(300.0, 32.0));
+        if ui.add_enabled(has_key && !running, btn).clicked() {
+            self.run_funded();
+        }
+        if running {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        ui.add_space(12.0);
+
+        let Ok(guard) = self.funded_report.lock() else {
+            return;
+        };
+        let Some(report) = guard.as_ref() else {
+            return;
+        };
+
+        if let Some(err) = &report.error {
+            ui.label(RichText::new(err).size(12.0).color(THREAT).italics());
+            return;
+        }
+
+        // Balance / identity banner.
+        egui::Frame::none()
+            .fill(SURFACE)
+            .rounding(Rounding::same(10.0))
+            .stroke(Stroke::new(1.0, alpha(GOLD, 120)))
+            .inner_margin(Margin::symmetric(16.0, 12.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("balance {}", report.balance)).size(13.0).strong().monospace().color(GOLD));
+                    ui.add_space(14.0);
+                    ui.label(RichText::new(format!("nonce {}", report.nonce)).size(12.0).monospace().color(MUTED));
+                    ui.add_space(14.0);
+                    if report.is_mainnet {
+                        ui.label(RichText::new("LIVE MAINNET").size(12.0).strong().monospace().color(GOLD));
+                    }
+                });
+                if report.balance_grains == 0 {
+                    ui.label(RichText::new("account shows no balance — fund it first for leg 1 to confirm").size(11.0).color(THREAT));
+                }
+            });
+        ui.add_space(10.0);
+
+        for o in &report.outcomes {
+            Self::outcome_row(ui, o.name, o.verdict, &o.detail, GOLD);
         }
     }
 }
