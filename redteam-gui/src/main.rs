@@ -33,7 +33,18 @@ fn alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
+/// Which probe the content area is showing. Funded is first — it's the marquee.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Funded,
+    FrontDoor,
+    BackDoor,
+    InProcess,
+}
+
 struct RedTeamApp {
+    /// The probe currently shown in the content area.
+    view: View,
     // In-process battery: attack a private replica of consensus.
     results: Arc<Mutex<Option<Vec<sov_redteam::Outcome>>>>,
     running: Arc<AtomicBool>,
@@ -57,6 +68,7 @@ struct RedTeamApp {
 impl Default for RedTeamApp {
     fn default() -> Self {
         Self {
+            view: View::Funded,
             results: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
             target: "127.0.0.1:8645".to_string(),
@@ -237,40 +249,98 @@ impl RedTeamApp {
 impl eframe::App for RedTeamApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.theme(ctx);
+
+        // Header bar: identity, the global node target, and Reset.
+        egui::TopBottomPanel::top("header")
+            .frame(egui::Frame::none().fill(PANEL).inner_margin(Margin::symmetric(20.0, 13.0)))
+            .show(ctx, |ui| self.header(ui));
+
+        // Left nav rail: pick the probe.
+        egui::SidePanel::left("nav")
+            .resizable(false)
+            .exact_width(186.0)
+            .frame(egui::Frame::none().fill(PANEL).inner_margin(Margin::symmetric(12.0, 14.0)))
+            .show(ctx, |ui| self.nav(ui));
+
+        // Content area: the active probe.
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(GROUND).inner_margin(Margin::symmetric(22.0, 18.0)))
+            .frame(egui::Frame::none().fill(GROUND).inner_margin(Margin::symmetric(24.0, 18.0)))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.render(ui));
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.set_max_width(720.0);
+                    match self.view {
+                        View::Funded => self.funded_section(ui),
+                        View::FrontDoor => self.live_section(ui),
+                        View::BackDoor => self.backdoor_section(ui),
+                        View::InProcess => self.inprocess_section(ui),
+                    }
+                });
             });
     }
 }
 
 impl RedTeamApp {
-    fn render(&mut self, ui: &mut egui::Ui) {
-        ui.set_max_width(720.0);
-
-        // ── masthead ──
+    /// The top bar: title, the shared node RPC field, and Reset.
+    fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("⚔ SOV Red Team").size(26.0).strong().color(GOLD));
+            ui.label(RichText::new("⚔ SOV Red Team").size(21.0).strong().color(GOLD));
+            ui.add_space(10.0);
+            ui.label(RichText::new("adversarial harness").size(12.0).color(MUTED));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let any_busy = self.running.load(Ordering::SeqCst)
                     || self.live_running.load(Ordering::SeqCst)
-                    || self.backdoor_running.load(Ordering::SeqCst);
+                    || self.backdoor_running.load(Ordering::SeqCst)
+                    || self.funded_running.load(Ordering::SeqCst);
                 let btn = egui::Button::new(RichText::new("↺ Reset").size(13.0).color(INK))
                     .fill(SURFACE)
                     .stroke(Stroke::new(1.0, BORDER))
-                    .min_size(egui::vec2(78.0, 26.0));
-                if ui.add_enabled(!any_busy, btn).on_hover_text("Clear all results and start over").clicked() {
+                    .min_size(egui::vec2(74.0, 26.0));
+                if ui.add_enabled(!any_busy, btn).on_hover_text("Clear all results").clicked() {
                     self.reset();
                 }
+                ui.add_space(14.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.target)
+                        .desired_width(150.0)
+                        .hint_text("host:port"),
+                );
+                ui.label(RichText::new("node RPC").size(12.0).color(MUTED));
             });
         });
-        ui.label(
-            RichText::new("adversarial harness · attacks the real consensus code, in-process")
-                .size(12.5)
-                .color(MUTED),
-        );
+    }
+
+    /// The left nav rail.
+    fn nav(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(2.0);
+        self.nav_item(ui, View::Funded, "₿", "Funded adversary", GOLD);
+        self.nav_item(ui, View::FrontDoor, "⌁", "Front door", PQ);
+        self.nav_item(ui, View::BackDoor, "⛒", "Back door", THREAT);
+        self.nav_item(ui, View::InProcess, "⚔", "In-process", HOLD);
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            ui.add_space(4.0);
+            ui.label(RichText::new("live mainnet").size(10.0).color(MUTED));
+            ui.label(RichText::new("real attacks ·").size(10.0).color(MUTED));
+        });
+    }
+
+    /// One nav rail entry.
+    fn nav_item(&mut self, ui: &mut egui::Ui, view: View, icon: &str, label: &str, accent: Color32) {
+        let active = self.view == view;
+        let fg = if active { accent } else { INK };
+        let fill = if active { SURFACE } else { PANEL };
+        let btn = egui::Button::new(RichText::new(format!("{icon}  {label}")).size(13.5).color(fg).strong())
+            .fill(fill)
+            .stroke(if active { Stroke::new(1.0, alpha(accent, 130)) } else { Stroke::NONE })
+            .min_size(egui::vec2(ui.available_width(), 38.0));
+        if ui.add(btn).clicked() {
+            self.view = view;
+        }
         ui.add_space(4.0);
+    }
+
+    /// The in-process battery: attacks against a private replica of consensus.
+    fn inprocess_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("⚔ In-process battery").size(19.0).strong().color(HOLD));
         ui.label(
             RichText::new(
                 "Builds a real chain and throws a battery of attacks at produce_block / \
@@ -429,11 +499,6 @@ impl RedTeamApp {
             .color(MUTED)
             .italics(),
         );
-
-        ui.add_space(20.0);
-        ui.separator();
-        ui.add_space(12.0);
-        self.live_section(ui);
     }
 
     /// The live front-door probe: point at a running node and submit adversarial txs
@@ -453,17 +518,10 @@ impl RedTeamApp {
 
         let live_running = self.live_running.load(Ordering::SeqCst);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("node RPC").size(12.0).color(MUTED));
-            ui.add_enabled(
-                !live_running,
-                egui::TextEdit::singleline(&mut self.target)
-                    .desired_width(210.0)
-                    .hint_text("host:port"),
-            );
             let label = if live_running { "⌁ probing…" } else { "⌁ Probe front door" };
             let btn = egui::Button::new(RichText::new(label).strong().color(Color32::from_rgb(17, 16, 13)))
                 .fill(PQ)
-                .min_size(egui::vec2(150.0, 30.0));
+                .min_size(egui::vec2(160.0, 32.0));
             if ui.add_enabled(!live_running, btn).clicked() {
                 self.run_live();
             }
@@ -576,12 +634,6 @@ impl RedTeamApp {
             }
             Self::outcome_row(ui, o.name, o.verdict, &o.detail, PQ);
         }
-
-        drop(guard);
-        ui.add_space(20.0);
-        ui.separator();
-        ui.add_space(12.0);
-        self.backdoor_section(ui);
     }
 
     /// The live back-door probe: join the P2P network as a hostile peer and gossip forged
@@ -602,15 +654,10 @@ impl RedTeamApp {
 
         let running = self.backdoor_running.load(Ordering::SeqCst);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("node").size(12.0).color(MUTED));
-            ui.add_enabled(
-                !running,
-                egui::TextEdit::singleline(&mut self.target).desired_width(210.0).hint_text("host:port (RPC)"),
-            );
             let label = if running { "⛒ attacking P2P…" } else { "⛒ Probe back door" };
             let btn = egui::Button::new(RichText::new(label).strong().color(Color32::from_rgb(17, 16, 13)))
                 .fill(THREAT)
-                .min_size(egui::vec2(150.0, 30.0));
+                .min_size(egui::vec2(160.0, 32.0));
             if ui.add_enabled(!running, btn).clicked() {
                 self.run_backdoor();
             }
@@ -698,12 +745,6 @@ impl RedTeamApp {
             }
             Self::outcome_row(ui, o.name, o.verdict, &o.detail, THREAT);
         }
-
-        drop(guard);
-        ui.add_space(20.0);
-        ui.separator();
-        ui.add_space(12.0);
-        self.funded_section(ui);
     }
 
     /// The funded-adversary probe: attack AS a REAL funded account. The operator pastes
@@ -806,8 +847,8 @@ impl RedTeamApp {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([780.0, 940.0])
-            .with_min_inner_size([560.0, 480.0])
+            .with_inner_size([1040.0, 920.0])
+            .with_min_inner_size([880.0, 560.0])
             .with_title("SOV Red Team"),
         ..Default::default()
     };
