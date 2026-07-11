@@ -754,10 +754,13 @@ impl RedTeamApp {
         ui.label(RichText::new("₿ Funded adversary").size(19.0).strong().color(GOLD));
         ui.label(
             RichText::new(
-                "Attack as a REAL, funded account. Paste its key (mnemonic or 32-byte hex seed) — \
-                 held in memory only, never written to disk. The probe tries to DOUBLE-SPEND the \
-                 account's own XUS: an honest net-zero self-transfer races a conflicting spend on \
-                 the same nonce. The chain must keep only one. This spends a real fee on leg 1.",
+                "Attack as a REAL, funded account — probe it like a thief. Paste its key (mnemonic \
+                 or 32-byte hex seed), held in memory only, never on disk. After proving control \
+                 with an honest net-zero self-transfer, it tries to STEAL: double-spend the whole \
+                 balance, front-run/replace, replay to drain twice, rewind the nonce, and drain an \
+                 account it doesn't own. Every theft is refused at admission — no coins move. Only \
+                 the honest tx lands (a small gas fee); overspend/overflow are proven in-process so \
+                 they can't wedge your account.",
             )
             .size(12.0)
             .color(MUTED),

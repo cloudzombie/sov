@@ -48,7 +48,7 @@ fn funded_mode(addr: &str) {
             std::process::exit(2);
         }
     };
-    println!("  attacking AS a real funded account — attempting a double-spend of its own XUS…\n");
+    println!("  attacking AS a real funded account — probing it like a thief (double-spend, replay, rewind, drain)…\n");
     let report = probe_funded(addr, &kp, 100_000);
     if let Some(err) = &report.error {
         println!("  \x1b[31m{err}\x1b[0m\n");

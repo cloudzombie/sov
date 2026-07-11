@@ -1,16 +1,23 @@
-//! **Funded-adversary probe** — attack the live chain AS a real, funded account.
+//! **Funded-adversary probe** — attack the live chain AS a real, funded account, probing
+//! it the way a thief would: try to spend the same coins twice, replay a payment, rewind
+//! the nonce, front-run yourself, and drain an account you don't own.
 //!
-//! Every other live probe uses zero-balance throwaway accounts, so its transactions are
-//! rejected at admission and nothing moves. This probe is different: the operator pastes
-//! the private key of a REAL account (funded with real XUS), and the tool acts as that
-//! account. The headline attack is a DOUBLE-SPEND — commit the same nonce to two
-//! conflicting transactions and prove the chain keeps at most one. Leg 1 is an honest
-//! net-zero self-transfer (a real, confirming tx that proves the funded key works, moving
-//! value out and back to itself minus a fee); leg 2 tries to spend that same nonce to an
-//! attacker. The chain must refuse leg 2. A replay of leg 1 must also be refused.
+//! Every other live probe uses zero-balance throwaways. This one holds a REAL key the
+//! operator pastes and controls real XUS. It first proves control with an honest net-zero
+//! self-transfer (the ONE tx that lands — value leaves and returns to the same account,
+//! only a gas fee spent), then runs a THEFT campaign whose every attempt the chain must
+//! refuse:
+//!   - double-spend the whole balance to a thief (nonce reuse) → refused (one tx / nonce),
+//!   - front-run / replace-by-fee (swap recipient on the same nonce) → refused (no RBF),
+//!   - replay the payment to drain twice → refused (already pooled),
+//!   - rewind the nonce to re-spend a past state → refused (stale nonce),
+//!   - drain an account we don't own (wrong signer) → refused (unauthorized).
 //!
-//! This DOES touch the live chain with real value: leg 1 confirms (a tiny fee is spent).
-//! It never sends the balance anywhere but back to itself, so the funds stay put.
+//! SAFETY: the theft attempts are all rejected AT ADMISSION, so they consume no nonce and
+//! leave no trace; only the honest self-transfer lands (a small gas fee). We deliberately
+//! do NOT fire overspend/overflow "mint" txs at the live account — an overspend is admitted
+//! but never selected (block building skips failing txs), and a stuck tx at a fresh nonce
+//! would wedge the account; that value-creation defense is proven in the in-process battery.
 
 use std::time::Duration;
 
@@ -75,16 +82,27 @@ pub fn account_of(kp: &Keypair) -> AccountId {
     kp.public_key().implicit_account_id()
 }
 
-/// Build a signed transfer of `amount` grains from `kp`'s implicit account to `to` at
-/// `nonce`.
+/// Build a signed transfer of `amount` from `kp`'s implicit account to `to` at `nonce`.
 fn transfer(kp: &Keypair, nonce: u64, to: AccountId, amount: Balance) -> SignedTransaction {
+    transfer_as(account_of(kp), kp, nonce, to, amount)
+}
+
+/// Build a transfer that DECLARES `signer` as the source account but is signed by `kp`.
+/// When `signer` is not `kp`'s own account, this is an attempt to spend an account the
+/// key does not control.
+fn transfer_as(signer: AccountId, kp: &Keypair, nonce: u64, to: AccountId, amount: Balance) -> SignedTransaction {
     let tx = Transaction {
-        signer: account_of(kp),
+        signer,
         public_key: kp.public_key(),
         nonce,
         action: Action::Transfer { to, amount },
     };
     SignedTransaction::sign(tx, kp).unwrap()
+}
+
+/// A distinct throwaway "thief" account (an implicit id nobody controls).
+fn thief(seed: u8) -> AccountId {
+    Keypair::hybrid_from_seed([seed; 32]).public_key().implicit_account_id()
 }
 
 /// Run the funded-adversary battery against `rpc_target` as the account controlled by
@@ -118,45 +136,81 @@ pub fn probe_funded(rpc_target: &str, kp: &Keypair, spend_grains: u128) -> Funde
         report.balance_grains = bal.grains();
     }
 
-    let sink = Keypair::hybrid_from_seed([202; 32]).public_key().implicit_account_id();
-    let amount = Balance::from_grains(spend_grains);
-    // Most of the balance — what an attacker would try to steal on the double-spent nonce.
-    let big = Balance::from_grains(report.balance_grains.max(spend_grains));
+    let whole = Balance::from_grains(report.balance_grains.max(spend_grains)); // the whole stash
+    let dust = Balance::from_grains(spend_grains);
 
-    // Leg 1 — honest, net-zero SELF-transfer at nonce N. A real, confirming tx: proves the
-    // funded key authorizes live transactions (value leaves and returns to the same
-    // account; only a fee is spent).
-    let leg1 = transfer(kp, nonce, account.clone(), amount);
-    let leg1_id = leg1.id().to_hex();
-    match client.submit_transaction(&leg1) {
+    // ── CONTROL: prove the key really owns spendable funds ──
+    // An honest, net-zero SELF-transfer at nonce N. The ONE tx that lands (value leaves
+    // and returns to the same account; only a gas fee is spent). Everything after it is a
+    // theft attempt that must fail.
+    let baseline = transfer(kp, nonce, account.clone(), dust);
+    let baseline_id = baseline.id().to_hex();
+    match client.submit_transaction(&baseline) {
         Ok(id) => report.outcomes.push(Outcome::info(
-            "funded",
-            "leg 1: honest self-transfer (real tx)",
+            "control",
+            "prove control — net-zero self-transfer",
             format!("ACCEPTED — the funded key signed a live tx ({}); confirms net-zero", short(&id.to_hex())),
         )),
         Err(e) => report.outcomes.push(Outcome::info(
-            "funded",
-            "leg 1: honest self-transfer (real tx)",
+            "control",
+            "prove control — net-zero self-transfer",
             format!("not accepted — {} (is the account funded?)", trim(&e.to_string())),
         )),
     }
 
-    // Leg 2 — the DOUBLE-SPEND: reuse nonce N to send most of the balance to an attacker.
-    // The mempool binds one transaction per (signer, nonce), so this must be refused.
-    let leg2 = transfer(kp, nonce, sink, big);
+    // ── THEFT: spend the same coins more than once ──
     report.outcomes.push(judge_rejected(
         &client,
-        "leg 2: DOUBLE-SPEND (reuse nonce N)",
-        &leg2,
-        "double-spend blocked — nonce already committed to leg 1",
+        "double-spend the whole balance to a thief",
+        &transfer(kp, nonce, thief(211), whole),
+        "refused — nonce N already committed; the coins can't be spent twice",
+    ));
+    report.outcomes.push(judge_rejected(
+        &client,
+        "front-run / replace-by-fee (swap recipient, same nonce)",
+        &transfer(kp, nonce, thief(212), whole),
+        "refused — no replace-by-fee; the nonce is already bound",
+    ));
+    report.outcomes.push(judge_rejected(
+        &client,
+        "replay to drain twice (resubmit the same tx)",
+        &baseline,
+        &format!("refused — {} already pooled", short(&baseline_id)),
+    ));
+    if nonce > 0 {
+        report.outcomes.push(judge_rejected(
+            &client,
+            "rewind the nonce to re-spend (stale nonce N-1)",
+            &transfer(kp, nonce - 1, thief(213), whole),
+            "refused — stale nonce; you can't rewind to re-spend",
+        ));
+    } else {
+        report.outcomes.push(Outcome::info(
+            "theft",
+            "rewind the nonce to re-spend (stale nonce N-1)",
+            "n/a — account has no history yet (nonce 0)".to_string(),
+        ));
+    }
+
+    // ── THEFT: spend an account we don't own ──
+    let victim = thief(216);
+    report.outcomes.push(judge_rejected(
+        &client,
+        "drain an account we don't own (wrong signer)",
+        &transfer_as(victim, kp, 0, account.clone(), whole),
+        "refused — our key can't authorize an account it doesn't control",
     ));
 
-    // Replay — resubmit leg 1's exact bytes. Already pooled, so it must be refused.
-    report.outcomes.push(judge_rejected(
-        &client,
-        "replay leg 1 (resubmit same tx)",
-        &leg1,
-        &format!("replay blocked — {} already pooled", short(&leg1_id)),
+    // ── THEFT: create value from nothing ──
+    // We DON'T fire these at the live account: an overspend has no mempool balance gate,
+    // so it would be admitted but never selected (block building skips failing txs), and a
+    // stuck tx at a fresh nonce would WEDGE the account. The value-creation defense is
+    // proven with certainty by the in-process battery, where the tx is force-included and
+    // observed to revert with no funds moved.
+    report.outcomes.push(Outcome::info(
+        "theft",
+        "mint from thin air / integer overflow",
+        "not fired live (would wedge the account's nonce) — overspend & ~u128::MAX overflow are proven to REVERT with no credit in the in-process battery".to_string(),
     ));
 
     report
