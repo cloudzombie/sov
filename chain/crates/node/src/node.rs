@@ -106,8 +106,24 @@ impl Node {
             });
         }
         self.mempool
-            .insert(stx, account.nonce)
+            .insert(stx, account.nonce, account.balance)
             .map_err(NodeError::Mempool)
+    }
+
+    /// A snapshot of the pending pool — persisted to disk so it survives a restart.
+    pub fn mempool_snapshot(&self) -> Vec<SignedTransaction> {
+        self.mempool.snapshot()
+    }
+
+    /// Re-admit a persisted pool against current state on startup, dropping any tx that no
+    /// longer validates (stale nonce, now unaffordable).
+    pub fn restore_mempool(&mut self, txs: Vec<SignedTransaction>) {
+        let ledger = self.chain.ledger();
+        self.mempool.restore(
+            txs,
+            |a| ledger.account(a).nonce,
+            |a| ledger.account(a).balance,
+        );
     }
 
     /// Produce (mine), import, and (self-)finalize the next block at
@@ -178,7 +194,8 @@ impl Node {
         }
         {
             let ledger = self.chain.ledger();
-            self.mempool.prune_stale(|a| ledger.account(a).nonce);
+            self.mempool
+                .prune(|a| ledger.account(a).nonce, |a| ledger.account(a).balance);
         }
         Ok(Produced { block, receipts })
     }
@@ -220,11 +237,13 @@ impl Node {
         // active chain already applied are rejected as stale, and the rest become
         // pending again. The reorg's new ledger is already in place.
         for stx in imported.reverted_txs {
-            let nonce = self.chain.ledger().account(&stx.transaction.signer).nonce;
-            let _ = self.mempool.insert(stx, nonce);
+            let acct = self.chain.ledger().account(&stx.transaction.signer);
+            let (nonce, balance) = (acct.nonce, acct.balance);
+            let _ = self.mempool.insert(stx, nonce, balance);
         }
         let ledger = self.chain.ledger();
-        self.mempool.prune_stale(|a| ledger.account(a).nonce);
+        self.mempool
+            .prune(|a| ledger.account(a).nonce, |a| ledger.account(a).balance);
         Ok(imported.receipts)
     }
 }

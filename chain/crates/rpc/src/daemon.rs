@@ -31,7 +31,7 @@ use sov_network::{NetMessage, TcpNode};
 use sov_node::{Node, NodeError, Produced};
 use sov_primitives::{AccountId, Balance, Hash};
 use sov_state::Ledger;
-use sov_types::{Block, Receipt};
+use sov_types::{Block, Receipt, SignedTransaction};
 
 use crate::sync_status::SyncShared;
 use crate::{RpcHandle, RpcServer};
@@ -779,6 +779,35 @@ fn snapshot_path(dir: &Path) -> PathBuf {
     dir.join("chainstate.snapshot")
 }
 
+/// The persisted mempool file: the pending pool, so it survives a restart instead of
+/// being silently dropped. Best-effort — the chain (block log) is the source of truth, so
+/// a missing/corrupt file just means an empty pool, and every restored tx is re-validated
+/// against live state on load (stale/unaffordable ones are dropped).
+fn mempool_path(dir: &Path) -> PathBuf {
+    dir.join("mempool.dat")
+}
+
+/// Serialize the pending pool and durably write it (atomic temp+rename), under a brief
+/// node lock. Cheap (the pool is bounded), so it is written on the periodic snapshot tick
+/// and once more on clean shutdown.
+fn write_mempool(path: &Path, node: &Mutex<Node>) {
+    let txs = match node.lock() {
+        Ok(n) => n.mempool_snapshot(),
+        Err(_) => return,
+    };
+    if let Ok(bytes) = borsh::to_vec(&txs) {
+        let _ = write_snapshot_bytes(path, &bytes);
+    }
+}
+
+/// Load a persisted pool; empty on missing/corrupt.
+fn load_mempool(path: &Path) -> Vec<SignedTransaction> {
+    match fs::read(path) {
+        Ok(bytes) => borsh::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// How often (in committed blocks of active-head advance) a running daemon refreshes
 /// its chainstate snapshot. Frequent enough that even an unclean exit leaves only a
 /// small post-snapshot gap to trusted-replay; the snapshot write is cheap and done off
@@ -949,6 +978,8 @@ pub struct Daemon {
     gossip: Option<Arc<TcpNode>>,
     /// Where the chainstate fast-start snapshot is written/refreshed.
     snapshot_path: PathBuf,
+    /// Where the pending mempool is persisted, so it survives a restart.
+    mempool_path: PathBuf,
     /// Whether this boot resumed from a chainstate snapshot (tier 1) rather than
     /// replaying the block log. Observability for operators/tests.
     resumed_fast: bool,
@@ -1110,12 +1141,22 @@ impl Daemon {
             }
         }
 
+        // Restore the pending pool persisted at last shutdown, re-validating every tx
+        // against the state we just replayed (stale/unaffordable ones are dropped). The
+        // chain is the source of truth, so a missing/corrupt file is harmless.
+        let mp_path = mempool_path(&data_dir);
+        let restored = load_mempool(&mp_path);
+        if !restored.is_empty() {
+            node.restore_mempool(restored);
+        }
+
         Ok(Daemon {
             node: Arc::new(Mutex::new(node)),
             resumed,
             block_log,
             gossip: None,
             snapshot_path: snap_path,
+            mempool_path: mp_path,
             resumed_fast,
             sync_status: None,
             log: None,
@@ -1302,6 +1343,7 @@ impl Daemon {
         let gossip = self.gossip.clone();
         let block_log = Arc::clone(&self.block_log);
         let snap_path = self.snapshot_path.clone();
+        let mp_path = self.mempool_path.clone();
         let sync_status = self.sync_status.clone();
         let log = self.log.clone();
         let sd = Arc::clone(&shutdown);
@@ -1357,6 +1399,9 @@ impl Daemon {
                     if write_snapshot_bytes(&snap_path, &bytes).is_ok() {
                         last_snap_height = h;
                     }
+                    // Persist the pending pool alongside each chainstate snapshot, so a
+                    // crash between here and shutdown still recovers most of the pool.
+                    write_mempool(&mp_path, &node);
                 }
 
                 // RELAY-ONLY: a seed/anchor node that never mines. It still snapshots
@@ -1622,6 +1667,8 @@ impl Daemon {
                 drop(n);
                 let _ = write_snapshot_bytes(&snap_path, &bytes);
             }
+            // Persist the pending pool on clean shutdown, so it survives the restart.
+            write_mempool(&mp_path, &node);
         });
 
         Ok(DaemonHandle {
@@ -2086,6 +2133,59 @@ mod tests {
             mining: MiningPolicy::test(),
             vesting: vec![],
         }
+    }
+
+    #[test]
+    fn mempool_persists_across_restart() {
+        use sov_types::{Action, Transaction};
+        let genesis = gate_test_genesis();
+        let dir = std::env::temp_dir().join(format!(
+            "sov-mempool-persist-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let signer = AccountId::new("val01.node.sov").unwrap();
+        let kp = Keypair::from_seed([7; 32]);
+        // A zero-value self-transfer: affordable from a zero-balance account (outflow 0),
+        // so it is admitted — all we need to exercise persistence, no funds required.
+        let stx = SignedTransaction::sign(
+            Transaction {
+                signer: signer.clone(),
+                public_key: kp.public_key(),
+                nonce: 0,
+                action: Action::Transfer { to: signer.clone(), amount: Balance::ZERO },
+            },
+            &kp,
+        )
+        .unwrap();
+        let tx_id = stx.id();
+        let keys = || vec![(signer.clone(), Keypair::from_seed([7; 32]))];
+
+        // First boot: submit the tx and persist the pool.
+        {
+            let daemon = Daemon::new(&genesis, &dir, 1024, 256, keys()).unwrap();
+            let node = daemon.node();
+            node.lock().unwrap().submit(stx).unwrap();
+            assert_eq!(node.lock().unwrap().mempool_len(), 1);
+            write_mempool(&mempool_path(&dir), &node);
+        }
+
+        // Restart: a fresh daemon on the same dir restores the pending tx on boot.
+        {
+            let daemon = Daemon::new(&genesis, &dir, 1024, 256, keys()).unwrap();
+            let node = daemon.node();
+            assert_eq!(
+                node.lock().unwrap().mempool_len(),
+                1,
+                "the pending pool must survive a restart"
+            );
+            assert!(node
+                .lock()
+                .unwrap()
+                .mempool_snapshot()
+                .iter()
+                .any(|t| t.id() == tx_id));
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
