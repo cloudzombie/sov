@@ -13,11 +13,14 @@
 //!   - rewind the nonce to re-spend a past state → refused (stale nonce),
 //!   - drain an account we don't own (wrong signer) → refused (unauthorized).
 //!
-//! SAFETY: the theft attempts are all rejected AT ADMISSION, so they consume no nonce and
-//! leave no trace; only the honest self-transfer lands (a small gas fee). We deliberately
-//! do NOT fire overspend/overflow "mint" txs at the live account — an overspend is admitted
-//! but never selected (block building skips failing txs), and a stuck tx at a fresh nonce
-//! would wedge the account; that value-creation defense is proven in the in-process battery.
+//! It also tries to CREATE value from nothing — a mint-from-thin-air and an integer
+//! overflow — fired live but signed by THROWAWAY empty accounts, so a node with the
+//! mempool affordability gate rejects them at admission (no value, no wedge) and a node
+//! that predates the gate only strands the throwaway, never the funded account.
+//!
+//! SAFETY: the theft attempts are all rejected at admission (or, for the mint attempts,
+//! signed by throwaways), so none consume the funded account's nonce or move its coins;
+//! only the honest self-transfer lands (a small gas fee).
 
 use std::time::Duration;
 
@@ -202,15 +205,21 @@ pub fn probe_funded(rpc_target: &str, kp: &Keypair, spend_grains: u128) -> Funde
     ));
 
     // ── THEFT: create value from nothing ──
-    // We DON'T fire these at the live account: an overspend has no mempool balance gate,
-    // so it would be admitted but never selected (block building skips failing txs), and a
-    // stuck tx at a fresh nonce would WEDGE the account. The value-creation defense is
-    // proven with certainty by the in-process battery, where the tx is force-included and
-    // observed to revert with no funds moved.
-    report.outcomes.push(Outcome::info(
-        "theft",
-        "mint from thin air / integer overflow",
-        "not fired live (would wedge the account's nonce) — overspend & ~u128::MAX overflow are proven to REVERT with no credit in the in-process battery".to_string(),
+    // Fired LIVE, but signed by THROWAWAY empty accounts — so a node with the affordability
+    // gate rejects them at admission (no value, no wedge), and a node that predates the gate
+    // would only strand the throwaway's own nonce, never the funded account. Either way the
+    // beneficiary is never credited, which is the property that actually matters.
+    report.outcomes.push(judge_mint(
+        &client,
+        "mint from thin air (spend from an EMPTY account)",
+        &mint_attempt(230, thief(231), Balance::from_sov(1_000_000).unwrap()),
+        &thief(231),
+    ));
+    report.outcomes.push(judge_mint(
+        &client,
+        "integer-overflow a credit (~u128::MAX)",
+        &mint_attempt(232, thief(233), Balance::from_grains(u128::MAX)),
+        &thief(233),
     ));
 
     report
@@ -221,6 +230,36 @@ fn judge_rejected(client: &RpcClient, name: &'static str, stx: &SignedTransactio
     match client.submit_transaction(stx) {
         Err(e) => Outcome::defended("funded", name, format!("{on_defended} — {}", trim(&e.to_string()))),
         Ok(id) => Outcome::vulnerable("funded", name, format!("ACCEPTED — a conflicting/replayed tx was admitted ({})", short(&id.to_hex()))),
+    }
+}
+
+/// A transfer of `amount` FROM a throwaway empty implicit account (self-certifying, so it
+/// authenticates) — an attempt to move value the account does not have. Signed by the
+/// throwaway's own key, so any admission strands only the throwaway, never a real account.
+fn mint_attempt(from_seed: u8, to: AccountId, amount: Balance) -> SignedTransaction {
+    let kp = Keypair::hybrid_from_seed([from_seed; 32]);
+    let tx = Transaction {
+        signer: kp.public_key().implicit_account_id(),
+        public_key: kp.public_key(),
+        nonce: 0,
+        action: Action::Transfer { to, amount },
+    };
+    SignedTransaction::sign(tx, &kp).unwrap()
+}
+
+/// Judge a mint/overflow attempt by the only thing that matters — did value appear? The
+/// `beneficiary`'s balance must stay zero. A gated node also REJECTS it at admission (best);
+/// a pre-gate node admits it but execution reverts (no credit) — reported as INFO with a
+/// nudge to deploy the affordability gate.
+fn judge_mint(client: &RpcClient, name: &'static str, stx: &SignedTransaction, beneficiary: &AccountId) -> Outcome {
+    let admitted = client.submit_transaction(stx).is_ok();
+    let credited = client.balance(beneficiary).map(|b| b.grains() > 0).unwrap_or(false);
+    if credited {
+        Outcome::vulnerable("theft", name, "VALUE CREATED — the beneficiary was credited from thin air".to_string())
+    } else if !admitted {
+        Outcome::defended("theft", name, "refused at admission — an unaffordable transfer can't be pooled (affordability gate); no value created".to_string())
+    } else {
+        Outcome::info("theft", name, "admitted but reverts — no value created (this node predates the affordability gate; rebuild to reject it at the door)".to_string())
     }
 }
 

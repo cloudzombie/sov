@@ -757,10 +757,10 @@ impl RedTeamApp {
                 "Attack as a REAL, funded account — probe it like a thief. Paste its key (mnemonic \
                  or 32-byte hex seed), held in memory only, never on disk. After proving control \
                  with an honest net-zero self-transfer, it tries to STEAL: double-spend the whole \
-                 balance, front-run/replace, replay to drain twice, rewind the nonce, and drain an \
-                 account it doesn't own. Every theft is refused at admission — no coins move. Only \
-                 the honest tx lands (a small gas fee); overspend/overflow are proven in-process so \
-                 they can't wedge your account.",
+                 balance, front-run/replace, replay to drain twice, rewind the nonce, drain an \
+                 account it doesn't own, and mint from thin air (from throwaway empty accounts, so \
+                 it can never wedge your funds). Every theft is refused — no coins move. Only the \
+                 honest tx lands (a small gas fee).",
             )
             .size(12.0)
             .color(MUTED),

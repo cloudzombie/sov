@@ -2189,6 +2189,57 @@ mod tests {
     }
 
     #[test]
+    fn rpc_rejects_an_overspend_at_admission() {
+        // The affordability gate, end-to-end over the real RPC socket: an overspend (any
+        // transfer from a zero-balance account) is refused at admission and never enters
+        // the pool — the exact behavior the funded red-team probe's "mint from thin air"
+        // relies on. Signed by a throwaway account, so nothing real is touched.
+        use crate::RpcClient;
+        use sov_types::{Action, Transaction};
+        let genesis = gate_test_genesis();
+        let dir = std::env::temp_dir().join(format!(
+            "sov-overspend-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let daemon = Daemon::new(
+            &genesis,
+            &dir,
+            1024,
+            256,
+            vec![(AccountId::new("val01.node.sov").unwrap(), Keypair::from_seed([7; 32]))],
+        )
+        .unwrap();
+        let handle = daemon.run("127.0.0.1:0", 1, 20, false).unwrap();
+
+        let kp = Keypair::from_seed([9; 32]);
+        let overspend = SignedTransaction::sign(
+            Transaction {
+                signer: kp.public_key().implicit_account_id(),
+                public_key: kp.public_key(),
+                nonce: 0,
+                action: Action::Transfer {
+                    to: AccountId::new("val01.node.sov").unwrap(),
+                    amount: Balance::from_sov(1).unwrap(), // from a 0-balance account ⇒ overspend
+                },
+            },
+            &kp,
+        )
+        .unwrap();
+
+        let client = RpcClient::new(handle.rpc_addr().to_string());
+        let res = client.submit_transaction(&overspend);
+        assert!(res.is_err(), "an overspend must be refused at admission, got {res:?}");
+        assert_eq!(
+            handle.node().lock().unwrap().mempool_len(),
+            0,
+            "the overspend must not enter the pool"
+        );
+
+        handle.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn mining_is_gated_while_behind_then_resumes_when_caught_up() {
         // The bootstrap-correctness guarantee: a node that is BEHIND a heavier peer
         // chain does not mine (it would only fork), and it resumes mining the instant
