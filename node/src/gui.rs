@@ -1427,8 +1427,8 @@ pub struct Station {
     pending_send: Option<PendingSend>, // a send awaiting confirmation (review modal)
     block_detail: Option<u64>,      // height of the block open in the detail view
     vault_ui: VaultUi,              // all state for the Vault (multisig) tab; isolated
-    wallets_dirty: bool, // wallets exist that aren't saved to the keystore
-    confirm_quit: bool,  // quit requested with unsaved wallets — show guard
+    wallets_dirty: bool,            // wallets exist that aren't saved to the keystore
+    confirm_quit: bool,             // quit requested with unsaved wallets — show guard
     gen_name: String,
     import_name: String,
     import_mnemonic: String,
