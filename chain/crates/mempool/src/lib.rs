@@ -427,7 +427,8 @@ mod tests {
         // the pooled total to 6 > 5, so it is refused.
         let mut pool = Mempool::new(100);
         let bal = Balance::from_sov(5).unwrap();
-        pool.insert(tx_amt([1; 32], "usa.reserve.sov", 0, 3), 0, bal).unwrap();
+        pool.insert(tx_amt([1; 32], "usa.reserve.sov", 0, 3), 0, bal)
+            .unwrap();
         assert!(matches!(
             pool.insert(tx_amt([1; 32], "usa.reserve.sov", 1, 3), 0, bal),
             Err(MempoolError::Insufficient { .. })
@@ -441,18 +442,36 @@ mod tests {
         // The next prune must evict it (it can no longer be mined).
         let mut pool = Mempool::new(100);
         let sender = id("usa.reserve.sov");
-        pool.insert(tx_amt([1; 32], "usa.reserve.sov", 0, 4), 0, Balance::from_sov(5).unwrap())
-            .unwrap();
+        pool.insert(
+            tx_amt([1; 32], "usa.reserve.sov", 0, 4),
+            0,
+            Balance::from_sov(5).unwrap(),
+        )
+        .unwrap();
         assert_eq!(pool.len(), 1);
-        pool.prune(|_| 0, |a| if *a == sender { Balance::from_sov(1).unwrap() } else { big() });
-        assert!(pool.is_empty(), "an unaffordable tx must be reaped by prune");
+        pool.prune(
+            |_| 0,
+            |a| {
+                if *a == sender {
+                    Balance::from_sov(1).unwrap()
+                } else {
+                    big()
+                }
+            },
+        );
+        assert!(
+            pool.is_empty(),
+            "an unaffordable tx must be reaped by prune"
+        );
     }
 
     #[test]
     fn snapshot_then_restore_keeps_affordable_drops_stale() {
         let mut pool = Mempool::new(100);
-        pool.insert(tx_amt([1; 32], "usa.reserve.sov", 0, 1), 0, big()).unwrap();
-        pool.insert(tx_amt([1; 32], "usa.reserve.sov", 1, 1), 0, big()).unwrap();
+        pool.insert(tx_amt([1; 32], "usa.reserve.sov", 0, 1), 0, big())
+            .unwrap();
+        pool.insert(tx_amt([1; 32], "usa.reserve.sov", 1, 1), 0, big())
+            .unwrap();
         let snap = pool.snapshot();
         assert_eq!(snap.len(), 2);
 
@@ -478,7 +497,10 @@ mod tests {
         let mut pool = Mempool::new(100);
         let mut t = tx([1; 32], "usa.reserve.sov", 0);
         t.transaction.nonce = 5; // breaks signature
-        assert_eq!(pool.insert(t, 0, big()), Err(MempoolError::InvalidSignature));
+        assert_eq!(
+            pool.insert(t, 0, big()),
+            Err(MempoolError::InvalidSignature)
+        );
     }
 
     #[test]
@@ -494,7 +516,8 @@ mod tests {
     #[test]
     fn rejects_duplicate() {
         let mut pool = Mempool::new(100);
-        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big()).unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
         assert_eq!(
             pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big()),
             Err(MempoolError::Duplicate)
@@ -541,7 +564,8 @@ mod tests {
     #[test]
     fn rejects_when_full() {
         let mut pool = Mempool::new(1);
-        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big()).unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
         assert_eq!(
             pool.insert(tx([2; 32], "ecb.reserve.sov", 0), 0, big()),
             Err(MempoolError::Full { capacity: 1 })
@@ -551,10 +575,13 @@ mod tests {
     #[test]
     fn select_returns_contiguous_run_and_stops_at_gap() {
         let mut pool = Mempool::new(100);
-        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big()).unwrap();
-        pool.insert(tx([1; 32], "usa.reserve.sov", 1), 0, big()).unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 1), 0, big())
+            .unwrap();
         // Nonce 2 is missing; 3 should be unreachable.
-        pool.insert(tx([1; 32], "usa.reserve.sov", 3), 0, big()).unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 3), 0, big())
+            .unwrap();
 
         let batch = pool.select(|_| 0, 10);
         assert_eq!(batch.len(), 2);
@@ -565,8 +592,10 @@ mod tests {
     #[test]
     fn select_respects_current_nonce() {
         let mut pool = Mempool::new(100);
-        pool.insert(tx([1; 32], "usa.reserve.sov", 5), 5, big()).unwrap();
-        pool.insert(tx([1; 32], "usa.reserve.sov", 6), 5, big()).unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 5), 5, big())
+            .unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 6), 5, big())
+            .unwrap();
         // Account is at nonce 5, so both are ready.
         assert_eq!(pool.select(|_| 5, 10).len(), 2);
         // If the account were already at 7, neither is selectable.
@@ -582,7 +611,8 @@ mod tests {
         assert!(pool.remove(&tid).is_some());
         assert!(pool.is_empty());
 
-        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big()).unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
         // Account advanced to nonce 1; the pooled nonce-0 tx is now stale.
         pool.prune_stale(|_| 1);
         assert!(pool.is_empty());
@@ -593,15 +623,18 @@ mod tests {
         // A single sender may hold at most `max_per_sender`; beyond that it is
         // refused even when the pool has room — anti-DoS fairness.
         let mut pool = Mempool::with_limits(100, 2);
-        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big()).unwrap();
-        pool.insert(tx([1; 32], "usa.reserve.sov", 1), 0, big()).unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 1), 0, big())
+            .unwrap();
         let third = pool.insert(tx([1; 32], "usa.reserve.sov", 2), 0, big());
         assert!(matches!(
             third,
             Err(MempoolError::SenderLimit { limit: 2, .. })
         ));
         // A different sender is unaffected (the cap is per-account).
-        pool.insert(tx([2; 32], "ecb.reserve.sov", 0), 0, big()).unwrap();
+        pool.insert(tx([2; 32], "ecb.reserve.sov", 0), 0, big())
+            .unwrap();
         assert_eq!(pool.len(), 3);
     }
 
@@ -609,12 +642,16 @@ mod tests {
     fn full_pool_evicts_the_heaviest_senders_highest_nonce() {
         // Capacity 3, generous per-sender cap. A hog fills the pool (nonces 0,1,2).
         let mut pool = Mempool::with_limits(3, 10);
-        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big()).unwrap();
-        pool.insert(tx([1; 32], "usa.reserve.sov", 1), 0, big()).unwrap();
-        pool.insert(tx([1; 32], "usa.reserve.sov", 2), 0, big()).unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 1), 0, big())
+            .unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 2), 0, big())
+            .unwrap();
         assert_eq!(pool.len(), 3);
         // A new sender's tx is admitted by evicting the hog's HIGHEST nonce (2).
-        pool.insert(tx([2; 32], "ecb.reserve.sov", 0), 0, big()).unwrap();
+        pool.insert(tx([2; 32], "ecb.reserve.sov", 0), 0, big())
+            .unwrap();
         assert_eq!(pool.len(), 3);
         assert!(
             !pool.by_sender.contains_key(&(id("usa.reserve.sov"), 2)),
@@ -629,8 +666,10 @@ mod tests {
         // Every sender holds exactly one tx: there is no over-represented victim,
         // so a full pool refuses the newcomer instead of evicting a fair sender.
         let mut pool = Mempool::with_limits(2, 10);
-        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big()).unwrap();
-        pool.insert(tx([2; 32], "ecb.reserve.sov", 0), 0, big()).unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(tx([2; 32], "ecb.reserve.sov", 0), 0, big())
+            .unwrap();
         let newcomer = pool.insert(tx([3; 32], "boj.reserve.sov", 0), 0, big());
         assert!(matches!(newcomer, Err(MempoolError::Full { capacity: 2 })));
         assert_eq!(pool.len(), 2);

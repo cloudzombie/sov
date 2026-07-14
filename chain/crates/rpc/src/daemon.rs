@@ -2141,7 +2141,10 @@ mod tests {
         let genesis = gate_test_genesis();
         let dir = std::env::temp_dir().join(format!(
             "sov-mempool-persist-{}",
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let signer = AccountId::new("val01.node.sov").unwrap();
         let kp = Keypair::from_seed([7; 32]);
@@ -2152,7 +2155,10 @@ mod tests {
                 signer: signer.clone(),
                 public_key: kp.public_key(),
                 nonce: 0,
-                action: Action::Transfer { to: signer.clone(), amount: Balance::ZERO },
+                action: Action::Transfer {
+                    to: signer.clone(),
+                    amount: Balance::ZERO,
+                },
             },
             &kp,
         )
@@ -2199,14 +2205,20 @@ mod tests {
         let genesis = gate_test_genesis();
         let dir = std::env::temp_dir().join(format!(
             "sov-overspend-{}",
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let daemon = Daemon::new(
             &genesis,
             &dir,
             1024,
             256,
-            vec![(AccountId::new("val01.node.sov").unwrap(), Keypair::from_seed([7; 32]))],
+            vec![(
+                AccountId::new("val01.node.sov").unwrap(),
+                Keypair::from_seed([7; 32]),
+            )],
         )
         .unwrap();
         let handle = daemon.run("127.0.0.1:0", 1, 20, false).unwrap();
@@ -2228,7 +2240,10 @@ mod tests {
 
         let client = RpcClient::new(handle.rpc_addr().to_string());
         let res = client.submit_transaction(&overspend);
-        assert!(res.is_err(), "an overspend must be refused at admission, got {res:?}");
+        assert!(
+            res.is_err(),
+            "an overspend must be refused at admission, got {res:?}"
+        );
         assert_eq!(
             handle.node().lock().unwrap().mempool_len(),
             0,

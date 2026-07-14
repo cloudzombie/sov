@@ -1945,13 +1945,18 @@ dependencies = [
 name = "sov-redteam"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "serde_json",
  "sov-chain",
  "sov-crypto",
  "sov-mining",
+ "sov-network",
  "sov-primitives",
+ "sov-rpc",
  "sov-state",
  "sov-types",
  "sov-verify",
+ "sov-wallet",
 ]
 
 [[package]]

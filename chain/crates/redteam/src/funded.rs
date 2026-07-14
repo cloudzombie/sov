@@ -66,7 +66,9 @@ pub fn seed_from_secret(input: &str) -> Result<[u8; 32], String> {
     // A bare 32-byte hex seed.
     if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
         let bytes = hex::decode(s).map_err(|e| format!("bad hex seed: {e}"))?;
-        return bytes.try_into().map_err(|_| "seed must be 32 bytes".to_string());
+        return bytes
+            .try_into()
+            .map_err(|_| "seed must be 32 bytes".to_string());
     }
     // Otherwise treat it as a BIP-39 mnemonic and derive account 0, index 0.
     HdWallet::from_mnemonic(s, "")
@@ -93,7 +95,13 @@ fn transfer(kp: &Keypair, nonce: u64, to: AccountId, amount: Balance) -> SignedT
 /// Build a transfer that DECLARES `signer` as the source account but is signed by `kp`.
 /// When `signer` is not `kp`'s own account, this is an attempt to spend an account the
 /// key does not control.
-fn transfer_as(signer: AccountId, kp: &Keypair, nonce: u64, to: AccountId, amount: Balance) -> SignedTransaction {
+fn transfer_as(
+    signer: AccountId,
+    kp: &Keypair,
+    nonce: u64,
+    to: AccountId,
+    amount: Balance,
+) -> SignedTransaction {
     let tx = Transaction {
         signer,
         public_key: kp.public_key(),
@@ -105,7 +113,9 @@ fn transfer_as(signer: AccountId, kp: &Keypair, nonce: u64, to: AccountId, amoun
 
 /// A distinct throwaway "thief" account (an implicit id nobody controls).
 fn thief(seed: u8) -> AccountId {
-    Keypair::hybrid_from_seed([seed; 32]).public_key().implicit_account_id()
+    Keypair::hybrid_from_seed([seed; 32])
+        .public_key()
+        .implicit_account_id()
 }
 
 /// Run the funded-adversary battery against `rpc_target` as the account controlled by
@@ -116,7 +126,10 @@ pub fn probe_funded(rpc_target: &str, kp: &Keypair, spend_grains: u128) -> Funde
     let account = account_of(kp);
 
     let chain_id = client.chain_id().ok();
-    let is_mainnet = chain_id.as_deref().map(|c| c.contains("mainnet")).unwrap_or(false);
+    let is_mainnet = chain_id
+        .as_deref()
+        .map(|c| c.contains("mainnet"))
+        .unwrap_or(false);
 
     let mut report = FundedReport {
         account: account.to_string(),
@@ -130,7 +143,9 @@ pub fn probe_funded(rpc_target: &str, kp: &Keypair, spend_grains: u128) -> Funde
     };
 
     let Ok(nonce) = client.nonce(&account) else {
-        report.error = Some(format!("node unreachable at {rpc_target}, or account not found"));
+        report.error = Some(format!(
+            "node unreachable at {rpc_target}, or account not found"
+        ));
         return report;
     };
     report.nonce = nonce;
@@ -152,12 +167,18 @@ pub fn probe_funded(rpc_target: &str, kp: &Keypair, spend_grains: u128) -> Funde
         Ok(id) => report.outcomes.push(Outcome::info(
             "control",
             "prove control — net-zero self-transfer",
-            format!("ACCEPTED — the funded key signed a live tx ({}); confirms net-zero", short(&id.to_hex())),
+            format!(
+                "ACCEPTED — the funded key signed a live tx ({}); confirms net-zero",
+                short(&id.to_hex())
+            ),
         )),
         Err(e) => report.outcomes.push(Outcome::info(
             "control",
             "prove control — net-zero self-transfer",
-            format!("not accepted — {} (is the account funded?)", trim(&e.to_string())),
+            format!(
+                "not accepted — {} (is the account funded?)",
+                trim(&e.to_string())
+            ),
         )),
     }
 
@@ -226,10 +247,26 @@ pub fn probe_funded(rpc_target: &str, kp: &Keypair, spend_grains: u128) -> Funde
 }
 
 /// Submit `stx`, expecting the chain to REJECT it (a defense). Acceptance is a finding.
-fn judge_rejected(client: &RpcClient, name: &'static str, stx: &SignedTransaction, on_defended: &str) -> Outcome {
+fn judge_rejected(
+    client: &RpcClient,
+    name: &'static str,
+    stx: &SignedTransaction,
+    on_defended: &str,
+) -> Outcome {
     match client.submit_transaction(stx) {
-        Err(e) => Outcome::defended("funded", name, format!("{on_defended} — {}", trim(&e.to_string()))),
-        Ok(id) => Outcome::vulnerable("funded", name, format!("ACCEPTED — a conflicting/replayed tx was admitted ({})", short(&id.to_hex()))),
+        Err(e) => Outcome::defended(
+            "funded",
+            name,
+            format!("{on_defended} — {}", trim(&e.to_string())),
+        ),
+        Ok(id) => Outcome::vulnerable(
+            "funded",
+            name,
+            format!(
+                "ACCEPTED — a conflicting/replayed tx was admitted ({})",
+                short(&id.to_hex())
+            ),
+        ),
     }
 }
 
@@ -251,11 +288,23 @@ fn mint_attempt(from_seed: u8, to: AccountId, amount: Balance) -> SignedTransact
 /// `beneficiary`'s balance must stay zero. A gated node also REJECTS it at admission (best);
 /// a pre-gate node admits it but execution reverts (no credit) — reported as INFO with a
 /// nudge to deploy the affordability gate.
-fn judge_mint(client: &RpcClient, name: &'static str, stx: &SignedTransaction, beneficiary: &AccountId) -> Outcome {
+fn judge_mint(
+    client: &RpcClient,
+    name: &'static str,
+    stx: &SignedTransaction,
+    beneficiary: &AccountId,
+) -> Outcome {
     let admitted = client.submit_transaction(stx).is_ok();
-    let credited = client.balance(beneficiary).map(|b| b.grains() > 0).unwrap_or(false);
+    let credited = client
+        .balance(beneficiary)
+        .map(|b| b.grains() > 0)
+        .unwrap_or(false);
     if credited {
-        Outcome::vulnerable("theft", name, "VALUE CREATED — the beneficiary was credited from thin air".to_string())
+        Outcome::vulnerable(
+            "theft",
+            name,
+            "VALUE CREATED — the beneficiary was credited from thin air".to_string(),
+        )
     } else if !admitted {
         Outcome::defended("theft", name, "refused at admission — an unaffordable transfer can't be pooled (affordability gate); no value created".to_string())
     } else {
@@ -265,9 +314,16 @@ fn judge_mint(client: &RpcClient, name: &'static str, stx: &SignedTransaction, b
 
 fn normalize(target: &str) -> String {
     let t = target.trim();
-    let t = t.strip_prefix("http://").or_else(|| t.strip_prefix("https://")).unwrap_or(t);
+    let t = t
+        .strip_prefix("http://")
+        .or_else(|| t.strip_prefix("https://"))
+        .unwrap_or(t);
     let t = t.split('/').next().unwrap_or(t);
-    if t.contains(':') { t.to_string() } else { format!("{t}:8645") }
+    if t.contains(':') {
+        t.to_string()
+    } else {
+        format!("{t}:8645")
+    }
 }
 
 fn short(hex: &str) -> String {
@@ -279,10 +335,14 @@ fn trim(s: &str) -> String {
     // Peel the JSON-RPC envelope + node prefixes down to the human reason.
     let first = first
         .strip_prefix("rpc error")
-        .map(|r| r.trim_start_matches(|c: char| c == ':' || c == ' ' || c == '-' || c.is_ascii_digit()))
+        .map(|r| {
+            r.trim_start_matches(|c: char| c == ':' || c == ' ' || c == '-' || c.is_ascii_digit())
+        })
         .unwrap_or(first);
     let first = first.strip_prefix("rejected: ").unwrap_or(first);
-    let first = first.strip_prefix("mempool rejected transaction: ").unwrap_or(first);
+    let first = first
+        .strip_prefix("mempool rejected transaction: ")
+        .unwrap_or(first);
     if first.len() > 120 {
         format!("{}…", &first[..119])
     } else {
@@ -292,5 +352,8 @@ fn trim(s: &str) -> String {
 
 /// Any VULNERABLE outcome?
 pub fn any_vulnerable(report: &FundedReport) -> bool {
-    report.outcomes.iter().any(|o| o.verdict == crate::Verdict::Vulnerable)
+    report
+        .outcomes
+        .iter()
+        .any(|o| o.verdict == crate::Verdict::Vulnerable)
 }

@@ -225,7 +225,13 @@ impl RedTeamApp {
                         ui.label(RichText::new(detail).size(11.5).color(MUTED));
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(chip).size(11.0).strong().monospace().color(chip_c));
+                        ui.label(
+                            RichText::new(chip)
+                                .size(11.0)
+                                .strong()
+                                .monospace()
+                                .color(chip_c),
+                        );
                     });
                 });
             });
@@ -252,19 +258,31 @@ impl eframe::App for RedTeamApp {
 
         // Header bar: identity, the global node target, and Reset.
         egui::TopBottomPanel::top("header")
-            .frame(egui::Frame::none().fill(PANEL).inner_margin(Margin::symmetric(20.0, 13.0)))
+            .frame(
+                egui::Frame::none()
+                    .fill(PANEL)
+                    .inner_margin(Margin::symmetric(20.0, 13.0)),
+            )
             .show(ctx, |ui| self.header(ui));
 
         // Left nav rail: pick the probe.
         egui::SidePanel::left("nav")
             .resizable(false)
             .exact_width(186.0)
-            .frame(egui::Frame::none().fill(PANEL).inner_margin(Margin::symmetric(12.0, 14.0)))
+            .frame(
+                egui::Frame::none()
+                    .fill(PANEL)
+                    .inner_margin(Margin::symmetric(12.0, 14.0)),
+            )
             .show(ctx, |ui| self.nav(ui));
 
         // Content area: the active probe.
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(GROUND).inner_margin(Margin::symmetric(24.0, 18.0)))
+            .frame(
+                egui::Frame::none()
+                    .fill(GROUND)
+                    .inner_margin(Margin::symmetric(24.0, 18.0)),
+            )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.set_max_width(720.0);
@@ -283,7 +301,12 @@ impl RedTeamApp {
     /// The top bar: title, the shared node RPC field, and Reset.
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("⚔ SOV Red Team").size(21.0).strong().color(GOLD));
+            ui.label(
+                RichText::new("⚔ SOV Red Team")
+                    .size(21.0)
+                    .strong()
+                    .color(GOLD),
+            );
             ui.add_space(10.0);
             ui.label(RichText::new("adversarial harness").size(12.0).color(MUTED));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -295,7 +318,11 @@ impl RedTeamApp {
                     .fill(SURFACE)
                     .stroke(Stroke::new(1.0, BORDER))
                     .min_size(egui::vec2(74.0, 26.0));
-                if ui.add_enabled(!any_busy, btn).on_hover_text("Clear all results").clicked() {
+                if ui
+                    .add_enabled(!any_busy, btn)
+                    .on_hover_text("Clear all results")
+                    .clicked()
+                {
                     self.reset();
                 }
                 ui.add_space(14.0);
@@ -324,14 +351,30 @@ impl RedTeamApp {
     }
 
     /// One nav rail entry.
-    fn nav_item(&mut self, ui: &mut egui::Ui, view: View, icon: &str, label: &str, accent: Color32) {
+    fn nav_item(
+        &mut self,
+        ui: &mut egui::Ui,
+        view: View,
+        icon: &str,
+        label: &str,
+        accent: Color32,
+    ) {
         let active = self.view == view;
         let fg = if active { accent } else { INK };
         let fill = if active { SURFACE } else { PANEL };
-        let btn = egui::Button::new(RichText::new(format!("{icon}  {label}")).size(13.5).color(fg).strong())
-            .fill(fill)
-            .stroke(if active { Stroke::new(1.0, alpha(accent, 130)) } else { Stroke::NONE })
-            .min_size(egui::vec2(ui.available_width(), 38.0));
+        let btn = egui::Button::new(
+            RichText::new(format!("{icon}  {label}"))
+                .size(13.5)
+                .color(fg)
+                .strong(),
+        )
+        .fill(fill)
+        .stroke(if active {
+            Stroke::new(1.0, alpha(accent, 130))
+        } else {
+            Stroke::NONE
+        })
+        .min_size(egui::vec2(ui.available_width(), 38.0));
         if ui.add(btn).clicked() {
             self.view = view;
         }
@@ -340,7 +383,12 @@ impl RedTeamApp {
 
     /// The in-process battery: attacks against a private replica of consensus.
     fn inprocess_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("⚔ In-process battery").size(19.0).strong().color(HOLD));
+        ui.label(
+            RichText::new("⚔ In-process battery")
+                .size(19.0)
+                .strong()
+                .color(HOLD),
+        );
         ui.label(
             RichText::new(
                 "Builds a real chain and throws a battery of attacks at produce_block / \
@@ -360,9 +408,13 @@ impl RedTeamApp {
             } else {
                 "⚔ Run red team"
             };
-            let btn = egui::Button::new(RichText::new(label).strong().color(Color32::from_rgb(17, 16, 13)))
-                .fill(GOLD)
-                .min_size(egui::vec2(180.0, 34.0));
+            let btn = egui::Button::new(
+                RichText::new(label)
+                    .strong()
+                    .color(Color32::from_rgb(17, 16, 13)),
+            )
+            .fill(GOLD)
+            .min_size(egui::vec2(180.0, 34.0));
             if ui.add_enabled(!running, btn).clicked() {
                 self.run();
             }
@@ -371,16 +423,14 @@ impl RedTeamApp {
             }
         });
         if running {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(120));
         }
         ui.add_space(14.0);
 
         // ── results ──
-        let results: Option<Vec<(&'static str, &'static str, sov_redteam::Verdict, String)>> = self
-            .results
-            .lock()
-            .ok()
-            .and_then(|g| {
+        let results: Option<Vec<(&'static str, &'static str, sov_redteam::Verdict, String)>> =
+            self.results.lock().ok().and_then(|g| {
                 g.as_ref().map(|v| {
                     v.iter()
                         .map(|o| (o.category, o.name, o.verdict, o.detail.clone()))
@@ -422,7 +472,10 @@ impl RedTeamApp {
         egui::Frame::none()
             .fill(SURFACE)
             .rounding(Rounding::same(12.0))
-            .stroke(Stroke::new(1.0, alpha(if clear { HOLD } else { THREAT }, 110)))
+            .stroke(Stroke::new(
+                1.0,
+                alpha(if clear { HOLD } else { THREAT }, 110),
+            ))
             .inner_margin(Margin::symmetric(18.0, 15.0))
             .show(ui, |ui| {
                 ui.label(
@@ -439,7 +492,13 @@ impl RedTeamApp {
                 ui.horizontal(|ui| {
                     let stat = |ui: &mut egui::Ui, n: usize, label: &str, c: Color32| {
                         ui.vertical(|ui| {
-                            ui.label(RichText::new(n.to_string()).size(26.0).strong().monospace().color(c));
+                            ui.label(
+                                RichText::new(n.to_string())
+                                    .size(26.0)
+                                    .strong()
+                                    .monospace()
+                                    .color(c),
+                            );
                             ui.label(RichText::new(label).size(10.0).color(MUTED));
                         });
                     };
@@ -459,7 +518,13 @@ impl RedTeamApp {
         for (cat, name, verdict, detail) in &results {
             if *cat != last {
                 ui.add_space(9.0);
-                ui.label(RichText::new(cat.to_uppercase()).size(11.0).strong().monospace().color(GOLD));
+                ui.label(
+                    RichText::new(cat.to_uppercase())
+                        .size(11.0)
+                        .strong()
+                        .monospace()
+                        .color(GOLD),
+                );
                 last = cat;
             }
             let is_pq = *cat == "post-quantum";
@@ -475,13 +540,23 @@ impl RedTeamApp {
                 .inner_margin(Margin::symmetric(13.0, 10.0))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("▎").size(22.0).color(if is_pq { PQ } else { THREAT }));
+                        ui.label(RichText::new("▎").size(22.0).color(if is_pq {
+                            PQ
+                        } else {
+                            THREAT
+                        }));
                         ui.vertical(|ui| {
                             ui.label(RichText::new(*name).strong().monospace().size(13.5));
                             ui.label(RichText::new(detail).size(11.5).color(MUTED));
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(chip).size(11.0).strong().monospace().color(chip_c));
+                            ui.label(
+                                RichText::new(chip)
+                                    .size(11.0)
+                                    .strong()
+                                    .monospace()
+                                    .color(chip_c),
+                            );
                         });
                     });
                 });
@@ -504,7 +579,12 @@ impl RedTeamApp {
     /// The live front-door probe: point at a running node and submit adversarial txs
     /// that are rejected at admission (nothing lands on the chain).
     fn live_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("⌁ Live front-door probe").size(19.0).strong().color(PQ));
+        ui.label(
+            RichText::new("⌁ Live front-door probe")
+                .size(19.0)
+                .strong()
+                .color(PQ),
+        );
         ui.label(
             RichText::new(
                 "Attack a REAL running node the only way an outsider can — through \
@@ -518,10 +598,18 @@ impl RedTeamApp {
 
         let live_running = self.live_running.load(Ordering::SeqCst);
         ui.horizontal(|ui| {
-            let label = if live_running { "⌁ probing…" } else { "⌁ Probe front door" };
-            let btn = egui::Button::new(RichText::new(label).strong().color(Color32::from_rgb(17, 16, 13)))
-                .fill(PQ)
-                .min_size(egui::vec2(160.0, 32.0));
+            let label = if live_running {
+                "⌁ probing…"
+            } else {
+                "⌁ Probe front door"
+            };
+            let btn = egui::Button::new(
+                RichText::new(label)
+                    .strong()
+                    .color(Color32::from_rgb(17, 16, 13)),
+            )
+            .fill(PQ)
+            .min_size(egui::vec2(160.0, 32.0));
             if ui.add_enabled(!live_running, btn).clicked() {
                 self.run_live();
             }
@@ -530,7 +618,8 @@ impl RedTeamApp {
             }
         });
         if live_running {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(150));
         }
         ui.add_space(12.0);
 
@@ -555,7 +644,12 @@ impl RedTeamApp {
                 .stroke(Stroke::new(1.0, alpha(THREAT, 120)))
                 .inner_margin(Margin::symmetric(16.0, 13.0))
                 .show(ui, |ui| {
-                    ui.label(RichText::new("UNREACHABLE").size(16.0).strong().color(THREAT));
+                    ui.label(
+                        RichText::new("UNREACHABLE")
+                            .size(16.0)
+                            .strong()
+                            .color(THREAT),
+                    );
                     ui.label(
                         RichText::new(format!(
                             "Could not reach {} — is the node running with RPC exposed?",
@@ -570,25 +664,47 @@ impl RedTeamApp {
 
         // connectivity + identity banner
         let chain = report.chain_id.as_deref().unwrap_or("unknown");
-        let height = report.height.map(|h| h.to_string()).unwrap_or_else(|| "?".into());
+        let height = report
+            .height
+            .map(|h| h.to_string())
+            .unwrap_or_else(|| "?".into());
         egui::Frame::none()
             .fill(SURFACE)
             .rounding(Rounding::same(10.0))
-            .stroke(Stroke::new(1.0, alpha(if report.is_mainnet { GOLD } else { PQ }, 120)))
+            .stroke(Stroke::new(
+                1.0,
+                alpha(if report.is_mainnet { GOLD } else { PQ }, 120),
+            ))
             .inner_margin(Margin::symmetric(16.0, 12.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("● connected").size(12.0).strong().color(HOLD));
                     ui.add_space(14.0);
-                    ui.label(RichText::new(&report.target).size(12.0).monospace().color(INK));
+                    ui.label(
+                        RichText::new(&report.target)
+                            .size(12.0)
+                            .monospace()
+                            .color(INK),
+                    );
                     ui.add_space(14.0);
                     if report.is_mainnet {
-                        ui.label(RichText::new("LIVE MAINNET").size(12.0).strong().monospace().color(GOLD));
+                        ui.label(
+                            RichText::new("LIVE MAINNET")
+                                .size(12.0)
+                                .strong()
+                                .monospace()
+                                .color(GOLD),
+                        );
                     } else {
                         ui.label(RichText::new(chain).size(12.0).monospace().color(PQ));
                     }
                     ui.add_space(14.0);
-                    ui.label(RichText::new(format!("height {height}")).size(12.0).monospace().color(MUTED));
+                    ui.label(
+                        RichText::new(format!("height {height}"))
+                            .size(12.0)
+                            .monospace()
+                            .color(MUTED),
+                    );
                 });
             });
         ui.add_space(10.0);
@@ -615,7 +731,11 @@ impl RedTeamApp {
             ui.label(
                 RichText::new(format!(
                     "mempool {b} → {a}  ·  {}",
-                    if ok { "no residue — nothing landed" } else { "RESIDUE — a tx was admitted!" }
+                    if ok {
+                        "no residue — nothing landed"
+                    } else {
+                        "RESIDUE — a tx was admitted!"
+                    }
                 ))
                 .size(11.5)
                 .monospace()
@@ -629,7 +749,13 @@ impl RedTeamApp {
         for o in &report.outcomes {
             if o.category != last {
                 ui.add_space(7.0);
-                ui.label(RichText::new(o.category.to_uppercase()).size(11.0).strong().monospace().color(PQ));
+                ui.label(
+                    RichText::new(o.category.to_uppercase())
+                        .size(11.0)
+                        .strong()
+                        .monospace()
+                        .color(PQ),
+                );
                 last = o.category;
             }
             Self::outcome_row(ui, o.name, o.verdict, &o.detail, PQ);
@@ -639,7 +765,12 @@ impl RedTeamApp {
     /// The live back-door probe: join the P2P network as a hostile peer and gossip forged
     /// blocks/txs over the encrypted wire, proving the node's tip never adopts them.
     fn backdoor_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("⛒ Live back-door probe").size(19.0).strong().color(THREAT));
+        ui.label(
+            RichText::new("⛒ Live back-door probe")
+                .size(19.0)
+                .strong()
+                .color(THREAT),
+        );
         ui.label(
             RichText::new(
                 "Join the P2P network as a HOSTILE peer and gossip forged blocks + txs over the \
@@ -654,10 +785,18 @@ impl RedTeamApp {
 
         let running = self.backdoor_running.load(Ordering::SeqCst);
         ui.horizontal(|ui| {
-            let label = if running { "⛒ attacking P2P…" } else { "⛒ Probe back door" };
-            let btn = egui::Button::new(RichText::new(label).strong().color(Color32::from_rgb(17, 16, 13)))
-                .fill(THREAT)
-                .min_size(egui::vec2(160.0, 32.0));
+            let label = if running {
+                "⛒ attacking P2P…"
+            } else {
+                "⛒ Probe back door"
+            };
+            let btn = egui::Button::new(
+                RichText::new(label)
+                    .strong()
+                    .color(Color32::from_rgb(17, 16, 13)),
+            )
+            .fill(THREAT)
+            .min_size(egui::vec2(160.0, 32.0));
             if ui.add_enabled(!running, btn).clicked() {
                 self.run_backdoor();
             }
@@ -666,7 +805,8 @@ impl RedTeamApp {
             }
         });
         if running {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(200));
         }
         ui.add_space(12.0);
 
@@ -691,7 +831,12 @@ impl RedTeamApp {
                 .stroke(Stroke::new(1.0, alpha(GOLD, 120)))
                 .inner_margin(Margin::symmetric(16.0, 12.0))
                 .show(ui, |ui| {
-                    ui.label(RichText::new("could not run").size(14.0).strong().color(GOLD));
+                    ui.label(
+                        RichText::new("could not run")
+                            .size(14.0)
+                            .strong()
+                            .color(GOLD),
+                    );
                     ui.label(RichText::new(err).size(12.0).color(MUTED));
                 });
             return;
@@ -701,7 +846,10 @@ impl RedTeamApp {
         egui::Frame::none()
             .fill(SURFACE)
             .rounding(Rounding::same(10.0))
-            .stroke(Stroke::new(1.0, alpha(if report.is_mainnet { GOLD } else { THREAT }, 120)))
+            .stroke(Stroke::new(
+                1.0,
+                alpha(if report.is_mainnet { GOLD } else { THREAT }, 120),
+            ))
             .inner_margin(Margin::symmetric(16.0, 12.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -712,10 +860,21 @@ impl RedTeamApp {
                     };
                     ui.label(RichText::new(txt).size(12.0).strong().color(col));
                     ui.add_space(12.0);
-                    ui.label(RichText::new(&report.p2p_target).size(12.0).monospace().color(INK));
+                    ui.label(
+                        RichText::new(&report.p2p_target)
+                            .size(12.0)
+                            .monospace()
+                            .color(INK),
+                    );
                     ui.add_space(12.0);
                     if report.is_mainnet {
-                        ui.label(RichText::new("LIVE MAINNET").size(12.0).strong().monospace().color(GOLD));
+                        ui.label(
+                            RichText::new("LIVE MAINNET")
+                                .size(12.0)
+                                .strong()
+                                .monospace()
+                                .color(GOLD),
+                        );
                     }
                 });
                 if let (Some((hb, _)), Some((ha, _))) = (&report.head_before, &report.head_after) {
@@ -723,7 +882,11 @@ impl RedTeamApp {
                     ui.label(
                         RichText::new(format!(
                             "head {hb} → {ha}  ·  {}",
-                            if moved { "advanced only by the node's own honest mining" } else { "tip unmoved" }
+                            if moved {
+                                "advanced only by the node's own honest mining"
+                            } else {
+                                "tip unmoved"
+                            }
                         ))
                         .size(11.5)
                         .monospace()
@@ -731,7 +894,12 @@ impl RedTeamApp {
                     );
                 }
                 if report.ejected {
-                    ui.label(RichText::new("the node BANNED our peer — attacker ejected").size(11.5).strong().color(HOLD));
+                    ui.label(
+                        RichText::new("the node BANNED our peer — attacker ejected")
+                            .size(11.5)
+                            .strong()
+                            .color(HOLD),
+                    );
                 }
             });
         ui.add_space(10.0);
@@ -740,7 +908,13 @@ impl RedTeamApp {
         for o in &report.outcomes {
             if o.category != last {
                 ui.add_space(7.0);
-                ui.label(RichText::new(o.category.to_uppercase()).size(11.0).strong().monospace().color(THREAT));
+                ui.label(
+                    RichText::new(o.category.to_uppercase())
+                        .size(11.0)
+                        .strong()
+                        .monospace()
+                        .color(THREAT),
+                );
                 last = o.category;
             }
             Self::outcome_row(ui, o.name, o.verdict, &o.detail, THREAT);
@@ -751,7 +925,12 @@ impl RedTeamApp {
     /// the key (held in memory only); the probe attempts a double-spend of that account's
     /// own XUS and proves the chain refuses it.
     fn funded_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("₿ Funded adversary").size(19.0).strong().color(GOLD));
+        ui.label(
+            RichText::new("₿ Funded adversary")
+                .size(19.0)
+                .strong()
+                .color(GOLD),
+        );
         ui.label(
             RichText::new(
                 "Attack as a REAL, funded account — probe it like a thief. Paste its key (mnemonic \
@@ -781,11 +960,20 @@ impl RedTeamApp {
             }
         });
         if !self.funded_account.is_empty() {
-            ui.label(RichText::new(format!("account  {}", self.funded_account)).size(11.5).monospace().color(HOLD));
+            ui.label(
+                RichText::new(format!("account  {}", self.funded_account))
+                    .size(11.5)
+                    .monospace()
+                    .color(HOLD),
+            );
         }
         if !self.funded_status.is_empty() {
             let ok = self.funded_seed.is_some();
-            ui.label(RichText::new(&self.funded_status).size(11.0).color(if ok { MUTED } else { THREAT }));
+            ui.label(RichText::new(&self.funded_status).size(11.0).color(if ok {
+                MUTED
+            } else {
+                THREAT
+            }));
         }
         ui.add_space(8.0);
 
@@ -793,9 +981,13 @@ impl RedTeamApp {
         let running = self.funded_running.load(Ordering::SeqCst);
         let has_key = self.funded_seed.is_some();
         let btn = egui::Button::new(
-            RichText::new(if running { "₿ attacking…" } else { "₿ Run funded double-spend (spends a real fee)" })
-                .strong()
-                .color(Color32::from_rgb(17, 16, 13)),
+            RichText::new(if running {
+                "₿ attacking…"
+            } else {
+                "₿ Run funded double-spend (spends a real fee)"
+            })
+            .strong()
+            .color(Color32::from_rgb(17, 16, 13)),
         )
         .fill(GOLD)
         .min_size(egui::vec2(300.0, 32.0));
@@ -803,7 +995,8 @@ impl RedTeamApp {
             self.run_funded();
         }
         if running {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(200));
         }
         ui.add_space(12.0);
 
@@ -827,16 +1020,39 @@ impl RedTeamApp {
             .inner_margin(Margin::symmetric(16.0, 12.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("balance {}", report.balance)).size(13.0).strong().monospace().color(GOLD));
+                    ui.label(
+                        RichText::new(format!("balance {}", report.balance))
+                            .size(13.0)
+                            .strong()
+                            .monospace()
+                            .color(GOLD),
+                    );
                     ui.add_space(14.0);
-                    ui.label(RichText::new(format!("nonce {}", report.nonce)).size(12.0).monospace().color(MUTED));
+                    ui.label(
+                        RichText::new(format!("nonce {}", report.nonce))
+                            .size(12.0)
+                            .monospace()
+                            .color(MUTED),
+                    );
                     ui.add_space(14.0);
                     if report.is_mainnet {
-                        ui.label(RichText::new("LIVE MAINNET").size(12.0).strong().monospace().color(GOLD));
+                        ui.label(
+                            RichText::new("LIVE MAINNET")
+                                .size(12.0)
+                                .strong()
+                                .monospace()
+                                .color(GOLD),
+                        );
                     }
                 });
                 if report.balance_grains == 0 {
-                    ui.label(RichText::new("account shows no balance — fund it first for leg 1 to confirm").size(11.0).color(THREAT));
+                    ui.label(
+                        RichText::new(
+                            "account shows no balance — fund it first for leg 1 to confirm",
+                        )
+                        .size(11.0)
+                        .color(THREAT),
+                    );
                 }
             });
         ui.add_space(10.0);

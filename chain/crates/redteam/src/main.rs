@@ -54,8 +54,18 @@ fn funded_mode(addr: &str) {
         println!("  \x1b[31m{err}\x1b[0m\n");
         std::process::exit(2);
     }
-    let banner = if report.is_mainnet { "\x1b[33mLIVE MAINNET\x1b[0m" } else { report.chain_id.as_deref().unwrap_or("unknown") };
-    println!("  account {}  ·  balance {}  ·  nonce {}  ·  {}", short(&report.account), report.balance, report.nonce, banner);
+    let banner = if report.is_mainnet {
+        "\x1b[33mLIVE MAINNET\x1b[0m"
+    } else {
+        report.chain_id.as_deref().unwrap_or("unknown")
+    };
+    println!(
+        "  account {}  ·  balance {}  ·  nonce {}  ·  {}",
+        short(&report.account),
+        report.balance,
+        report.nonce,
+        banner
+    );
     println!();
 
     let (mut defended, mut vulnerable, mut info) = (0u32, 0u32, 0u32);
@@ -129,14 +139,27 @@ fn live_mode(addr: &str) {
     let report = probe_frontdoor(addr);
 
     if !report.reachable {
-        println!("  \x1b[31mcould not reach {} — is the node running and RPC exposed?\x1b[0m\n", report.target);
+        println!(
+            "  \x1b[31mcould not reach {} — is the node running and RPC exposed?\x1b[0m\n",
+            report.target
+        );
         std::process::exit(2);
     }
 
     let chain = report.chain_id.as_deref().unwrap_or("unknown");
-    let height = report.height.map(|h| h.to_string()).unwrap_or_else(|| "?".into());
-    let banner = if report.is_mainnet { "\x1b[33mLIVE MAINNET\x1b[0m" } else { chain };
-    println!("  target {}  ·  chain {}  ·  height {}\n", report.target, banner, height);
+    let height = report
+        .height
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| "?".into());
+    let banner = if report.is_mainnet {
+        "\x1b[33mLIVE MAINNET\x1b[0m"
+    } else {
+        chain
+    };
+    println!(
+        "  target {}  ·  chain {}  ·  height {}\n",
+        report.target, banner, height
+    );
 
     let (mut defended, mut vulnerable, mut info) = (0u32, 0u32, 0u32);
     let mut last_cat = "";
@@ -174,7 +197,9 @@ fn live_mode(addr: &str) {
 
 fn backdoor_mode(addr: &str) {
     println!("\n  sov-redteam — LIVE BACK-DOOR probe (P2P peer)");
-    println!("  joining the network as a hostile peer and gossiping forged blocks/txs over the wire…\n");
+    println!(
+        "  joining the network as a hostile peer and gossiping forged blocks/txs over the wire…\n"
+    );
 
     let report = probe_backdoor(addr);
 
@@ -184,9 +209,20 @@ fn backdoor_mode(addr: &str) {
     }
 
     let chain = report.chain_id.as_deref().unwrap_or("unknown");
-    let banner = if report.is_mainnet { "\x1b[33mLIVE MAINNET\x1b[0m" } else { chain };
-    let auth = if report.authenticated { "\x1b[32mauthenticated\x1b[0m" } else { "\x1b[31mNOT authenticated\x1b[0m" };
-    println!("  p2p {}  ·  chain {}  ·  hostile peer {}", report.p2p_target, banner, auth);
+    let banner = if report.is_mainnet {
+        "\x1b[33mLIVE MAINNET\x1b[0m"
+    } else {
+        chain
+    };
+    let auth = if report.authenticated {
+        "\x1b[32mauthenticated\x1b[0m"
+    } else {
+        "\x1b[31mNOT authenticated\x1b[0m"
+    };
+    println!(
+        "  p2p {}  ·  chain {}  ·  hostile peer {}",
+        report.p2p_target, banner, auth
+    );
     if let Some((h, hash)) = &report.head_before {
         println!("  head before: height {h}  {}", &hash[..16.min(hash.len())]);
     }
@@ -208,7 +244,11 @@ fn backdoor_mode(addr: &str) {
         let moved = ha != hb;
         println!(
             "\n  head after: height {ha}  ·  {}",
-            if moved { "advanced by the node's OWN honest mining (no forged hash adopted)" } else { "unmoved" }
+            if moved {
+                "advanced by the node's OWN honest mining (no forged hash adopted)"
+            } else {
+                "unmoved"
+            }
         );
     }
     if report.ejected {

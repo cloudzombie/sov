@@ -69,7 +69,10 @@ impl LiveReport {
 /// (the SOV JSON-RPC port) when none is given.
 fn normalize(target: &str) -> String {
     let t = target.trim();
-    let t = t.strip_prefix("http://").or_else(|| t.strip_prefix("https://")).unwrap_or(t);
+    let t = t
+        .strip_prefix("http://")
+        .or_else(|| t.strip_prefix("https://"))
+        .unwrap_or(t);
     let t = t.split('/').next().unwrap_or(t);
     if t.contains(':') {
         t.to_string()
@@ -82,7 +85,9 @@ fn normalize(target: &str) -> String {
 
 /// The throwaway recipient every probe pays: a fresh implicit account nobody controls.
 fn sink() -> AccountId {
-    Keypair::hybrid_from_seed([200; 32]).public_key().implicit_account_id()
+    Keypair::hybrid_from_seed([200; 32])
+        .public_key()
+        .implicit_account_id()
 }
 
 /// A signed transfer whose declared account is the implicit id of `account_seed`, signed
@@ -97,7 +102,10 @@ fn signed(account_seed: u8, key_seed: u8, nonce: u64, amount_sov: u64) -> Signed
         signer: account_kp.public_key().implicit_account_id(),
         public_key: key_kp.public_key(),
         nonce,
-        action: Action::Transfer { to: sink(), amount: Balance::from_sov(amount_sov as u128).unwrap() },
+        action: Action::Transfer {
+            to: sink(),
+            amount: Balance::from_sov(amount_sov as u128).unwrap(),
+        },
     };
     // `public_key` == the signing key, so `sign` succeeds even when the *account* differs.
     SignedTransaction::sign(tx, &key_kp).unwrap()
@@ -120,14 +128,34 @@ fn ed_half(sig: &Signature) -> [u8; 64] {
 
 /// Submit `stx` and judge: a rejection is a DEFENSE (the door held); acceptance means
 /// the adversarial tx was ADMITTED to the live mempool — a real finding.
-fn expect_rejected(client: &RpcClient, cat: &'static str, name: &'static str, stx: SignedTransaction) -> Outcome {
-    judge(cat, name, client.submit_transaction(&stx).map(|h| h.to_hex()))
+fn expect_rejected(
+    client: &RpcClient,
+    cat: &'static str,
+    name: &'static str,
+    stx: SignedTransaction,
+) -> Outcome {
+    judge(
+        cat,
+        name,
+        client.submit_transaction(&stx).map(|h| h.to_hex()),
+    )
 }
 
 /// Submit a raw JSON payload as the params to `sov_submitTransaction` (for encoding
 /// attacks that never form a valid `SignedTransaction`).
-fn expect_rejected_raw(client: &RpcClient, cat: &'static str, name: &'static str, params: Value) -> Outcome {
-    judge(cat, name, client.call("sov_submitTransaction", params).map(|_| "accepted".to_string()))
+fn expect_rejected_raw(
+    client: &RpcClient,
+    cat: &'static str,
+    name: &'static str,
+    params: Value,
+) -> Outcome {
+    judge(
+        cat,
+        name,
+        client
+            .call("sov_submitTransaction", params)
+            .map(|_| "accepted".to_string()),
+    )
 }
 
 /// Shared verdict logic: `Err(Rpc)` → DEFENDED, `Err(Io)` → INFO (couldn't reach),
@@ -137,9 +165,15 @@ fn judge(cat: &'static str, name: &'static str, res: Result<String, RpcClientErr
         Err(RpcClientError::Rpc { message, .. }) => {
             Outcome::defended(cat, name, format!("REJECTED — {}", trim(&message)))
         }
-        Err(RpcClientError::Io(e)) => Outcome::info(cat, name, format!("could not reach node: {e}")),
+        Err(RpcClientError::Io(e)) => {
+            Outcome::info(cat, name, format!("could not reach node: {e}"))
+        }
         Err(e) => Outcome::defended(cat, name, format!("REJECTED — {}", trim(&e.to_string()))),
-        Ok(id) => Outcome::vulnerable(cat, name, format!("ADMITTED to the live mempool ({id}) — the door did not reject it")),
+        Ok(id) => Outcome::vulnerable(
+            cat,
+            name,
+            format!("ADMITTED to the live mempool ({id}) — the door did not reject it"),
+        ),
     }
 }
 
@@ -166,7 +200,10 @@ pub fn probe_frontdoor(target: &str) -> LiveReport {
     let height = client.height().ok();
     let chain_id = client.chain_id().ok();
     let reachable = height.is_some();
-    let is_mainnet = chain_id.as_deref().map(|c| c.contains("mainnet")).unwrap_or(false);
+    let is_mainnet = chain_id
+        .as_deref()
+        .map(|c| c.contains("mainnet"))
+        .unwrap_or(false);
     let mempool_before = client.mempool_size().ok();
 
     let mut outcomes = Vec::new();
@@ -177,7 +214,11 @@ pub fn probe_frontdoor(target: &str) -> LiveReport {
         rpc_probes(&client, &mut outcomes);
     }
 
-    let mempool_after = if reachable { client.mempool_size().ok() } else { None };
+    let mempool_after = if reachable {
+        client.mempool_size().ok()
+    } else {
+        None
+    };
 
     LiveReport {
         target: addr,
@@ -207,7 +248,12 @@ fn crypto_probes(client: &RpcClient, out: &mut Vec<Outcome>) {
     // Ed25519 alone cannot forge.
     let mut s = base(10);
     s.signature = tamper_signature(s.signature, Half::MlDsa);
-    out.push(expect_rejected(client, c, "forge post-quantum half only (keep Ed25519 valid)", s));
+    out.push(expect_rejected(
+        client,
+        c,
+        "forge post-quantum half only (keep Ed25519 valid)",
+        s,
+    ));
 
     // Corrupt BOTH halves.
     let mut s = base(11);
@@ -216,22 +262,40 @@ fn crypto_probes(client: &RpcClient, out: &mut Vec<Outcome>) {
 
     // Edit the amount AFTER signing (malleability) — the signature binds the body.
     let mut s = base(12);
-    s.transaction.action = Action::Transfer { to: sink(), amount: Balance::from_sov(500).unwrap() };
-    out.push(expect_rejected(client, c, "edit amount after signing (malleability)", s));
+    s.transaction.action = Action::Transfer {
+        to: sink(),
+        amount: Balance::from_sov(500).unwrap(),
+    };
+    out.push(expect_rejected(
+        client,
+        c,
+        "edit amount after signing (malleability)",
+        s,
+    ));
 
     // DOWNGRADE: present a V1 Ed25519-only signature (valid Ed25519 bytes) against a
     // hybrid V2 key. Scheme mismatch — the verifier must refuse to fall back to the
     // classical-only half.
     let mut s = base(13);
     s.signature = Signature::V1Ed25519(ed_half(&s.signature));
-    out.push(expect_rejected(client, c, "downgrade to Ed25519-only vs a hybrid key", s));
+    out.push(expect_rejected(
+        client,
+        c,
+        "downgrade to Ed25519-only vs a hybrid key",
+        s,
+    ));
 
     // SPLICE: attach a signature that is valid for a DIFFERENT transaction (same account,
     // different nonce/amount). It cannot verify over this transaction's bytes.
     let donor = signed(14, 14, 7, 3);
     let mut victim = signed(14, 14, 0, 1);
     victim.signature = donor.signature;
-    out.push(expect_rejected(client, c, "splice a signature from another transaction", victim));
+    out.push(expect_rejected(
+        client,
+        c,
+        "splice a signature from another transaction",
+        victim,
+    ));
 }
 
 /// AUTHZ: control of the account. A valid signature is not enough — the key must be
@@ -240,7 +304,12 @@ fn authz_probes(client: &RpcClient, out: &mut Vec<Outcome>) {
     let c = "authz";
 
     // Spend an implicit account with a key that is NOT its own (impersonation).
-    out.push(expect_rejected(client, c, "impersonate an implicit account (wrong key)", signed(3, 4, 0, 1)));
+    out.push(expect_rejected(
+        client,
+        c,
+        "impersonate an implicit account (wrong key)",
+        signed(3, 4, 0, 1),
+    ));
 
     // Spend from a keyless NAMED account we do not control. Only `RotateKey` (a first
     // claim) is permitted on a keyless named account, so a Transfer must be refused.
@@ -249,9 +318,17 @@ fn authz_probes(client: &RpcClient, out: &mut Vec<Outcome>) {
         signer: AccountId::new("attacker.sov").unwrap(),
         public_key: attacker.public_key(),
         nonce: 0,
-        action: Action::Transfer { to: sink(), amount: Balance::from_sov(1).unwrap() },
+        action: Action::Transfer {
+            to: sink(),
+            amount: Balance::from_sov(1).unwrap(),
+        },
     };
-    out.push(expect_rejected(client, c, "spend from a keyless named account", SignedTransaction::sign(tx, &attacker).unwrap()));
+    out.push(expect_rejected(
+        client,
+        c,
+        "spend from a keyless named account",
+        SignedTransaction::sign(tx, &attacker).unwrap(),
+    ));
 
     // Seize an implicit account via RotateKey signed by the wrong key. Even the
     // privileged claim action must honor implicit self-certification (signer id == the
@@ -263,9 +340,17 @@ fn authz_probes(client: &RpcClient, out: &mut Vec<Outcome>) {
         signer: account.public_key().implicit_account_id(),
         public_key: attacker.public_key(),
         nonce: 0,
-        action: Action::RotateKey { new_key: attacker.public_key(), proof: Signature::V1Ed25519([0; 64]) },
+        action: Action::RotateKey {
+            new_key: attacker.public_key(),
+            proof: Signature::V1Ed25519([0; 64]),
+        },
     };
-    out.push(expect_rejected(client, c, "seize an account via RotateKey (wrong key)", SignedTransaction::sign(tx, &attacker).unwrap()));
+    out.push(expect_rejected(
+        client,
+        c,
+        "seize an account via RotateKey (wrong key)",
+        SignedTransaction::sign(tx, &attacker).unwrap(),
+    ));
 }
 
 /// ENCODING: the parser / validator. Each mutates a VALID transaction so exactly one
@@ -275,17 +360,32 @@ fn encoding_probes(client: &RpcClient, out: &mut Vec<Outcome>) {
     let valid = to_value(base(30)).unwrap();
 
     // A payload that is not a transaction at all.
-    out.push(expect_rejected_raw(client, c, "payload is not a transaction", json!("not-a-transaction")));
+    out.push(expect_rejected_raw(
+        client,
+        c,
+        "payload is not a transaction",
+        json!("not-a-transaction"),
+    ));
 
     // Nonce as a string instead of a number.
     let mut v = valid.clone();
     v["transaction"]["nonce"] = json!("not-a-number");
-    out.push(expect_rejected_raw(client, c, "nonce as a string (type confusion)", v));
+    out.push(expect_rejected_raw(
+        client,
+        c,
+        "nonce as a string (type confusion)",
+        v,
+    ));
 
     // Negative amount (the balance type is unsigned).
     let mut v = valid.clone();
     v["transaction"]["action"]["amount"] = json!(-1);
-    out.push(expect_rejected_raw(client, c, "negative transfer amount", v));
+    out.push(expect_rejected_raw(
+        client,
+        c,
+        "negative transfer amount",
+        v,
+    ));
 
     // Missing signature field entirely.
     let mut v = valid.clone();
@@ -297,7 +397,12 @@ fn encoding_probes(client: &RpcClient, out: &mut Vec<Outcome>) {
     // Over-length account id (> 64 chars — the id validator's hard cap).
     let mut v = valid.clone();
     v["transaction"]["signer"] = json!("a".repeat(96));
-    out.push(expect_rejected_raw(client, c, "over-length account id (>64 chars)", v));
+    out.push(expect_rejected_raw(
+        client,
+        c,
+        "over-length account id (>64 chars)",
+        v,
+    ));
 }
 
 /// RPC: protocol resilience. Neither an unknown method nor an oversized body should
@@ -307,25 +412,55 @@ fn rpc_probes(client: &RpcClient, out: &mut Vec<Outcome>) {
 
     // Unknown method.
     let unknown = match client.call("sov_thisMethodDoesNotExist", json!({})) {
-        Err(RpcClientError::Rpc { message, .. }) => Outcome::defended(c, "unknown method", format!("rejected cleanly — {}", trim(&message))),
-        Err(RpcClientError::Io(e)) => Outcome::info(c, "unknown method", format!("could not reach node: {e}")),
-        Err(e) => Outcome::defended(c, "unknown method", format!("rejected — {}", trim(&e.to_string()))),
-        Ok(_) => Outcome::vulnerable(c, "unknown method", "the node returned a result for a method it does not implement"),
+        Err(RpcClientError::Rpc { message, .. }) => Outcome::defended(
+            c,
+            "unknown method",
+            format!("rejected cleanly — {}", trim(&message)),
+        ),
+        Err(RpcClientError::Io(e)) => {
+            Outcome::info(c, "unknown method", format!("could not reach node: {e}"))
+        }
+        Err(e) => Outcome::defended(
+            c,
+            "unknown method",
+            format!("rejected — {}", trim(&e.to_string())),
+        ),
+        Ok(_) => Outcome::vulnerable(
+            c,
+            "unknown method",
+            "the node returned a result for a method it does not implement",
+        ),
     };
     out.push(unknown);
 
     // Oversized body (~1 MB of junk as the params) — must be bounded/rejected, not hang.
     let big = json!("x".repeat(1_000_000));
-    out.push(expect_rejected_raw(client, c, "oversized request body (~1MB)", big));
+    out.push(expect_rejected_raw(
+        client,
+        c,
+        "oversized request body (~1MB)",
+        big,
+    ));
 
     // Liveness: after every attack, the node must still answer — proof it never crashed.
     match client.height() {
-        Ok(h) => out.push(Outcome::info(c, "node still serving after the barrage", format!("height {h} — node alive"))),
-        Err(e) => out.push(Outcome::vulnerable(c, "node still serving after the barrage", format!("node stopped answering: {e}"))),
+        Ok(h) => out.push(Outcome::info(
+            c,
+            "node still serving after the barrage",
+            format!("height {h} — node alive"),
+        )),
+        Err(e) => out.push(Outcome::vulnerable(
+            c,
+            "node still serving after the barrage",
+            format!("node stopped answering: {e}"),
+        )),
     }
 }
 
 /// Convenience for the CLI: does the report contain any VULNERABLE outcome?
 pub fn any_vulnerable(report: &LiveReport) -> bool {
-    report.outcomes.iter().any(|o| o.verdict == Verdict::Vulnerable)
+    report
+        .outcomes
+        .iter()
+        .any(|o| o.verdict == Verdict::Vulnerable)
 }

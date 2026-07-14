@@ -25,10 +25,10 @@ use std::time::Duration;
 
 use sov_crypto::Keypair;
 use sov_network::{NetMessage, TcpNode};
+use sov_primitives::Balance;
 use sov_primitives::{AccountId, BlockHeight, Hash};
 use sov_rpc::RpcClient;
 use sov_types::{Action, Block, BlockHeader, SignedTransaction, Transaction};
-use sov_primitives::Balance;
 
 use crate::Outcome;
 
@@ -63,7 +63,10 @@ pub struct P2pReport {
 /// Split a user target into (rpc `host:port`, p2p `host:port`), defaulting the ports.
 fn split_targets(target: &str) -> (String, String) {
     let t = target.trim();
-    let t = t.strip_prefix("http://").or_else(|| t.strip_prefix("https://")).unwrap_or(t);
+    let t = t
+        .strip_prefix("http://")
+        .or_else(|| t.strip_prefix("https://"))
+        .unwrap_or(t);
     let t = t.split('/').next().unwrap_or(t);
     let (host, rpc_port) = match t.rsplit_once(':') {
         Some((h, p)) => (h.to_string(), p.to_string()),
@@ -79,7 +82,13 @@ fn split_targets(target: &str) -> (String, String) {
 /// A forged block extending some parent at some height. Its roots are garbage and its
 /// nonce is unmined, so it can never carry valid PoW — the point is to prove the node
 /// rejects it. `proposer` is where the (never-granted) reward would go.
-fn forged_block(height: u64, prev_hash: Hash, proposer: AccountId, timestamp_ms: u64, bits: u32) -> Block {
+fn forged_block(
+    height: u64,
+    prev_hash: Hash,
+    proposer: AccountId,
+    timestamp_ms: u64,
+    bits: u32,
+) -> Block {
     Block {
         header: BlockHeader {
             height: BlockHeight::new(height),
@@ -103,7 +112,9 @@ fn nowhere() -> Hash {
 }
 
 fn attacker_id() -> AccountId {
-    Keypair::hybrid_from_seed([88; 32]).public_key().implicit_account_id()
+    Keypair::hybrid_from_seed([88; 32])
+        .public_key()
+        .implicit_account_id()
 }
 
 // ── forged-tx builders (gossiped over the wire, not the RPC) ─────────────────
@@ -111,12 +122,17 @@ fn attacker_id() -> AccountId {
 fn implicit_transfer(account_seed: u8, key_seed: u8) -> SignedTransaction {
     let account_kp = Keypair::hybrid_from_seed([account_seed; 32]);
     let key_kp = Keypair::hybrid_from_seed([key_seed; 32]);
-    let to = Keypair::hybrid_from_seed([201; 32]).public_key().implicit_account_id();
+    let to = Keypair::hybrid_from_seed([201; 32])
+        .public_key()
+        .implicit_account_id();
     let tx = Transaction {
         signer: account_kp.public_key().implicit_account_id(),
         public_key: key_kp.public_key(),
         nonce: 0,
-        action: Action::Transfer { to, amount: Balance::from_sov(1).unwrap() },
+        action: Action::Transfer {
+            to,
+            amount: Balance::from_sov(1).unwrap(),
+        },
     };
     SignedTransaction::sign(tx, &key_kp).unwrap()
 }
@@ -124,39 +140,76 @@ fn implicit_transfer(account_seed: u8, key_seed: u8) -> SignedTransaction {
 // ── verdict helpers ──────────────────────────────────────────────────────────
 
 fn head_of(client: &RpcClient) -> Option<(u64, String)> {
-    client.head().ok().map(|b| (b.header.height.get(), b.hash().to_hex()))
+    client
+        .head()
+        .ok()
+        .map(|b| (b.header.height.get(), b.hash().to_hex()))
 }
 
 /// Gossip a forged block and judge: the node must NOT adopt it as its head.
-fn send_block(node: &TcpNode, victim: SocketAddr, client: &RpcClient, name: &'static str, block: Block) -> Outcome {
+fn send_block(
+    node: &TcpNode,
+    victim: SocketAddr,
+    client: &RpcClient,
+    name: &'static str,
+    block: Block,
+) -> Outcome {
     let forged_hash = block.hash().to_hex();
     let sent = node.send(victim, &NetMessage::NewBlock(block));
     if !sent {
-        return Outcome::info("p2p block", name, "our peer was already dropped — node ejected us");
+        return Outcome::info(
+            "p2p block",
+            name,
+            "our peer was already dropped — node ejected us",
+        );
     }
     std::thread::sleep(Duration::from_millis(600));
     match head_of(client) {
-        Some((_, hash)) if hash == forged_hash => {
-            Outcome::vulnerable("p2p block", name, format!("ACCEPTED — the node adopted our forged block as its head ({forged_hash})"))
-        }
-        Some((h, _)) => Outcome::defended("p2p block", name, format!("rejected — tip unmoved (still honest head at height {h})")),
+        Some((_, hash)) if hash == forged_hash => Outcome::vulnerable(
+            "p2p block",
+            name,
+            format!("ACCEPTED — the node adopted our forged block as its head ({forged_hash})"),
+        ),
+        Some((h, _)) => Outcome::defended(
+            "p2p block",
+            name,
+            format!("rejected — tip unmoved (still honest head at height {h})"),
+        ),
         None => Outcome::info("p2p block", name, "could not read the node's head over RPC"),
     }
 }
 
 /// Gossip a forged transaction and judge: it must NOT enter the mempool.
-fn send_tx(node: &TcpNode, victim: SocketAddr, client: &RpcClient, name: &'static str, stx: SignedTransaction) -> Outcome {
+fn send_tx(
+    node: &TcpNode,
+    victim: SocketAddr,
+    client: &RpcClient,
+    name: &'static str,
+    stx: SignedTransaction,
+) -> Outcome {
     let before = client.mempool_size().unwrap_or(0);
     let sent = node.send(victim, &NetMessage::NewTransaction(stx));
     if !sent {
-        return Outcome::info("p2p tx", name, "our peer was already dropped — node ejected us");
+        return Outcome::info(
+            "p2p tx",
+            name,
+            "our peer was already dropped — node ejected us",
+        );
     }
     std::thread::sleep(Duration::from_millis(500));
     let after = client.mempool_size().unwrap_or(before);
     if after > before {
-        Outcome::vulnerable("p2p tx", name, format!("ADMITTED to the mempool via gossip ({before} → {after})"))
+        Outcome::vulnerable(
+            "p2p tx",
+            name,
+            format!("ADMITTED to the mempool via gossip ({before} → {after})"),
+        )
     } else {
-        Outcome::defended("p2p tx", name, format!("rejected — mempool unchanged ({before} → {after})"))
+        Outcome::defended(
+            "p2p tx",
+            name,
+            format!("rejected — mempool unchanged ({before} → {after})"),
+        )
     }
 }
 
@@ -178,7 +231,11 @@ pub fn probe_backdoor(target: &str) -> P2pReport {
         outcomes: Vec::new(),
         error: None,
     };
-    report.is_mainnet = report.chain_id.as_deref().map(|c| c.contains("mainnet")).unwrap_or(false);
+    report.is_mainnet = report
+        .chain_id
+        .as_deref()
+        .map(|c| c.contains("mainnet"))
+        .unwrap_or(false);
 
     // We need the node reachable over RPC (to observe the tip) and its chain identity.
     let Some(chain_id) = report.chain_id.clone() else {
@@ -202,7 +259,11 @@ pub fn probe_backdoor(target: &str) -> P2pReport {
     let head_ts = client.head().map(|b| b.header.timestamp_ms).unwrap_or(0);
 
     // Resolve the victim's P2P socket address.
-    let Some(victim) = p2p_target.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
+    let Some(victim) = p2p_target
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+    else {
         report.error = Some(format!("could not resolve P2P address {p2p_target}"));
         return report;
     };
@@ -230,7 +291,8 @@ pub fn probe_backdoor(target: &str) -> P2pReport {
         std::thread::sleep(Duration::from_millis(50));
     }
     let Some(binding) = binding else {
-        report.error = Some("P2P handshake did not complete (node not accepting peers on :9645?)".into());
+        report.error =
+            Some("P2P handshake did not complete (node not accepting peers on :9645?)".into());
         node.shutdown();
         return report;
     };
@@ -239,7 +301,10 @@ pub fn probe_backdoor(target: &str) -> P2pReport {
     // name works — the network is permissionless (we just avoid the victim's own id).
     let keypair = Keypair::hybrid_from_seed([77; 32]);
     let account = AccountId::new("redteam-probe.sov").unwrap();
-    node.send(victim, &NetMessage::hello(chain_id, genesis, account, &binding, &keypair));
+    node.send(
+        victim,
+        &NetMessage::hello(chain_id, genesis, account, &binding, &keypair),
+    );
 
     // The victim reciprocates a Hello/Status ONLY after it authenticates us, so its
     // reply is our synchronization signal that mutual auth is done (and that our forged
@@ -272,34 +337,91 @@ pub fn probe_backdoor(target: &str) -> P2pReport {
     // First, the unconnectable forgeries (fabricated parents) — dropped without penalty,
     // so they run cleanly while we are still connected.
     report.outcomes.push(send_block(
-        &node, victim, &client, "orphan block (fabricated parent)",
-        forged_block(head_h + 1, nowhere(), attacker_id(), head_ts + 150_000, head_bits),
+        &node,
+        victim,
+        &client,
+        "orphan block (fabricated parent)",
+        forged_block(
+            head_h + 1,
+            nowhere(),
+            attacker_id(),
+            head_ts + 150_000,
+            head_bits,
+        ),
     ));
     report.outcomes.push(send_block(
-        &node, victim, &client, "rewrite history (old height, fake parent)",
-        forged_block(head_h.saturating_sub(3), nowhere(), attacker_id(), head_ts, head_bits),
+        &node,
+        victim,
+        &client,
+        "rewrite history (old height, fake parent)",
+        forged_block(
+            head_h.saturating_sub(3),
+            nowhere(),
+            attacker_id(),
+            head_ts,
+            head_bits,
+        ),
     ));
     report.outcomes.push(send_block(
-        &node, victim, &client, "future-height leap (+10000)",
-        forged_block(head_h + 10_000, nowhere(), attacker_id(), head_ts + 150_000, head_bits),
+        &node,
+        victim,
+        &client,
+        "future-height leap (+10000)",
+        forged_block(
+            head_h + 10_000,
+            nowhere(),
+            attacker_id(),
+            head_ts + 150_000,
+            head_bits,
+        ),
     ));
 
     // Forged transactions over the gossip path (the mempool back door).
     let mut forged_sig = implicit_transfer(30, 30);
     forged_sig.signature = crate::tamper_signature(forged_sig.signature, crate::Half::Ed25519);
-    report.outcomes.push(send_tx(&node, victim, &client, "gossip a forged-signature tx", forged_sig));
-    report.outcomes.push(send_tx(&node, victim, &client, "gossip an impersonation tx (wrong key)", implicit_transfer(31, 32)));
+    report.outcomes.push(send_tx(
+        &node,
+        victim,
+        &client,
+        "gossip a forged-signature tx",
+        forged_sig,
+    ));
+    report.outcomes.push(send_tx(
+        &node,
+        victim,
+        &client,
+        "gossip an impersonation tx (wrong key)",
+        implicit_transfer(31, 32),
+    ));
 
     // Finally the CONNECTING forgeries: they link to the real head, so they reach full
     // validation (and cost misbehavior points). This proves the seal gate rejects a
     // correctly-linked but unmined block — and typically trips the ban that ejects us.
     report.outcomes.push(send_block(
-        &node, victim, &client, "unmined block on the real head (no PoW)",
-        forged_block(head_h + 1, head_hash, attacker_id(), head_ts + 150_000, head_bits),
+        &node,
+        victim,
+        &client,
+        "unmined block on the real head (no PoW)",
+        forged_block(
+            head_h + 1,
+            head_hash,
+            attacker_id(),
+            head_ts + 150_000,
+            head_bits,
+        ),
     ));
     report.outcomes.push(send_block(
-        &node, victim, &client, "steal the coinbase on the real head",
-        forged_block(head_h + 1, head_hash, attacker_id(), head_ts + 150_001, head_bits),
+        &node,
+        victim,
+        &client,
+        "steal the coinbase on the real head",
+        forged_block(
+            head_h + 1,
+            head_hash,
+            attacker_id(),
+            head_ts + 150_001,
+            head_bits,
+        ),
     ));
 
     // Did the node eject us?
@@ -311,7 +433,10 @@ pub fn probe_backdoor(target: &str) -> P2pReport {
 
 /// Any VULNERABLE outcome?
 pub fn any_vulnerable(report: &P2pReport) -> bool {
-    report.outcomes.iter().any(|o| o.verdict == crate::Verdict::Vulnerable)
+    report
+        .outcomes
+        .iter()
+        .any(|o| o.verdict == crate::Verdict::Vulnerable)
 }
 
 /// The tip never adopted a forged block: either unchanged, or advanced only by the node's
