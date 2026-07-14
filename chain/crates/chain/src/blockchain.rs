@@ -1144,28 +1144,60 @@ impl Blockchain {
         block: &Block,
         sha_target: Target,
     ) -> Result<Vec<Receipt>, ChainError> {
-        let mut scratch = self.ledger.clone();
-        // Record this block's writes so it can be DISCONNECTED later (a reorg) in
-        // O(1), instead of replaying the chain from genesis to undo it.
-        scratch.begin_undo();
-        let receipts = self.execute_block_on(&mut scratch, block, sha_target, &self.signals)?;
-        if scratch.state_root() != block.header.state_root {
+        // Capture ONLY the transition-invariant inputs from the pre-state (supply +
+        // per-asset counters) — O(#assets), cheap — instead of deep-cloning the WHOLE
+        // ledger. The authenticated SMT is hundreds of MB on a live chain, so that
+        // per-block `self.ledger.clone()` was the dominant import cost (~270 ms), which
+        // made initial sync crawl and starved the P2P thread. Instead we execute the
+        // block IN PLACE (mirroring `extend_trusted`) and, on ANY failure, roll the
+        // ledger back with the undo journal — the exact mechanism `disconnect_to` uses
+        // to reverse a block during a reorg — restoring the pre-state byte-for-byte.
+        let pre = sov_verify::TransitionPre::capture(&self.ledger)?;
+        let mut ledger = std::mem::take(&mut self.ledger);
+        ledger.begin_undo();
+        match self.try_connect_block(&mut ledger, block, sha_target, &pre) {
+            Ok(receipts) => {
+                // Keep this block's undo log so a later reorg can DISCONNECT it in
+                // O(writes) instead of replaying the chain from genesis.
+                let undo = ledger.take_undo();
+                self.ledger = ledger;
+                self.signals
+                    .record(block.header.height, block.header.version_bits);
+                self.blocks.push(block.clone());
+                self.remember_undo(block.header.height.get(), block.hash(), undo);
+                Ok(receipts)
+            }
+            Err(e) => {
+                let undo = ledger.take_undo();
+                ledger.apply_undo(undo); // reverse every write → exact pre-state
+                self.ledger = ledger;
+                Err(e)
+            }
+        }
+    }
+
+    /// Execute `block` on `ledger` (already `begin_undo`'d) and verify its committed roots
+    /// and consensus invariants against the captured pre-state `pre`. Returns the receipts
+    /// on success; on ANY error the caller rolls `ledger` back via its undo journal, so the
+    /// atomic-rejection guarantee is preserved without a per-block ledger clone.
+    fn try_connect_block(
+        &self,
+        ledger: &mut Ledger,
+        block: &Block,
+        sha_target: Target,
+        pre: &sov_verify::TransitionPre,
+    ) -> Result<Vec<Receipt>, ChainError> {
+        let receipts = self.execute_block_on(ledger, block, sha_target, &self.signals)?;
+        if ledger.state_root() != block.header.state_root {
             return Err(ChainError::StateRootMismatch);
         }
         if receipts_root(&receipts) != block.header.receipts_root {
             return Err(ChainError::ReceiptsRootMismatch);
         }
-        // Consensus backstop: the block must conserve value (supply only moves by
-        // the coinbase counter) and leave every protocol invariant intact, or it is
-        // rejected. `self.ledger` is the pre-state, `scratch` the post-state, so this
-        // is free — no extra clone — and runs on every committed block, every network.
-        self.verify_invariants(&self.ledger, &scratch, sha_target)?;
-        let undo = scratch.take_undo();
-        self.ledger = scratch;
-        self.signals
-            .record(block.header.height, block.header.version_bits);
-        self.blocks.push(block.clone());
-        self.remember_undo(block.header.height.get(), block.hash(), undo);
+        // Consensus backstop: value is conserved (supply moves only by the coinbase
+        // counter) and every protocol invariant holds, or the block is rejected.
+        sov_verify::check_transition_pre(pre, ledger)?;
+        sov_verify::check_ledger(ledger, &self.policy_with(sha_target))?;
         Ok(receipts)
     }
 
@@ -3098,6 +3130,50 @@ mod tests {
             }
             block.header.nonce = block.header.nonce.wrapping_add(1);
         }
+    }
+
+    #[test]
+    fn a_bad_block_extending_the_head_is_rolled_back_in_place() {
+        // `connect_to_active` now executes IN PLACE with an undo journal instead of on a
+        // full ledger clone (the clone was the ~270ms per-block import cost that made sync
+        // crawl). This guards the atomic-rejection property on that fast path: a block
+        // that extends the head but LIES about its state root (carrying valid PoW) must be
+        // rejected AND leave the ledger byte-for-byte unchanged — the undo must reverse
+        // every write the failed block made.
+        let mut chain = fresh_chain();
+        for i in 0..3u64 {
+            let b = chain
+                .produce_block(vec![usa_transfer("ecb.reserve.sov", 10, i)], 2_000 + i * 1_000)
+                .unwrap();
+            chain.import_block(b).unwrap();
+        }
+        let head = chain.head().hash();
+        let root = chain.ledger().state_root();
+        let height = chain.height();
+
+        // Honest next block, then reseal with a bogus state root (still valid PoW) so it
+        // survives seal validation and reaches the in-place execution path.
+        let good = chain
+            .produce_block(vec![usa_transfer("ecb.reserve.sov", 5, 3)], 5_000)
+            .unwrap();
+        let bad = reseal_with_bad_state_root(&chain, good);
+        assert_eq!(bad.header.prev_hash, head, "must extend the head (fast path)");
+        assert!(
+            matches!(chain.import_block(bad), Err(ChainError::StateRootMismatch)),
+            "a lying block must be rejected"
+        );
+
+        // The in-place rollback restored the EXACT pre-state.
+        assert_eq!(chain.head().hash(), head, "head unchanged");
+        assert_eq!(chain.ledger().state_root(), root, "state root restored byte-for-byte");
+        assert_eq!(chain.height(), height, "height unchanged");
+
+        // And the chain is NOT wedged: it still accepts the honest next block.
+        let good2 = chain
+            .produce_block(vec![usa_transfer("ecb.reserve.sov", 5, 3)], 6_000)
+            .unwrap();
+        chain.import_block(good2).unwrap();
+        assert_eq!(chain.height(), height + 1);
     }
 
     #[test]

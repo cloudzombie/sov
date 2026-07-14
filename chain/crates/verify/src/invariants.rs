@@ -14,9 +14,56 @@
 //!   create or destroy it) and **no unauthorized mint** (supply can only rise via
 //!   the coinbase counter). There is no burn: SOV is not deflationary.
 
+use std::collections::HashMap;
+
 use sov_mining::MiningPolicy;
-use sov_primitives::MAX_SUPPLY_GRAINS;
+use sov_primitives::{AccountId, Balance, Hash, MAX_SUPPLY_GRAINS};
 use sov_state::Ledger;
+
+/// The small slice of a pre-state that [`check_transition`] compares a post-state
+/// against: the supply/emission scalars plus each asset's identity and monotonic
+/// counters. Captured with [`TransitionPre::capture`] — O(#assets), cheap — so a caller
+/// validating one block need NOT deep-clone the whole ledger (whose authenticated SMT is
+/// the dominant cost) just to hold onto the pre-state. This is what lets network import
+/// execute in place (with an undo journal for rollback) instead of cloning per block.
+pub struct TransitionPre {
+    supply: u128,
+    mined: u128,
+    tokens: HashMap<Hash, TokenPre>,
+}
+
+struct TokenPre {
+    issuer: AccountId,
+    symbol: String,
+    issued: Balance,
+    burned: Balance,
+}
+
+impl TransitionPre {
+    /// Capture the transition-relevant pre-state from `ledger`.
+    pub fn capture(ledger: &Ledger) -> Result<Self, InvariantViolation> {
+        let supply = ledger
+            .total_supply()
+            .ok_or(InvariantViolation::SupplyOverflow)?
+            .grains();
+        let mined = ledger.mined_emitted().grains();
+        let tokens = ledger
+            .token_iter()
+            .map(|(asset, info)| {
+                (
+                    *asset,
+                    TokenPre {
+                        issuer: info.issuer.clone(),
+                        symbol: info.symbol.clone(),
+                        issued: info.issued,
+                        burned: info.burned,
+                    },
+                )
+            })
+            .collect();
+        Ok(Self { supply, mined, tokens })
+    }
+}
 
 /// A violated protocol invariant. Each variant names the exact quantities so a
 /// failure is diagnosable, not merely "invalid".
@@ -234,16 +281,24 @@ fn check_token_conservation(ledger: &Ledger) -> Result<(), InvariantViolation> {
 /// coinbase tax only changes *who* is credited, not the total). There is no
 /// burn, so supply never decreases. Any other change to supply is a violation.
 pub fn check_transition(before: &Ledger, after: &Ledger) -> Result<(), InvariantViolation> {
-    let supply_before = before
-        .total_supply()
-        .ok_or(InvariantViolation::SupplyOverflow)?
-        .grains();
+    check_transition_pre(&TransitionPre::capture(before)?, after)
+}
+
+/// Identical to [`check_transition`], but the pre-state is a cheap captured
+/// [`TransitionPre`] rather than a full `&Ledger`. This lets the import path execute a
+/// block IN PLACE (rolling back via the undo journal on failure) instead of deep-cloning
+/// the entire ledger every block — the clone that dominated live-chain import time.
+pub fn check_transition_pre(
+    before: &TransitionPre,
+    after: &Ledger,
+) -> Result<(), InvariantViolation> {
+    let supply_before = before.supply;
     let supply_after = after
         .total_supply()
         .ok_or(InvariantViolation::SupplyOverflow)?
         .grains();
 
-    let mined_before = before.mined_emitted().grains();
+    let mined_before = before.mined;
     let mined_after = after.mined_emitted().grains();
     if mined_after < mined_before {
         return Err(InvariantViolation::EmissionRegressed {
@@ -276,7 +331,7 @@ pub fn check_transition(before: &Ledger, after: &Ledger) -> Result<(), Invariant
     // are monotonic. Combined with the per-state conservation check
     // (`sum(balances) == issued − burned`, in `check_ledger`), this gives every
     // native asset the same counter-accounted conservation theorem as SOV.
-    for (asset, before_info) in before.token_iter() {
+    for (asset, before_info) in &before.tokens {
         let Some(after_info) = after.token(asset) else {
             return Err(InvariantViolation::TokenIdentityMutated {
                 asset: asset.to_string(),

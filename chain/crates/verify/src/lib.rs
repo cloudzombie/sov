@@ -20,4 +20,6 @@
 
 pub mod invariants;
 
-pub use invariants::{check_ledger, check_transition, InvariantViolation};
+pub use invariants::{
+    check_ledger, check_transition, check_transition_pre, InvariantViolation, TransitionPre,
+};
