@@ -33,9 +33,11 @@ fn alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }
 
-/// Which probe the content area is showing. Funded is first — it's the marquee.
+/// Which probe the content area is showing. The Gauntlet is first — it attacks the real
+/// live pot.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
+    Gauntlet,
     Funded,
     FrontDoor,
     BackDoor,
@@ -45,6 +47,9 @@ enum View {
 struct RedTeamApp {
     /// The probe currently shown in the content area.
     view: View,
+    // The Gauntlet: attack the live steal-the-pot account, no key.
+    gauntlet_report: Arc<Mutex<Option<sov_redteam::GauntletReport>>>,
+    gauntlet_running: Arc<AtomicBool>,
     // In-process battery: attack a private replica of consensus.
     results: Arc<Mutex<Option<Vec<sov_redteam::Outcome>>>>,
     running: Arc<AtomicBool>,
@@ -68,10 +73,12 @@ struct RedTeamApp {
 impl Default for RedTeamApp {
     fn default() -> Self {
         Self {
-            view: View::Funded,
+            view: View::Gauntlet,
+            gauntlet_report: Arc::new(Mutex::new(None)),
+            gauntlet_running: Arc::new(AtomicBool::new(false)),
             results: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
-            target: "127.0.0.1:8645".to_string(),
+            target: "64.225.10.34:8645".to_string(),
             live_report: Arc::new(Mutex::new(None)),
             live_running: Arc::new(AtomicBool::new(false)),
             backdoor_report: Arc::new(Mutex::new(None)),
@@ -124,6 +131,9 @@ impl RedTeamApp {
     /// Clear every result panel so the app returns to its initial state. Disabled while
     /// any probe is running (we don't interrupt a live attack mid-flight).
     fn reset(&self) {
+        if let Ok(mut r) = self.gauntlet_report.lock() {
+            *r = None;
+        }
         if let Ok(mut r) = self.results.lock() {
             *r = None;
         }
@@ -197,6 +207,112 @@ impl RedTeamApp {
             }
             running.store(false, Ordering::SeqCst);
         });
+    }
+
+    /// Fire the Gauntlet probe at the live pot, off the UI thread.
+    fn run_gauntlet(&self) {
+        if self.gauntlet_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let target = self.target.clone();
+        let report = Arc::clone(&self.gauntlet_report);
+        let running = Arc::clone(&self.gauntlet_running);
+        std::thread::spawn(move || {
+            let r = sov_redteam::probe_gauntlet(&target);
+            if let Ok(mut slot) = report.lock() {
+                *slot = Some(r);
+            }
+            running.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// The Gauntlet: attack the real live steal-the-pot account every key-less way.
+    fn gauntlet_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("🏆 The Gauntlet — attack the live pot").size(19.0).strong().color(GOLD));
+        ui.label(
+            RichText::new(
+                "The public steal-the-pot account holds real XUS on live mainnet, and its private \
+                 key is in cold storage. This is the outsider who wants it and has NO key: it throws \
+                 every key-less theft — forged signatures, wrong-key spends, RotateKey seizure, \
+                 overflow drains, malformed payloads, a brute-force sweep — over the real RPC, then \
+                 checks the pot balance. Every attempt must be refused and not a grain may move.",
+            )
+            .size(12.0)
+            .color(MUTED),
+        );
+        ui.add_space(10.0);
+
+        let running = self.gauntlet_running.load(Ordering::SeqCst);
+        let btn = egui::Button::new(
+            RichText::new(if running { "🏆 attacking the pot…" } else { "🏆 Attack the pot" })
+                .strong()
+                .color(Color32::from_rgb(17, 16, 13)),
+        )
+        .fill(GOLD)
+        .min_size(egui::vec2(200.0, 32.0));
+        if ui.add_enabled(!running, btn).clicked() {
+            self.run_gauntlet();
+        }
+        if running {
+            ui.spinner();
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+        }
+        ui.add_space(12.0);
+
+        let Ok(guard) = self.gauntlet_report.lock() else {
+            return;
+        };
+        let Some(report) = guard.as_ref() else {
+            if !running {
+                ui.label(RichText::new("Point at a node and attack the pot.").color(MUTED).italics());
+            }
+            return;
+        };
+
+        if let Some(err) = &report.error {
+            ui.label(RichText::new(err).size(12.0).color(THREAT).italics());
+            return;
+        }
+
+        let intact = report.pot_intact() && !sov_redteam::gauntlet_any_vulnerable(report);
+        egui::Frame::none()
+            .fill(SURFACE)
+            .rounding(Rounding::same(12.0))
+            .stroke(Stroke::new(1.0, alpha(if intact { HOLD } else { THREAT }, 120)))
+            .inner_margin(Margin::symmetric(18.0, 14.0))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(if intact { "THE POT HELD" } else { "THE POT IS IN DANGER" })
+                        .size(22.0)
+                        .strong()
+                        .color(if intact { HOLD } else { THREAT }),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("pot {}…", &report.pot[..16.min(report.pot.len())])).size(12.0).monospace().color(MUTED));
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "{} → {} XUS",
+                            sov_redteam::GauntletReport::xus(report.balance_before),
+                            sov_redteam::GauntletReport::xus(report.balance_after),
+                        ))
+                        .size(13.0)
+                        .strong()
+                        .monospace()
+                        .color(if intact { HOLD } else { THREAT }),
+                    );
+                    if report.is_mainnet {
+                        ui.add_space(12.0);
+                        ui.label(RichText::new("LIVE MAINNET").size(12.0).strong().monospace().color(GOLD));
+                    }
+                });
+            });
+        ui.add_space(10.0);
+
+        for o in &report.outcomes {
+            Self::outcome_row(ui, o.name, o.verdict, &o.detail, GOLD);
+        }
     }
 
     /// One attack card: left accent, name + detail, and a verdict chip on the right.
@@ -287,6 +403,7 @@ impl eframe::App for RedTeamApp {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.set_max_width(720.0);
                     match self.view {
+                        View::Gauntlet => self.gauntlet_section(ui),
                         View::Funded => self.funded_section(ui),
                         View::FrontDoor => self.live_section(ui),
                         View::BackDoor => self.backdoor_section(ui),
@@ -339,6 +456,7 @@ impl RedTeamApp {
     /// The left nav rail.
     fn nav(&mut self, ui: &mut egui::Ui) {
         ui.add_space(2.0);
+        self.nav_item(ui, View::Gauntlet, "🏆", "The Gauntlet", GOLD);
         self.nav_item(ui, View::Funded, "₿", "Funded adversary", GOLD);
         self.nav_item(ui, View::FrontDoor, "⌁", "Front door", PQ);
         self.nav_item(ui, View::BackDoor, "⛒", "Back door", THREAT);

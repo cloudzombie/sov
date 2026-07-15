@@ -11,24 +11,67 @@
 //! so nothing lands in the target's mempool.
 
 use sov_redteam::{
-    backdoor_any_vulnerable, funded_any_vulnerable, keypair_from_secret, live_any_vulnerable,
-    probe_backdoor, probe_frontdoor, probe_funded, run_all, Verdict,
+    backdoor_any_vulnerable, funded_any_vulnerable, gauntlet_any_vulnerable, keypair_from_secret,
+    live_any_vulnerable, probe_backdoor, probe_frontdoor, probe_funded, probe_gauntlet, run_all,
+    GauntletReport, Verdict,
 };
 
 fn main() {
-    // `--target <addr>` switches to a live probe; add `--p2p` for the back-door probe, or
-    // `--funded` for the funded-adversary probe (key from the SOV_REDTEAM_KEY env var, so
-    // the secret is never on the command line).
+    // `--target <addr>` switches to a live probe; add `--p2p` (back door), `--funded`
+    // (funded adversary, key from SOV_REDTEAM_KEY), or `--gauntlet` (attack the live pot).
     let args: Vec<String> = std::env::args().skip(1).collect();
     let target = parse_target(&args);
     let p2p = args.iter().any(|a| a == "--p2p" || a == "--backdoor");
     let funded = args.iter().any(|a| a == "--funded");
+    let gauntlet = args.iter().any(|a| a == "--gauntlet");
 
     match target {
+        Some(addr) if gauntlet => gauntlet_mode(&addr),
         Some(addr) if funded => funded_mode(&addr),
         Some(addr) if p2p => backdoor_mode(&addr),
         Some(addr) => live_mode(&addr),
         None => in_process_mode(),
+    }
+}
+
+fn gauntlet_mode(addr: &str) {
+    println!("\n  sov-redteam — THE GAUNTLET (attack the live pot)");
+    println!("  trying to drain the steal-the-pot account with no key — every way possible…\n");
+    let report = probe_gauntlet(addr);
+    if let Some(err) = &report.error {
+        println!("  \x1b[31m{err}\x1b[0m\n");
+        std::process::exit(2);
+    }
+    let banner = if report.is_mainnet { "\x1b[33mLIVE MAINNET\x1b[0m" } else { report.chain_id.as_deref().unwrap_or("unknown") };
+    println!(
+        "  pot {}…  ·  balance {} XUS  ·  {}\n",
+        short(&report.pot),
+        GauntletReport::xus(report.balance_before),
+        banner
+    );
+    let (mut defended, mut vulnerable, mut info) = (0u32, 0u32, 0u32);
+    for o in &report.outcomes {
+        let (tag, mark) = mark_of(o.verdict, &mut defended, &mut vulnerable, &mut info);
+        println!("   {mark} [{tag:<10}] {:<40} {}", o.name, o.detail);
+    }
+    if let (Some(b), Some(a)) = (report.balance_before, report.balance_after) {
+        let ok = b == a;
+        println!(
+            "\n  pot {} → {} XUS  ·  {}",
+            GauntletReport::xus(Some(b)),
+            GauntletReport::xus(Some(a)),
+            if ok { "\x1b[32mnot a grain moved\x1b[0m" } else { "\x1b[31mTHE POT MOVED\x1b[0m" }
+        );
+    }
+    println!(
+        "  {} attacks · \x1b[32m{defended} defended\x1b[0m · \x1b[31m{vulnerable} vulnerable\x1b[0m · {info} info",
+        report.outcomes.len()
+    );
+    if gauntlet_any_vulnerable(&report) {
+        println!("  \x1b[31mTHE POT IS IN DANGER — see ✗ above.\x1b[0m\n");
+        std::process::exit(1);
+    } else {
+        println!("  the pot held — no key, no coins.\n");
     }
 }
 
