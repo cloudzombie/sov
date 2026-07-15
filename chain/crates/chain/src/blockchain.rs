@@ -425,6 +425,23 @@ impl Blockchain {
         self.checkpoints = checkpoints.into_iter().collect();
     }
 
+    /// ADD trusted checkpoints without discarding existing ones — so a node's baked
+    /// network defaults (e.g. the mainnet assumevalid checkpoint) and any operator-
+    /// configured checkpoints coexist.
+    pub fn add_checkpoints(&mut self, checkpoints: impl IntoIterator<Item = (u64, Hash)>) {
+        self.checkpoints.extend(checkpoints);
+    }
+
+    /// The height of the newest trusted checkpoint, or `0` if none are configured. Blocks
+    /// strictly below this are assumed-valid on import (their PoW/signatures are not
+    /// re-verified — the checkpoint transitively pins them), which is what lets a fresh
+    /// node sync historical blocks at state-application speed instead of re-running every
+    /// RandomX seal and hybrid signature. A chain with no checkpoints (dev/test) returns
+    /// `0`, so nothing is ever skipped there and the KAT is unaffected.
+    fn newest_checkpoint_height(&self) -> u64 {
+        self.checkpoints.keys().copied().max().unwrap_or(0)
+    }
+
     /// The network identifier.
     pub fn chain_id(&self) -> &str {
         &self.chain_id
@@ -1111,15 +1128,20 @@ impl Blockchain {
                 got: block.header.bits,
             });
         }
-        // Proof of work (Nakamoto consensus): the header's seal (RandomX on
-        // mainnet, SHA-256d on dev) must meet the branch-in-force target. This —
-        // not a validator schedule — is what authorizes a block; the `proposer`
-        // field merely names the coinbase recipient. Cheap to verify, expensive
-        // to produce.
-        if !sha_target.is_met_by(&self.seal(&block.header)) {
+        // ASSUMEVALID (Bitcoin's model): a block strictly BELOW the newest trusted
+        // checkpoint is transitively pinned by that checkpoint's hash — a fake history
+        // reaching the checkpoint height is caught by the hash pin (CheckpointMismatch
+        // above), and the real one has valid PoW by definition — so re-running its
+        // (expensive) RandomX seal proves nothing here. Skipping it turns historical sync
+        // from RandomX-bound into cheap state application. The seal is still fully checked
+        // AT and ABOVE the newest checkpoint, and a chain with no checkpoints (dev/test)
+        // has `newest_checkpoint_height() == 0`, so nothing is ever skipped there and the
+        // KAT is byte-identical. (Signatures + roots are always verified below.)
+        let assume_valid = block.header.height.get() < self.newest_checkpoint_height();
+        if !assume_valid && !sha_target.is_met_by(&self.seal(&block.header)) {
             return Err(ChainError::PowInsufficient);
         }
-        // Body internal consistency (independent of execution).
+        // Body internal consistency (independent of execution) — cheap; always verified.
         if !block.tx_root_matches() {
             return Err(ChainError::TxRootMismatch);
         }

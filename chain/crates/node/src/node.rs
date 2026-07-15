@@ -60,6 +60,12 @@ impl Node {
         self.chain.set_checkpoints(checkpoints);
     }
 
+    /// Add trusted checkpoints, keeping any already installed (baked defaults + operator
+    /// config coexist).
+    pub fn add_checkpoints(&mut self, checkpoints: impl IntoIterator<Item = (u64, Hash)>) {
+        self.chain.add_checkpoints(checkpoints);
+    }
+
     /// The underlying chain.
     pub fn chain(&self) -> &Blockchain {
         &self.chain

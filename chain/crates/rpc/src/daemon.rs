@@ -787,6 +787,31 @@ fn mempool_path(dir: &Path) -> PathBuf {
     dir.join("mempool.dat")
 }
 
+/// Baked trusted **assumevalid** checkpoints for mainnet: `(height, block-hash)` pairs a
+/// fresh node trusts so it can skip re-running RandomX for every historical block below
+/// them (Bitcoin's model), syncing at state-application speed instead. Each is a deeply-
+/// final block, independently agreed by the network's seed nodes when it was pinned — a
+/// weak-subjectivity anchor, NOT a consensus rule (a chain that reaches this height with
+/// a different hash is rejected by the checkpoint hash-pin regardless). Genesis-safe and
+/// additive; operators may configure MORE checkpoints on top.
+const MAINNET_CHECKPOINTS: &[(u64, &str)] = &[(
+    5000,
+    "fd5cb664b1cac096160dab6cae444c085cbf6232927af711c8cca556417e5684",
+)];
+
+/// The baked checkpoints for a chain, parsed to `(height, Hash)`. Empty for any non-
+/// mainnet chain (dev/test/testnet), so nothing is ever assumed-valid there.
+fn baked_checkpoints(chain_id: &str) -> Vec<(u64, Hash)> {
+    if chain_id.contains("mainnet") {
+        MAINNET_CHECKPOINTS
+            .iter()
+            .filter_map(|(h, hex)| Hash::from_hex(hex).ok().map(|hash| (*h, hash)))
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
 /// Serialize the pending pool and durably write it (atomic temp+rename), under a brief
 /// node lock. Cheap (the pool is bounded), so it is written on the periodic snapshot tick
 /// and once more on clean shutdown.
@@ -1141,6 +1166,11 @@ impl Daemon {
             }
         }
 
+        // Install the network's baked assumevalid checkpoints (mainnet only) so this node
+        // skips re-verifying RandomX for historical blocks below them during sync.
+        // Operator-configured checkpoints are ADDED on top later (`with_checkpoints`).
+        node.add_checkpoints(baked_checkpoints(&genesis.chain_id));
+
         // Restore the pending pool persisted at last shutdown, re-validating every tx
         // against the state we just replayed (stale/unaffordable ones are dropped). The
         // chain is the source of truth, so a missing/corrupt file is harmless.
@@ -1228,7 +1258,8 @@ impl Daemon {
     /// forged long-range history is rejected on import.
     pub fn with_checkpoints(self, checkpoints: impl IntoIterator<Item = (u64, Hash)>) -> Self {
         if let Ok(mut node) = self.node.lock() {
-            node.set_checkpoints(checkpoints);
+            // ADD, so the baked network checkpoints installed at construction survive.
+            node.add_checkpoints(checkpoints);
         }
         self
     }
