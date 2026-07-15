@@ -33,7 +33,9 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -200,6 +202,14 @@ struct Shared {
     /// decaying misbehavior score and any active ban. Replaces a fixed-window
     /// counter so the rate limiter is robust under load (see [`PeerScore`]).
     scores: Mutex<HashMap<IpAddr, PeerScore>>,
+    /// Operator allowlist: IPs that are NEVER banned and never refused, however they
+    /// score. Their traffic is still rate-accounted, but a ban is never armed for them.
+    /// This is the escape hatch that stops an operator locking their OWN infrastructure
+    /// out — own miners, sibling relays, a monitor, or an adversarial test harness run
+    /// from a trusted address (which by design gossips forged blocks and would otherwise
+    /// earn an instant [`INVALID_BLOCK_PENALTY`] ban). Loopback is always present. Bitcoin
+    /// Core calls the equivalent permission `noban`.
+    protected: Mutex<HashSet<IpAddr>>,
     /// Channel to request the manager thread dial an address (discovery + retry).
     dial_tx: Sender<SocketAddr>,
     /// Optional Node-tab log sink for human-readable transport diagnostics (dial
@@ -302,6 +312,13 @@ impl TcpNode {
             dialing: Mutex::new(HashSet::new()),
             inbound: Mutex::new(HashSet::new()),
             scores: Mutex::new(HashMap::new()),
+            // Loopback is always exempt: a local wallet, miner, or test harness on the
+            // same host must never be able to ban 127.0.0.1/::1 and cut the node off from
+            // its own tooling.
+            protected: Mutex::new(HashSet::from([
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ])),
             dial_tx,
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
@@ -556,6 +573,31 @@ impl TcpNode {
     /// The connection addresses of all currently-connected peers.
     pub fn connected_peers(&self) -> Vec<SocketAddr> {
         self.shared.peers.lock().unwrap().keys().copied().collect()
+    }
+
+    /// Add `ip` to the operator allowlist: it is never banned and never refused,
+    /// however it scores (see [`Shared::protected`]). Idempotent. Any active ban on the
+    /// IP is also lifted, so calling this un-bans a peer immediately.
+    pub fn protect_ip(&self, ip: IpAddr) {
+        self.shared.protected.lock().unwrap().insert(ip);
+        // Lift any ban already in place so the allowlist takes effect right now, not on
+        // the next expiry.
+        if let Some(s) = self.shared.scores.lock().unwrap().get_mut(&ip) {
+            s.banned_until = None;
+            s.misbehavior = 0.0;
+        }
+    }
+
+    /// Allowlist every IP that `host` resolves to — a bare IP, `host:port`, or a DNS
+    /// name resolving to several addresses. Best-effort: unresolvable entries are
+    /// skipped. Lets an operator protect a seed / sibling relay / own miner by the same
+    /// string they'd configure it with. The port is irrelevant (the ban is per-IP).
+    pub fn protect_host(&self, host: &str) {
+        if let Ok(targets) = resolve_dial_targets(host) {
+            for sa in targets {
+                self.protect_ip(sa.ip());
+            }
+        }
     }
 
     /// Score `peer` for **application-layer** misbehavior the transport cannot see by
@@ -1145,6 +1187,12 @@ fn admit_inbound(inbound: &HashSet<SocketAddr>, candidate: IpAddr) -> bool {
 
 /// Whether `ip` is currently banned (expired bans are cleared lazily).
 fn is_banned(shared: &Shared, ip: IpAddr) -> bool {
+    // An allowlisted IP is never banned. Checked (and its guard dropped) before the
+    // `scores` lock so the lock order is always protected-then-scores, matching
+    // `penalize_inner` — no path takes them in the opposite order, so no deadlock.
+    if shared.protected.lock().unwrap().contains(&ip) {
+        return false;
+    }
     let mut scores = shared.scores.lock().unwrap();
     match scores.get_mut(&ip) {
         Some(s) => match s.banned_until {
@@ -1185,11 +1233,15 @@ fn penalize(shared: &Shared, ip: IpAddr, penalty: f64) -> bool {
 /// standing, `false` once it is banned.
 fn penalize_inner(shared: &Shared, ip: IpAddr, adjust: impl FnOnce(&mut PeerScore)) -> bool {
     let now = Instant::now();
+    // Allowlisted IPs are rate-accounted like anyone else but a ban is never armed for
+    // them. Read (and drop the guard) before the `scores` lock to keep a consistent
+    // protected-then-scores lock order (see [`is_banned`]).
+    let exempt = shared.protected.lock().unwrap().contains(&ip);
     let mut scores = shared.scores.lock().unwrap();
     let s = scores.entry(ip).or_insert_with(|| PeerScore::fresh(now));
     s.age(now);
     adjust(s);
-    if s.misbehavior >= MISBEHAVIOR_BAN {
+    if s.misbehavior >= MISBEHAVIOR_BAN && !exempt {
         s.banned_until = Some(now + BAN_DURATION);
         s.misbehavior = 0.0;
         false
@@ -1486,6 +1538,10 @@ mod tests {
         let server = TcpNode::bind("127.0.0.1:0").unwrap();
         let addr = server.local_addr().to_string();
         let client = TcpNode::bind("127.0.0.1:0").unwrap();
+        // Loopback is allowlisted by default (own-tooling protection), so drop that
+        // exemption here — this test exercises the ban path itself over a real socket,
+        // which necessarily runs on 127.0.0.1.
+        server.shared.protected.lock().unwrap().clear();
         client.connect(&addr).unwrap();
         assert!(
             wait_until(15, || server.peer_count() >= 1),
@@ -1786,6 +1842,7 @@ mod tests {
             dialing: Mutex::new(HashSet::new()),
             inbound: Mutex::new(HashSet::new()),
             scores: Mutex::new(HashMap::new()),
+            protected: Mutex::new(HashSet::new()),
             dial_tx: tx,
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
@@ -1824,6 +1881,7 @@ mod tests {
             dialing: Mutex::new(HashSet::new()),
             inbound: Mutex::new(HashSet::new()),
             scores: Mutex::new(HashMap::new()),
+            protected: Mutex::new(HashSet::new()),
             dial_tx: tx,
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
@@ -1848,6 +1906,73 @@ mod tests {
     }
 
     #[test]
+    fn an_allowlisted_ip_is_never_banned_however_it_scores() {
+        // The operator "noban" escape hatch: an allowlisted IP can be hammered with
+        // application-layer penalties (a forged block scores INVALID_BLOCK_PENALTY = 50,
+        // two ⇒ the 100 ban threshold) and STILL never be banned or refused. This is what
+        // stops an operator locking their own miner / sibling relay out — the exact
+        // failure a red-team run from a trusted address would otherwise cause.
+        let (tx, _rx) = channel();
+        let shared = Shared {
+            local_addr: "127.0.0.1:0".parse().unwrap(),
+            peers: Mutex::new(HashMap::new()),
+            inbox: Mutex::new(VecDeque::new()),
+            known: Mutex::new(HashSet::new()),
+            dialing: Mutex::new(HashSet::new()),
+            inbound: Mutex::new(HashSet::new()),
+            scores: Mutex::new(HashMap::new()),
+            protected: Mutex::new(HashSet::new()),
+            dial_tx: tx,
+            log: Mutex::new(None),
+            shutdown: AtomicBool::new(false),
+            self_addrs: Mutex::new(HashSet::new()),
+            incompatible: Mutex::new(HashSet::new()),
+        };
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        shared.protected.lock().unwrap().insert(ip);
+
+        // Well past the threshold with the heaviest penalty available.
+        for _ in 0..10 {
+            // `penalize` returns true only when it just banned; it must NEVER do so here.
+            assert!(
+                !penalize(&shared, ip, MISBEHAVIOR_BAN),
+                "an allowlisted IP is never banned by a penalty"
+            );
+        }
+        assert!(
+            !is_banned(&shared, ip),
+            "an allowlisted IP never reads as banned"
+        );
+
+        // A non-allowlisted IP with the SAME abuse is banned — the exemption is specific.
+        let other = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9));
+        assert!(
+            penalize(&shared, other, MISBEHAVIOR_BAN),
+            "a normal IP is banned"
+        );
+        assert!(is_banned(&shared, other));
+    }
+
+    #[test]
+    fn protect_ip_lifts_an_active_ban_immediately() {
+        // Allowlisting an already-banned IP un-bans it on the spot (not on the next
+        // expiry), so an operator can rescue a mistakenly-banned own node at runtime.
+        let node = TcpNode::bind("127.0.0.1:0").unwrap();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 55));
+        // Drive it over the threshold so it is genuinely banned.
+        while !penalize(&node.shared, ip, MISBEHAVIOR_BAN) {}
+        assert!(
+            is_banned(&node.shared, ip),
+            "peer is banned before allowlisting"
+        );
+        node.protect_ip(ip);
+        assert!(
+            !is_banned(&node.shared, ip),
+            "allowlisting lifts the ban at once"
+        );
+    }
+
+    #[test]
     fn penalize_peer_bans_and_drops_for_app_layer_misbehavior() {
         // The sync layer reports application-level misbehavior (e.g. a fabricated
         // block) the transport can't see; a penalty at the ban threshold must drop the
@@ -1855,6 +1980,9 @@ mod tests {
         let server = TcpNode::bind("127.0.0.1:0").unwrap();
         let addr = server.local_addr().to_string();
         let client = TcpNode::bind("127.0.0.1:0").unwrap();
+        // Loopback is allowlisted by default; this test needs the ban path, and the
+        // socket is necessarily on 127.0.0.1, so drop the exemption here.
+        server.shared.protected.lock().unwrap().clear();
         client.connect(&addr).unwrap();
         assert!(
             wait_until(15, || server.peer_count() >= 1),
@@ -1956,6 +2084,7 @@ mod tests {
             // An inbound from 192.168.1.5 still completing its handshake (ephemeral port).
             inbound: Mutex::new(["192.168.1.5:54321".parse().unwrap()].into_iter().collect()),
             scores: Mutex::new(HashMap::new()),
+            protected: Mutex::new(HashSet::new()),
             dial_tx: tx,
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),

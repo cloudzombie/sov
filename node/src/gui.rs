@@ -8681,6 +8681,7 @@ fn setup_node_dir(node_dir: &Path, spec_filename: &str) -> Result<(), String> {
         p2p_addr: Some("0.0.0.0:9645".to_string()),
         bootstrap_peers: Vec::new(),
         checkpoints: Vec::new(),
+        noban: Vec::new(),
     };
     std::fs::write(
         node_dir.join("node-1/node-config.json"),
@@ -9150,6 +9151,7 @@ fn build_and_run_node(
             .map_err(|e| format!("p2p bind: {e}"))?
             .with_block_log(daemon.block_log())
             .with_bootstrap(config.bootstrap_peers.clone())
+            .with_noban(config.noban.clone())
             .with_sync_status(Arc::clone(&sync))
             .with_log_sink(logs.clone());
             // Surface transport-level dial/handshake diagnostics in the Node tab too,

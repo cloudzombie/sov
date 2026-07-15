@@ -171,6 +171,7 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
             )?
             .with_block_log(daemon.block_log())
             .with_bootstrap(bootstrap.clone())
+            .with_noban(config.noban.clone())
             .with_sync_status(Arc::clone(&sync))
             .with_log_sink(Arc::clone(&logs));
             // Surface transport-level dial/handshake diagnostics (dialing → tcp connected

@@ -191,7 +191,23 @@ impl P2p {
     /// re-established if it drops. (Initial best-effort dials can still be made via
     /// [`connect`](Self::connect).)
     pub fn with_bootstrap(mut self, peers: Vec<String>) -> Self {
+        // Your own bootstrap/seed peers are trusted infrastructure: allowlist them so a
+        // sibling relay can never be banned off (e.g. during a resync it briefly serves
+        // a block that fails to connect), which would partition the anchor nodes.
+        for p in &peers {
+            self.tcp.protect_host(p);
+        }
         self.bootstrap = peers;
+        self
+    }
+
+    /// Allowlist ("noban") the given IPs / hosts on the transport: they are never banned
+    /// or refused by the misbehavior scorer, however they score. Protects your own
+    /// miners / relays / monitors so testing or a transient fault can't lock them out.
+    pub fn with_noban(self, hosts: Vec<String>) -> Self {
+        for h in &hosts {
+            self.tcp.protect_host(h);
+        }
         self
     }
 

@@ -322,6 +322,14 @@ pub struct NodeConfig {
     /// the pinned value, rejecting a forged long-range history. Empty by default.
     #[serde(default)]
     pub checkpoints: Vec<CheckpointSpec>,
+    /// P2P allowlist ("noban"): IPs / hosts that are NEVER banned or refused by the
+    /// misbehavior scorer, however they score. Each entry is a bare IP, `host:port`, or
+    /// a DNS name (resolved; the port is ignored — the ban is per-IP). Use it to protect
+    /// your OWN infrastructure — miners, sibling relays, a monitor — so testing or a
+    /// transient fault can never lock your own nodes out. Loopback and configured
+    /// bootstrap/seed peers are already exempt automatically. Empty by default.
+    #[serde(default)]
+    pub noban: Vec<String>,
 }
 
 /// A trusted weak-subjectivity checkpoint in a node config: a height pinned to a

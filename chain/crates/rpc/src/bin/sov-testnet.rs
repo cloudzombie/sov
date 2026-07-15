@@ -429,6 +429,7 @@ fn cmd_gen(flags: &Flags) -> Result<(), Box<dyn Error>> {
                 vec![seed_p2p.clone()]
             },
             checkpoints: Vec::new(),
+            noban: Vec::new(),
         };
         write_json(&node_dir.join("node-config.json"), &config)?;
         let keystore = Keystore {
@@ -542,6 +543,7 @@ fn cmd_join(flags: &Flags) -> Result<(), Box<dyn Error>> {
         p2p_addr: Some(p2p_addr.clone()),
         bootstrap_peers,
         checkpoints: Vec::new(),
+        noban: Vec::new(),
     };
     write_json(&node_dir.join("node-config.json"), &config)?;
     let keystore = Keystore {
