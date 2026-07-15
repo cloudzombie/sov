@@ -42,7 +42,11 @@ fn gauntlet_mode(addr: &str) {
         println!("  \x1b[31m{err}\x1b[0m\n");
         std::process::exit(2);
     }
-    let banner = if report.is_mainnet { "\x1b[33mLIVE MAINNET\x1b[0m" } else { report.chain_id.as_deref().unwrap_or("unknown") };
+    let banner = if report.is_mainnet {
+        "\x1b[33mLIVE MAINNET\x1b[0m"
+    } else {
+        report.chain_id.as_deref().unwrap_or("unknown")
+    };
     println!(
         "  pot {}…  ·  balance {} XUS  ·  {}\n",
         short(&report.pot),
@@ -60,7 +64,11 @@ fn gauntlet_mode(addr: &str) {
             "\n  pot {} → {} XUS  ·  {}",
             GauntletReport::xus(Some(b)),
             GauntletReport::xus(Some(a)),
-            if ok { "\x1b[32mnot a grain moved\x1b[0m" } else { "\x1b[31mTHE POT MOVED\x1b[0m" }
+            if ok {
+                "\x1b[32mnot a grain moved\x1b[0m"
+            } else {
+                "\x1b[31mTHE POT MOVED\x1b[0m"
+            }
         );
     }
     println!(

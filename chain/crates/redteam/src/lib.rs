@@ -33,7 +33,9 @@ pub use backdoor::{any_vulnerable as backdoor_any_vulnerable, probe_backdoor, P2
 
 /// The Gauntlet probe: attack the live steal-the-pot account every key-less way.
 pub mod gauntlet;
-pub use gauntlet::{any_vulnerable as gauntlet_any_vulnerable, probe_gauntlet, GauntletReport, POT};
+pub use gauntlet::{
+    any_vulnerable as gauntlet_any_vulnerable, probe_gauntlet, GauntletReport, POT,
+};
 
 /// Funded-adversary probe: attack the live chain AS a real, funded account.
 pub mod funded;

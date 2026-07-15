@@ -7,7 +7,9 @@
 use std::io::Write;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: genwallet <mnemonic-out-path>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: genwallet <mnemonic-out-path>");
     let mnemonic = sov_wallet::generate_mnemonic(24).expect("generate mnemonic");
     let seed = sov_wallet::HdWallet::from_mnemonic(&mnemonic, "")
         .expect("valid mnemonic")
