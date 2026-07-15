@@ -61,7 +61,11 @@ impl TransitionPre {
                 )
             })
             .collect();
-        Ok(Self { supply, mined, tokens })
+        Ok(Self {
+            supply,
+            mined,
+            tokens,
+        })
     }
 }
 

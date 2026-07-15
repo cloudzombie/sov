@@ -3165,7 +3165,10 @@ mod tests {
         let mut chain = fresh_chain();
         for i in 0..3u64 {
             let b = chain
-                .produce_block(vec![usa_transfer("ecb.reserve.sov", 10, i)], 2_000 + i * 1_000)
+                .produce_block(
+                    vec![usa_transfer("ecb.reserve.sov", 10, i)],
+                    2_000 + i * 1_000,
+                )
                 .unwrap();
             chain.import_block(b).unwrap();
         }
@@ -3179,7 +3182,10 @@ mod tests {
             .produce_block(vec![usa_transfer("ecb.reserve.sov", 5, 3)], 5_000)
             .unwrap();
         let bad = reseal_with_bad_state_root(&chain, good);
-        assert_eq!(bad.header.prev_hash, head, "must extend the head (fast path)");
+        assert_eq!(
+            bad.header.prev_hash, head,
+            "must extend the head (fast path)"
+        );
         assert!(
             matches!(chain.import_block(bad), Err(ChainError::StateRootMismatch)),
             "a lying block must be rejected"
@@ -3187,7 +3193,11 @@ mod tests {
 
         // The in-place rollback restored the EXACT pre-state.
         assert_eq!(chain.head().hash(), head, "head unchanged");
-        assert_eq!(chain.ledger().state_root(), root, "state root restored byte-for-byte");
+        assert_eq!(
+            chain.ledger().state_root(),
+            root,
+            "state root restored byte-for-byte"
+        );
         assert_eq!(chain.height(), height, "height unchanged");
 
         // And the chain is NOT wedged: it still accepts the honest next block.
