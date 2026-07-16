@@ -9383,8 +9383,9 @@ mod tests {
         let spec = ChainSpec::from_json(MAINNET_SPEC).expect("mainnet spec parses");
         assert_eq!(
             spec.seeds,
-            vec!["64.225.10.34:9645", "137.184.83.91:9645"],
-            "every updated mainnet node must bootstrap through both relay hosts"
+            vec!["137.184.83.91:9645", "164.92.141.24:9645"],
+            "every updated mainnet node must bootstrap through the live relay hosts \
+             (SFO relay-2 + Frankfurt; the retired NYC relay-1 64.225.10.34 was removed)"
         );
         let genesis = spec
             .to_genesis_config_verified()
