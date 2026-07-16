@@ -601,9 +601,11 @@ pub fn apply_transaction(
                     Some(htlc) if ctx.height >= htlc.timeout_height => ExecutionStatus::Failed {
                         reason: "HTLC has timed out".into(),
                     },
-                    Some(htlc) if sha256(preimage) != htlc.hashlock => ExecutionStatus::Failed {
-                        reason: "preimage does not match hashlock".into(),
-                    },
+                    Some(htlc) if Hash::from_bytes(sha256(preimage)) != htlc.hashlock => {
+                        ExecutionStatus::Failed {
+                            reason: "preimage does not match hashlock".into(),
+                        }
+                    }
                     Some(htlc) => {
                         ledger.settle_htlc(htlc_id);
                         signer.balance = signer
@@ -1989,7 +1991,7 @@ mod tests {
     use super::*;
     use sov_crypto::Keypair;
     use sov_mining::MiningPolicy;
-    use sov_primitives::{AccountId, Balance};
+    use sov_primitives::{AccountId, Balance, Hash};
     use sov_state::Account;
     use sov_types::Transaction;
 
@@ -2346,7 +2348,7 @@ mod tests {
         let supply_before = ledger.total_supply().unwrap();
 
         let secret = b"the-shared-atomic-swap-secret";
-        let hashlock = sha256(secret);
+        let hashlock = Hash::from_bytes(sha256(secret));
         let lock = signed(
             [1; 32],
             "usa.reserve.sov",
@@ -2424,7 +2426,7 @@ mod tests {
             Action::HtlcLock {
                 recipient: id("bob.sov"),
                 amount: Balance::from_sov(30).unwrap(),
-                hashlock: sha256(b"secret"),
+                hashlock: Hash::from_bytes(sha256(b"secret")),
                 timeout_height: 50,
             },
         );

@@ -289,7 +289,7 @@ fn stf_vector() -> Value {
         Action::HtlcLock {
             recipient: id("bob.sov"),
             amount: sov(10),
-            hashlock,
+            hashlock: Hash::from_bytes(hashlock),
             timeout_height: 2_000,
         },
     );
@@ -414,7 +414,7 @@ fn stf_vector() -> Value {
                 "type": "htlc_lock",
                 "recipient": recipient.as_str(),
                 "amount": amount.grains().to_string(),
-                "hashlock": format!("0x{}", hex::encode(hashlock)),
+                "hashlock": format!("0x{}", hex::encode(hashlock.as_bytes())),
                 "timeout_height": timeout_height,
             }),
             Action::HtlcClaim { htlc_id, preimage } => json!({

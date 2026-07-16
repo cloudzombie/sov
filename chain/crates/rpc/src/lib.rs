@@ -1044,7 +1044,7 @@ fn call(
                     "locker": h.locker.as_str(),
                     "recipient": h.recipient.as_str(),
                     "amount": h.amount.grains().to_string(),
-                    "hashlock": hex::encode(h.hashlock),
+                    "hashlock": hex::encode(h.hashlock.as_bytes()),
                     "timeoutHeight": h.timeout_height,
                 })
             }))

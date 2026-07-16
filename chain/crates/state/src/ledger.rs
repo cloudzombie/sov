@@ -212,8 +212,10 @@ pub struct Htlc {
     pub recipient: AccountId,
     /// The escrowed amount.
     pub amount: Balance,
-    /// SHA-256 of the secret preimage that unlocks the funds.
-    pub hashlock: [u8; 32],
+    /// SHA-256 of the secret preimage that unlocks the funds. A [`Hash`] so `sov_getHtlc`
+    /// renders it as hex (consistent with other 32-byte fields); Borsh is byte-identical to
+    /// a bare `[u8; 32]`, so the state root and genesis are unchanged.
+    pub hashlock: Hash,
     /// Block height at/after which the locker may refund.
     pub timeout_height: u64,
 }
@@ -2037,7 +2039,7 @@ mod tests {
                 locker: id("alice.sov"),
                 recipient: id("bob.sov"),
                 amount: Balance::from_sov(5).unwrap(),
-                hashlock: [0u8; 32],
+                hashlock: Hash::from_bytes([0u8; 32]),
                 timeout_height: 100,
             },
         )
@@ -2116,7 +2118,7 @@ mod tests {
                 locker: id("carol.sov"),
                 recipient: id("alice.sov"),
                 amount: Balance::from_sov(3).unwrap(),
-                hashlock: [1u8; 32],
+                hashlock: Hash::from_bytes([1u8; 32]),
                 timeout_height: 200,
             },
         )
