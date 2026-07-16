@@ -59,6 +59,26 @@ partition the net; that mistake is explicitly avoided):
 
 **Result:** the network is version-aware. Rollouts stop being blind.
 
+## 4. RPC JSON consistency — 32-byte fields accept hex (unblocks atomic swaps)
+
+**Today:** the `htlc_lock` action's `hashlock` is a raw `[u8; 32]`, so serde renders it in
+JSON as an *array of 32 numbers* — while every other 32-byte field (`Hash`, `AccountId`,
+tx-ids) is a **hex string**. A client that hex-encodes the hashlock (as it does for all
+other 32-byte fields) is rejected: `invalid SignedTransaction: invalid type: string "…",
+expected an array of length 32`. This is the wart that broke the first live XUS↔ZEC swap
+(`swap_mrmzgc3t_0`, 2026-07-16) and forced a fragile client-side wire-mutation workaround in
+the swap desk. `sov_getHtlc` output is inconsistent the same way — the SDK already expects
+`hashlock` back as hex.
+
+**v0.1.86:** change `HtlcLock.hashlock` from `[u8; 32]` to the `Hash` newtype (whose serde is
+hex for human-readable/JSON, raw bytes for binary). **Borsh-identical** — `Hash` derives
+Borsh over `[u8; 32]`, and `Action` derives Borsh separately from serde, so signatures,
+tx-ids, KAT vectors, and genesis `cb0272ff` are byte-for-byte unchanged; only the JSON
+representation becomes hex, consistent on both input (`sov_submitTransaction`) and output
+(`sov_getHtlc`). Removes the client workaround. (Consider the same for `HtlcClaim.preimage`,
+though as a variable-length `Vec<u8>` it already round-trips as an array and works.)
+**Node upgrade → ships in v0.1.86.**
+
 ## 3. Miner-signaled activation (BIP-9 / BIP-8) wired to the header
 
 **Today:** the `sov-governance` crate is a complete BIP-9/BIP-8 threshold state machine
@@ -109,6 +129,65 @@ consensus change activate by hashpower vote, never a flag day again.**
 
 ## Backlog (tracked, not in v0.1.86)
 
-Efficient headers-first sync (avoid genesis replay on deep reorgs); remaining audit items
-(oracle deviation bound / TWAP, HTLC preimage cap, zeroize-on-drop for in-process signing
-seeds).
+Remaining audit items: HTLC preimage byte cap, zeroize-on-drop for in-process signing seeds,
+`disconnect_to` hard-assert. These are small and land opportunistically.
+
+---
+
+# Major development gaps (post-v0.1.86 roadmap — the REALLY big tickets)
+
+Beyond v0.1.86's P2P work, these are the large, strategic gaps between "a working PoW
+cryptocurrency" (which SOV is) and "a complete, trust-minimized, production monetary
+network." Each is a multi-day-to-multi-week effort and would be its own release track.
+Ranked by leverage. **None requires a genesis change** unless explicitly noted.
+
+1. **Light client / SPV — trust-minimized wallets.** Today every wallet needs a full node
+   or must *trust* an RPC endpoint (the relays). There is no header-chain + Merkle-proof
+   verification path (only the block header type exists). This is the single biggest
+   adoption/decentralization gap: mobile and browser wallets currently trust our relays for
+   balances. Ship a headers-only sync + `sov_getProof` (Merkle proof of a tx/account against
+   a committed root) so a light wallet verifies without a full node. Pairs with #2.
+
+2. **Efficient sync — headers-first, no genesis replay.** A joining node and any deep reorg
+   replay the chain **from genesis** (`rebuild_branch`, O(chain length)); the undo ring only
+   covers the last 256 blocks. As the chain grows this makes fresh sync and partition-heal
+   costs balloon. Add headers-first download + checkpoint-anchored state sync so a new node is
+   usable in minutes, not a full replay. (assumevalid from v0.1.83 helps seal cost, not this.)
+
+3. **xUSD is not production-safe — no liquidation engine + weak oracle.** The CDP stablecoin
+   can mint against 150%-collateralized vaults, but there is **no liquidation mechanism** —
+   an undercollateralized vault (ZEC/collateral price drop) cannot be liquidated, so the peg
+   and system solvency are unprotected. The oracle is a **single key** with only a crude 10×
+   circuit-breaker (v0.1.85) — no TWAP, no multi-source median, no staleness bound. Build:
+   a keeper-driven liquidation auction + oracle hardening (median-of-N feeds, TWAP, staleness
+   rejection). Until then xUSD should be treated as experimental.
+
+4. **Post-quantum shielded pool.** Transparent sigs + transport are hybrid PQ (Ed25519+ML-DSA,
+   X25519+ML-KEM), but the shielded pool is Orchard/Halo2 over Pallas — **not** PQ (harvest-
+   now-decrypt-later exposure, honestly disclosed). Closing this is a large cryptographic
+   effort (a PQ-secure shielded construction) and is the one real hole in the PQ positioning.
+
+5. **End-to-end atomic swap completion (XUS↔ZEC).** The HTLC legs exist on both chains and the
+   `lightwalletd` client is written, but no swap has completed end-to-end: the ZEC **sighash
+   is unproven** and the running desk isn't wired to a ZEC watcher (no lightwalletd endpoint
+   in its config). Prove a ZEC claim/refund sighash against mainnet, wire the desk's ZEC
+   observation, and land an acceptance self-swap. (v0.1.86 item #4 unblocks the XUS leg.)
+
+6. **External professional security audit + formal review.** All audits to date are internal
+   (adversarial reviews + the redteam gauntlet). Before promoting mainnet as production-grade,
+   a reputable third-party audit of consensus, the shielded circuits, and the crypto
+   composition — plus economic/emission review — is the missing trust anchor.
+
+7. **Smart-contract platform maturity.** A wasmi VM + host ABI + token composability exist,
+   but gas metering hardening, cross-node determinism guarantees under adversarial contracts,
+   and a contract-developer SDK/toolchain are unproven at production scale. Decide whether
+   contracts are a first-class product; if so, this is a large track of its own.
+
+8. **Hashpower decentralization — mining pool / Stratum.** External miners can't easily join a
+   shared pool (no Stratum/pool protocol); today mining is effectively our nodes plus the
+   home rig. A pool/Stratum path and public mining docs would let third parties contribute
+   hashpower — the real test of "trustless P2P mining."
+
+Cross-cutting operational (not code, but load-bearing): treasury keys should be **cold +
+multisig + SLIP-39** (currently hot); and the fleet still needs the home rig + laptop on
+v0.1.85 before the 22:00 UTC EDA activation.
