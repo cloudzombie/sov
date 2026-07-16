@@ -1855,12 +1855,31 @@ impl Station {
         // deterministically from the mnemonic's key.
         let label = self.import_name.trim();
         let label = if label.is_empty() { "wallet" } else { label }.to_string();
-        let mnemonic = self.import_mnemonic.trim().to_string();
-        let mut seed = match HdWallet::from_mnemonic(&mnemonic, "") {
-            Ok(w) => w.derive_seed(0, 0),
-            Err(e) => return self.set_action(&format!("invalid mnemonic: {e}")),
+        let input = self.import_mnemonic.trim().to_string();
+        // Accept EITHER a BIP-39 mnemonic OR a raw 32-byte hex seed (64 hex chars). The
+        // hex-seed path imports a seed-only wallet — e.g. the one the atomic-swap desk
+        // hands out — reproducing the exact account via `hybrid_from_seed` (byte-identical
+        // to the SDK). Its recovery phrase can't be re-shown (there is none), but it spends
+        // normally.
+        let is_hex_seed =
+            input.len() == 64 && input.bytes().all(|b| b.is_ascii_hexdigit());
+        let (mut seed, mnemonic_opt): ([u8; 32], Option<String>) = if is_hex_seed {
+            let mut s = [0u8; 32];
+            for i in 0..32 {
+                match u8::from_str_radix(&input[i * 2..i * 2 + 2], 16) {
+                    Ok(b) => s[i] = b,
+                    Err(_) => return self.set_action("invalid seed hex (need 64 hex chars)"),
+                }
+            }
+            (s, None)
+        } else {
+            let seed = match HdWallet::from_mnemonic(&input, "") {
+                Ok(w) => w.derive_seed(0, 0),
+                Err(e) => return self.set_action(&format!("invalid mnemonic or 64-hex seed: {e}")),
+            };
+            (seed, Some(input.clone()))
         };
-        let result = LoadedWallet::from_seed(label, seed, Some(mnemonic));
+        let result = LoadedWallet::from_seed(label, seed, mnemonic_opt);
         seed.zeroize(); // wipe the stack copy; the wallet owns its own (also zeroized)
         match result {
             Ok(w) => {
