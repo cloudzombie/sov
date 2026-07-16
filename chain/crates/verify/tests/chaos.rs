@@ -71,7 +71,7 @@ fn actor_tx(idx: usize, nonce: u64, rng: &mut Rng) -> SignedTransaction {
         Action::HtlcLock {
             recipient: id(ACTORS[(idx + 1) % ACTORS.len()].0),
             amount: Balance::from_sov(u128::from(rng.below(50))).unwrap(),
-            hashlock: [0x42; 32],
+            hashlock: Hash::from_bytes([0x42; 32]),
             timeout_height: 1_000_000,
         }
     } else {

@@ -1003,9 +1003,14 @@ impl SyncState {
                 self.peer_agents
                     .insert(peer, (protocol_version, agent.clone()));
                 // Refuse a peer below the minimum supported protocol. MIN is 0 during the
-                // v0.1.86 rollout (accept everyone); a future mandatory upgrade raises it
-                // to shun laggards at the handshake instead of silently forking them.
-                if protocol_version < sov_network::MIN_SUPPORTED_PROTOCOL {
+                // v0.1.86 rollout (accept everyone); a future mandatory upgrade raises it to
+                // shun laggards at the handshake instead of silently forking them. The
+                // comparison is trivially false today (MIN == u32::MIN) — deliberate
+                // forward-compat scaffolding, so the lint is silenced with intent, not by
+                // deleting the gate that a mandatory upgrade will rely on.
+                #[allow(clippy::absurd_extreme_comparisons)]
+                let below_min = protocol_version < sov_network::MIN_SUPPORTED_PROTOCOL;
+                if below_min {
                     tcp.mark_incompatible(peer);
                     tcp.disconnect(&peer);
                     self.authenticated.remove(&peer);

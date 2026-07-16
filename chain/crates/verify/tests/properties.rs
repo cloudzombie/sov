@@ -14,7 +14,7 @@ use proptest::prelude::*;
 use sov_chain::{Blockchain, GenesisAccount, GenesisConfig};
 use sov_crypto::Keypair;
 use sov_mining::MiningPolicy;
-use sov_primitives::{AccountId, Balance};
+use sov_primitives::{AccountId, Balance, Hash};
 use sov_types::{Action, Block, SignedTransaction, Transaction};
 use sov_verify::{check_ledger, check_transition};
 
@@ -100,7 +100,7 @@ proptest! {
                 Action::HtlcLock {
                     recipient: id(ACTORS[op.to].0),
                     amount,
-                    hashlock: [0x42; 32],
+                    hashlock: Hash::from_bytes([0x42; 32]),
                     timeout_height: 1_000_000,
                 }
             };
