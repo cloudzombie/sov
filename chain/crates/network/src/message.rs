@@ -97,6 +97,13 @@ pub enum NetMessage {
         /// The advertiser's current chain head height (a cheap liveness/sync hint).
         height: u64,
     },
+    /// **Pull-based peer discovery** (v0.1.86+): ask a peer to send back the addresses it
+    /// knows, answered with a [`Peers`](NetMessage::Peers) reply. Complements the existing
+    /// push gossip so a node with few peers can actively widen its address book instead of
+    /// waiting for a push. Sent ONLY to peers already known to speak v0.1.86+ (they
+    /// advertised a `Version`), so a pre-v0.1.86 node is never handed a frame it cannot
+    /// decode. An APPENDED variant (after `Version`) — same wire-compat rule.
+    GetAddr,
     // WIRE-COMPATIBILITY RULE: Borsh encodes an enum variant by its declaration-order
     // index, so a NEW variant MUST be appended HERE, at the end — never inserted
     // between existing ones, which would shift every later discriminant and break the
@@ -251,6 +258,14 @@ mod tests {
             }
             _ => panic!("expected Version"),
         }
+    }
+
+    #[test]
+    fn getaddr_roundtrips() {
+        let msg = NetMessage::GetAddr;
+        assert_eq!(NetMessage::decode(&msg.encode()).unwrap(), msg);
+        // Appended after Version, so its discriminant is higher than every original variant.
+        assert!(NetMessage::GetAddr.encode()[0] > NetMessage::Peers(vec![]).encode()[0]);
     }
 
     #[test]

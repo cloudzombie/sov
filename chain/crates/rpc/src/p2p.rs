@@ -258,6 +258,7 @@ impl P2p {
             let mut last_announce = past;
             let mut last_reconnect = past;
             let mut last_sweep = past;
+            let mut last_getaddr = past;
             while !stop.load(Ordering::SeqCst) {
                 // Announce our identity + head so peers authenticate us and learn whether
                 // they need to sync from us.
@@ -309,6 +310,12 @@ impl P2p {
                     state.sweep_unauthenticated(&tcp);
                     state.reap_dead_peers(&tcp);
                     last_sweep = Instant::now();
+                }
+                // Pull fresh peers from version-compatible peers (widens the address book
+                // beyond the push gossip). Only sent to peers that advertised v0.1.86+.
+                if last_getaddr.elapsed() >= GETADDR_INTERVAL {
+                    state.request_peers(&tcp);
+                    last_getaddr = Instant::now();
                 }
                 // ADAPTIVE poll: while a block request is in flight (actively catching
                 // up) poll fast so batches stream back-to-back, turning a long initial
@@ -410,6 +417,11 @@ const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How often to sweep unauthenticated zombies and reap dead half-open connections.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often a node pulls fresh peers (`GetAddr`) from its v0.1.86+ peers, widening the
+/// address book beyond what the push gossip delivers. Infrequent — discovery is not urgent,
+/// and each request only goes to peers known to understand it.
+const GETADDR_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Warn when a single block import holds the node lock at least this long. A plain
 /// extend is sub-millisecond; crossing this means the reorg replay (currently O(chain
@@ -1017,7 +1029,10 @@ impl SyncState {
                     );
                 }
             }
-            NetMessage::Peers(_) | NetMessage::Hello { .. } => {}
+            // Peers/Hello are consumed by the transport (discovery) / handshake auth path
+            // above; GetAddr is answered entirely inside the transport reader loop. None
+            // reach the app-level sync dispatch, so they are no-ops here.
+            NetMessage::Peers(_) | NetMessage::Hello { .. } | NetMessage::GetAddr => {}
         }
     }
 
@@ -1277,6 +1292,19 @@ impl SyncState {
         let local_height = local_status(node).map(|l| l.height).unwrap_or(0);
         let behind_blocks = best.saturating_sub(local_height);
         (behind_blocks, best, distinct.len())
+    }
+
+    /// Pull-based discovery: ask each **version-compatible** peer for the addresses it
+    /// knows (`GetAddr`), so the address book grows beyond what the push gossip delivers.
+    /// Gated on `peer_agents`: a `GetAddr` is sent ONLY to a peer that advertised a
+    /// `Version` at or above this build's protocol, so a pre-v0.1.86 peer (absent from
+    /// `peer_agents`, or below `PROTOCOL_VERSION`) is never handed a frame it can't decode.
+    fn request_peers(&self, tcp: &TcpNode) {
+        for (peer, (proto, _)) in &self.peer_agents {
+            if *proto >= sov_network::PROTOCOL_VERSION && self.authenticated.contains(peer) {
+                tcp.send(*peer, &NetMessage::GetAddr);
+            }
+        }
     }
 
     /// A snapshot of `(addr, protocol_version, agent)` for every peer that advertised a

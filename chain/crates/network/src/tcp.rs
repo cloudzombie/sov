@@ -1434,6 +1434,22 @@ fn reader_loop(shared: &Arc<Shared>, key: SocketAddr, mut reader: TcpStream, pee
                             }
                         }
                     }
+                    // Pull-based discovery: answer with our known addresses (bounded), the
+                    // same set the connect-time push sends. Only a v0.1.86+ peer sends
+                    // GetAddr, so a `Peers` reply (an original variant) is always decodable.
+                    NetMessage::GetAddr => {
+                        let mut addrs = vec![shared.local_addr.to_string()];
+                        addrs.extend(
+                            shared
+                                .known
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .take(MAX_PEERS_PER_MSG.saturating_sub(1))
+                                .map(|a| a.to_string()),
+                        );
+                        let _ = write_frame(&peer, &NetMessage::Peers(addrs));
+                    }
                     message => {
                         let mut inbox = shared.inbox.lock().unwrap();
                         // Bound memory: drop the oldest if the worker has fallen behind
