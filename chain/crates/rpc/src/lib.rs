@@ -89,6 +89,53 @@ const MAX_REQUEST_HEADERS: usize = 64;
 /// Maximum JSON-RPC batch length, so one request cannot fan out without bound.
 const MAX_RPC_BATCH: usize = 100;
 
+/// Per-IP RPC rate limit (token bucket). The RPC is bound on `0.0.0.0` so any state query
+/// or `sov_submitTransaction` (which forces a hybrid PQ signature verify before it can be
+/// rejected) is reachable by anyone; without a throttle an unauthenticated flood pins the
+/// node's CPU and contends the node lock with mining/sync. These are generous for real
+/// clients (20 req/s sustained, 100 burst) and loopback is exempt (local tooling).
+const RPC_RATE_PER_SEC: f64 = 20.0;
+const RPC_RATE_BURST: f64 = 100.0;
+/// Prune the per-IP table once it exceeds this, dropping idle (full-bucket) entries so it
+/// can't grow without bound across many distinct clients.
+const RPC_RATE_MAX_TRACKED: usize = 8_192;
+
+/// A per-IP token-bucket rate limiter for inbound RPC connections.
+#[derive(Default)]
+struct RpcRateLimiter {
+    buckets:
+        std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (f64, std::time::Instant)>>,
+}
+
+impl RpcRateLimiter {
+    /// Spend one token for `ip`; returns `false` if the bucket is empty (refuse the
+    /// connection). Loopback is always allowed.
+    fn allow(&self, ip: std::net::IpAddr) -> bool {
+        if ip.is_loopback() {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        let mut b = self.buckets.lock().unwrap();
+        if b.len() > RPC_RATE_MAX_TRACKED {
+            // Drop idle entries (bucket refilled to full since last seen) to bound memory.
+            b.retain(|_, (tokens, last)| {
+                *tokens + now.duration_since(*last).as_secs_f64() * RPC_RATE_PER_SEC
+                    < RPC_RATE_BURST
+            });
+        }
+        let e = b.entry(ip).or_insert((RPC_RATE_BURST, now));
+        let dt = now.duration_since(e.1).as_secs_f64();
+        e.1 = now;
+        e.0 = (e.0 + dt * RPC_RATE_PER_SEC).min(RPC_RATE_BURST);
+        if e.0 >= 1.0 {
+            e.0 -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Hard cap on `sov_listTokens` page size, so a registry of any size yields a
 /// bounded response (the client pages through with `offset`).
 const MAX_TOKEN_PAGE: usize = 200;
@@ -210,16 +257,23 @@ impl RpcServer {
             gossip: self.gossip.clone(),
             sync: self.sync.clone(),
         };
+        let limiter = Arc::new(RpcRateLimiter::default());
         let mut handles = Vec::new();
         for _ in 0..workers.max(1) {
             let listener = Arc::clone(&listener);
             let shutdown = Arc::clone(&shutdown);
             let node = Arc::clone(&self.node);
             let ctx = ctx.clone();
+            let limiter = Arc::clone(&limiter);
             handles.push(thread::spawn(move || {
                 while !shutdown.load(Ordering::SeqCst) {
                     match listener.accept() {
-                        Ok((stream, _peer)) => {
+                        Ok((stream, peer)) => {
+                            // Throttle per source IP before doing any work (a rejected
+                            // request still costs a PQ verify, so refuse the flood early).
+                            if !limiter.allow(peer.ip()) {
+                                continue;
+                            }
                             let _ = handle_connection(stream, &node, &ctx);
                         }
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {

@@ -169,6 +169,15 @@ const MAX_PEERS_PER_MSG: usize = 128;
 /// grow node memory without bound. Far more than a healthy network needs.
 const MAX_KNOWN_PEERS: usize = 4_096;
 
+/// Cap on the receive `inbox` queue. Up to [`MAX_INBOUND_PEERS`] reader threads push
+/// decoded messages into one queue drained by the single P2P worker; while that worker is
+/// busy in a slow block import/reorg it isn't draining, so without a bound the queue could
+/// grow to the readers' full throughput × frame size. When full we drop the OLDEST entry —
+/// a peer whose message is dropped simply re-requests (sync retries; Status re-announces),
+/// so bounding memory is strictly safe. Generous for normal operation (messages are drained
+/// every poll), tripped only under a stall or flood.
+const MAX_INBOX: usize = 1_024;
+
 /// LAN auto-discovery (mDNS-style): nodes announce themselves on this
 /// administratively-scoped IPv4 multicast group + port, so peers on the SAME LAN
 /// find and dial each other with **zero configuration**. The group is site-local
@@ -1322,7 +1331,15 @@ fn reader_loop(shared: &Arc<Shared>, key: SocketAddr, mut reader: TcpStream, pee
                             }
                         }
                     }
-                    message => shared.inbox.lock().unwrap().push_back((key, message)),
+                    message => {
+                        let mut inbox = shared.inbox.lock().unwrap();
+                        // Bound memory: drop the oldest if the worker has fallen behind
+                        // (e.g. mid-reorg). The dropped peer re-requests; sync self-heals.
+                        if inbox.len() >= MAX_INBOX {
+                            inbox.pop_front();
+                        }
+                        inbox.push_back((key, message));
+                    }
                 }
             }
             FrameRead::Malformed => {

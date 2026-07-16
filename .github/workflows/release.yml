@@ -108,7 +108,12 @@ jobs:
           </dict></plist>
           PLIST
           cp .github/STATION-README.txt "$STAGE/READ ME.txt" || true
-          codesign --force --deep --sign - "$APP" || true
+          # Ad-hoc sign the binary first, then the bundle (Apple Silicon requires a
+          # valid signature to run at all). --deep is deprecated and can corrupt the
+          # signature, so sign explicitly. Not notarized (no paid Apple account) — users
+          # clear quarantine with `xattr -cr` per the READ ME.
+          codesign --force --options runtime --sign - "$MAC/sov-station" || true
+          codesign --force --sign - "$APP" || true
           ( cd "$STAGE" && ln -sf /Applications Applications )
           hdiutil create -volname "SOV Station" -srcfolder "$STAGE" -ov -format UDZO "dist/SOV-Station-${VER}-macOS.dmg"
       - uses: actions/upload-artifact@v4

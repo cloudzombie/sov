@@ -1419,8 +1419,24 @@ pub fn apply_transaction(
                         reason: "oracle: price must be positive".into(),
                     }
                 } else {
-                    ledger.set_oracle_price(*price);
-                    ExecutionStatus::Success
+                    // Circuit breaker: reject an absurd single-update move so a compromised
+                    // or malicious feed key cannot set the price arbitrarily in one block and
+                    // over-mint xUSD against unchanged collateral. A legitimate feed never
+                    // jumps 10x between updates; this bounds the per-block blast radius (a
+                    // sustained attack still needs many blocks, giving time to react — the
+                    // full fix, a multi-source median / TWAP, is tracked separately).
+                    const MAX_ORACLE_MOVE: u128 = 10;
+                    let current = ledger.oracle_price();
+                    let too_high = *price > current.saturating_mul(MAX_ORACLE_MOVE);
+                    let too_low = *price < current / MAX_ORACLE_MOVE;
+                    if current > 0 && (too_high || too_low) {
+                        ExecutionStatus::Failed {
+                            reason: "oracle: update exceeds the max per-update move (10x)".into(),
+                        }
+                    } else {
+                        ledger.set_oracle_price(*price);
+                        ExecutionStatus::Success
+                    }
                 }
             }
         }
@@ -2264,6 +2280,55 @@ mod tests {
             .unwrap()
             .succeeded());
         assert_eq!(ledger.oracle_price(), sov_state::vault::SEED_XUS_USD_PRICE);
+    }
+
+    #[test]
+    fn oracle_update_circuit_breaker_rejects_an_absurd_single_move() {
+        // SECURITY (audit MED): even the authorized feed cannot move the price arbitrarily
+        // in one update — a >10x jump is refused, bounding a compromised feed key's
+        // per-block ability to over-mint xUSD against unchanged collateral.
+        use sov_state::vault::SEED_XUS_USD_PRICE;
+        let mut ledger = ledger_with_usa(10);
+        let p = policy();
+        let oracle = AccountId::new(sov_state::vault::ORACLE_ACCOUNT).unwrap();
+        let okp = Keypair::from_seed([9; 32]);
+        // Give the oracle account a known key so we can publish valid updates in-test.
+        ledger.set_account(
+            &oracle,
+            Account::new(okp.public_key(), Balance::from_sov(1).unwrap()),
+        );
+
+        let mk = |nonce: u64, price: u128| {
+            SignedTransaction::sign(
+                Transaction {
+                    signer: oracle.clone(),
+                    public_key: okp.public_key(),
+                    nonce,
+                    action: Action::OracleUpdate { price },
+                },
+                &okp,
+            )
+            .unwrap()
+        };
+
+        // A modest 2x move from the $1 seed is accepted.
+        assert!(
+            apply_transaction(&mut ledger, &mk(0, 2 * SEED_XUS_USD_PRICE), &ctx(&p))
+                .unwrap()
+                .succeeded()
+        );
+        assert_eq!(ledger.oracle_price(), 2 * SEED_XUS_USD_PRICE);
+
+        // A 100x jump from the new current is refused by the breaker; the price holds.
+        let r = apply_transaction(&mut ledger, &mk(1, 200 * SEED_XUS_USD_PRICE), &ctx(&p)).unwrap();
+        assert!(!r.succeeded());
+        match r.status {
+            ExecutionStatus::Failed { reason } => {
+                assert!(reason.contains("per-update move"), "reason: {reason}")
+            }
+            o => panic!("expected Failed, got {o:?}"),
+        }
+        assert_eq!(ledger.oracle_price(), 2 * SEED_XUS_USD_PRICE);
     }
 
     #[test]
