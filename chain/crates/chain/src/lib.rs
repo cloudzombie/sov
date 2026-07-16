@@ -20,7 +20,7 @@ pub mod blockchain;
 pub mod genesis;
 
 pub use blockchain::{
-    Blockchain, ChainError, Imported, MinerStats, MiningCandidate, EDA_ACTIVATION_MS,
-    FINALITY_DEPTH,
+    Blockchain, ChainError, DeploymentStatus, Imported, MinerStats, MiningCandidate,
+    EDA_ACTIVATION_MS, FINALITY_DEPTH,
 };
 pub use genesis::{Genesis, GenesisAccount, GenesisConfig, GenesisError};

@@ -254,6 +254,27 @@ pub struct PqDeploymentConfig {
     pub threshold_grains: u128,
 }
 
+/// The live state of a miner-signaled governance deployment, for `sov_getDeployments`.
+/// Reports what the BIP-9/BIP-8 state machine derives from committed header signals —
+/// the same evaluation that gates real activation.
+#[derive(Clone, Debug)]
+pub struct DeploymentStatus {
+    /// Human-readable deployment name (e.g. `"pq-sunset"`).
+    pub name: String,
+    /// The signaling bit miners set to vote for it (`0..=28`).
+    pub bit: u8,
+    /// The current BIP-9/BIP-8 threshold state (`Defined`/`Started`/`LockedIn`/`Active`/`Failed`).
+    pub state: sov_governance::ThresholdState,
+    /// First height at which signaling is counted.
+    pub start_height: u64,
+    /// Height at which an un-locked-in deployment fails (or, with LOT, force-locks-in).
+    pub timeout_height: u64,
+    /// The signaling-window length in blocks.
+    pub period: u64,
+    /// BIP-8 lock-in-on-timeout (a guaranteed mandatory activation).
+    pub lockinontimeout: bool,
+}
+
 /// A miner's activity, derived from committed block headers: every block's
 /// `proposer` is the account its coinbase paid — the miner that found its proof
 /// of work.
@@ -531,6 +552,31 @@ impl Blockchain {
     /// activates under the BIP-9/8 state machine over committed header bits.
     pub fn set_pq_deployment(&mut self, config: PqDeploymentConfig) {
         self.pq_deployment = Some(config);
+    }
+
+    /// The live BIP-9/BIP-8 state of every registered governance deployment, evaluated
+    /// over the ACTIVE chain's committed miner signals at the current height. This is
+    /// read-only observability for `sov_getDeployments`; the exact same evaluation
+    /// (`sov_governance::state_at` over `self.signals`) drives real activation — e.g.
+    /// [`resolved_pq_with`](Self::resolved_pq_with) — so what this reports is precisely
+    /// what consensus will enforce. Miners move a deployment through
+    /// `Defined→Started→LockedIn→Active` by setting its bit in the blocks they mine.
+    pub fn deployment_states(&self) -> Vec<DeploymentStatus> {
+        let mut out = Vec::new();
+        let h = self.height();
+        if let Some(cfg) = &self.pq_deployment {
+            let d = &cfg.deployment;
+            out.push(DeploymentStatus {
+                name: d.name.clone(),
+                bit: d.bit,
+                state: sov_governance::state_at(d, BlockHeight::new(h), &self.signals),
+                start_height: d.start_height.get(),
+                timeout_height: d.timeout_height.get(),
+                period: d.period,
+                lockinontimeout: d.lockinontimeout,
+            });
+        }
+        out
     }
 
     /// The resolved post-quantum schedule in force for a block at `height`,
@@ -2150,6 +2196,40 @@ mod tests {
     }
 
     // ---- Miner-signaled post-quantum sunset (the Q-day runbook) ----
+
+    #[test]
+    fn deployment_states_reports_registered_deployments_for_getdeployments_rpc() {
+        use sov_governance::{Deployment, Threshold, ThresholdState};
+        // A chain with no deployment registered reports nothing — sov_getDeployments is
+        // simply empty (no governance in force).
+        let mut chain = fresh_chain();
+        assert!(chain.deployment_states().is_empty());
+        // Register the pq-sunset deployment; deployment_states() must now surface it with
+        // the BIP-9/BIP-8 state derived from committed signals (Defined at genesis, before
+        // any signaling window elapses) — the same evaluation that gates real activation.
+        chain.set_pq_deployment(PqDeploymentConfig {
+            deployment: Deployment::new(
+                "pq-sunset",
+                0,
+                BlockHeight::new(4),
+                BlockHeight::new(400),
+                4,
+                Threshold::new(3, 4).unwrap(),
+                BlockHeight::new(0),
+                true,
+            )
+            .unwrap(),
+            sunset_delay_blocks: 8,
+            threshold_grains: Balance::from_sov(50).unwrap().grains(),
+        });
+        let states = chain.deployment_states();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].name, "pq-sunset");
+        assert_eq!(states[0].bit, 0);
+        assert_eq!(states[0].period, 4);
+        assert!(states[0].lockinontimeout);
+        assert_eq!(states[0].state, ThresholdState::Defined);
+    }
 
     #[test]
     fn miner_signaled_pq_sunset_activates_and_enforces_end_to_end() {

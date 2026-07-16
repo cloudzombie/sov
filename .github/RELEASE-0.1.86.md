@@ -87,13 +87,19 @@ the header already carries a `version_bits` field and records it per block, yet 
 consumes those signals. So every activation (mainnet launch, the v0.1.85 EDA) has to be a
 hard-coded flag day.
 
-**v0.1.86:** connect the machine to the chain:
-- Feed the header `version_bits` stream into `sov-governance` at each retarget-style window
-  boundary; evaluate `ThresholdState` from real mined blocks (hashpower, not stake — a
-  whale's balance has zero weight).
-- Miners signal readiness by setting a deployment bit in the blocks they mine; once the
-  threshold is met over a window it **locks in**, then **activates** — no operator flag day.
-- Expose deployment status over RPC (`sov_getDeployments`) so activation is observable.
+**Correction after code review:** the machine is in fact **already connected** — `Blockchain`
+records the header `version_bits` stream into a `SignalLog`, and `resolved_pq_with()` already
+drives the `pq-sunset` deployment by evaluating `sov_governance::state_at(deployment, height,
+&signals)`. So BIP-9/BIP-8 miner-signaled activation → consensus is **done today** (the
+governance crate's "not yet in the live header" doc comment is stale). Miners already move a
+deployment `Defined→Started→LockedIn→Active` by setting its bit in the blocks they mine, with
+no operator flag day.
+
+**v0.1.86 therefore adds the missing OBSERVABILITY** (the machinery was invisible):
+- `Blockchain::deployment_states()` + a `sov_getDeployments` RPC exposing each deployment's
+  name, bit, live `ThresholdState`, window, and LOT flag — evaluated at the current height by
+  the *same* `state_at` that gates real activation, so what it reports is what consensus will
+  enforce. An operator (and the explorer) can now watch a hashpower vote progress.
 
 **Honest boundary (chicken-and-egg):** v0.1.86 *itself* cannot be miner-signaled — the
 signaling machinery has to be deployed before anything can signal through it. So v0.1.86 is

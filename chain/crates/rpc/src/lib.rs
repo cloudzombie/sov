@@ -962,6 +962,32 @@ fn call(
                 .collect();
             Ok(Value::Array(paged(params, miners)))
         }
+        // Miner-signaled governance (BIP-9/BIP-8): the live state of every deployment,
+        // derived from committed header signals at the current height — the same
+        // evaluation that gates real activation. Makes hashpower-voted upgrades
+        // observable so an operator can watch a deployment move Defined→…→Active.
+        "sov_getDeployments" => {
+            let deployments: Vec<Value> = node
+                .chain()
+                .deployment_states()
+                .iter()
+                .map(|d| {
+                    json!({
+                        "name": d.name,
+                        "bit": d.bit,
+                        "state": format!("{:?}", d.state),
+                        "startHeight": d.start_height,
+                        "timeoutHeight": d.timeout_height,
+                        "period": d.period,
+                        "lockinontimeout": d.lockinontimeout,
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "height": node.chain().height(),
+                "deployments": deployments,
+            }))
+        }
         "sov_submitTransaction" => {
             let stx: SignedTransaction = serde_json::from_value(params.clone())
                 .map_err(|e| RpcError::invalid_params(format!("invalid SignedTransaction: {e}")))?;
