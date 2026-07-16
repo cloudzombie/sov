@@ -7,19 +7,22 @@ Phase 7 item **p7-i9** — the public invariant dashboard is the other half (see
 `dashboard/index.html`, the *Verification & Validity* panel).
 
 > **Honest status:** Mainnet is **live** (fair-launched 2026-07-04) and has **not**
-> had a third-party security audit; no bug-bounty payouts are live. The current
-> assessment of record is the internal `Luna` audit (2026-07-09). This policy defines
-> the program and scope so an external audit/bounty can begin; it does **not** claim
-> either has happened. Run a node and hold value at your own risk until an external
-> audit is completed (see the roadmap).
+> had a third-party security audit. The internal `Luna` audit (2026-07-09) is the
+> current assessment of record. A **live public challenge — "The Gauntlet"** — funds a
+> real on-chain account and invites anyone to break the chain and take it, alongside
+> coordinated disclosure of any flaw; a formal tiered bounty program is still being
+> defined. This policy defines the program and scope so an **external** audit can begin;
+> it does **not** claim one has happened. Run a node and hold value at your own risk
+> until an external audit is completed (see the roadmap).
 
 ## Reporting a vulnerability
 
 Please report suspected vulnerabilities **privately** — do not open a public
 issue for anything exploitable.
 
-- Email: `security@sov.example` *(placeholder — replace with the project's real
-  disclosure address before any public testnet)*.
+- Email: `security@sovxus.com` — a forwarding alias that reaches the maintainers
+  privately without exposing a personal address. Encrypt sensitive reports if you can;
+  request a key at that address.
 - Include: affected component/crate, version/commit, impact, and a minimal
   reproduction.
 - We aim to acknowledge within 72 hours and to coordinate a fix and disclosure
@@ -61,9 +64,16 @@ have **not** had a third-party audit; the internal `Luna` audit (2026-07-09) is 
 current assessment of record. The block explorer is a separate application in the
 `cloudzombie/sov-explorer` repository and must be audited there.
 
-## Bug bounty (planned)
+## Bug bounty
 
-A bounty program will open alongside the public "Sovereign Testnet". Severity will
-follow the invariant list above (consensus-safety / supply / unauthorized-mint =
-critical). Reward tiers and the funding pool are operational decisions to be set
-before launch; this section reserves the policy, not specific payouts.
+**Live — "The Gauntlet".** A standing challenge funds a real on-chain account and invites
+anyone to break the chain and take it; the account holds a real balance and its key is in
+cold storage, so a successful theft *is* the proof of a critical flaw (see the challenge
+page linked from `sovxus.com`). Coordinated disclosure of any flaw — whether or not it
+drains the pot — is welcome via the disclosure address above and is the safer path for
+high-severity issues.
+
+Severity follows the invariant list above (consensus-safety / supply / unauthorized-mint
+= critical). A formal tiered program (reward tiers + funding pool) is still being defined;
+this section reserves the policy, not specific payouts. The earlier plan to open a bounty
+alongside a public testnet is **superseded** — SOV is on live mainnet.
