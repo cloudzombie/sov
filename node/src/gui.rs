@@ -1861,8 +1861,7 @@ impl Station {
         // hands out — reproducing the exact account via `hybrid_from_seed` (byte-identical
         // to the SDK). Its recovery phrase can't be re-shown (there is none), but it spends
         // normally.
-        let is_hex_seed =
-            input.len() == 64 && input.bytes().all(|b| b.is_ascii_hexdigit());
+        let is_hex_seed = input.len() == 64 && input.bytes().all(|b| b.is_ascii_hexdigit());
         let (mut seed, mnemonic_opt): ([u8; 32], Option<String>) = if is_hex_seed {
             let mut s = [0u8; 32];
             for i in 0..32 {
@@ -5966,7 +5965,9 @@ impl Station {
                 ui.horizontal(|ui| {
                     ui.label("Mnemonic / seed");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.import_mnemonic).desired_width(420.0).hint_text("24-word phrase OR 64-hex seed"),
+                        egui::TextEdit::singleline(&mut self.import_mnemonic)
+                            .desired_width(420.0)
+                            .hint_text("24-word phrase OR 64-hex seed"),
                     );
                     if ui.button("Restore").clicked() {
                         do_import = true;
@@ -6142,7 +6143,9 @@ impl Station {
             ui.horizontal(|ui| {
                 ui.label("mnemonic / seed");
                 let r = ui.add(
-                    egui::TextEdit::singleline(&mut self.import_mnemonic).desired_width(420.0).hint_text("24-word phrase OR 64-hex seed"),
+                    egui::TextEdit::singleline(&mut self.import_mnemonic)
+                        .desired_width(420.0)
+                        .hint_text("24-word phrase OR 64-hex seed"),
                 );
                 if ui.button("Import").clicked() || enter(&r, ui) {
                     do_import = true;
