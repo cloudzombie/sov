@@ -99,6 +99,20 @@ type PeerWriter = Arc<Peer>;
 /// thread for the OS default timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// First retry delay after a dial fails; doubles each consecutive failure up to
+/// [`DIAL_BACKOFF_MAX`]. Without this, a permanently-dead dial target (e.g. a retired
+/// seed's IP still in a peer's startup bootstrap) is re-dialed every reconnect tick
+/// forever, spamming `dialing…`/`dial failed` and burning a `CONNECT_TIMEOUT` each time.
+const DIAL_BACKOFF_BASE: Duration = Duration::from_secs(5);
+
+/// Ceiling on the exponential dial backoff: a dead peer is still retried, but at most
+/// this often (so a seed that comes back is eventually rediscovered) — not every tick.
+const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// Log the first this-many consecutive dial failures for an address, then go quiet while
+/// backing off — so a dead peer is visible once without flooding the operator's log.
+const DIAL_FAIL_LOG_LIMIT: u32 = 3;
+
 /// Default P2P listen/dial port. When an operator enters a bare IP or hostname in
 /// the seed-peer box (no `:port`), this is appended — it matches the port the app
 /// advertises to the other machine ("enter THIS in the other node's Seed peer:
@@ -244,6 +258,12 @@ struct Shared {
     /// [`enable_persistence`](TcpNode::enable_persistence) was called. `None` keeps the
     /// address book in-memory only (the pre-persistence behavior — tests, ephemeral nodes).
     peers_path: Mutex<Option<PathBuf>>,
+    /// Per-address dial backoff: consecutive failure count + the earliest instant the
+    /// address may be dialed again. Exponential (base [`DIAL_BACKOFF_BASE`], capped at
+    /// [`DIAL_BACKOFF_MAX`]) so a persistently-unreachable target (a retired seed, a peer
+    /// that went offline) is retried ever more rarely instead of every reconnect tick —
+    /// killing the `dialing…`/`dial failed` spam. Cleared on a successful connect.
+    dial_backoff: Mutex<HashMap<SocketAddr, (u32, Instant)>>,
     /// Addresses that authenticated as OUR OWN node identity — a peer gossiped our
     /// public address back and we connected to ourselves. Skipped by `attempt_dial`
     /// so the pointless self-link isn't reopened every discovery pass. Populated by the
@@ -348,6 +368,7 @@ impl TcpNode {
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             peers_path: Mutex::new(None),
+            dial_backoff: Mutex::new(HashMap::new()),
             self_addrs: Mutex::new(HashSet::new()),
             incompatible: Mutex::new(HashSet::new()),
         });
@@ -915,29 +936,56 @@ fn attempt_dial(shared: &Arc<Shared>, addr: SocketAddr) -> std::io::Result<()> {
     if dial_would_duplicate(shared, addr) {
         return Ok(());
     }
+    // Respect the exponential dial backoff: if this address failed recently, do not
+    // re-dial (or log) until its backoff window elapses. This is what stops a retired
+    // seed / dead peer from being hammered — and logged — every reconnect tick.
+    let prior_fails = {
+        let bk = shared.dial_backoff.lock().unwrap();
+        match bk.get(&addr) {
+            Some((_, next)) if Instant::now() < *next => return Ok(()),
+            Some((fails, _)) => *fails,
+            None => 0,
+        }
+    };
     // Claim the in-flight slot; if another dial already holds it, defer to that one.
     if !shared.dialing.lock().unwrap().insert(addr) {
         return Ok(());
     }
     shared.known.lock().unwrap().insert(addr);
 
-    // Past the dedup/in-flight guards: this is a genuine new dial, so make it visible
-    // (the guarded skips above stay quiet to avoid spamming the log every retry once a
-    // link is already up).
-    net_log(shared, format!("dialing {addr}…"));
+    // Past the dedup/in-flight/backoff guards: a genuine attempt. Log it only until the
+    // failure-log limit — after that a dead peer's periodic retries stay quiet.
+    if prior_fails < DIAL_FAIL_LOG_LIMIT {
+        net_log(shared, format!("dialing {addr}…"));
+    }
     match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
         Ok(stream) => {
             net_log(shared, format!("tcp connected to {addr} — handshaking"));
-            // `setup_connection` clears the in-flight slot once the peer is live.
+            shared.dial_backoff.lock().unwrap().remove(&addr); // reachable again
+                                                               // `setup_connection` clears the in-flight slot once the peer is live.
             register(shared, stream, true); // we dialed: we are the Noise initiator
             Ok(())
         }
         Err(e) => {
-            net_log(shared, format!("dial to {addr} failed: {e}"));
-            // Unreachable: drop the in-flight slot AND forget the address, so a
-            // later reconnect request can try again from scratch.
+            // Drop the in-flight slot AND forget the address so a later reconnect can try
+            // again — but record an exponentially-growing backoff (base doubling, capped)
+            // so the retry is ever rarer, and suppress the log past the first few failures.
             shared.dialing.lock().unwrap().remove(&addr);
             shared.known.lock().unwrap().remove(&addr);
+            let fails = {
+                let mut bk = shared.dial_backoff.lock().unwrap();
+                let entry = bk.entry(addr).or_insert((0, Instant::now()));
+                entry.0 = entry.0.saturating_add(1);
+                let shift = (entry.0 - 1).min(6); // cap the doubling at 2^6
+                let delay = DIAL_BACKOFF_BASE
+                    .saturating_mul(1u32 << shift)
+                    .min(DIAL_BACKOFF_MAX);
+                entry.1 = Instant::now() + delay;
+                entry.0
+            };
+            if fails <= DIAL_FAIL_LOG_LIMIT {
+                net_log(shared, format!("dial to {addr} failed: {e} (backing off)"));
+            }
             Err(e)
         }
     }
@@ -1565,6 +1613,47 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn a_dead_dial_target_backs_off_instead_of_being_hammered_every_tick() {
+        // The retired-seed spam fix: repeatedly dialing an unreachable address must record
+        // an exponentially-growing backoff so subsequent dials are skipped (no spam), not
+        // re-attempted every tick. Use a TEST-NET reserved, unroutable port that refuses
+        // fast so the test stays quick.
+        let node = TcpNode::bind("127.0.0.1:0").unwrap();
+        // 192.0.2.0/24 is TEST-NET-1 (RFC 5737) — guaranteed unroutable; the connect fails.
+        let dead: SocketAddr = "192.0.2.1:9645".parse().unwrap();
+        // First attempt: fails, records a backoff (failure count 1, next_attempt in future).
+        let _ = attempt_dial(&node.shared, dead);
+        let (fails, next) = *node
+            .shared
+            .dial_backoff
+            .lock()
+            .unwrap()
+            .get(&dead)
+            .expect("a failed dial records a backoff entry");
+        assert_eq!(fails, 1, "one failure recorded");
+        assert!(
+            next > Instant::now(),
+            "next attempt is deferred into the future"
+        );
+        // While inside the backoff window, another attempt is a no-op — it must NOT
+        // increment the failure count (proving it skipped the actual dial + its log).
+        let _ = attempt_dial(&node.shared, dead);
+        let fails_after = node
+            .shared
+            .dial_backoff
+            .lock()
+            .unwrap()
+            .get(&dead)
+            .unwrap()
+            .0;
+        assert_eq!(
+            fails_after, 1,
+            "a dial inside the backoff window is skipped, not retried"
+        );
+        node.shutdown();
+    }
+
+    #[test]
     fn peers_dat_round_trips_and_repopulates_known_on_load() {
         // Persistence is what makes seeds bootstrap-only: a node that learned peers,
         // then restarted, must recover them from peers.dat instead of falling back to
@@ -2018,6 +2107,7 @@ mod tests {
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             peers_path: Mutex::new(None),
+            dial_backoff: Mutex::new(HashMap::new()),
             self_addrs: Mutex::new(HashSet::new()),
             incompatible: Mutex::new(HashSet::new()),
         };
@@ -2058,6 +2148,7 @@ mod tests {
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             peers_path: Mutex::new(None),
+            dial_backoff: Mutex::new(HashMap::new()),
             self_addrs: Mutex::new(HashSet::new()),
             incompatible: Mutex::new(HashSet::new()),
         };
@@ -2099,6 +2190,7 @@ mod tests {
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             peers_path: Mutex::new(None),
+            dial_backoff: Mutex::new(HashMap::new()),
             self_addrs: Mutex::new(HashSet::new()),
             incompatible: Mutex::new(HashSet::new()),
         };
@@ -2263,6 +2355,7 @@ mod tests {
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             peers_path: Mutex::new(None),
+            dial_backoff: Mutex::new(HashMap::new()),
             self_addrs: Mutex::new(HashSet::new()),
             incompatible: Mutex::new(HashSet::new()),
         };

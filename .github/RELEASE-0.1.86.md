@@ -59,6 +59,21 @@ partition the net; that mistake is explicitly avoided):
 
 **Result:** the network is version-aware. Rollouts stop being blind.
 
+## 4a. Dial backoff — a dead peer no longer spams the log
+
+**Found in production during the v0.1.86 build:** after a seed droplet was retired, every
+node kept dialing its now-dead IP every reconnect tick (a `CONNECT_TIMEOUT` + a
+`dialing…`/`dial failed` log pair each time), *forever* — because v0.1.85 has no
+per-address dial backoff, and the dead IP stays alive in the `Peers` gossip (peers keep
+re-sharing it), so restarting a node just re-learns it. Cosmetically alarming; the network
+itself stayed healthy.
+
+**v0.1.86:** a failed dial records an **exponential backoff** per address (base 5s, doubling,
+capped at 5 min) and suppresses the log after the first 3 failures. A dead or retired peer is
+now retried ever more rarely and silently, and a peer that comes back is still rediscovered
+(the backoff clears on a successful connect). No wire change. Test:
+`a_dead_dial_target_backs_off_instead_of_being_hammered_every_tick`.
+
 ## 4. RPC JSON consistency — 32-byte fields accept hex (unblocks atomic swaps)
 
 **Today:** the `htlc_lock` action's `hashlock` is a raw `[u8; 32]`, so serde renders it in
