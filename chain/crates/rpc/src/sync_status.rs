@@ -59,6 +59,11 @@ pub struct SyncShared {
     /// by the UI so an operator can compare machines — block rewards track THIS
     /// (hashpower), not the number of machines, so a 10×-faster node earns ~10× the blocks.
     local_hashrate: AtomicU64,
+    /// Per-peer advertised `(addr, protocol_version, agent)` from the v0.1.86 `Version`
+    /// handshake, so `sov_getPeerInfo` shows the REAL software each peer is running (a
+    /// pre-v0.1.86 peer that advertises nothing simply isn't listed here). Not lock-free
+    /// (it is a small snapshot refreshed once per poll), but read only by the RPC.
+    peer_agents: std::sync::Mutex<Vec<(String, u32, String)>>,
 }
 
 impl SyncShared {
@@ -73,6 +78,17 @@ impl SyncShared {
         self.best_peer_height
             .store(best_peer_height, Ordering::Relaxed);
         self.authed_peers.store(authed_peers, Ordering::Relaxed);
+    }
+
+    /// **(writer — P2P engine.)** Publish the per-peer version snapshot (addr,
+    /// protocol_version, agent) for `sov_getPeerInfo`.
+    pub fn set_peer_agents(&self, agents: Vec<(String, u32, String)>) {
+        *self.peer_agents.lock().unwrap() = agents;
+    }
+
+    /// **(reader — RPC.)** The advertised versions of the currently-known peers.
+    pub fn peer_agents(&self) -> Vec<(String, u32, String)> {
+        self.peer_agents.lock().unwrap().clone()
     }
 
     /// How many blocks behind the best authenticated peer we are (0 = at/ahead of tip).

@@ -1313,7 +1313,7 @@ fn cmd_sim(flags: &Flags) -> Result<(), Box<dyn Error>> {
             Action::HtlcLock {
                 recipient: bob_acct.clone(),
                 amount: Balance::from_sov(1)?,
-                hashlock: sim_sha256(preimage.as_bytes()),
+                hashlock: Hash::from_bytes(sim_sha256(preimage.as_bytes())),
                 timeout_height: 1_000_000,
             },
             "htlc-lock",

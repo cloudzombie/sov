@@ -299,6 +299,7 @@ impl P2p {
                 let (behind_blocks, best, peers) = state.telemetry(&node);
                 if let Some(s) = &sync_status {
                     s.update(behind_blocks, best, peers);
+                    s.set_peer_agents(state.agents_snapshot());
                 }
                 // Reclaim slots from peers that connected but never authenticated
                 // (zombie-eclipse defense), and reap dead half-open connections to a
@@ -346,6 +347,18 @@ fn announce(tcp: &TcpNode, node: &Mutex<Node>, config: &P2pConfig) {
             }
         }
     }
+}
+
+/// This build's agent string for [`NetMessage::Version`], e.g. `"sov/v0.1.86"`.
+const AGENT: &str = concat!("sov/", env!("SOV_VERSION"));
+
+/// Our version advertisement, carrying this build's protocol version, agent, and head
+/// height. Sent ONCE per connection (on first authentication), never in the periodic
+/// announce — so a pre-v0.1.86 peer that cannot decode it takes at most one small,
+/// self-decaying malformed-frame penalty over the connection's life, never a ban.
+fn version_msg(node: &Mutex<Node>) -> NetMessage {
+    let height = node.lock().map(|n| n.chain().height()).unwrap_or(0);
+    NetMessage::version(AGENT, height)
 }
 
 fn hello(config: &P2pConfig, channel_binding: &[u8]) -> NetMessage {
@@ -477,6 +490,12 @@ struct SyncState {
     identity: HashMap<SocketAddr, AccountId>,
     /// Last-known head status per peer (drives chainwork-based catch-up).
     peer_status: HashMap<SocketAddr, PeerStatus>,
+    /// Advertised (protocol_version, agent) per peer from its [`NetMessage::Version`]
+    /// (v0.1.86+). A peer that never sends one (a pre-v0.1.86 node) is absent here and
+    /// reported as protocol 0 / "unknown". Informational + used to feature-gate
+    /// version-only messages (e.g. `GetAddr`) so an older peer is never sent a frame it
+    /// cannot decode.
+    peer_agents: HashMap<SocketAddr, (u32, String)>,
     /// Next height to request from each peer while walking backward to a common
     /// ancestor, then forward along that peer's heavier active chain.
     sync_next: HashMap<SocketAddr, u64>,
@@ -693,6 +712,7 @@ impl SyncState {
                 self.authenticated.remove(&peer);
                 self.identity.remove(&peer);
                 self.peer_status.remove(&peer);
+                self.peer_agents.remove(&peer);
                 self.sync_next.remove(&peer);
                 self.bt_step.remove(&peer);
                 self.last_recv.remove(&peer);
@@ -732,6 +752,9 @@ impl SyncState {
                 if let Some(status) = status(node) {
                     tcp.send(peer, &status);
                 }
+                // Advertise our version ONCE, now — makes the peer version-aware without
+                // ever re-sending (which would penalize a pre-v0.1.86 peer repeatedly).
+                tcp.send(peer, &version_msg(node));
                 // A duplicate link can only form when a connection FIRST authenticates,
                 // so dedup here (not on every repeat Hello — that would be O(peers²) at
                 // scale). Collapse any duplicate connections to this node down to one.
@@ -958,6 +981,42 @@ impl SyncState {
                     }
                 }
             }
+            NetMessage::Version {
+                protocol_version,
+                agent,
+                ..
+            } => {
+                // Record the peer's advertised version (informational + feature-gating).
+                // Carries no authority — trust still flows only from the signed Hello.
+                self.peer_agents
+                    .insert(peer, (protocol_version, agent.clone()));
+                // Refuse a peer below the minimum supported protocol. MIN is 0 during the
+                // v0.1.86 rollout (accept everyone); a future mandatory upgrade raises it
+                // to shun laggards at the handshake instead of silently forking them.
+                if protocol_version < sov_network::MIN_SUPPORTED_PROTOCOL {
+                    tcp.mark_incompatible(peer);
+                    tcp.disconnect(&peer);
+                    self.authenticated.remove(&peer);
+                    self.identity.remove(&peer);
+                    self.peer_agents.remove(&peer);
+                    p2p_log(
+                        &self.log,
+                        format!(
+                            "✗ dropped {} — protocol v{protocol_version} < min v{}",
+                            short_peer(&peer),
+                            sov_network::MIN_SUPPORTED_PROTOCOL
+                        ),
+                    );
+                } else {
+                    p2p_log(
+                        &self.log,
+                        format!(
+                            "{} is {agent} (protocol v{protocol_version})",
+                            short_peer(&peer)
+                        ),
+                    );
+                }
+            }
             NetMessage::Peers(_) | NetMessage::Hello { .. } => {}
         }
     }
@@ -982,6 +1041,7 @@ impl SyncState {
         self.authenticated.retain(|p| connected.contains(p));
         self.identity.retain(|p, _| connected.contains(p));
         self.peer_status.retain(|p, _| connected.contains(p));
+        self.peer_agents.retain(|p, _| connected.contains(p));
         self.sync_next.retain(|p, _| connected.contains(p));
         self.bt_step.retain(|p, _| connected.contains(p));
         self.first_seen.retain(|p, _| connected.contains(p));
@@ -1217,6 +1277,18 @@ impl SyncState {
         let local_height = local_status(node).map(|l| l.height).unwrap_or(0);
         let behind_blocks = best.saturating_sub(local_height);
         (behind_blocks, best, distinct.len())
+    }
+
+    /// A snapshot of `(addr, protocol_version, agent)` for every peer that advertised a
+    /// [`NetMessage::Version`], for `sov_getPeerInfo`. Sorted for a stable display.
+    fn agents_snapshot(&self) -> Vec<(String, u32, String)> {
+        let mut out: Vec<(String, u32, String)> = self
+            .peer_agents
+            .iter()
+            .map(|(addr, (ver, agent))| (addr.to_string(), *ver, agent.clone()))
+            .collect();
+        out.sort();
+        out
     }
 }
 

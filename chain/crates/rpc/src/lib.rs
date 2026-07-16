@@ -900,6 +900,20 @@ fn call(
                 .as_ref()
                 .map(|s| (s.authed_peers(), s.best_peer_height(), s.behind_blocks()))
                 .unwrap_or((0, 0, 0));
+            // Real per-peer software versions (v0.1.86 Version handshake): the network is
+            // now version-aware, so an operator sees exactly what each peer is running.
+            let peer_versions: Vec<serde_json::Value> = ctx
+                .sync
+                .as_ref()
+                .map(|s| {
+                    s.peer_agents()
+                        .into_iter()
+                        .map(|(addr, ver, agent)| {
+                            json!({ "addr": addr, "protocol": ver, "agent": agent })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let connected: Vec<String> = ctx
                 .gossip
                 .as_ref()
@@ -915,6 +929,8 @@ fn call(
                 "tcpLinks": ctx.gossip.as_ref().map(|g| g.peer_count()).unwrap_or(0),
                 "peers": peers,
                 "connectedPeers": connected,
+                "peerVersions": peer_versions,
+                "protocolVersion": sov_network::PROTOCOL_VERSION,
                 "bestPeerHeight": best,
                 "behindBlocks": behind,
                 "syncing": behind > 0,

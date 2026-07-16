@@ -79,6 +79,24 @@ pub enum NetMessage {
         /// Ed25519 signature over [`handshake_bytes`]`(chain_id, genesis_hash, channel_binding)`.
         signature: Signature,
     },
+    /// Software/protocol version advertisement (v0.1.86+). Sent once per peer right after
+    /// the encrypted channel is up so each side learns the other's wire-protocol version
+    /// and human agent string — the network becomes version-aware, and a node can refuse
+    /// or feature-gate a peer by version instead of silently forking on an upgrade. This
+    /// is a NEW, APPENDED variant (never a change to `Hello`, whose Borsh encoding must
+    /// stay stable): a pre-v0.1.86 peer simply cannot decode it and takes one small,
+    /// self-decaying malformed-frame penalty — sub-ban, harmless over the coordinated
+    /// upgrade window. Carries no authority (it is unsigned telemetry); trust decisions
+    /// still flow only from the signed `Hello`.
+    Version {
+        /// Wire-protocol version — bumped only when the P2P protocol changes in a way
+        /// peers must negotiate. Distinct from the human release string.
+        protocol_version: u32,
+        /// Human agent string, e.g. `"sov/0.1.86"` — shown by `sov_getPeerInfo`.
+        agent: String,
+        /// The advertiser's current chain head height (a cheap liveness/sync hint).
+        height: u64,
+    },
     // WIRE-COMPATIBILITY RULE: Borsh encodes an enum variant by its declaration-order
     // index, so a NEW variant MUST be appended HERE, at the end — never inserted
     // between existing ones, which would shift every later discriminant and break the
@@ -89,10 +107,30 @@ pub enum NetMessage {
     // its ordering does not affect the block log or genesis KAT.
 }
 
+/// The current P2P wire-protocol version this build speaks. Bumped only on a
+/// protocol change peers must negotiate; v0.1.86 is the first versioned protocol.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The lowest protocol version this build will still peer with. `0` = accept every
+/// peer (pre-v0.1.86 nodes advertise nothing and are treated as version 0), so the
+/// v0.1.86 rollout refuses no one; a FUTURE mandatory upgrade raises this to shun
+/// laggards at the handshake instead of silently forking them.
+pub const MIN_SUPPORTED_PROTOCOL: u32 = 0;
+
 impl NetMessage {
     /// Encode to the canonical Borsh wire bytes.
     pub fn encode(&self) -> Vec<u8> {
         borsh::to_vec(self).expect("Borsh serialization of a NetMessage is infallible")
+    }
+
+    /// Build a [`NetMessage::Version`] advertising this build's protocol version, the
+    /// human `agent` string (e.g. `"sov/0.1.86"`), and current chain `height`.
+    pub fn version(agent: impl Into<String>, height: u64) -> NetMessage {
+        NetMessage::Version {
+            protocol_version: PROTOCOL_VERSION,
+            agent: agent.into(),
+            height,
+        }
     }
 
     /// Decode from wire bytes.
@@ -195,6 +233,45 @@ mod tests {
     fn get_block_roundtrips() {
         let msg = NetMessage::GetBlock { height: 7 };
         assert_eq!(NetMessage::decode(&msg.encode()).unwrap(), msg);
+    }
+
+    #[test]
+    fn version_message_roundtrips_and_carries_this_builds_protocol() {
+        let msg = NetMessage::version("sov/v0.1.86", 6751);
+        assert_eq!(NetMessage::decode(&msg.encode()).unwrap(), msg);
+        match msg {
+            NetMessage::Version {
+                protocol_version,
+                agent,
+                height,
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert_eq!(agent, "sov/v0.1.86");
+                assert_eq!(height, 6751);
+            }
+            _ => panic!("expected Version"),
+        }
+    }
+
+    #[test]
+    fn version_is_the_last_variant_so_older_variants_keep_their_discriminants() {
+        // Borsh encodes an enum variant by declaration-order index. `Version` was APPENDED,
+        // so every pre-existing variant must still encode to its original leading byte —
+        // this is what lets a v0.1.85 node still decode Status/NewBlock/Hello unchanged.
+        // Status is variant 0; its encoding must still begin with 0x00.
+        let status = NetMessage::Status {
+            height: 1,
+            head: Hash::digest(b"h"),
+            chain_work: [0u8; 32],
+        };
+        assert_eq!(status.encode()[0], 0, "Status stays discriminant 0");
+        // A pre-v0.1.86 peer receiving a Version (a higher, unknown discriminant) fails to
+        // decode it — a graceful, penalized drop of that one frame, never a silent misparse.
+        let ver_disc = NetMessage::version("sov/x", 0).encode()[0];
+        assert!(
+            ver_disc > 0,
+            "Version is appended after the original variants"
+        );
     }
 
     #[test]
