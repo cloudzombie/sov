@@ -1535,9 +1535,11 @@ impl Daemon {
                 }
 
                 // Build a template on the CURRENT tip (brief lock); grind OFF the lock.
-                let (mut candidate, tip_height) = {
+                let (mut candidate, tip_height, parent_ts, target_ms) = {
                     let Ok(mut n) = node.lock() else { break };
                     let h = n.chain().height();
+                    let parent_ts = n.chain().head().header.timestamp_ms;
+                    let target_ms = n.chain().mining_policy().target_block_ms;
                     match n.build_candidate(now_ms()) {
                         Ok((c, excluded)) => {
                             // EVICT front-of-line unminable txs (their turn has come and
@@ -1562,7 +1564,7 @@ impl Daemon {
                                     );
                                 }
                             }
-                            (c, h)
+                            (c, h, parent_ts, target_ms)
                         }
                         Err(e) => {
                             drop(n);
@@ -1579,6 +1581,17 @@ impl Daemon {
                 // template if shutdown is requested or the tip moved (we adopted a peer's
                 // block), so no work is wasted on a stale tip.
                 let mining_height = candidate.block().header.height.get();
+                // The EDA halvings this template's bits were built with — if wall-clock
+                // crosses another stall boundary while grinding, the branch's REQUIRED
+                // difficulty eases below what we're grinding, so rebuild (below).
+                let template_eda = sov_mining::Difficulty::eda_halvings(
+                    candidate
+                        .block()
+                        .header
+                        .timestamp_ms
+                        .saturating_sub(parent_ts),
+                    target_ms,
+                );
                 let grind_started = Instant::now();
                 let mut last_beat = grind_started;
                 let mut nonce = random_nonce_start();
@@ -1628,6 +1641,27 @@ impl Daemon {
                             ),
                         );
                         last_beat = Instant::now();
+                    }
+                    // EDA (stall recovery): past activation, once wall-clock crosses the
+                    // next halving boundary the chain will ACCEPT an easier block than
+                    // this template commits to — rebuild with a fresh timestamp so the
+                    // grind chases the current (easier) requirement instead of the stale
+                    // bits. Without this a stalled miner grinds the old difficulty forever.
+                    let wall = now_ms();
+                    if wall >= sov_chain::EDA_ACTIVATION_MS
+                        && sov_mining::Difficulty::eda_halvings(
+                            wall.saturating_sub(parent_ts),
+                            target_ms,
+                        ) > template_eda
+                    {
+                        daemon_log(
+                            &log,
+                            format!(
+                                "⚠ stall: no block for {}s — emergency difficulty adjustment eased the requirement; rebuilding block {mining_height}'s template",
+                                wall.saturating_sub(parent_ts) / 1000
+                            ),
+                        );
+                        break; // rebuild with a fresh (easier) template
                     }
                     // A new tip? `try_lock` so a momentarily-busy node never stalls the grind.
                     if let Ok(n) = node.try_lock() {

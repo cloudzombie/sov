@@ -18,6 +18,18 @@ use sov_primitives::Hash;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Difficulty(pub u128);
 
+/// A block interval this many times the target block time is a STALL for the
+/// emergency difficulty adjustment ([`Difficulty::eda`]): every full multiple
+/// halves the required difficulty. 6× matches the LWMA solve-time clamp ceiling.
+pub const EDA_STALL_FACTOR: u64 = 6;
+
+/// Ceiling on the EDA reduction a single block may claim: 2^8 = 256×. Chosen so
+/// the most a miner can shave by lying forward in time is bounded by the node
+/// acceptance rule's 2-hour future-drift cap (2h / (6 × 2.5min) = 8 intervals) —
+/// claiming the maximum future timestamp buys exactly the cap and no more. A
+/// longer real stall recovers by compounding across consecutive blocks instead.
+pub const EDA_MAX_HALVINGS: u32 = 8;
+
 impl Difficulty {
     /// The easiest difficulty: target is the maximum (every hash qualifies).
     pub const MIN: Difficulty = Difficulty(1);
@@ -125,6 +137,31 @@ impl Difficulty {
         let lo = (parent / MAX_STEP).max(1);
         let hi = parent.saturating_mul(MAX_STEP);
         Difficulty(next.clamp(lo, hi))
+    }
+
+    /// How many EDA halvings a block whose parent gap is `elapsed_ms` may claim:
+    /// one per full [`EDA_STALL_FACTOR`]`× target_ms`, capped at
+    /// [`EDA_MAX_HALVINGS`]. Zero for any ordinary block interval.
+    pub fn eda_halvings(elapsed_ms: u64, target_ms: u64) -> u32 {
+        let unit = EDA_STALL_FACTOR.saturating_mul(target_ms.max(1));
+        ((elapsed_ms / unit).min(EDA_MAX_HALVINGS as u64)) as u32
+    }
+
+    /// **Emergency difficulty adjustment** — the stall-recovery rule. LWMA can
+    /// only retarget when blocks ARRIVE, so if the hashpower behind the current
+    /// difficulty leaves, the chain freezes (the small-chain death spiral: the
+    /// 2026-07-16 mainnet 8-hour stall). The EDA breaks the spiral: the
+    /// difficulty required of a block is halved for every full
+    /// [`EDA_STALL_FACTOR`]`× target` of wall-clock gap between it and its
+    /// parent (per its own committed timestamp), so a stalled chain becomes
+    /// minable by whatever hashpower remains, and each recovered block lets
+    /// LWMA re-converge from its (lower) difficulty. Cheap blocks carry
+    /// proportionally less chain work, so heaviest-work fork choice is
+    /// unaffected; the reduction is capped at [`EDA_MAX_HALVINGS`] per block to
+    /// bound what a future-dated timestamp can claim (see that constant).
+    pub fn eda(self, elapsed_ms: u64, target_ms: u64) -> Difficulty {
+        let halvings = Self::eda_halvings(elapsed_ms, target_ms);
+        Difficulty((self.0 >> halvings).max(1))
     }
 }
 
@@ -248,6 +285,41 @@ mod tests {
             worst_after_ramp <= target_ms * 2,
             "no block may run far past target: worst {worst_after_ramp}ms vs target {target_ms}ms"
         );
+    }
+
+    #[test]
+    fn eda_is_inert_for_ordinary_block_intervals() {
+        let t = 150_000u64; // 2.5-min target
+        let d = Difficulty(91_692);
+        // Anything under 6× the target changes nothing — including exactly at
+        // the boundary minus one.
+        for elapsed in [0u64, 1, t, 2 * t, 6 * t - 1] {
+            assert_eq!(d.eda(elapsed, t).0, d.0, "elapsed={elapsed}");
+        }
+    }
+
+    #[test]
+    fn eda_halves_per_stall_interval_and_caps() {
+        let t = 150_000u64;
+        let d = Difficulty(91_692);
+        // One full stall interval (15 min) halves; each further interval halves again.
+        assert_eq!(d.eda(6 * t, t).0, 91_692 / 2);
+        assert_eq!(d.eda(12 * t, t).0, 91_692 / 4);
+        assert_eq!(d.eda(30 * t, t).0, 91_692 / 32);
+        // The reduction caps at EDA_MAX_HALVINGS even for a multi-hour gap
+        // (the 2026-07-16 8-hour stall) — deeper recovery compounds across
+        // consecutive blocks instead of being claimable in one.
+        let eight_hours = 8 * 60 * 60 * 1000;
+        assert_eq!(d.eda(eight_hours, t).0, 91_692 >> EDA_MAX_HALVINGS);
+        assert_eq!(Difficulty::eda_halvings(u64::MAX, t), EDA_MAX_HALVINGS);
+    }
+
+    #[test]
+    fn eda_never_goes_below_minimum_difficulty() {
+        let t = 150_000u64;
+        // A tiny difficulty shifted past zero floors at MIN, so the target stays valid.
+        assert_eq!(Difficulty(3).eda(u64::MAX, t).0, 1);
+        assert_eq!(Difficulty(1).eda(6 * t, t).0, 1);
     }
 
     #[test]

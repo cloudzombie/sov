@@ -19,7 +19,7 @@
 
 use sov_chain::{Blockchain, GenesisAccount, GenesisConfig};
 use sov_crypto::{Keypair, Signature};
-use sov_mining::MiningPolicy;
+use sov_mining::{Difficulty, MiningPolicy, Target, Work};
 use sov_primitives::{AccountId, Balance};
 use sov_types::{Action, Block, SignedTransaction, Transaction};
 
@@ -174,6 +174,58 @@ fn atk_timewarp_backdate() -> Outcome {
             }
         }
     }
+}
+
+/// TIME: EDA farming — a miner stamps its block as far in the future as it
+/// dares, claiming a stall that never happened so the emergency difficulty
+/// adjustment eases its required target. The defense is the CAP: the easing a
+/// single block can claim is bounded at 2^EDA_MAX_HALVINGS — exactly what the
+/// node-acceptance 2-hour future-drift rule tolerates anyway — and an eased
+/// block carries proportionally less chain work, so an honestly-difficult
+/// competitor still outweighs it. Verifies both: the cap holds for an absurd
+/// future stamp, and the eased block cannot out-work an honest one.
+fn atk_eda_future_farm() -> Outcome {
+    let c = "time";
+    let name = "EDA farming: future-stamp for easier difficulty";
+    let mut chain = fresh_chain();
+    advance(&mut chain, 12);
+    // Cross into the EDA era, then demand the easing an ABSURD (year-scale)
+    // future stamp yields. The claimable reduction must cap at EDA_MAX_HALVINGS.
+    // Compact-grid canonical form of a target, as consensus stores/compares it.
+    let canonical =
+        |t: Target| Target::from_compact(t.to_compact()).expect("canonical target decodes");
+    let year_ms: u64 = 365 * 24 * 60 * 60 * 1000;
+    let far_future = sov_chain::EDA_ACTIVATION_MS + year_ms;
+    let Ok(block) = chain.produce_block(vec![], far_future) else {
+        return Outcome::defended(c, name, "production refused the future stamp");
+    };
+    let honest = Difficulty::from_target(canonical(MiningPolicy::test().sha256d_target)).0;
+    let claimed =
+        Difficulty::from_target(Target::from_compact(block.header.bits).expect("bits decode")).0;
+    let floor = (honest >> sov_mining::EDA_MAX_HALVINGS).max(1);
+    if claimed < floor {
+        return Outcome::vulnerable(
+            c,
+            name,
+            "a future stamp eased difficulty PAST the EDA cap — unbounded farming",
+        );
+    }
+    // The eased block must also carry LESS work than an honest-difficulty block,
+    // so fork choice cannot be gamed by farming easings.
+    let eased_work = Work::of_target(&Target::from_compact(block.header.bits).unwrap());
+    let honest_work = Work::of_target(&canonical(MiningPolicy::test().sha256d_target));
+    if eased_work >= honest_work {
+        return Outcome::vulnerable(
+            c,
+            name,
+            "an EDA-eased block claims >= the honest chain work — fork choice gameable",
+        );
+    }
+    Outcome::defended(
+        c,
+        name,
+        "easing capped at 2^EDA_MAX_HALVINGS and eased work weighs proportionally less",
+    )
 }
 
 /// TIME: a timestamp far in the past (before genesis) must never be accepted.
@@ -640,6 +692,7 @@ pub fn run_all() -> Vec<Outcome> {
     vec![
         atk_timewarp_backdate(),
         atk_timewarp_far_past(),
+        atk_eda_future_farm(),
         atk_tamper_header("tamper: state_root", |b| {
             b.header.state_root = flip_hash(b.header.state_root)
         }),

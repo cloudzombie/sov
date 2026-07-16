@@ -21,7 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod difficulty;
-pub use difficulty::Difficulty;
+pub use difficulty::{Difficulty, EDA_MAX_HALVINGS, EDA_STALL_FACTOR};
 
 pub mod work;
 pub use work::Work;

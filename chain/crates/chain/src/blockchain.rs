@@ -350,6 +350,16 @@ fn elastic_block_cap(mut sizes: Vec<usize>) -> usize {
 /// this constant is where the protocol draws the operational line.
 pub const FINALITY_DEPTH: u64 = 6;
 
+/// **Emergency-difficulty-adjustment activation** (consensus): the EDA
+/// ([`Difficulty::eda`]) applies only to blocks whose own committed timestamp is
+/// at or past this instant — 2026-07-16 22:00:00 UTC, the v0.1.85 coordinated
+/// upgrade. Gating by the block's OWN timestamp (the same way the mainnet launch
+/// itself was gated) keeps every earlier block's required difficulty — and the
+/// frozen genesis — byte-identical: history including the 2026-07-16 stall's
+/// multi-hour blocks revalidates unchanged, and KAT vectors (whose synthetic
+/// timestamps predate this) are untouched. NEVER lower this once shipped.
+pub const EDA_ACTIVATION_MS: u64 = 1_784_239_200_000;
+
 /// How many recent active blocks keep an undo log for O(reorg-depth) disconnects.
 /// Far deeper than any honest reorg (and than [`FINALITY_DEPTH`]), so in practice a
 /// reorg never exceeds the window; one that did (a massive partition heal) simply
@@ -606,13 +616,45 @@ impl Blockchain {
         elastic_block_cap(sizes)
     }
 
-    fn expected_target(&self, parent: &BlockIndexEntry) -> Target {
+    /// `timestamp_ms` is the CANDIDATE block's own committed timestamp: past
+    /// [`EDA_ACTIVATION_MS`] the emergency difficulty adjustment
+    /// ([`Difficulty::eda`]) lowers the requirement when the gap to the parent
+    /// shows a stall, so a chain whose hashpower left recovers instead of
+    /// freezing. Producer (`build_candidate`) and importer (`validate_candidate`)
+    /// pass the same header field, so both derive identical bits.
+    fn expected_target(&self, parent: &BlockIndexEntry, timestamp_ms: u64) -> Target {
+        let base = self.base_target(parent);
+        if timestamp_ms < EDA_ACTIVATION_MS {
+            return base;
+        }
+        let elapsed = timestamp_ms.saturating_sub(parent.block.header.timestamp_ms);
+        let halvings = Difficulty::eda_halvings(elapsed, self.mining.target_block_ms);
+        if halvings == 0 {
+            // No stall — return `base` untouched (not a from_target/to_target
+            // round-trip, which is lossy and would perturb historical bits).
+            return base;
+        }
+        canonical_target(
+            Difficulty::from_target(base)
+                .eda(elapsed, self.mining.target_block_ms)
+                .to_target(),
+        )
+    }
+
+    /// The pre-EDA (LWMA / warmup) target for a block extending `parent` — the
+    /// scheduled difficulty, before any stall-recovery reduction.
+    fn base_target(&self, parent: &BlockIndexEntry) -> Target {
         let height = parent.height + 1;
-        // Warmup: until a full window of history exists, carry the parent's (ultimately
-        // the genesis) difficulty forward. Genesis (height 0) is therefore unaffected, so
-        // the frozen genesis hash is unchanged.
+        // Warmup: until a full window of history exists, the GENESIS difficulty is the
+        // schedule. (Before the EDA this was expressed as "carry the parent's target
+        // forward", which was identical — every warmup block carried the genesis bits —
+        // but with the EDA a parent's committed bits may be stall-eased, and the easing
+        // must not stick: the schedule stays the genesis difficulty.) Genesis (height 0)
+        // is unaffected, so the frozen genesis hash is unchanged.
         if height <= DIFFICULTY_WINDOW {
-            return parent.sha_target;
+            // Canonical, exactly as the genesis index entry stores it — byte-identical
+            // to the old carry-the-parent form for all pre-EDA history.
+            return canonical_target(self.mining.sha256d_target);
         }
         // PER-BLOCK retarget by LWMA-1 (Monero/Zcash-family). Collect the last
         // `DIFFICULTY_WINDOW` blocks' difficulties and their solve times (oldest first),
@@ -647,11 +689,13 @@ impl Blockchain {
 
     /// Recompute the active head's *next-block* difficulty and cache it in the
     /// reported [`sha256d_difficulty`](Self::sha256d_difficulty) scalar. Called
-    /// after every head change (extend or reorg).
+    /// after every head change (extend or reorg). Reports the SCHEDULED
+    /// (pre-EDA) difficulty — the head's own timestamp implies zero stall, and
+    /// a wall-clock-dependent value here would make the cache nondeterministic.
     fn sync_active_difficulty(&mut self) {
         let sha = {
             let head = self.index.get(&self.head).expect("head is always indexed");
-            self.expected_target(head)
+            self.base_target(head)
         };
         self.sha256d_difficulty = Difficulty::from_target(sha);
     }
@@ -840,7 +884,10 @@ impl Blockchain {
         // recompute them, so the producer and the importer agree bit-for-bit.
         let (sha_target, size_limit) = {
             let head = self.index.get(&self.head).expect("head is always indexed");
-            (self.expected_target(head), self.block_size_limit(head))
+            (
+                self.expected_target(head, timestamp_ms),
+                self.block_size_limit(head),
+            )
         };
         // Transactions are selected only while the assembled block stays within the
         // elastic block-size cap (reserving headroom for the header + length prefix, so
@@ -1084,7 +1131,7 @@ impl Blockchain {
             });
         }
 
-        let sha_target = self.expected_target(parent);
+        let sha_target = self.expected_target(parent, block.header.timestamp_ms);
         let expected_height = parent.height + 1;
         if block.header.height.get() != expected_height {
             return Err(ChainError::HeightMismatch {
@@ -2600,6 +2647,101 @@ mod tests {
         assert!(
             slow_difficulty < fast_difficulty,
             "slow blocks must LOWER difficulty: {slow_difficulty} vs fast {fast_difficulty}"
+        );
+    }
+
+    #[test]
+    fn eda_recovers_a_stalled_chain_after_activation() {
+        // The 2026-07-16 mainnet stall: hashpower leaves, LWMA can't retarget
+        // without blocks, chain freezes. Past EDA activation a block whose own
+        // timestamp shows a stall is REQUIRED (and therefore allowed) an easier
+        // target — one halving per 6× target — so the chain recovers.
+        let mut chain = fresh_chain();
+        let target_ms = MiningPolicy::test().target_block_ms;
+        let d0 = chain.sha256d_difficulty().0; // 256 in the test policy
+
+        // The activation-crossover block: its parent (genesis) is dated far in
+        // the past, so the gap reads as a (capped) stall — exactly what mainnet's
+        // first v0.1.85 block sees after the real outage. Maximally eased.
+        let mut ts = EDA_ACTIVATION_MS;
+        let crossover = chain.produce_block(vec![], ts).unwrap();
+        assert_eq!(
+            Difficulty::from_target(Target::from_compact(crossover.header.bits).unwrap()).0,
+            (d0 >> sov_mining::EDA_MAX_HALVINGS).max(1),
+            "the crossover stall gets the CAPPED easing, no more"
+        );
+        chain.import_block(crossover).unwrap();
+
+        // Back on cadence: the easing does NOT stick — the schedule reasserts.
+        for _ in 0..2 {
+            ts += target_ms;
+            let b = chain.produce_block(vec![], ts).unwrap();
+            assert_eq!(
+                Difficulty::from_target(Target::from_compact(b.header.bits).unwrap()).0,
+                d0,
+                "no stall ⇒ scheduled difficulty, even after activation"
+            );
+            chain.import_block(b).unwrap();
+        }
+
+        // A 4-stall-interval gap (24× target) ⇒ 4 halvings required of THIS block.
+        ts += 4 * 6 * target_ms;
+        let stalled = chain.produce_block(vec![], ts).unwrap();
+        let claimed = Difficulty::from_target(Target::from_compact(stalled.header.bits).unwrap()).0;
+        // Canonical (compact-grid) snapping makes the value approximate; bound it.
+        assert!(
+            claimed <= d0 / 8 && claimed >= d0 / 32,
+            "4 halvings from {d0} expected ≈{}, got {claimed}",
+            d0 / 16
+        );
+        // And the importer AGREES — the eased block is accepted.
+        chain.import_block(stalled).unwrap();
+    }
+
+    #[test]
+    fn eda_is_inert_for_historical_timestamps() {
+        // Pre-activation blocks — ALL existing mainnet history, including the
+        // stall's own multi-hour blocks — keep their original required bits, so
+        // the chain revalidates byte-identically under the new rule.
+        let mut chain = fresh_chain();
+        let target_ms = MiningPolicy::test().target_block_ms;
+        let genesis_bits = MiningPolicy::test().sha256d_target.to_compact();
+        let mut ts = 1_000u64; // synthetic historical clock, far before activation
+        for gap in [target_ms, 6 * target_ms, 100 * 6 * target_ms] {
+            ts += gap;
+            let b = chain.produce_block(vec![], ts).unwrap();
+            assert_eq!(
+                b.header.bits, genesis_bits,
+                "a pre-activation stall (gap {gap}ms) must NOT ease difficulty"
+            );
+            chain.import_block(b).unwrap();
+        }
+    }
+
+    #[test]
+    fn eda_bits_are_bound_to_the_committed_timestamp() {
+        // A miner cannot keep EDA-eased bits while backdating the stall away:
+        // the required target is derived from the header's OWN timestamp, so
+        // shrinking the gap makes the eased bits a mismatch.
+        let mut chain = fresh_chain();
+        let target_ms = MiningPolicy::test().target_block_ms;
+        // Cross activation (capped-eased block over the genesis gap), then one
+        // on-cadence block so the tip is back at the scheduled difficulty.
+        let ts0 = EDA_ACTIVATION_MS;
+        let b = chain.produce_block(vec![], ts0).unwrap();
+        chain.import_block(b).unwrap();
+        let ts1 = ts0 + target_ms;
+        let b = chain.produce_block(vec![], ts1).unwrap();
+        chain.import_block(b).unwrap();
+        // Honestly produce an eased (stalled) block, then rewrite its timestamp
+        // to an ordinary cadence while KEEPING the eased bits.
+        let stalled_ts = ts1 + 6 * target_ms;
+        let mut cheat = chain.produce_block(vec![], stalled_ts).unwrap();
+        cheat.header.timestamp_ms = ts1 + target_ms;
+        let err = chain.import_block(cheat).unwrap_err();
+        assert!(
+            matches!(err, ChainError::BadDifficultyBits { .. }),
+            "eased bits without the stall must be BadDifficultyBits, got {err:?}"
         );
     }
 

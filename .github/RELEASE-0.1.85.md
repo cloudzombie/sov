@@ -1,7 +1,36 @@
 # SOV v0.1.85
 
-A security + compatibility release. All changes are on `main` and tested; this is the
-tag/release description for when v0.1.85 is cut.
+A consensus stall-recovery + security + compatibility release. All changes are on `main`
+and tested; this is the tag/release description for when v0.1.85 is cut.
+
+## ⛏ Emergency Difficulty Adjustment — the 2026-07-16 stall, fixed for good
+
+On 2026-07-16 (~07:19 UTC) most of the network's hashpower went offline (a home-internet
+outage at the dominant miners) and mainnet froze at height 6731 for 8+ hours: LWMA can only
+retarget **when a block arrives**, so with difficulty tuned for ~516 H/s and ~6 H/s
+remaining, blocks took ~4 hours each — the small-chain death spiral. Nothing in consensus
+could recover quickly; the chain would have crawled for days.
+
+**The fix (consensus, this release):** a block whose own committed timestamp is more than
+6× the target block time (15 min) past its parent's is *required* — and therefore allowed —
+an easier target: the scheduled difficulty is **halved once per full 15-minute stall
+interval**, capped at 2^8 (256×) per block. A stalled chain automatically becomes minable
+by whatever hashpower remains, each recovered block feeds LWMA a lower difficulty, and the
+schedule reconverges. Deterministic for producer and importer alike (both derive it from
+the header's committed timestamp), so `bits` remain exactly checkable.
+
+Safety properties:
+- **Activation is timestamp-gated at 2026-07-16 22:00:00 UTC** — every earlier block
+  (including the stall's own multi-hour blocks) revalidates byte-identically; genesis and
+  KAT vectors untouched.
+- The per-block cap (2^8) equals what the existing 2-hour future-drift acceptance rule
+  could yield (2h / 15min = 8 intervals): lying forward in time buys nothing beyond the
+  drift already tolerated, and the MTP lower bound + monotonicity box the timestamp as
+  before.
+- Eased blocks carry proportionally **less chain work**, so heaviest-work fork choice and
+  reorg security are unchanged — a cheap-block chain cannot outweigh an honest one.
+- Miners rebuild their template when a stall crosses the next easing boundary (previously
+  a stalled miner ground the stale, too-hard template forever).
 
 ## 🔒 Security (from the 2026-07-15 internal adversarial audit)
 
@@ -41,6 +70,8 @@ tag/release description for when v0.1.85 is cut.
 ## Safety
 
 Genesis `cb0272ff…` unchanged. The consensus-tightening changes (multisig, oracle) reject
-transaction classes that are astronomically unlikely to exist in mainnet history; KAT vectors
-+ frozen-genesis tests are byte-identical. **This is a coordinated upgrade — update both
-relays and the miner together.**
+transaction classes that are astronomically unlikely to exist in mainnet history, and the
+EDA is timestamp-gated past all existing history; KAT vectors + frozen-genesis tests are
+byte-identical. **This is a coordinated upgrade — every node (both relays, every miner,
+every SOV Station) must run v0.1.85 before the 22:00 UTC activation**: an un-upgraded node
+would reject post-stall eased blocks and fork itself off.
