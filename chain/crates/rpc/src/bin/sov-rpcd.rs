@@ -182,6 +182,11 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
                 &logs,
                 format!("P2P gossip listening on {}", p2p.local_addr()),
             );
+            // Persistent peer discovery: remember reachable peers across restarts so the
+            // hard-coded seeds are only ever needed for the FIRST contact. Loads
+            // <data_dir>/peers.dat, redials a sample, and re-flushes it periodically.
+            p2p.tcp()
+                .enable_persistence(std::path::Path::new(&config.data_dir).join("peers.dat"));
             for peer in &bootstrap {
                 // Best-effort first dial; if the seed isn't up yet, the engine keeps
                 // retrying in the background, so the link forms once it is.

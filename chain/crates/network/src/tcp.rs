@@ -32,10 +32,12 @@
 //! runtime — which keeps the model simple.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket,
 };
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -169,6 +171,16 @@ const MAX_PEERS_PER_MSG: usize = 128;
 /// grow node memory without bound. Far more than a healthy network needs.
 const MAX_KNOWN_PEERS: usize = 4_096;
 
+/// How often the discovered peer set is flushed to `peers.dat` (also flushed on
+/// shutdown). Persisting the address book is what makes hard-coded seeds
+/// *bootstrap-only*: after first contact a node remembers reachable peers and, on
+/// restart, redials them directly instead of depending on the seeds still being up.
+const PEERS_SAVE_INTERVAL: Duration = Duration::from_secs(120);
+
+/// On startup, redial at most this many remembered peers from `peers.dat` — enough to
+/// rejoin the mesh immediately without a thundering-herd of 4k dials.
+const MAX_PEERS_REDIAL_ON_LOAD: usize = 32;
+
 /// Cap on the receive `inbox` queue. Up to [`MAX_INBOUND_PEERS`] reader threads push
 /// decoded messages into one queue drained by the single P2P worker; while that worker is
 /// busy in a slow block import/reorg it isn't draining, so without a bound the queue could
@@ -228,6 +240,10 @@ struct Shared {
     /// Set to stop the background threads and release the listen port, so the node
     /// can be cleanly shut down and its address rebound (e.g. an in-process restart).
     shutdown: AtomicBool,
+    /// Where to persist the discovered peer set (`<data_dir>/peers.dat`), if
+    /// [`enable_persistence`](TcpNode::enable_persistence) was called. `None` keeps the
+    /// address book in-memory only (the pre-persistence behavior — tests, ephemeral nodes).
+    peers_path: Mutex<Option<PathBuf>>,
     /// Addresses that authenticated as OUR OWN node identity — a peer gossiped our
     /// public address back and we connected to ourselves. Skipped by `attempt_dial`
     /// so the pointless self-link isn't reopened every discovery pass. Populated by the
@@ -331,6 +347,7 @@ impl TcpNode {
             dial_tx,
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
+            peers_path: Mutex::new(None),
             self_addrs: Mutex::new(HashSet::new()),
             incompatible: Mutex::new(HashSet::new()),
         });
@@ -456,6 +473,68 @@ impl TcpNode {
             }
         });
         Ok(())
+    }
+
+    /// Enable **persistent peer discovery**: load the remembered address book from
+    /// `path` (`<data_dir>/peers.dat`), redial a bounded sample immediately, and flush
+    /// the discovered set back to `path` every [`PEERS_SAVE_INTERVAL`] and on shutdown.
+    ///
+    /// This is what turns hard-coded seeds into *bootstrap-only* infrastructure: without
+    /// it, the `known` set is in-memory and every restart falls back to the seeds; with
+    /// it, a node that has met the network once rejoins on its own even if every seed is
+    /// down. The file is a simple newline-delimited list of `host:port` (human-readable,
+    /// safe to delete — it just forces a bootstrap next start). Idempotent-ish: call once
+    /// after [`bind`](Self::bind). Load failures are non-fatal (a fresh node has no file).
+    pub fn enable_persistence(&self, path: impl Into<PathBuf>) {
+        let path = path.into();
+        // Load + redial synchronously so first-tick discovery reflects the saved book.
+        if let Ok(contents) = fs::read_to_string(&path) {
+            let mut loaded = 0usize;
+            let mut redialed = 0usize;
+            let mut known = self.shared.known.lock().unwrap();
+            for line in contents.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(addr) = line.parse::<SocketAddr>() else {
+                    continue;
+                };
+                if addr == self.shared.local_addr || known.len() >= MAX_KNOWN_PEERS {
+                    continue;
+                }
+                if known.insert(addr) {
+                    loaded += 1;
+                    if redialed < MAX_PEERS_REDIAL_ON_LOAD
+                        && !dial_would_duplicate(&self.shared, addr)
+                    {
+                        let _ = self.shared.dial_tx.send(addr);
+                        redialed += 1;
+                    }
+                }
+            }
+            drop(known);
+            net_log(
+                &self.shared,
+                format!("peers.dat: loaded {loaded} known peer(s), redialing {redialed}"),
+            );
+        }
+        *self.shared.peers_path.lock().unwrap() = Some(path);
+
+        // Background flusher: persist periodically and once more on shutdown, so a clean
+        // stop never loses the book and a crash loses at most PEERS_SAVE_INTERVAL of it.
+        let shared = Arc::clone(&self.shared);
+        thread::spawn(move || {
+            let mut last = Instant::now();
+            while !shared.shutdown.load(Ordering::SeqCst) {
+                if last.elapsed() >= PEERS_SAVE_INTERVAL {
+                    persist_peers(&shared);
+                    last = Instant::now();
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+            persist_peers(&shared); // final flush on shutdown
+        });
     }
 
     /// The address this node is listening on.
@@ -747,6 +826,30 @@ fn resolve_dial_targets(addr: &str) -> std::io::Result<Vec<SocketAddr>> {
 /// Append one timestamped transport-diagnostic line to the (optional) Node-tab log.
 /// A no-op when no sink is attached (headless/tests), so it is free to call on the
 /// dial/handshake paths. Mirrors the GUI logger's format and cap.
+/// Flush the discovered peer set to `peers.dat` (no-op if persistence is disabled).
+/// Written atomically (temp file + rename) so a crash mid-write can't corrupt the book,
+/// and capped at [`MAX_KNOWN_PEERS`] lines. Any I/O error is swallowed — a node that
+/// cannot persist its peers is degraded, not broken (it just re-bootstraps next start).
+fn persist_peers(shared: &Shared) {
+    let path = match shared.peers_path.lock().unwrap().clone() {
+        Some(p) => p,
+        None => return,
+    };
+    let addrs: Vec<String> = shared
+        .known
+        .lock()
+        .unwrap()
+        .iter()
+        .take(MAX_KNOWN_PEERS)
+        .map(|a| a.to_string())
+        .collect();
+    let body = addrs.join("\n");
+    let tmp = path.with_extension("dat.tmp");
+    if fs::write(&tmp, body.as_bytes()).is_ok() {
+        let _ = fs::rename(&tmp, &path);
+    }
+}
+
 fn net_log(shared: &Shared, msg: impl AsRef<str>) {
     let sink = match shared.log.lock().unwrap().clone() {
         Some(s) => s,
@@ -1445,6 +1548,41 @@ mod tests {
     use sov_primitives::Hash;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn peers_dat_round_trips_and_repopulates_known_on_load() {
+        // Persistence is what makes seeds bootstrap-only: a node that learned peers,
+        // then restarted, must recover them from peers.dat instead of falling back to
+        // the seeds. Save a known set, then load it into a FRESH node and confirm the
+        // addresses come back.
+        let dir = std::env::temp_dir().join(format!("sov-peers-test-{}", node_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("peers.dat");
+
+        let a = TcpNode::bind("127.0.0.1:0").unwrap();
+        let p1: SocketAddr = "203.0.113.7:9645".parse().unwrap();
+        let p2: SocketAddr = "198.51.100.9:9645".parse().unwrap();
+        a.shared.known.lock().unwrap().insert(p1);
+        a.shared.known.lock().unwrap().insert(p2);
+        *a.shared.peers_path.lock().unwrap() = Some(path.clone());
+        persist_peers(&a.shared);
+        assert!(path.exists(), "peers.dat is written");
+
+        // A fresh node loads the same file (public addrs, so no real dial completes —
+        // we only assert they are remembered in `known`).
+        let b = TcpNode::bind("127.0.0.1:0").unwrap();
+        b.enable_persistence(path.clone());
+        let known = b.shared.known.lock().unwrap();
+        assert!(
+            known.contains(&p1) && known.contains(&p2),
+            "loaded both peers"
+        );
+
+        drop(known);
+        a.shutdown();
+        b.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn status(h: u64) -> NetMessage {
         NetMessage::Status {
             height: h,
@@ -1863,6 +2001,7 @@ mod tests {
             dial_tx: tx,
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
+            peers_path: Mutex::new(None),
             self_addrs: Mutex::new(HashSet::new()),
             incompatible: Mutex::new(HashSet::new()),
         };
@@ -1902,6 +2041,7 @@ mod tests {
             dial_tx: tx,
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
+            peers_path: Mutex::new(None),
             self_addrs: Mutex::new(HashSet::new()),
             incompatible: Mutex::new(HashSet::new()),
         };
@@ -1942,6 +2082,7 @@ mod tests {
             dial_tx: tx,
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
+            peers_path: Mutex::new(None),
             self_addrs: Mutex::new(HashSet::new()),
             incompatible: Mutex::new(HashSet::new()),
         };
@@ -2105,6 +2246,7 @@ mod tests {
             dial_tx: tx,
             log: Mutex::new(None),
             shutdown: AtomicBool::new(false),
+            peers_path: Mutex::new(None),
             self_addrs: Mutex::new(HashSet::new()),
             incompatible: Mutex::new(HashSet::new()),
         };
