@@ -5964,9 +5964,9 @@ impl Station {
                     ui.add(egui::TextEdit::singleline(&mut self.import_name).desired_width(220.0));
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Mnemonic    ");
+                    ui.label("Mnemonic / seed");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.import_mnemonic).desired_width(420.0),
+                        egui::TextEdit::singleline(&mut self.import_mnemonic).desired_width(420.0).hint_text("24-word phrase OR 64-hex seed"),
                     );
                     if ui.button("Restore").clicked() {
                         do_import = true;
@@ -6140,9 +6140,9 @@ impl Station {
                 ui.add(egui::TextEdit::singleline(&mut self.import_name).desired_width(200.0));
             });
             ui.horizontal(|ui| {
-                ui.label("mnemonic");
+                ui.label("mnemonic / seed");
                 let r = ui.add(
-                    egui::TextEdit::singleline(&mut self.import_mnemonic).desired_width(420.0),
+                    egui::TextEdit::singleline(&mut self.import_mnemonic).desired_width(420.0).hint_text("24-word phrase OR 64-hex seed"),
                 );
                 if ui.button("Import").clicked() || enter(&r, ui) {
                     do_import = true;
