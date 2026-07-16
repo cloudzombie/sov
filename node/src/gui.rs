@@ -5458,7 +5458,7 @@ impl Station {
             let action = Action::HtlcLock {
                 recipient: recipient_id,
                 amount: Balance::from_grains(grains),
-                hashlock: sha256_bytes(secret.as_bytes()),
+                hashlock: sov_primitives::Hash::from_bytes(sha256_bytes(secret.as_bytes())),
                 timeout_height: timeout,
             };
             let msg = submit_action(&rpc, seed, &signer, action)
