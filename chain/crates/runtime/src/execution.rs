@@ -828,6 +828,20 @@ pub fn apply_transaction(
                     ExecutionStatus::Failed {
                         reason: "an owner cannot fill their own intent".into(),
                     }
+                } else if ledger.multisig_of(&intent.owner).is_some() {
+                    // SECURITY: the multisig gate (top of `execute`) only guards
+                    // `tx.signer`, i.e. the SOLVER. The intent OWNER is a passive party
+                    // authorized here purely by a signature against its retained
+                    // `account.key` — and `SetMultisig` never clears that key. Without
+                    // this guard, a single key that signed an intent (e.g. a compromised
+                    // key the owner adopted multisig to defend against, or an intent
+                    // signed before the policy was installed) could drain a multisig
+                    // account with the M-of-N threshold never consulted. Single-key
+                    // intents from a multisig account are therefore not authorized;
+                    // a multisig account must move value through `MultisigExec`.
+                    ExecutionStatus::Failed {
+                        reason: "intent owner is a multisig account; single-key intent settlement is not authorized".into(),
+                    }
                 } else if ledger.account(&intent.owner).key != Some(intent.public_key) {
                     ExecutionStatus::Failed {
                         reason: "intent key is not the owner account's registered key".into(),
@@ -3978,6 +3992,57 @@ mod tests {
         assert_eq!(ledger.total_supply().unwrap(), native_supply_before);
         check_transition(&before, &ledger).unwrap();
         check_ledger(&ledger, &p).unwrap();
+    }
+
+    #[test]
+    fn a_multisig_owner_intent_cannot_be_single_key_settled() {
+        // SECURITY regression: an intent the owner signed with its single key must NOT be
+        // settleable once the owner account carries an M-of-N policy. Otherwise a retained
+        // (or compromised) single key drains a multisig account with the threshold never
+        // consulted — the exact attack multisig exists to stop. See the guard in the
+        // IntentSettle arm.
+        let (mut ledger, asset) = liquidity_setup();
+        let p = policy();
+
+        // usa's real, validly-signed intent (single key [1;32]).
+        let intent = usa_intent(asset, 0);
+
+        // usa adopts a 2-of-2 multisig policy (its old single key is retained by the
+        // ledger — SetMultisig never clears account.key).
+        let m1 = Keypair::from_seed([11; 32]).public_key();
+        let m2 = Keypair::from_seed([12; 32]).public_key();
+        ledger.set_multisig(
+            id("usa.reserve.sov"),
+            sov_state::Multisig {
+                signers: vec![m1, m2],
+                threshold: 2,
+            },
+        );
+
+        let usa_sov_before = ledger.account(&id("usa.reserve.sov")).balance;
+        let bob_token_before = ledger.token_balance(&asset, &id("bob.sov"));
+
+        // bob (solver) tries to settle usa's single-key intent → must be REFUSED now.
+        let r = apply_transaction(&mut ledger, &fill(intent, 95, 0), &ctx_at(10, &p)).unwrap();
+        assert!(
+            !r.succeeded(),
+            "a single-key intent on a multisig account must not settle"
+        );
+        match r.status {
+            ExecutionStatus::Failed { reason } => {
+                assert!(reason.contains("multisig"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // Not a grain moved.
+        assert_eq!(
+            ledger.account(&id("usa.reserve.sov")).balance,
+            usa_sov_before
+        );
+        assert_eq!(
+            ledger.token_balance(&asset, &id("bob.sov")),
+            bob_token_before
+        );
     }
 
     #[test]
