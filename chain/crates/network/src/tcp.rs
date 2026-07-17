@@ -113,6 +113,15 @@ const DIAL_BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// backing off — so a dead peer is visible once without flooding the operator's log.
 const DIAL_FAIL_LOG_LIMIT: u32 = 3;
 
+/// After this many consecutive dial failures an address is treated as **dead**: it is no
+/// longer re-added from gossip, no longer gossiped to others, and not persisted to
+/// `peers.dat`. This is what lets a RETIRED seed (e.g. a deleted relay droplet whose IP
+/// is stuck circulating in the `Peers` gossip) actually *age out of the whole mesh* —
+/// backoff alone only slows the re-dials; every node still keeps re-learning and
+/// re-sharing the corpse. A single successful connect clears the count, so a peer that
+/// merely had an outage comes right back.
+const DIAL_DEAD_THRESHOLD: u32 = 5;
+
 /// Default P2P listen/dial port. When an operator enters a bare IP or hostname in
 /// the seed-peer box (no `:port`), this is appended — it matches the port the app
 /// advertises to the other machine ("enter THIS in the other node's Seed peer:
@@ -847,6 +856,18 @@ fn resolve_dial_targets(addr: &str) -> std::io::Result<Vec<SocketAddr>> {
 /// Append one timestamped transport-diagnostic line to the (optional) Node-tab log.
 /// A no-op when no sink is attached (headless/tests), so it is free to call on the
 /// dial/handshake paths. Mirrors the GUI logger's format and cap.
+/// Whether `addr` has failed enough consecutive dials ([`DIAL_DEAD_THRESHOLD`]) to be
+/// treated as dead — no longer re-learned from gossip, gossiped, or persisted. A
+/// successful connect clears the backoff entry, so this reverts the moment a peer returns.
+fn addr_is_dead(shared: &Shared, addr: &SocketAddr) -> bool {
+    shared
+        .dial_backoff
+        .lock()
+        .unwrap()
+        .get(addr)
+        .is_some_and(|(fails, _)| *fails >= DIAL_DEAD_THRESHOLD)
+}
+
 /// Flush the discovered peer set to `peers.dat` (no-op if persistence is disabled).
 /// Written atomically (temp file + rename) so a crash mid-write can't corrupt the book,
 /// and capped at [`MAX_KNOWN_PEERS`] lines. Any I/O error is swallowed — a node that
@@ -856,11 +877,18 @@ fn persist_peers(shared: &Shared) {
         Some(p) => p,
         None => return,
     };
-    let addrs: Vec<String> = shared
+    // Never persist an address we've marked dead — otherwise a retired seed resurrects
+    // from peers.dat on the next restart (backoff state is in-memory only).
+    let live: Vec<SocketAddr> = shared
         .known
         .lock()
         .unwrap()
         .iter()
+        .copied()
+        .filter(|a| !addr_is_dead(shared, a))
+        .collect();
+    let addrs: Vec<String> = live
+        .into_iter()
         .take(MAX_KNOWN_PEERS)
         .map(|a| a.to_string())
         .collect();
@@ -1077,7 +1105,15 @@ fn setup_connection(
 
     // Announce ourselves + everyone we know, so the peer can discover the network.
     let mut addrs = vec![shared.local_addr.to_string()];
-    addrs.extend(shared.known.lock().unwrap().iter().map(|a| a.to_string()));
+    addrs.extend(
+        shared
+            .known
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| !addr_is_dead(shared, a))
+            .map(|a| a.to_string()),
+    );
     let _ = write_frame(&peer, &NetMessage::Peers(addrs));
 
     reader_loop(shared, key, reader, peer);
@@ -1467,6 +1503,13 @@ fn reader_loop(shared: &Arc<Shared>, key: SocketAddr, mut reader: TcpStream, pee
                             {
                                 continue;
                             }
+                            // Refuse to re-learn an address we've proven dead. This is what
+                            // makes a retired seed AGE OUT of the mesh: once enough nodes
+                            // mark it dead they stop re-adding it from each other's gossip,
+                            // so it stops circulating instead of being re-dialed forever.
+                            if addr_is_dead(shared, &sa) {
+                                continue;
+                            }
                             // Record it for future dials under one lock; stop if the
                             // discovered set is already full, so gossip can't grow memory
                             // without bound. Drop the lock before dialing.
@@ -1493,6 +1536,7 @@ fn reader_loop(shared: &Arc<Shared>, key: SocketAddr, mut reader: TcpStream, pee
                                 .lock()
                                 .unwrap()
                                 .iter()
+                                .filter(|a| !addr_is_dead(shared, a))
                                 .take(MAX_PEERS_PER_MSG.saturating_sub(1))
                                 .map(|a| a.to_string()),
                         );
@@ -1611,6 +1655,47 @@ mod tests {
     use super::*;
     use sov_primitives::Hash;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_dead_address_is_evicted_from_persistence_and_gossip() {
+        // Past DIAL_DEAD_THRESHOLD failures an address is DEAD: not persisted, not gossiped,
+        // not re-learned — so a retired seed ages out of the mesh instead of circulating.
+        let node = TcpNode::bind("127.0.0.1:0").unwrap();
+        let dead: SocketAddr = "203.0.113.9:9645".parse().unwrap();
+        let live: SocketAddr = "198.51.100.5:9645".parse().unwrap();
+        node.shared
+            .dial_backoff
+            .lock()
+            .unwrap()
+            .insert(dead, (DIAL_DEAD_THRESHOLD, Instant::now()));
+        node.shared.known.lock().unwrap().insert(dead);
+        node.shared.known.lock().unwrap().insert(live);
+        assert!(addr_is_dead(&node.shared, &dead), "past threshold ⇒ dead");
+        assert!(
+            !addr_is_dead(&node.shared, &live),
+            "a live peer is not dead"
+        );
+        // Persistence must drop the dead one and keep the live one.
+        let dir = std::env::temp_dir().join(format!("sov-dead-test-{}", node_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("peers.dat");
+        *node.shared.peers_path.lock().unwrap() = Some(path.clone());
+        persist_peers(&node.shared);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains("203.0.113.9"),
+            "dead address is NOT persisted"
+        );
+        assert!(saved.contains("198.51.100.5"), "live address IS persisted");
+        // A single successful-connect equivalent (clearing the backoff entry) revives it.
+        node.shared.dial_backoff.lock().unwrap().remove(&dead);
+        assert!(
+            !addr_is_dead(&node.shared, &dead),
+            "clearing backoff revives the address"
+        );
+        node.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_dead_dial_target_backs_off_instead_of_being_hammered_every_tick() {
