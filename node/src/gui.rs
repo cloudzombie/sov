@@ -8866,11 +8866,41 @@ fn read_node_pid() -> Option<u32> {
         .ok()
 }
 
+/// Run `cmd` but never let it wedge the caller: spawn it, wait up to `timeout` for it
+/// to exit, and force-kill + abandon it if it overruns. This runs on the NODE-STARTUP
+/// path, where any indefinite block shows up to the operator as "the app never gets
+/// past Starting…". Windows `taskkill` against a process stuck in an uninterruptible
+/// kernel wait (e.g. a wedged prior node mid ~2 GiB RandomX dataset allocation, or a
+/// blocked socket syscall) can otherwise hang forever — the exact "sync hangs on
+/// startup, macOS is fine" symptom, since macOS reaps via `pgrep`/`kill -9` and never
+/// spawns `taskkill`. Best-effort by design: the single-instance guard and pid-kill are
+/// advisory, so a timeout just means we proceed — a genuinely-leftover ghost surfaces
+/// later as a clear "address already in use" bind error, never a silent hang.
+fn run_bounded(mut cmd: Command, timeout: Duration) {
+    let mut child = match cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        Ok(c) => c,
+        Err(_) => return, // the tool isn't present / couldn't launch — nothing to wait on
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return, // exited cleanly
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill(); // overran the budget — abandon it and move on
+                let _ = child.wait();
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => return,
+        }
+    }
+}
+
 /// Whether process `pid` is alive. Unix: `kill -0` (a no-signal liveness probe).
 /// Windows: `tasklist` filtered by PID (its output names the image only if the
 /// process exists). Both are real probes, so adopt-on-launch behaves the same.
 /// Force-stop process `pid`. The block log is append-only and crash-recovers, so
-/// a hard kill is safe for the node.
+/// a hard kill is safe for the node. Bounded so a stuck target can't wedge startup.
 fn kill_pid(pid: u32) {
     #[cfg(unix)]
     let mut cmd = Command::new("kill");
@@ -8880,7 +8910,7 @@ fn kill_pid(pid: u32) {
     let mut cmd = Command::new("taskkill");
     #[cfg(windows)]
     cmd.args(["/PID", &pid.to_string(), "/F"]);
-    let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status();
+    run_bounded(cmd, Duration::from_secs(4));
 }
 
 /// Stop the local node recorded in the pidfile (if any) and clear the pidfile.
@@ -8906,11 +8936,13 @@ fn kill_other_instances() {
     };
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
-            .args(["/F", "/IM", &name, "/FI", &format!("PID ne {self_pid}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // Bounded: a wedged prior instance (stuck in a kernel wait) must not let
+        // `taskkill` hang node startup — that is the "app never gets past Starting…"
+        // Windows symptom. If it overruns we proceed; any real port conflict then
+        // surfaces as a clear bind error, not a silent hang.
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/F", "/IM", &name, "/FI", &format!("PID ne {self_pid}")]);
+        run_bounded(cmd, Duration::from_secs(4));
     }
     #[cfg(unix)]
     {
@@ -8961,10 +8993,15 @@ fn build_and_run_node(
     passphrase: &str,
     logs: &Arc<Mutex<Vec<String>>>,
 ) -> Result<EmbeddedNode, String> {
+    // Breadcrumb the PRE-INDEXING startup so a hang here is never a silent black box:
+    // every heavy/blocking step below logs before it runs, so the operator's Node-tab
+    // log pinpoints exactly which call wedged (this is how the Windows "never reaches
+    // 'indexing'" hang gets diagnosed instead of guessed at).
+    push_log(logs, "startup: clearing any stale instance…");
     // SINGLE INSTANCE: kill any ghost copy of this app first, so a leftover process from
     // a previous launch can't still hold the P2P/RPC ports and fail our bind with
     // "address already in use" (os error 10048/48) — the real cause of "node start
-    // FAILED: p2p bind". One node, no ghosts.
+    // FAILED: p2p bind". One node, no ghosts. Bounded so a wedged ghost can't hang us.
     kill_other_instances();
     // On Windows, make sure we're allowed inbound through the firewall (once), so LAN
     // peers can actually reach this node — otherwise discovery silently never connects.
@@ -9012,6 +9049,7 @@ fn build_and_run_node(
                 .to_string(),
         );
     }
+    push_log(logs, "startup: sealing miner keystore (encrypting)…");
     let keystore_json = Keystore {
         miners: vec![KeystoreEntry {
             account: account.to_string(),
@@ -9090,6 +9128,7 @@ fn build_and_run_node(
             config.bootstrap_peers.push(s.clone());
         }
     }
+    push_log(logs, "startup: unlocking keystore + verifying genesis…");
     let keystore = Keystore::from_encrypted_or_plain(
         &read(&node_dir.join("node-1/keystore.json"))?,
         Some(passphrase),
