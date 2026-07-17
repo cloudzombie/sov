@@ -24,12 +24,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use sov_chain::ChainError;
+use sov_chain::{Blockchain, ChainError};
 use sov_crypto::Keypair;
 use sov_network::{NetMessage, TcpNode};
 use sov_node::{Node, NodeError};
 use sov_primitives::{AccountId, Hash};
-use sov_types::Block;
+use sov_types::{Block, BlockHeader};
 
 use crate::sync_status::SyncShared;
 use crate::BlockLog;
@@ -431,8 +431,33 @@ const SLOW_IMPORT_MS: u128 = 50;
 
 /// Largest exponential backtrack step when walking back to a common ancestor on a
 /// fork: 1, 2, 4, … capped here, so even a deep divergence is located in O(log)
-/// requests instead of one height at a time.
+/// requests instead of one height at a time. LEGACY path only (protocol < 2 peers):
+/// a protocol-v2 peer names the fork point in ONE round-trip via a block locator
+/// ([`NetMessage::GetHeaders`]).
 const BACKTRACK_CAP: u64 = 256;
+
+/// The lowest advertised peer protocol that understands headers-first fork-point
+/// discovery ([`NetMessage::GetHeaders`] / [`NetMessage::Headers`]). A peer below it
+/// — or one that never advertised a `Version` at all (pre-v0.1.86, reported as 0) —
+/// keeps the legacy single-block backward walk, so an older node is never handed a
+/// frame it cannot decode.
+const HEADERS_MIN_PROTOCOL: u32 = 2;
+
+/// How many headers one [`GetHeaders`](NetMessage::GetHeaders) response carries at
+/// most (Bitcoin's `getheaders` cap). Headers are small (~200 bytes), so 2000 sits
+/// far under the transport frame limit while covering a deep divergence in one
+/// round-trip; a longer catch-up simply repeats from the new tip.
+const HEADERS_BATCH: usize = 2000;
+
+/// Max entries in a block locator we BUILD: hashes at heights tip, tip-1, tip-2,
+/// tip-4, … (doubling), always ending with genesis. 32 exponentially-spaced entries
+/// span any realistic chain length (2^30 blocks).
+const LOCATOR_CAP: usize = 32;
+
+/// Max locator entries we PROCESS when serving a [`GetHeaders`](NetMessage::GetHeaders)
+/// — bounds the lookup work a hostile oversized locator can demand. An honest
+/// locator is at most [`LOCATOR_CAP`]; the headroom tolerates a future cap bump.
+const LOCATOR_MAX_ACCEPT: usize = 64;
 
 /// Misbehavior points charged (via [`TcpNode::penalize_peer`]) to a peer that sends a
 /// block which FAILS validation — bad proof of work, a fabricated state/receipts root,
@@ -981,15 +1006,112 @@ impl SyncState {
                         self.advance_or_done(peer, h);
                         p2p_log(&self.log, format!("← imported blocks up to height {h}"));
                     } else if let Some(h) = rejected {
-                        // First block didn't connect → on a fork; start backtracking.
-                        self.sync_next.insert(peer, h.saturating_sub(1).max(1));
-                        self.bt_step.insert(peer, 1);
+                        // First block didn't connect → we are on a fork (a stale tip).
+                        // A protocol-v2 peer names the fork point in ONE round-trip via
+                        // a block locator (headers-first, as Bitcoin/Monero/Zcash do);
+                        // an older peer keeps the legacy one-block backward walk.
+                        let peer_proto = self.peer_agents.get(&peer).map(|(v, _)| *v).unwrap_or(0);
+                        let locator = if peer_proto >= HEADERS_MIN_PROTOCOL {
+                            build_locator(node)
+                        } else {
+                            Vec::new()
+                        };
+                        if !locator.is_empty()
+                            && tcp.send(
+                                peer,
+                                &NetMessage::GetHeaders {
+                                    locator,
+                                    stop: Hash::ZERO,
+                                },
+                            )
+                        {
+                            // Await the Headers reply (one round-trip); the in-flight
+                            // marker keeps request_missing from re-asking meanwhile,
+                            // and its timeout still protects against a silent peer.
+                            self.inflight = Some(InFlight {
+                                peer,
+                                since: Instant::now(),
+                            });
+                            p2p_log(
+                                &self.log,
+                                format!(
+                                    "↩ height {h} didn't connect — asking {} for the fork \
+                                     point (block locator)",
+                                    short_peer(&peer)
+                                ),
+                            );
+                        } else {
+                            // Legacy peer (protocol < 2), or the send failed: fall back
+                            // to the single-block backward walk.
+                            self.sync_next.insert(peer, h.saturating_sub(1).max(1));
+                            self.bt_step.insert(peer, 1);
+                            p2p_log(
+                                &self.log,
+                                format!(
+                                    "↩ height {h} didn't connect — backtracking to find the fork point"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            NetMessage::GetHeaders { locator, stop } => {
+                // Headers-first fork-point discovery (protocol v2): name the fork
+                // point for a lagging peer in ONE round-trip. Cheap to serve — a few
+                // O(1) lookups plus header clones — and only answered for
+                // authenticated peers (gated above, like GetBlocks).
+                let headers = node
+                    .lock()
+                    .ok()
+                    .map(|n| headers_from_fork_point(n.chain(), &locator, &stop))
+                    .unwrap_or_default();
+                if !headers.is_empty() {
+                    p2p_log(
+                        &self.log,
+                        format!(
+                            "→ served {} header(s) from height {} to {}",
+                            headers.len(),
+                            headers[0].height.get(),
+                            short_peer(&peer)
+                        ),
+                    );
+                }
+                tcp.send(peer, &NetMessage::Headers(headers));
+            }
+            NetMessage::Headers(headers) => {
+                // The fork-point answer to our GetHeaders. On a valid, attached
+                // sequence: resume the EXISTING forward batched download from just
+                // past the fork point — the whole point of the locator is that this
+                // took one round-trip instead of a one-block-per-round-trip crawl.
+                self.inflight = None;
+                self.stalled_logged = false; // a reply arrived — clear the stall latch
+                if headers.len() > HEADERS_BATCH {
+                    // More than we ever serve — an amplification an honest peer never
+                    // sends (mirrors the oversized-BlocksResponse rule).
+                    tcp.penalize_peer(peer, OVERSIZE_RESPONSE_PENALTY);
+                    return;
+                }
+                match headers_fork_point(node, &headers) {
+                    Some(fork) => {
+                        self.bt_step.remove(&peer); // forward mode
+                        self.sync_next.insert(peer, fork + 1);
                         p2p_log(
                             &self.log,
                             format!(
-                                "↩ height {h} didn't connect — backtracking to find the fork point"
+                                "↔ fork point at height {fork} (found in one headers \
+                                 exchange) — downloading forward from {}",
+                                fork + 1
                             ),
                         );
+                    }
+                    None => {
+                        // Empty, gapped, or unattached headers: fall back to the
+                        // legacy single-block backward walk for this peer, seeded
+                        // from the current cursor, so sync still makes progress.
+                        if let Some(next) = self.sync_next.get(&peer).copied() {
+                            self.sync_next.insert(peer, next.saturating_sub(1).max(1));
+                            self.bt_step.insert(peer, 1);
+                        }
                     }
                 }
             }
@@ -1325,6 +1447,104 @@ impl SyncState {
     }
 }
 
+/// The heights a block locator samples for a chain whose tip is `tip`: the tip,
+/// then exponentially-spaced steps back (tip-1, tip-2, tip-4, tip-8, …), ALWAYS
+/// ending with genesis (height 0), capped at [`LOCATOR_CAP`] entries. Dense near
+/// the tip (where a fork most likely is), sparse toward genesis — so ANY fork
+/// depth is bracketed within one doubling step, in O(log) locator size.
+fn locator_heights(tip: u64) -> Vec<u64> {
+    let mut heights = Vec::new();
+    let mut offset = 0u64;
+    while let Some(h) = tip.checked_sub(offset) {
+        if h == 0 || heights.len() >= LOCATOR_CAP - 1 {
+            break;
+        }
+        heights.push(h);
+        offset = if offset == 0 {
+            1
+        } else {
+            offset.saturating_mul(2)
+        };
+    }
+    heights.push(0); // genesis: the guaranteed common block on a same-genesis peer
+    heights
+}
+
+/// Build a block locator from OUR active chain: the block hashes at
+/// [`locator_heights`], ordered tip → genesis, for a
+/// [`GetHeaders`](NetMessage::GetHeaders) request.
+fn build_locator(node: &Mutex<Node>) -> Vec<Hash> {
+    let Ok(n) = node.lock() else {
+        return Vec::new();
+    };
+    let chain = n.chain();
+    locator_heights(chain.height())
+        .into_iter()
+        .filter_map(|h| chain.block_by_height(h).map(|b| b.hash()))
+        .collect()
+}
+
+/// Serve a [`GetHeaders`](NetMessage::GetHeaders): find the fork point — the FIRST
+/// locator hash (the locator is ordered tip → genesis, so the first match is the
+/// highest/deepest-common block) that is on OUR active chain — and return up to
+/// [`HEADERS_BATCH`] consecutive headers from just past it, stopping early once a
+/// header's hash equals `stop` (⁠[`Hash::ZERO`] = no stop). No locator hash matching
+/// means the peer shares nothing but genesis with us: serve from height 1.
+fn headers_from_fork_point(chain: &Blockchain, locator: &[Hash], stop: &Hash) -> Vec<BlockHeader> {
+    let mut fork = 0u64;
+    for h in locator.iter().take(LOCATOR_MAX_ACCEPT) {
+        if let Some(b) = chain.block_by_hash(h) {
+            let height = b.header.height.get();
+            // On the ACTIVE chain, not merely known: a hash on a stale side branch
+            // is not a point the requester can download forward from.
+            if chain.block_by_height(height).map(|x| x.hash()) == Some(*h) {
+                fork = height;
+                break;
+            }
+        }
+    }
+    let mut headers = Vec::new();
+    let mut h = fork + 1;
+    while headers.len() < HEADERS_BATCH {
+        let Some(b) = chain.block_by_height(h) else {
+            break; // reached our head
+        };
+        let hit_stop = b.hash() == *stop;
+        headers.push(b.header.clone());
+        if hit_stop {
+            break;
+        }
+        h += 1;
+    }
+    headers
+}
+
+/// Validate a [`Headers`](NetMessage::Headers) response LIGHTLY and name the fork
+/// point: the first header's `prev_hash` must be a block we already have (that
+/// block's height IS the fork point), and the sequence must be contiguous —
+/// consecutive ascending heights, each header's `prev_hash` the previous header's
+/// hash. Proof of work is deliberately NOT re-verified here: the fork point is only
+/// a download hint, and the forward full-block import re-validates everything — a
+/// lying peer yields at worst a bad guess whose blocks then fail import (penalized).
+/// Returns `None` for an empty, gapped, or unattached sequence.
+fn headers_fork_point(node: &Mutex<Node>, headers: &[BlockHeader]) -> Option<u64> {
+    let first = headers.first()?;
+    let n = node.lock().ok()?;
+    let chain = n.chain();
+    let parent = chain.block_by_hash(&first.prev_hash)?; // a block we HAVE
+    let fork = parent.header.height.get();
+    let mut expect_height = fork.checked_add(1)?;
+    let mut expect_prev = first.prev_hash;
+    for h in headers {
+        if h.height.get() != expect_height || h.prev_hash != expect_prev {
+            return None;
+        }
+        expect_prev = h.hash();
+        expect_height = expect_height.checked_add(1)?;
+    }
+    Some(fork)
+}
+
 fn local_status(node: &Mutex<Node>) -> Option<PeerStatus> {
     let n = node.lock().ok()?;
     Some(PeerStatus {
@@ -1567,6 +1787,259 @@ mod tests {
         assert!(
             reaped,
             "a silent (dead) peer is reaped, clearing the ghost slot"
+        );
+    }
+
+    /// The shared test genesis (Sha256d test PoW — never RandomX in tests).
+    fn test_genesis() -> sov_chain::GenesisConfig {
+        use sov_chain::{GenesisAccount, GenesisConfig};
+        use sov_mining::MiningPolicy;
+        use sov_primitives::Balance;
+        GenesisConfig {
+            chain_id: "sov-test".into(),
+            timestamp_ms: 1_000,
+            accounts: vec![GenesisAccount {
+                account: AccountId::new("val01.node.sov").unwrap(),
+                key: Keypair::from_seed([1; 32]).public_key(),
+                balance: Balance::ZERO,
+            }],
+            mining: MiningPolicy::test(),
+            vesting: vec![],
+        }
+    }
+
+    /// Mine `len` empty blocks on a fresh [`test_genesis`] chain, one per second.
+    fn mined_chain(len: u64) -> Blockchain {
+        let mut chain = Blockchain::new(&test_genesis()).unwrap();
+        for i in 1..=len {
+            let b = chain.produce_block(vec![], 1_000 + i * 1_000).unwrap();
+            chain.import_block(b).unwrap();
+        }
+        chain
+    }
+
+    #[test]
+    fn locator_heights_are_exponentially_spaced_and_include_genesis() {
+        // Genesis-only chain: the locator is just genesis.
+        assert_eq!(locator_heights(0), vec![0]);
+        assert_eq!(locator_heights(1), vec![1, 0]);
+        // Dense near the tip (tip, tip-1, tip-2), then doubling steps back
+        // (tip-4, tip-8, …), and ALWAYS ending at genesis.
+        assert_eq!(
+            locator_heights(100),
+            vec![100, 99, 98, 96, 92, 84, 68, 36, 0]
+        );
+        // Capped and strictly descending at any chain length.
+        let big = locator_heights(1_000_000);
+        assert!(big.len() <= LOCATOR_CAP);
+        assert_eq!(big[0], 1_000_000, "starts at the tip");
+        assert_eq!(*big.last().unwrap(), 0, "always includes genesis");
+        assert!(big.windows(2).all(|w| w[0] > w[1]), "strictly descending");
+    }
+
+    #[test]
+    fn serving_get_headers_returns_headers_from_the_fork_point() {
+        let chain = mined_chain(12);
+        let h5 = chain.block_by_height(5).unwrap().hash();
+
+        // Locator ordered tip → genesis: an unknown (forked) tip hash first, then a
+        // hash on our active chain (height 5), then genesis. The FIRST match names
+        // the fork point → headers 6..=12.
+        let locator = vec![
+            Hash::digest(b"a-forked-tip-we-do-not-have"),
+            h5,
+            chain.block_by_height(0).unwrap().hash(),
+        ];
+        let headers = headers_from_fork_point(&chain, &locator, &Hash::ZERO);
+        assert_eq!(headers.len(), 7, "headers 6..=12 after fork point 5");
+        assert_eq!(headers[0].height.get(), 6);
+        assert_eq!(headers[0].prev_hash, h5, "attaches to the fork point");
+        assert!(
+            headers.windows(2).all(
+                |w| w[1].prev_hash == w[0].hash() && w[1].height.get() == w[0].height.get() + 1
+            ),
+            "served headers are contiguous"
+        );
+
+        // No locator hash known to us ⇒ fork point is genesis: serve from height 1.
+        let none = headers_from_fork_point(&chain, &[Hash::digest(b"alien")], &Hash::ZERO);
+        assert_eq!(none.len(), 12);
+        assert_eq!(none[0].height.get(), 1);
+
+        // A stop hash ends the batch at (and including) that header.
+        let stop = chain.block_by_height(9).unwrap().hash();
+        let stopped = headers_from_fork_point(&chain, &locator, &stop);
+        assert_eq!(stopped.last().unwrap().height.get(), 9);
+    }
+
+    #[test]
+    fn headers_fork_point_validates_linkage_and_names_the_forks_parent() {
+        let chain = mined_chain(8);
+        let headers: Vec<BlockHeader> = (4..=8)
+            .map(|h| chain.block_by_height(h).unwrap().header.clone())
+            .collect();
+        let node = Mutex::new(Node::new(chain, 1024, 256));
+
+        // A contiguous run attaching to our block 3 names fork point 3.
+        assert_eq!(headers_fork_point(&node, &headers), Some(3));
+
+        // A gap (missing height) is rejected — no fork point from a broken chain.
+        let mut gapped = headers.clone();
+        gapped.remove(1);
+        assert_eq!(headers_fork_point(&node, &gapped), None);
+
+        // A first header attaching to a block we do NOT have is rejected.
+        let mut alien = headers.clone();
+        alien[0].prev_hash = Hash::digest(b"not-our-block");
+        assert_eq!(headers_fork_point(&node, &alien), None);
+
+        // Empty is rejected (the caller falls back to the legacy walk).
+        assert_eq!(headers_fork_point(&node, &[]), None);
+    }
+
+    /// THE bug this ships to fix: a node on a STALE tip (it mined a short branch,
+    /// then fell behind the canonical chain) used to discover the fork point by
+    /// walking BACKWARD one block per round-trip — O(N) round-trips that crawled on
+    /// mainnet. With the locator, the fork point is named in a SINGLE
+    /// GetHeaders/Headers exchange and the existing forward batched download takes
+    /// over. This test drives two REAL nodes over the real encrypted transport and
+    /// counts the actual wire requests: exactly ONE GetHeaders, ZERO single-block
+    /// (legacy-backtrack) requests, and a couple of forward batches.
+    #[test]
+    fn stale_tip_node_finds_fork_point_in_one_headers_exchange_and_catches_up() {
+        const FORK: u64 = 40; // last common height
+        const STALE: u64 = 3; // A's short divergent branch beyond the fork
+        const B_HEIGHT: u64 = 120; // the canonical chain A must catch up to
+
+        // Shared history to FORK: mine on B, import the same blocks into A.
+        let mut chain_a = Blockchain::new(&test_genesis()).unwrap();
+        let mut chain_b = Blockchain::new(&test_genesis()).unwrap();
+        let genesis_hash = chain_a.head().hash();
+        for i in 1..=FORK {
+            let b = chain_b.produce_block(vec![], 1_000 + i * 1_000).unwrap();
+            chain_b.import_block(b.clone()).unwrap();
+            chain_a.import_block(b).unwrap();
+        }
+        // A diverges onto a short stale branch (offset timestamps ⇒ different blocks).
+        for i in 1..=STALE {
+            let b = chain_a
+                .produce_block(vec![], 1_000 + (FORK + i) * 1_000 + 500)
+                .unwrap();
+            chain_a.import_block(b).unwrap();
+        }
+        // The canonical chain marches on without A.
+        for i in FORK + 1..=B_HEIGHT {
+            let b = chain_b.produce_block(vec![], 1_000 + i * 1_000).unwrap();
+            chain_b.import_block(b).unwrap();
+        }
+        assert_eq!(chain_a.height(), FORK + STALE);
+        assert_eq!(chain_b.height(), B_HEIGHT);
+        assert!(
+            chain_a.head().hash() != chain_b.block_by_height(chain_a.height()).unwrap().hash(),
+            "A's tip is genuinely off the canonical chain"
+        );
+
+        let node_a = Mutex::new(Node::new(chain_a, 1024, 256));
+        let node_b = Mutex::new(Node::new(chain_b, 1024, 256));
+        let target_head = node_b.lock().unwrap().chain().head().hash();
+
+        // Real transport: two nodes over the encrypted loopback link.
+        let tcp_a = TcpNode::bind("127.0.0.1:0").unwrap();
+        let tcp_b = TcpNode::bind("127.0.0.1:0").unwrap();
+        tcp_a.connect(&tcp_b.local_addr().to_string()).unwrap();
+        let mut linked = false;
+        // Generous ceiling (~30s): the CPU-bound Noise+ML-KEM handshake competes
+        // with parallel tests on CI; the healthy path links in well under a second.
+        for _ in 0..1500 {
+            if !tcp_a.connected_peers().is_empty() && !tcp_b.connected_peers().is_empty() {
+                linked = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(linked, "nodes connected");
+        let b_seen_by_a = tcp_a.connected_peers()[0];
+        let a_seen_by_b = tcp_b.connected_peers()[0];
+
+        let config_a = P2pConfig {
+            chain_id: "sov-test".into(),
+            genesis_hash,
+            account: AccountId::new("val02.node.sov").unwrap(),
+            keypair: Keypair::from_seed([2; 32]),
+        };
+        let config_b = P2pConfig {
+            chain_id: "sov-test".into(),
+            genesis_hash,
+            account: AccountId::new("val03.node.sov").unwrap(),
+            keypair: Keypair::from_seed([3; 32]),
+        };
+
+        // Sync state as it stands right after the handshake + Status/Version
+        // exchange: mutually authenticated, A knows B speaks protocol v2 and
+        // advertises the heavier canonical chain.
+        let mut state_a = SyncState::new(None, None);
+        let mut state_b = SyncState::new(None, None);
+        state_a.authenticated.insert(b_seen_by_a);
+        state_a
+            .peer_agents
+            .insert(b_seen_by_a, (2, "sov/test".into()));
+        {
+            let n = node_b.lock().unwrap();
+            state_a.peer_status.insert(
+                b_seen_by_a,
+                PeerStatus {
+                    height: n.chain().height(),
+                    head: n.chain().head().hash(),
+                    chain_work: n.chain().chain_work().to_be_bytes(),
+                },
+            );
+        }
+        state_b.authenticated.insert(a_seen_by_b);
+
+        // Drive the REAL sync loop bodies (request_missing + handle on both ends)
+        // and count every request A puts on the wire, by type.
+        let mut get_headers_reqs = 0usize;
+        let mut single_block_reqs = 0usize; // the legacy backtrack probe
+        let mut batch_reqs = 0usize;
+        let mut synced = false;
+        for _ in 0..3_000 {
+            state_a.request_missing(&tcp_a, &node_a);
+            for (peer, msg) in tcp_b.drain() {
+                match &msg {
+                    NetMessage::GetHeaders { .. } => get_headers_reqs += 1,
+                    NetMessage::GetBlock { .. } => single_block_reqs += 1,
+                    NetMessage::GetBlocks { .. } => batch_reqs += 1,
+                    _ => {}
+                }
+                state_b.handle(&tcp_b, &node_b, &config_b, peer, msg);
+            }
+            for (peer, msg) in tcp_a.drain() {
+                state_a.handle(&tcp_a, &node_a, &config_a, peer, msg);
+            }
+            {
+                let n = node_a.lock().unwrap();
+                if n.chain().height() == B_HEIGHT && n.chain().head().hash() == target_head {
+                    synced = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(synced, "A reorged onto the canonical chain and caught up");
+        assert_eq!(node_a.lock().unwrap().chain().height(), B_HEIGHT);
+        assert_eq!(node_a.lock().unwrap().chain().head().hash(), target_head);
+        assert_eq!(
+            get_headers_reqs, 1,
+            "the fork point was discovered in exactly ONE GetHeaders/Headers exchange"
+        );
+        assert_eq!(
+            single_block_reqs, 0,
+            "no legacy one-block-per-round-trip backward walk (the old O(N) crawl)"
+        );
+        assert!(
+            batch_reqs <= 4,
+            "forward download stays batched ({batch_reqs} GetBlocks round-trips)"
         );
     }
 

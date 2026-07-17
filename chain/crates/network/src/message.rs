@@ -10,7 +10,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use sov_crypto::{Keypair, PublicKey, Signature};
 use sov_primitives::{AccountId, Hash};
-use sov_types::{Block, SignedTransaction};
+use sov_types::{Block, BlockHeader, SignedTransaction};
 
 /// A protocol message exchanged between peers.
 // The block-carrying variants (`NewBlock`, `BlockResponse`) are inherently larger
@@ -104,19 +104,49 @@ pub enum NetMessage {
     /// advertised a `Version`), so a pre-v0.1.86 node is never handed a frame it cannot
     /// decode. An APPENDED variant (after `Version`) — same wire-compat rule.
     GetAddr,
+    /// **Headers-first fork-point discovery** (protocol v2, v0.1.89+): a lagging node
+    /// on a stale tip sends a Bitcoin-style **block locator** — its own active-chain
+    /// block hashes at exponentially-spaced heights (tip, tip-1, tip-2, tip-4, …,
+    /// genesis) — and the serving peer names the fork point in ONE round-trip by
+    /// replying with [`Headers`](NetMessage::Headers) from the first locator hash on
+    /// its active chain. Replaces the O(N) one-block-per-round-trip backward walk that
+    /// crawled when a node fell hundreds of blocks behind. Sent ONLY to peers that
+    /// advertised protocol >= 2 (older peers keep the legacy single-block backtrack,
+    /// so a v0.1.86–88 node is never handed a frame it cannot decode). An APPENDED
+    /// variant (after `GetAddr`) — same wire-compat rule.
+    GetHeaders {
+        /// Active-chain block hashes, ordered tip → genesis, exponentially spaced
+        /// (tip, tip-1, tip-2, tip-4, …), ALWAYS ending with the genesis hash.
+        locator: Vec<Hash>,
+        /// Stop serving once a header with this hash has been included;
+        /// [`Hash::ZERO`] = no stop, serve up to the server's batch cap.
+        stop: Hash,
+    },
+    /// Response to [`GetHeaders`](NetMessage::GetHeaders): consecutive block headers
+    /// in ascending height order, starting at fork_point + 1 along the server's
+    /// active chain (empty if the server's head IS the fork point). Headers only —
+    /// the requester learns the fork point from the first header's `prev_hash` and
+    /// then downloads full blocks forward via the existing
+    /// [`GetBlocks`](NetMessage::GetBlocks); every block is still fully validated on
+    /// import, so a lying server yields at worst a bad fork-point guess whose blocks
+    /// then fail validation (and it is penalized).
+    Headers(Vec<BlockHeader>),
     // WIRE-COMPATIBILITY RULE: Borsh encodes an enum variant by its declaration-order
     // index, so a NEW variant MUST be appended HERE, at the end — never inserted
     // between existing ones, which would shift every later discriminant and break the
     // handshake with peers on an older binary. (`GetBlocks`/`BlocksResponse` sit
     // mid-enum because they shipped that way in v0.1.6; they are deliberately left in
     // place — moving them now would break compatibility with deployed nodes for a
-    // purely cosmetic reordering.) NetMessage is wire-only; it is never persisted, so
-    // its ordering does not affect the block log or genesis KAT.
+    // purely cosmetic reordering. `GetHeaders`/`Headers` are appended after `GetAddr`
+    // for the same reason.) NetMessage is wire-only; it is never persisted, so its
+    // ordering does not affect the block log or genesis KAT.
 }
 
 /// The current P2P wire-protocol version this build speaks. Bumped only on a
-/// protocol change peers must negotiate; v0.1.86 is the first versioned protocol.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// protocol change peers must negotiate; v0.1.86 was the first versioned protocol
+/// (v1). v2 adds headers-first fork-point discovery
+/// ([`GetHeaders`](NetMessage::GetHeaders) / [`Headers`](NetMessage::Headers)).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The lowest protocol version this build will still peer with. `0` = accept every
 /// peer (pre-v0.1.86 nodes advertise nothing and are treated as version 0), so the
@@ -287,6 +317,44 @@ mod tests {
             ver_disc > 0,
             "Version is appended after the original variants"
         );
+    }
+
+    #[test]
+    fn get_headers_and_headers_roundtrip_and_are_appended() {
+        use sov_primitives::BlockHeight;
+
+        let msg = NetMessage::GetHeaders {
+            locator: vec![Hash::digest(b"tip"), Hash::digest(b"genesis")],
+            stop: Hash::ZERO,
+        };
+        assert_eq!(NetMessage::decode(&msg.encode()).unwrap(), msg);
+
+        let header = BlockHeader {
+            height: BlockHeight::new(7),
+            prev_hash: Hash::digest(b"parent"),
+            tx_root: Hash::ZERO,
+            receipts_root: Hash::ZERO,
+            state_root: Hash::digest(b"state"),
+            timestamp_ms: 1_000,
+            proposer: AccountId::new("val01.node.sov").unwrap(),
+            version_bits: 0,
+            bits: 0x207f_ffff,
+            nonce: 42,
+        };
+        let msg = NetMessage::Headers(vec![header]);
+        assert_eq!(NetMessage::decode(&msg.encode()).unwrap(), msg);
+
+        // Both are APPENDED after GetAddr, so every pre-existing variant keeps its
+        // discriminant — a v1 (v0.1.86–88) peer still decodes the whole old surface.
+        let get_headers_disc = NetMessage::GetHeaders {
+            locator: vec![],
+            stop: Hash::ZERO,
+        }
+        .encode()[0];
+        let headers_disc = NetMessage::Headers(vec![]).encode()[0];
+        let get_addr_disc = NetMessage::GetAddr.encode()[0];
+        assert!(get_headers_disc > get_addr_disc, "GetHeaders after GetAddr");
+        assert!(headers_disc > get_headers_disc, "Headers after GetHeaders");
     }
 
     #[test]
