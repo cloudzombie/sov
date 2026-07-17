@@ -802,10 +802,22 @@ fn mempool_path(dir: &Path) -> PathBuf {
 /// weak-subjectivity anchor, NOT a consensus rule (a chain that reaches this height with
 /// a different hash is rejected by the checkpoint hash-pin regardless). Genesis-safe and
 /// additive; operators may configure MORE checkpoints on top.
-const MAINNET_CHECKPOINTS: &[(u64, &str)] = &[(
-    5000,
-    "fd5cb664b1cac096160dab6cae444c085cbf6232927af711c8cca556417e5684",
-)];
+const MAINNET_CHECKPOINTS: &[(u64, &str)] = &[
+    (
+        5000,
+        "fd5cb664b1cac096160dab6cae444c085cbf6232927af711c8cca556417e5684",
+    ),
+    // Pinned 2026-07-17 at tip 6908 (this block is ~108 deep — far past finality). The
+    // canonical hash was independently confirmed identical on all three live relays
+    // (SFO/Frankfurt/Singapore). Moving the assumevalid anchor from 5000 up to 6800 means
+    // a fresh node re-runs RandomX for only the handful of blocks above it instead of
+    // ~1,900 — the cure for the slow (light-mode) initial sync on low-RAM machines
+    // (notably Windows). Weak-subjectivity anchor, genesis-safe, additive.
+    (
+        6800,
+        "e91b89c6a1764a686dacf4028ab5487d6cac9e69b62210c56ebd85d2939bdd89",
+    ),
+];
 
 /// The baked checkpoints for a chain, parsed to `(height, Hash)`. Empty for any non-
 /// mainnet chain (dev/test/testnet), so nothing is ever assumed-valid there.
