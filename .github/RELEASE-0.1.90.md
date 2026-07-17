@@ -38,3 +38,50 @@ lean rewrite — verify before shipping).
 **Do NOT touch:** the consensus actions, the SNS RPCs (`sov_getName`, `sov_resolveName`,
 `sov_listNames`, `sov_namesOf`) — they can stay for anyone who wants them; they're just not
 surfaced. Genesis + KAT unchanged (this is all UI).
+
+---
+
+## Mempool nonce-gap resilience — a rejected/missing tx must not wedge an account
+
+> **Status: planned for v0.1.90.** Raised 2026-07-17 while load-testing with the TX cannon.
+
+**The problem.** SOV uses an account-nonce model: a sender's txs must mine in strict,
+contiguous nonce order. Today the mempool (`chain/crates/mempool/src/lib.rs`) *admits*
+future-nonce txs and holds them, but block-building "skips any sender whose next expected
+nonce is missing — never proposing a transaction that would be rejected for a nonce gap."
+So if nonce `N` never lands (it was rejected at admission — per-sender pending limit,
+mempool full, a momentary affordability race — or simply never submitted), every later tx
+`N+1, N+2, …` the account already pushed is **stranded behind the gap and stalls**. The
+code itself notes this ("later stall, wedging the nonce"). A high submission rate (Target
+TX/s / Firehose, or any buggy client that advances its local nonce on a *rejected* submit)
+makes it easy to open such a gap.
+
+**Goal for v0.1.90: mitigate or fully resolve so a gap can never permanently wedge an
+account.** Node-side, consensus-neutral, genesis `cb0272ff` untouched (mempool is
+node-local policy, not consensus; no block/STF/KAT change).
+
+**Options (decide during implementation):**
+
+1. **Mitigation — gap-free admission.** Reject at admission any tx whose nonce is not
+   contiguous with the account's current on-chain nonce + its already-pending set (i.e. only
+   admit `next..=next+pending_len`). A gap then simply *cannot form in the pool*; the client
+   learns immediately (a clear `NonceGap { expected, got }` error) and resubmits the missing
+   nonce instead of silently stranding a queue. Simplest and fully robust; the only cost is
+   that a client must submit roughly in order (which correct clients already do).
+
+2. **Full resolution — queued→pending promotion + eviction (Ethereum-style).** Keep a
+   bounded per-sender *queued* set for future-nonce txs, promote to *pending* the moment the
+   gap fills, and **time-evict** txs stranded behind a gap after a TTL so a permanent gap
+   self-clears instead of occupying the pool forever. Pairs with a richer `sov_getNonce`
+   that reports both the on-chain nonce and the next *mineable* (contiguous) nonce, so a
+   client can always recover.
+
+**Recommended:** ship **(1)** as the guaranteed mitigation (a gap can't wedge anything),
+and layer **(2)**'s TTL-eviction on stranded entries so any pre-existing stuck txs drain.
+Add a regression test: open a gap, confirm later txs are neither stranded forever nor
+block-building poison, and that the account recovers once the missing nonce is (re)submitted.
+
+**Client-side (already handled in the TX cannon):** continuous modes advance the local nonce
+only on *accept* (commit-on-accept), holding + retrying the same nonce on a capacity
+rejection — so the tool never opens a gap in the first place. The node-side fix above is the
+defense-in-depth so that *no* client (not just ours) can wedge an account.
