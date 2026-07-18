@@ -6,7 +6,7 @@
 //! / mempool. This is the nation-state surface: the SOV network is permissionless, so an
 //! attacker CAN complete the handshake and gossip anything. The only question is whether
 //! they can push a forged/mined block or a stolen coinbase THROUGH. This probe stands up
-//! a real adversarial [`TcpNode`] peer, authenticates to the target, gossips a battery of
+//! a real adversarial [`TcpNode`](sov_network::TcpNode) peer, authenticates to the target, gossips a battery of
 //! forgeries, and reads the target's head over RPC after each — a forgery "succeeds" only
 //! if the node adopts it as its tip.
 //!

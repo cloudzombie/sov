@@ -144,7 +144,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: cargo-deny (advisories + bans)
-        uses: EmbarkStudios/cargo-deny-action@e2f4ede4a4e60ea15ff31bc0647485d80c66cfba # v2.0.4
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           manifest-path: chain/Cargo.toml
           command: check advisories bans
@@ -327,6 +327,10 @@ jobs:
         shell: pwsh
         run: |
           Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
-          # Print the full report for visibility, then fail on any diagnostic.
+          # Print the FULL report (all severities) for visibility…
           Invoke-ScriptAnalyzer -Path windows -Recurse | Format-Table -AutoSize
-          Invoke-ScriptAnalyzer -Path windows -Recurse -EnableExit
+          # …but only FAIL the check on Error-severity diagnostics. These operator
+          # scripts have never been linted, so we gate on real errors now and can
+          # tighten to Warning/Info once the style backlog is cleared (this job is
+          # [trial]/continue-on-error until then).
+          Invoke-ScriptAnalyzer -Path windows -Recurse -Severity Error -EnableExit

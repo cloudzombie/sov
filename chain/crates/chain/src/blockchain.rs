@@ -558,7 +558,7 @@ impl Blockchain {
     /// over the ACTIVE chain's committed miner signals at the current height. This is
     /// read-only observability for `sov_getDeployments`; the exact same evaluation
     /// (`sov_governance::state_at` over `self.signals`) drives real activation — e.g.
-    /// [`resolved_pq_with`](Self::resolved_pq_with) — so what this reports is precisely
+    /// `resolved_pq_with` — so what this reports is precisely
     /// what consensus will enforce. Miners move a deployment through
     /// `Defined→Started→LockedIn→Active` by setting its bit in the blocks they mine.
     pub fn deployment_states(&self) -> Vec<DeploymentStatus> {

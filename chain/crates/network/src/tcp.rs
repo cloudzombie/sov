@@ -507,7 +507,7 @@ impl TcpNode {
 
     /// Enable **persistent peer discovery**: load the remembered address book from
     /// `path` (`<data_dir>/peers.dat`), redial a bounded sample immediately, and flush
-    /// the discovered set back to `path` every [`PEERS_SAVE_INTERVAL`] and on shutdown.
+    /// the discovered set back to `path` every `PEERS_SAVE_INTERVAL` and on shutdown.
     ///
     /// This is what turns hard-coded seeds into *bootstrap-only* infrastructure: without
     /// it, the `known` set is in-memory and every restart falls back to the seeds; with
@@ -694,7 +694,7 @@ impl TcpNode {
     }
 
     /// Add `ip` to the operator allowlist: it is never banned and never refused,
-    /// however it scores (see [`Shared::protected`]). Idempotent. Any active ban on the
+    /// however it scores (see `Shared::protected`). Idempotent. Any active ban on the
     /// IP is also lifted, so calling this un-bans a peer immediately.
     pub fn protect_ip(&self, ip: IpAddr) {
         self.shared.protected.lock().unwrap().insert(ip);

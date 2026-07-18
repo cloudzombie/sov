@@ -75,7 +75,7 @@ pub enum Action {
         recipient: AccountId,
         /// Amount to escrow out of the signer's balance.
         amount: Balance,
-        /// SHA-256 of the secret preimage that unlocks the escrow. A [`Hash`] so JSON-RPC
+        /// SHA-256 of the secret preimage that unlocks the escrow. A [`Hash`](struct@Hash) so JSON-RPC
         /// renders it as a hex string, consistent with every other 32-byte field
         /// (account-ids, tx-ids); Borsh (the signed/consensus form) is byte-identical to a
         /// bare `[u8; 32]`, so signatures, tx-ids, and genesis are unchanged.

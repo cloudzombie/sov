@@ -125,7 +125,7 @@ fn short(h: &str) -> String {
     h.chars().take(12).collect()
 }
 
-/// Attack the pot at `rpc_target` (host[:port]) every key-less way, and verify it's intact.
+/// Attack the pot at `rpc_target` (`host[:port]`) every key-less way, and verify it's intact.
 pub fn probe_gauntlet(rpc_target: &str) -> GauntletReport {
     let addr = normalize(rpc_target);
     let client = RpcClient::new(addr).with_timeout(Duration::from_secs(12));
