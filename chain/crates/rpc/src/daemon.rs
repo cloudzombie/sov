@@ -1073,6 +1073,16 @@ pub struct DaemonHandle {
     /// live state DIRECTLY instead of over a loopback RPC socket (which can time out
     /// and falsely read "offline" while the node is actually fine).
     node: Arc<Mutex<Node>>,
+    /// Runtime mining switch read by the production loop every iteration, so mining
+    /// can be turned ON/OFF while the node keeps running (connecting, serving, and
+    /// syncing regardless). The desktop app starts this `false` — a node CONNECTS and
+    /// SYNCS without mining — and flips it on only when the user opts in from the
+    /// Mining tab. Toggling it never restarts the node or drops peers.
+    mining_enabled: Arc<AtomicBool>,
+    /// The C001 coinbase-binding error, if this node cannot prove its coinbase account
+    /// is key-bound. Checked when mining is ENABLED (not just at start), so a node that
+    /// syncs fine can still be refused mining to an account nobody controls.
+    coinbase_binding_error: Option<String>,
 }
 
 impl DaemonHandle {
@@ -1085,6 +1095,27 @@ impl DaemonHandle {
     /// UI. Use `try_lock` so a momentarily-busy node never blocks the caller.
     pub fn node(&self) -> Arc<Mutex<Node>> {
         Arc::clone(&self.node)
+    }
+
+    /// Whether this node is currently mining (grinding proof-of-work). `false` means
+    /// it is connecting/serving/syncing only — the default the desktop app starts in.
+    pub fn is_mining(&self) -> bool {
+        self.mining_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Turn mining ON or OFF at runtime without restarting the node. Enabling is
+    /// refused (with the C001 reason) if this node cannot prove its coinbase account
+    /// is key-bound — a relay/sync node must never mine to an account nobody controls.
+    /// Disabling always succeeds and takes effect on the production loop's next
+    /// iteration (well under a second); the node keeps syncing and serving throughout.
+    pub fn set_mining(&self, on: bool) -> Result<(), String> {
+        if on {
+            if let Some(err) = &self.coinbase_binding_error {
+                return Err(err.clone());
+            }
+        }
+        self.mining_enabled.store(on, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Stop block production and the RPC server, then wait for both to finish.
@@ -1408,6 +1439,14 @@ impl Daemon {
         let rpc = self.serve_rpc(addr, workers)?;
         let rpc_addr = rpc.local_addr();
         let shutdown = Arc::new(AtomicBool::new(false));
+        // Runtime mining switch: seeded from the initial `mine` flag, but readable and
+        // flippable while the node runs (see `DaemonHandle::set_mining`). The production
+        // loop reads it every iteration, so a node can sync first and mine later without
+        // a restart. The C001 binding error is carried into the handle so ENABLING mining
+        // re-checks it (a sync-only start skipped the check above).
+        let mining_enabled = Arc::new(AtomicBool::new(mine));
+        let mining_for_loop = Arc::clone(&mining_enabled);
+        let coinbase_binding_error = self.coinbase_binding_error.clone();
 
         let node = self.node();
         let handle_node = self.node(); // for the DaemonHandle's direct-read accessor
@@ -1475,11 +1514,13 @@ impl Daemon {
                     write_mempool(&mp_path, &node);
                 }
 
-                // RELAY-ONLY: a seed/anchor node that never mines. It still snapshots
-                // (above), serves RPC, and imports+relays peers' blocks via the gossip
-                // thread — so it holds the network up without competing for blocks. The
-                // real miner clients are the ones that find them.
-                if !mine {
+                // RELAY-ONLY / MINING-OFF: a seed/anchor node — or any node whose user
+                // has not enabled mining — never grinds. It still snapshots (above),
+                // serves RPC, and imports+relays peers' blocks via the gossip thread, so
+                // it holds the network up and SYNCS without competing for blocks or
+                // burning CPU on proof-of-work. Read every iteration so the Mining-tab
+                // toggle takes effect live (no restart).
+                if !mining_for_loop.load(Ordering::Relaxed) {
                     if let Some(ss) = sync_status.as_ref() {
                         ss.set_local_hashrate(0);
                     }
@@ -1787,6 +1828,8 @@ impl Daemon {
             produce,
             rpc,
             node: handle_node,
+            mining_enabled,
+            coinbase_binding_error,
         })
     }
 }
@@ -2477,6 +2520,65 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(mined, "a solo node with no heavier peer mines normally");
+        handle.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_node_started_with_mining_off_syncs_only_then_mines_when_enabled() {
+        // The desktop-app default: start NOT mining (connect + sync only, no proof-of-work
+        // burning CPU), then flip mining on at runtime with no restart. Guards the
+        // "Connect just syncs; Mining is an opt-in toggle" behavior.
+        let genesis = gate_test_genesis();
+        let dir = std::env::temp_dir().join(format!(
+            "sov-toggle-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let daemon = Daemon::new(
+            &genesis,
+            &dir,
+            1024,
+            256,
+            vec![(
+                AccountId::new("val01.node.sov").unwrap(),
+                Keypair::from_seed([7; 32]),
+            )],
+        )
+        .unwrap();
+        // Start with mining OFF.
+        let handle = daemon.run("127.0.0.1:0", 1, 20, false).unwrap();
+        assert!(!handle.is_mining(), "starts in sync-only mode");
+
+        // With mining off, a solo node must NOT extend the chain even given ample time.
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            handle.node().lock().unwrap().chain().height(),
+            0,
+            "a mining-off node does not grind blocks"
+        );
+
+        // Enable mining at runtime (no restart): the loop picks it up and advances.
+        handle
+            .set_mining(true)
+            .expect("coinbase is key-bound, so enabling succeeds");
+        assert!(handle.is_mining());
+        let mut mined = false;
+        for _ in 0..200 {
+            if handle.node().lock().unwrap().chain().height() > 0 {
+                mined = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(mined, "mining begins once the toggle is turned on");
+
+        // And it can be turned back off.
+        handle.set_mining(false).unwrap();
+        assert!(!handle.is_mining());
+
         handle.shutdown();
         let _ = fs::remove_dir_all(&dir);
     }

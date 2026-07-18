@@ -1297,6 +1297,18 @@ impl EmbeddedNode {
         self.daemon.shutdown();
     }
 
+    /// Whether this node is currently mining. `false` = connecting/serving/syncing only
+    /// (the default the app starts in — no proof-of-work burning the CPU).
+    fn is_mining(&self) -> bool {
+        self.daemon.is_mining()
+    }
+
+    /// Turn mining on/off at runtime — no node restart, peers and sync are unaffected.
+    /// Enabling is refused (with the reason) if the coinbase account is not key-bound.
+    fn set_mining(&self, on: bool) -> Result<(), String> {
+        self.daemon.set_mining(on)
+    }
+
     /// Dial a peer now — non-blocking; the engine keeps retrying so the link forms
     /// once the peer is reachable. Tolerant of the address form (`ip:port`,
     /// `host:port`, or a bare ip / hostname → default P2P port appended). Returns the
@@ -3349,15 +3361,20 @@ impl Station {
         let net = self.network.data_subdir().to_string();
 
         *self.node_run.lock().unwrap() = NodeRun::Starting;
+        // The selected wallet is the coinbase target IF the user later enables mining;
+        // the node itself starts in sync-only mode (no proof-of-work) until then.
         self.mining_account = Some(account.clone());
-        self.node_status = format!("starting node (replaying chain) — mining to {label}…");
+        self.node_status =
+            "starting node (replaying chain) — connecting + syncing (mining off)…".to_string();
         if let Ok(mut c) = self.config.lock() {
             c.rpc = "127.0.0.1:8645".to_string();
             self.rpc_field = c.rpc.clone();
         }
         push_log(
             &self.node_logs,
-            format!("start requested — mining to {label}"),
+            format!(
+                "start requested — sync-only; enable mining in the Mining tab (coinbase → {label})"
+            ),
         );
 
         // Build + replay the node OFF the UI thread (replaying thousands of blocks
@@ -4133,6 +4150,7 @@ impl eframe::App for Station {
                     egui::ScrollArea::vertical()
                         .id_salt("scroll_mining")
                         .show(ui, |ui| {
+                            self.mining_control_ui(ui);
                             self.mining_earnings_section(ui);
                             mining_panel(ui, &snap);
                         });
@@ -5730,6 +5748,106 @@ impl Station {
     fn set_swap_msg(&self, msg: &str) {
         if let Ok(mut v) = self.swaps_view.lock() {
             v.message = msg.to_string();
+        }
+    }
+
+    /// The Mining tab's mining ON/OFF control. The node CONNECTS and SYNCS without
+    /// mining; proof-of-work is an explicit opt-in here, flipped live (no restart) via
+    /// `EmbeddedNode::set_mining`. Kept OFF by default so a slow machine can catch up
+    /// without RandomX starving the sync loop.
+    fn mining_control_ui(&mut self, ui: &mut egui::Ui) {
+        // Read node + mining state under a brief lock, then release it before mutating
+        // self (status/logs) to keep borrows clean.
+        let (running, mining) = match &*self.node_run.lock().unwrap() {
+            NodeRun::Running(node) => (true, node.is_mining()),
+            _ => (false, false),
+        };
+
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("MINING")
+                        .small()
+                        .color(palette::text_dim()),
+                );
+                let (state, color) = if !running {
+                    ("node not running", palette::text_dim())
+                } else if mining {
+                    ("ON — grinding proof-of-work", palette::accent_hi())
+                } else {
+                    ("OFF — connected & syncing only", palette::text())
+                };
+                ui.label(egui::RichText::new(state).strong().color(color));
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Your node stays fully synced WITHOUT mining. Turn mining on only when you \
+                     want this machine to grind proof-of-work — it is CPU-heavy (RandomX), so on \
+                     an older/low-power machine leave it OFF and just run a wallet + synced node.",
+                )
+                .weak()
+                .small(),
+            );
+            ui.add_space(6.0);
+
+            if !running {
+                ui.label(
+                    egui::RichText::new("Start the node from the Node tab first.")
+                        .small()
+                        .color(palette::text_dim()),
+                );
+                return;
+            }
+
+            if mining {
+                if ui.button("⏹  Stop mining").clicked() {
+                    self.apply_set_mining(false);
+                }
+            } else {
+                // Enabling needs a wallet to pay the coinbase to.
+                let have_wallet = self.wallets.get(self.selected).is_some();
+                let btn = ui.add_enabled(have_wallet, egui::Button::new("⛏  Start mining"));
+                if btn.clicked() {
+                    self.apply_set_mining(true);
+                }
+                if !have_wallet {
+                    ui.label(
+                        egui::RichText::new("select or create a wallet to mine to first")
+                            .small()
+                            .color(palette::text_dim()),
+                    );
+                }
+            }
+        });
+        ui.add_space(8.0);
+    }
+
+    /// Flip the running node's mining switch and report the outcome. Enabling can be
+    /// refused (coinbase not key-bound) — surfaced verbatim, never a silent no-op.
+    fn apply_set_mining(&mut self, on: bool) {
+        let result = match &*self.node_run.lock().unwrap() {
+            NodeRun::Running(node) => Some(node.set_mining(on)),
+            _ => None,
+        };
+        match result {
+            Some(Ok(())) => {
+                let msg = if on {
+                    "mining ENABLED — will grind once caught up to the tip".to_string()
+                } else {
+                    "mining DISABLED — node keeps syncing + serving".to_string()
+                };
+                self.node_status = msg.clone();
+                push_log(&self.node_logs, msg);
+            }
+            Some(Err(e)) => {
+                let msg = format!("could not enable mining: {e}");
+                self.node_status = msg.clone();
+                push_log(&self.node_logs, msg);
+            }
+            None => {
+                self.node_status = "start the node first".to_string();
+            }
         }
     }
 
@@ -8978,7 +9096,11 @@ fn setup_node_dir(node_dir: &Path, spec_filename: &str) -> Result<(), String> {
         block_time_ms: 60_000,
         mempool_capacity: 16_384,
         max_block_txs: 4_096,
-        mine: true,
+        // Start in SYNC-ONLY mode: the node connects, serves, and downloads the chain
+        // WITHOUT mining, so it never burns CPU on proof-of-work while catching up (the
+        // thing that starved sync on slow machines). Mining is an explicit opt-in from
+        // the Mining tab, flipped live via `DaemonHandle::set_mining` — no restart.
+        mine: false,
         p2p_addr: Some("0.0.0.0:9645".to_string()),
         bootstrap_peers: Vec::new(),
         checkpoints: Vec::new(),
@@ -9336,8 +9458,10 @@ fn build_and_run_node(
     // bundle, so a fresh install failed with "sov-testnet not built" — worse, on
     // mainnet.) The genesis spec is EMBEDDED in the binary (`embedded_spec`); here we
     // write it (the "already set up" marker), create the data dir, and write the
-    // node-config the in-process daemon reads back below. `mine: true` self-funds from
-    // this wallet's coinbase; the miner keystore is written next; peers are filled in
+    // node-config the in-process daemon reads back below. The node starts in SYNC-ONLY
+    // mode (`mine: false`); mining to this wallet's coinbase is an opt-in toggle in the
+    // Mining tab. The miner keystore is still written next (so mining CAN be enabled);
+    // peers are filled in
     // afterward. `block_time_ms` is unused by the continuous miner (the difficulty
     // retarget regulates cadence), so its value here is immaterial.
     if !node_dir.join(spec_filename).exists() {
@@ -9765,7 +9889,10 @@ mod tests {
                 &std::fs::read_to_string(dir.join("node-1/node-config.json")).unwrap(),
             )
             .expect("node-config parses");
-            assert!(cfg.mine, "the GUI node self-funds from coinbase");
+            assert!(
+                !cfg.mine,
+                "the GUI node starts in sync-only mode; mining is an opt-in Mining-tab toggle"
+            );
             assert!(dir.join("node-1/data").is_dir(), "data dir created");
             // The embedded spec builds + verifies the FROZEN genesis, byte-for-byte.
             let spec_obj =
