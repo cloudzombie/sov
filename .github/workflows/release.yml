@@ -26,12 +26,12 @@ jobs:
     name: release gate (genesis double-lock + full verification)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: wasm32-unknown-unknown
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: chain
           cache-on-failure: true
@@ -44,12 +44,12 @@ jobs:
     needs: gate
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@1.97.0
       # Cache compiled dependencies across runs. The heavy deps (egui, halo2/orchard,
       # RandomX, the PQ crypto) dominate a cold release build; caching them turns a ~9
       # min from-scratch compile into a couple of minutes that only rebuilds OUR crates.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: |
             node
@@ -65,7 +65,7 @@ jobs:
           cp node/target/release/sov-station.exe "dist/SOV-Station/"
           cp .github/STATION-README.txt "dist/SOV-Station/READ ME.txt" || true
           cd dist && 7z a "SOV-Station-${GITHUB_REF_NAME}-windows-x64.zip" "SOV-Station"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         with:
           name: windows
           path: dist/*.zip
@@ -74,9 +74,9 @@ jobs:
     needs: gate
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: |
             node
@@ -116,7 +116,7 @@ jobs:
           codesign --force --sign - "$APP" || true
           ( cd "$STAGE" && ln -sf /Applications Applications )
           hdiutil create -volname "SOV Station" -srcfolder "$STAGE" -ov -format UDZO "dist/SOV-Station-${VER}-macOS.dmg"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         with:
           name: macos
           path: dist/*.dmg
@@ -125,9 +125,9 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: chain
           cache-on-failure: true
@@ -145,7 +145,7 @@ jobs:
           cp chain/testnet/RUNBOOK.md "$STAGE/"
           chmod +x "$STAGE/sov-rpcd" "$STAGE/sov-testnet"
           cd dist && tar czf "SOV-Node-${GITHUB_REF_NAME}-linux-x64.tar.gz" "SOV-Node"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         with:
           name: linux
           path: dist/*.tar.gz
@@ -153,13 +153,75 @@ jobs:
   release:
     needs: [windows, macos, linux]
     runs-on: ubuntu-latest
+    # Supply-chain provenance needs OIDC (Sigstore keyless signing + build
+    # provenance attestation) and the ability to write attestations; contents:write
+    # publishes the release. The top-level grant is contents:write only, so widen it
+    # here (job-level permissions REPLACE the top-level set, they don't merge).
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
         with: { path: artifacts }
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
+      # Checkout is needed to generate the SBOM from the chain workspace.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          files: artifacts/**/*
+          path: src
+      - uses: dtolnay/rust-toolchain@1.97.0
+
+      # ── Provenance step 1: SHA256SUMS over every published artifact ──
+      # Flatten path so the checksum file names match the uploaded asset names.
+      - name: Collect artifacts + SHA256SUMS
+        run: |
+          mkdir -p publish
+          find artifacts -type f -exec cp {} publish/ \;
+          ( cd publish && sha256sum -- * > SHA256SUMS )
+          echo "== SHA256SUMS =="; cat publish/SHA256SUMS
+
+      # ── Provenance step 2: CycloneDX SBOM for the chain workspace ──
+      - name: Generate CycloneDX SBOM
+        run: |
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --manifest-path src/chain/Cargo.toml --format json
+          # cargo-cyclonedx writes one bom per workspace member next to its manifest
+          # (naming has varied across versions: `*.cdx.json` or `bom.json`); gather
+          # whichever it produced into a single attachable archive.
+          find src/chain \( -name '*.cdx.json' -o -name 'bom.json' \) -print0 \
+            | tar --null -czf "publish/SOV-SBOM-${GITHUB_REF_NAME}-cyclonedx.tar.gz" --files-from -
+          echo "== SBOM members =="; find src/chain \( -name '*.cdx.json' -o -name 'bom.json' \)
+
+      # ── Provenance step 3: keyless (Sigstore/OIDC) signature of SHA256SUMS ──
+      # No pre-shared secret: the runner's OIDC identity is the signer. Verifiable
+      # with `cosign verify-blob`. Certificate + signature both attached.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+      - name: Sign SHA256SUMS (keyless)
+        run: |
+          cd publish
+          cosign sign-blob --yes \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.pem \
+            SHA256SUMS
+
+      # ── Provenance step 4: GitHub build-provenance attestation for the binaries ──
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
+        with:
+          subject-path: |
+            publish/*.zip
+            publish/*.dmg
+            publish/*.tar.gz
+
+      - name: Publish release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
+        with:
+          files: |
+            artifacts/**/*
+            publish/SHA256SUMS
+            publish/SHA256SUMS.sig
+            publish/SHA256SUMS.pem
+            publish/SOV-SBOM-${{ github.ref_name }}-cyclonedx.tar.gz
           prerelease: false
           name: "SOV Station ${{ github.ref_name }}"
           body: |

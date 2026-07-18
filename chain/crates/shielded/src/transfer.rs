@@ -97,15 +97,20 @@ pub fn shielded_transfer_with_change(
             [0u8; 512],
         )
         .map_err(|e| ShieldedError::Build(e.to_string()))?;
-    // The change note pays the spender back, privately.
-    builder
-        .add_output(
-            Some(ovk),
-            change_addr.0,
-            NoteValue::from_raw(change),
-            [0u8; 512],
-        )
-        .map_err(|e| ShieldedError::Build(e.to_string()))?;
+    // The change note pays the spender back, privately. Only add it when there is
+    // change to return: an exact-value send (`change == 0`) must NOT mint a
+    // zero-value note (Orchard pads with dummy actions, so the bundle stays
+    // valid) — mirroring the de-shield builders' `if change > 0` gate.
+    if change > 0 {
+        builder
+            .add_output(
+                Some(ovk),
+                change_addr.0,
+                NoteValue::from_raw(change),
+                [0u8; 512],
+            )
+            .map_err(|e| ShieldedError::Build(e.to_string()))?;
+    }
 
     let unauthorized = builder
         .build::<i64>(&mut rng)

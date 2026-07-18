@@ -12,6 +12,11 @@
 // It fabricates no data: /api/regenerate just shells out to the same generator
 // you would run by hand and reports its real exit code + real output.
 //
+// The action endpoint is guarded two ways because it spawns a multi-minute
+// `cargo test --workspace`: a localhost-only Origin/Host allowlist (drive-by
+// CSRF + DNS-rebind can't reach it) and a single-flight lock (a second POST
+// while one is running is rejected, never a second overlapping cargo run).
+//
 // Usage:
 //   node dashboard/serve.mjs            # serve on http://localhost:8787
 //   PORT=9000 node dashboard/serve.mjs  # choose a port
@@ -50,8 +55,55 @@ function send(res, code, body, headers = {}) {
 
 const JSON_HDR = { "Content-Type": MIME[".json"] };
 
+// --- request-origin guard: localhost only ----------------------------------
+// The /api/regenerate action spawns a multi-minute `cargo test --workspace`, so
+// a hostile page in the user's browser (a drive-by tab, or a DNS-rebind that
+// makes a foreign hostname resolve to 127.0.0.1) must not be able to POST to it.
+// Accept the action only when it plainly originates from this local server:
+//   - Host header (if present) must name localhost/127.0.0.1/[::1] on our port;
+//   - Origin/Referer (if present) must do the same. A same-origin fetch from our
+//     own page sends a matching Origin; a rebind attack cannot forge one that
+//     both parses as a URL and carries a loopback hostname on our port.
+// A CLI caller (curl) with no Host/Origin at all is allowed — it is not a
+// browser and cannot be driven cross-origin by a web page.
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+function hostIsLocal(hostHeader) {
+  if (!hostHeader) return true; // absent Host: not a browser attack vector
+  const hostname = hostHeader.replace(/:\d+$/, ""); // strip :port
+  return LOOPBACK_HOSTS.has(hostname);
+}
+function originIsLocal(originHeader) {
+  if (!originHeader || originHeader === "null") return true; // absent: allow (CLI); "null": opaque origin, treated below
+  try {
+    const u = new URL(originHeader);
+    return LOOPBACK_HOSTS.has(u.hostname) && Number(u.port || 0) === PORT;
+  } catch {
+    return false;
+  }
+}
+function isLocalRequest(req) {
+  if (!hostIsLocal(req.headers.host)) return false;
+  // An Origin of "null" (opaque, e.g. from a sandboxed/file:// document) is not
+  // our own same-origin page, so reject it for the action endpoint.
+  if (req.headers.origin === "null") return false;
+  if (!originIsLocal(req.headers.origin)) return false;
+  if (!originIsLocal(req.headers.referer)) return false;
+  return true;
+}
+
 // --- POST /api/regenerate : run the real generator, report real output -----
+// Single-flight: at most one generator runs at a time. A concurrent POST while
+// one is in flight is rejected (409) rather than spawning a second overlapping
+// `cargo test --workspace` — which would burn CPU twice over and race two
+// writers on status.js.
+let regenInFlight = false;
 function regenerate(res) {
+  if (regenInFlight) {
+    return send(res, 409, JSON.stringify({
+      ok: false, code: null, error: "a regeneration is already in progress",
+    }), JSON_HDR);
+  }
+  regenInFlight = true;
   const startedAt = Date.now();
   console.log(`[regenerate] spawning: node ${GENERATOR}`);
   const child = spawn(process.execPath, [GENERATOR], { cwd: REPO_ROOT, env: process.env });
@@ -60,12 +112,14 @@ function regenerate(res) {
   child.stdout.on("data", (d) => { stdout += d; process.stdout.write(d); });
   child.stderr.on("data", (d) => { stderr += d; process.stderr.write(d); });
   child.on("error", (err) => {
+    regenInFlight = false;
     send(res, 500, JSON.stringify({
       ok: false, code: null, error: `could not spawn generator: ${err.message}`,
       stdout, stderr, durationMs: Date.now() - startedAt,
     }), JSON_HDR);
   });
   child.on("close", (code) => {
+    regenInFlight = false;
     const durationMs = Date.now() - startedAt;
     console.log(`[regenerate] generator exited ${code} in ${durationMs}ms`);
     send(res, code === 0 ? 200 : 500,
@@ -108,6 +162,12 @@ const server = createServer((req, res) => {
   }
   if (pathname === "/api/regenerate") {
     if (req.method !== "POST") return send(res, 405, "Method Not Allowed", { Allow: "POST" });
+    // Reject cross-origin / foreign-Host POSTs (drive-by CSRF + DNS-rebind).
+    if (!isLocalRequest(req)) {
+      return send(res, 403, JSON.stringify({
+        ok: false, code: null, error: "forbidden: this action is localhost-only",
+      }), JSON_HDR);
+    }
     return regenerate(res);
   }
   if (req.method !== "GET" && req.method !== "HEAD") {

@@ -17,6 +17,7 @@
 //! is still re-validated by the chain's own import path, so the network is
 //! trustless even among handshaken peers.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -493,6 +494,29 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 /// never reap a healthy, actively-syncing peer — the "hokey connections" failure mode.
 const PEER_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// How long a peer's advertised `Status` is trusted for catch-up selection AND the
+/// mining-gate decision after it is received. A healthy peer re-announces every
+/// announce cycle (sub-second), so a claim older than this means the peer went quiet
+/// (its socket is separately reaped by [`PEER_INACTIVITY_TIMEOUT`]); its now-stale
+/// height must not keep the miner gated. Comfortably above the announce cadence so a
+/// briefly-busy but live peer is never dropped.
+const STATUS_TTL: Duration = Duration::from_secs(30);
+
+/// Consecutive unanswered block requests a peer may accrue before its advertised
+/// height is treated as UNSUBSTANTIATED — no longer chosen for catch-up nor counted
+/// toward the mining gate — and it is penalized once. Bounds an authenticated peer
+/// that advertises a chain it never delivers: three back-to-back
+/// [`BLOCK_REQUEST_TIMEOUT`] stalls (~6s of non-delivery) with no progress. Any real
+/// forward progress from the peer clears its strikes, so an honest-but-briefly-slow
+/// peer never trips it.
+const STATUS_MAX_STRIKES: u32 = 3;
+
+/// Misbehavior points charged ONCE to a peer whose advertised height crosses
+/// [`STATUS_MAX_STRIKES`] without ever materializing into importable blocks. Modest
+/// (well under the transport ban threshold of 100) and self-decaying, so a peer that
+/// later delivers recovers, while a persistent non-deliverer is eventually dropped.
+const UNSUBSTANTIATED_CLAIM_PENALTY: f64 = 20.0;
+
 /// Of several connections to the SAME node, pick the deterministic survivor: the one
 /// with the lexicographically smallest channel binding (Noise handshake hash). Both
 /// ends of a connection share its binding, so each node picks the SAME survivor with
@@ -566,6 +590,20 @@ struct SyncState {
     /// Whether we have logged the current stall, so "no reply, retrying" fires on the
     /// stall transition rather than continuously.
     stalled_logged: bool,
+    /// Consecutive unanswered block requests per peer. A request that stalls
+    /// ([`BLOCK_REQUEST_TIMEOUT`]) charges a strike; any forward progress from the peer
+    /// clears it. Once a peer reaches [`STATUS_MAX_STRIKES`] its advertised height is
+    /// treated as UNSUBSTANTIATED — dropped from catch-up selection AND from the mining
+    /// gate — so one authenticated liar advertising a tall chain it never delivers can
+    /// no longer hold the node in `Syncing` (never mining) indefinitely.
+    sync_strikes: HashMap<SocketAddr, u32>,
+    /// Latched once a peer block is committed to memory but CANNOT be persisted
+    /// (append or fsync failure). The in-memory chain is then AHEAD of durable
+    /// history; mirroring the mined path's fail-closed posture, we STOP importing and
+    /// STOP serving blocks so a restart can never replay a shorter durable prefix than
+    /// we advertised. Interior-mutable because the durability sinks (`import_and_persist`,
+    /// `sync_log`) run on the single worker thread behind `&self`.
+    durable_broken: Cell<bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -573,6 +611,11 @@ struct PeerStatus {
     height: u64,
     head: Hash,
     chain_work: [u8; 32],
+    /// When this status was received (local monotonic clock). A claimed height is
+    /// trusted for sync + the mining gate only while it is fresh ([`STATUS_TTL`]),
+    /// so a peer that authenticates, advertises a tall chain once, then goes quiet
+    /// cannot keep an honest node pinned in `Syncing` (out of mining) forever.
+    received_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -615,7 +658,32 @@ impl SyncState {
                          blocks are not durable; fix storage"
                     ),
                 );
+                // Fail CLOSED, mirroring the mined path (daemon.rs commit_mined): the
+                // batch just imported into memory is not on disk, so a restart would
+                // replay a shorter prefix than we advertised. Halt further import +
+                // serving rather than advancing an undurable chain.
+                self.latch_durability_failure("block-log fsync failed");
             }
+        }
+    }
+
+    /// Latch a durability failure. Once set, [`import_and_persist`](Self::import_and_persist)
+    /// refuses to advance the chain and the block-serving handlers stop answering, so
+    /// this node behaves as if it is no longer durable (which it is not) instead of
+    /// serving/gossiping a prefix it cannot recover on restart. Logs a single FATAL
+    /// line on the transition — the operator must fix storage and restart. Deliberately
+    /// does NOT panic the process: a graceful degraded halt matches the mined path,
+    /// which stops the mining loop without tearing the node down.
+    fn latch_durability_failure(&self, context: &str) {
+        if !self.durable_broken.replace(true) {
+            p2p_log(
+                &self.log,
+                format!(
+                    "FATAL: {context}; the in-memory chain is now ahead of durable \
+                     history — halting peer-block import + serving to avoid a divergent \
+                     restart. Fix storage and restart."
+                ),
+            );
         }
     }
 
@@ -626,6 +694,13 @@ impl SyncState {
     /// what lets a follower replay its own log on restart rather than re-syncing
     /// the whole chain.
     fn import_and_persist(&self, node: &Mutex<Node>, block: Block) -> ImportOutcome {
+        // Fail closed: a prior append/fsync failure means memory is already ahead of
+        // durable history. Do NOT advance the chain further (and thus do not gossip a
+        // block via the `New` path) — treat every subsequent block as a benign
+        // non-connect so the node degrades quietly instead of widening the divergence.
+        if self.durable_broken.get() {
+            return ImportOutcome::Rejected;
+        }
         let Ok(mut n) = node.lock() else {
             return ImportOutcome::Rejected;
         };
@@ -672,6 +747,12 @@ impl SyncState {
                         block.header.height.get(),
                     ),
                 );
+                // Fail CLOSED, exactly as the mined path halts on an append failure
+                // (daemon.rs commit_mined): latch, drop the lock, and DO NOT return
+                // `New` — so this block is not re-broadcast and no further blocks import.
+                drop(n);
+                self.latch_durability_failure("peer block committed but log append failed");
+                return ImportOutcome::Rejected;
             }
         }
         let lock_ms = started.elapsed().as_millis();
@@ -734,13 +815,22 @@ impl SyncState {
                 ..
             } = &msg
             {
+                let spoofed_implicit = msg.implicit_account_mismatch();
                 let reason = if chain_id != &config.chain_id {
                     format!("wrong chain id {chain_id}")
                 } else if genesis_hash != &config.genesis_hash {
                     "wrong genesis hash".to_string()
+                } else if spoofed_implicit {
+                    "implicit account id does not derive from its public key (spoof)".to_string()
                 } else {
                     "invalid key signature or encrypted-channel binding".to_string()
                 };
+                // An implicit-id spoof is deliberate misbehavior (a valid key claiming
+                // an implicit id it does not own), not a benign wrong-network peer —
+                // charge it so a persistent spoofer is banned by the transport.
+                if spoofed_implicit {
+                    tcp.penalize_peer(peer, INVALID_BLOCK_PENALTY);
+                }
                 // A peer that explicitly presents an invalid/wrong-network Hello can
                 // never become trusted on this connection. Drop it immediately instead
                 // of retaining a useless encrypted socket until the generic 30s zombie
@@ -752,6 +842,7 @@ impl SyncState {
                 self.peer_agents.remove(&peer);
                 self.sync_next.remove(&peer);
                 self.bt_step.remove(&peer);
+                self.sync_strikes.remove(&peer);
                 self.last_recv.remove(&peer);
                 self.first_seen.remove(&peer);
                 p2p_log(
@@ -844,6 +935,7 @@ impl SyncState {
                         height,
                         head,
                         chain_work,
+                        received_at: Instant::now(),
                     },
                 );
                 if let Some(local) = local_status(node) {
@@ -886,35 +978,43 @@ impl SyncState {
                 }
             }
             NetMessage::GetBlock { height } => {
-                let block = node
-                    .lock()
-                    .ok()
-                    .and_then(|n| n.chain().block_by_height(height).cloned());
+                // Fail closed: once durability is broken we no longer serve blocks — we
+                // may be advertising a height we cannot recover on restart.
+                let block = if self.durable_broken.get() {
+                    None
+                } else {
+                    node.lock()
+                        .ok()
+                        .and_then(|n| n.chain().block_by_height(height).cloned())
+                };
                 tcp.send(peer, &NetMessage::BlockResponse(block));
             }
             NetMessage::GetBlocks { start, count } => {
                 // Serve up to `count` (server-capped) consecutive blocks from `start`
                 // for a peer doing batched catch-up — a few round-trips instead of one
-                // request per block.
+                // request per block. Fail closed once durability is broken (serve none).
                 let want = count.min(SYNC_BATCH) as usize;
-                let blocks: Vec<Block> = node
-                    .lock()
-                    .ok()
-                    .map(|n| {
-                        let mut v = Vec::with_capacity(want);
-                        let mut h = start;
-                        while v.len() < want {
-                            match n.chain().block_by_height(h) {
-                                Some(b) => {
-                                    v.push(b.clone());
-                                    h += 1;
+                let blocks: Vec<Block> = if self.durable_broken.get() {
+                    Vec::new()
+                } else {
+                    node.lock()
+                        .ok()
+                        .map(|n| {
+                            let mut v = Vec::with_capacity(want);
+                            let mut h = start;
+                            while v.len() < want {
+                                match n.chain().block_by_height(h) {
+                                    Some(b) => {
+                                        v.push(b.clone());
+                                        h += 1;
+                                    }
+                                    None => break,
                                 }
-                                None => break,
                             }
-                        }
-                        v
-                    })
-                    .unwrap_or_default();
+                            v
+                        })
+                        .unwrap_or_default()
+                };
                 if !blocks.is_empty() {
                     p2p_log(
                         &self.log,
@@ -1166,6 +1266,10 @@ impl SyncState {
     /// After importing up to height `h` from `peer`, continue forward from `h + 1`
     /// or stop if we've reached the peer's head.
     fn advance_or_done(&mut self, peer: SocketAddr, h: u64) {
+        // Real forward progress from this peer substantiates its claim: clear any
+        // accrued stall strikes so an honest-but-briefly-slow peer never trips the
+        // unsubstantiated-claim bound.
+        self.sync_strikes.remove(&peer);
         match self.peer_status.get(&peer) {
             Some(s) if h < s.height => {
                 self.sync_next.insert(peer, h + 1);
@@ -1188,6 +1292,7 @@ impl SyncState {
         self.bt_step.retain(|p, _| connected.contains(p));
         self.first_seen.retain(|p, _| connected.contains(p));
         self.last_recv.retain(|p, _| connected.contains(p));
+        self.sync_strikes.retain(|p, _| connected.contains(p));
     }
 
     /// Collapse MULTIPLE live connections to the SAME node identity down to exactly
@@ -1223,6 +1328,7 @@ impl SyncState {
             self.peer_status.remove(&p);
             self.sync_next.remove(&p);
             self.bt_step.remove(&p);
+            self.sync_strikes.remove(&p);
         }
     }
 
@@ -1289,6 +1395,28 @@ impl SyncState {
         // avoid that peer this round so it cannot keep wedging catch-up.
         let stalled_peer = self.inflight.as_ref().map(|f| f.peer);
         if let Some(sp) = stalled_peer {
+            // Charge a strike: this peer advertised more work than us but did not deliver
+            // the block we asked for. Strikes are cleared by any real forward progress
+            // (see `advance_or_done`), so only a peer that PERSISTENTLY fails to
+            // substantiate its claim accrues them. At the bound its claim stops gating
+            // mining / being chosen for sync (via `status_actionable`) and it is
+            // penalized once — closing the "one authenticated liar pins us in Syncing".
+            let strikes = {
+                let s = self.sync_strikes.entry(sp).or_insert(0);
+                *s = s.saturating_add(1);
+                *s
+            };
+            if strikes == STATUS_MAX_STRIKES {
+                tcp.penalize_peer(sp, UNSUBSTANTIATED_CLAIM_PENALTY);
+                p2p_log(
+                    &self.log,
+                    format!(
+                        "⚠ {} advertised a chain it has not delivered in {STATUS_MAX_STRIKES} \
+                         requests — its claim no longer gates mining or catch-up",
+                        short_peer(&sp)
+                    ),
+                );
+            }
             if !self.stalled_logged {
                 // The smoking gun for "connected but nothing pulled": WE asked, the peer
                 // never answered. (If the peer instead logs "requesting blocks but has
@@ -1313,6 +1441,7 @@ impl SyncState {
                 s.chain_work > local.chain_work
                     && self.authenticated.contains(p)
                     && connected.contains(p)
+                    && self.status_actionable(p, s)
             })
             .map(|(p, _)| *p)
             .collect();
@@ -1387,6 +1516,17 @@ impl SyncState {
         self.inflight.is_some()
     }
 
+    /// Whether `peer`'s advertised `status` is still ACTIONABLE for catch-up selection
+    /// and the mining-gate decision: it was received within [`STATUS_TTL`] (a fresh,
+    /// non-stale claim) AND the peer has not accrued [`STATUS_MAX_STRIKES`] unanswered
+    /// block requests against it (an authenticated peer advertising a tall chain it
+    /// never delivers is disqualified, so it can neither be chosen for sync nor keep the
+    /// miner gated). A stale OR unsubstantiated claim is ignored by both consumers.
+    fn status_actionable(&self, peer: &SocketAddr, status: &PeerStatus) -> bool {
+        status.received_at.elapsed() < STATUS_TTL
+            && self.sync_strikes.get(peer).copied().unwrap_or(0) < STATUS_MAX_STRIKES
+    }
+
     /// Snapshot the node's sync position for [`SyncShared`]: `(behind_blocks,
     /// best_peer_height, distinct_peers)`.
     ///
@@ -1412,7 +1552,7 @@ impl SyncState {
         let best = self
             .peer_status
             .iter()
-            .filter(|(p, _)| self.authenticated.contains(p))
+            .filter(|(p, s)| self.authenticated.contains(p) && self.status_actionable(p, s))
             .map(|(_, s)| s.height)
             .max()
             .unwrap_or(0);
@@ -1551,6 +1691,9 @@ fn local_status(node: &Mutex<Node>) -> Option<PeerStatus> {
         height: n.chain().height(),
         head: n.chain().head().hash(),
         chain_work: n.chain().chain_work().to_be_bytes(),
+        // Our own status is always current; `received_at` is only meaningful for a
+        // remote peer's claim (TTL/staleness) and is unused for the local snapshot.
+        received_at: Instant::now(),
     })
 }
 
@@ -1567,6 +1710,7 @@ mod tests {
             height,
             head: Hash::digest(&[work]),
             chain_work: [work; 32],
+            received_at: Instant::now(),
         }
     }
 
@@ -1681,6 +1825,119 @@ mod tests {
             state.import_and_persist(&node, bad),
             ImportOutcome::Invalid,
             "a block that fails validation flags the sender as misbehaving"
+        );
+    }
+
+    #[test]
+    fn a_durability_failure_latches_the_import_path_closed() {
+        // Mirror the mined path (daemon.rs commit_mined): once a block is committed to
+        // memory but cannot be persisted, the node must fail CLOSED — stop advancing the
+        // chain and stop gossiping — so a restart can never replay a shorter durable
+        // prefix than we advertised.
+        use std::sync::Mutex;
+
+        let val = AccountId::new("val01.node.sov").unwrap();
+
+        // A genuinely valid block, mined on a peer node at the same genesis.
+        let mut producer = Node::new(Blockchain::new(&test_genesis()).unwrap(), 1024, 256);
+        producer.set_coinbase(val);
+        let produced = producer.produce(2_000).expect("valid block mined");
+        assert_eq!(produced.block.header.height.get(), 1);
+
+        // Baseline: a HEALTHY follower imports the block as New (it IS importable).
+        let healthy_node = Mutex::new(Node::new(
+            Blockchain::new(&test_genesis()).unwrap(),
+            1024,
+            256,
+        ));
+        let healthy = SyncState::new(None, None);
+        assert_eq!(
+            healthy.import_and_persist(&healthy_node, produced.block.clone()),
+            ImportOutcome::New,
+        );
+        assert_eq!(healthy_node.lock().unwrap().chain().height(), 1);
+
+        // Fail closed: latch a durability failure, then the SAME valid block is refused
+        // and the chain never advances.
+        let broken_node = Mutex::new(Node::new(
+            Blockchain::new(&test_genesis()).unwrap(),
+            1024,
+            256,
+        ));
+        let broken = SyncState::new(None, None);
+        broken.latch_durability_failure("test-injected durability failure");
+        assert!(broken.durable_broken.get());
+        assert_eq!(
+            broken.import_and_persist(&broken_node, produced.block.clone()),
+            ImportOutcome::Rejected,
+            "once durability is broken the import path fails closed (no advance, no gossip)"
+        );
+        assert_eq!(
+            broken_node.lock().unwrap().chain().height(),
+            0,
+            "the in-memory chain must not advance past durable history",
+        );
+    }
+
+    #[test]
+    fn a_stale_status_claim_is_ignored_after_expiry() {
+        // A claim older than STATUS_TTL is stale: it must not keep the miner gated nor
+        // be chosen for catch-up (its socket is separately reaped by inactivity).
+        let s = SyncState::new(None, None);
+        let peer = addr(7101);
+
+        let fresh = peer_status(5_000, 9);
+        assert!(
+            s.status_actionable(&peer, &fresh),
+            "a fresh claim is actionable"
+        );
+
+        let mut stale = peer_status(5_000, 9);
+        stale.received_at = Instant::now()
+            .checked_sub(STATUS_TTL + Duration::from_secs(1))
+            .expect("test clock");
+        assert!(
+            !s.status_actionable(&peer, &stale),
+            "a claim older than STATUS_TTL is ignored"
+        );
+    }
+
+    #[test]
+    fn a_persistently_unsubstantiated_high_claim_stops_gating_mining() {
+        // One authenticated peer advertises a very tall chain it never delivers. Until
+        // it is struck out it holds us "behind" (gating mining); once it has stalled
+        // STATUS_MAX_STRIKES unanswered requests, its claim is dropped from telemetry so
+        // the miner is released — the fix for "one liar pins the node in Syncing forever".
+        use std::sync::Mutex;
+
+        let node = Mutex::new(Node::new(
+            Blockchain::new(&test_genesis()).unwrap(),
+            1024,
+            256,
+        ));
+        let mut s = SyncState::new(None, None);
+        let liar = addr(7102);
+        let claim = peer_status(9_000_000, 9);
+        s.authenticated.insert(liar);
+        s.peer_status.insert(liar, claim);
+
+        // Before strikes: the tall claim is counted → we read as far behind → gate on.
+        assert!(s.status_actionable(&liar, &claim));
+        let (behind_before, best_before, _) = s.telemetry(&node);
+        assert_eq!(best_before, 9_000_000);
+        assert_eq!(behind_before, 9_000_000);
+
+        // Accrue the strike bound (as request_missing does on each unanswered request).
+        s.sync_strikes.insert(liar, STATUS_MAX_STRIKES);
+        assert!(
+            !s.status_actionable(&liar, &claim),
+            "an unsubstantiated claim no longer gates mining or is chosen for catch-up"
+        );
+        let (behind_after, best_after, _) = s.telemetry(&node);
+        assert_eq!(best_after, 0, "the liar's claim is dropped from telemetry");
+        assert_eq!(
+            behind_after, 0,
+            "the miner is no longer gated by the phantom chain"
         );
     }
 
@@ -1991,6 +2248,7 @@ mod tests {
                     height: n.chain().height(),
                     head: n.chain().head().hash(),
                     chain_work: n.chain().chain_work().to_be_bytes(),
+                    received_at: Instant::now(),
                 },
             );
         }

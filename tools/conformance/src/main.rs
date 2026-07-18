@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use sov_crypto::Keypair;
 use sov_primitives::{AccountId, Balance, Hash};
@@ -47,6 +48,56 @@ const MINE_TIMEOUT: Duration = Duration::from_secs(120);
 const PROPAGATE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Poll cadence while waiting.
 const POLL: Duration = Duration::from_millis(400);
+
+/// The FROZEN mainnet genesis. A node reporting this genesis is LIVE MAINNET: every
+/// case in this sweep moves REAL, irrecoverable value (helper funding, a 5-XUS HTLC
+/// lock, two permanent 1-XUS SNS registrations, ~20 signed txs whose fees cannot be
+/// refunded). Denied by default — see [`mainnet_gate`].
+const MAINNET_GENESIS: &str = "cb0272ff88e64c18cde0257f7fae1c8236b02651f10cc7a02456fd682ee2e72d";
+
+/// The exact literal an operator must supply to run against mainnet — as the
+/// `--i-understand-this-spends-real-xus` CLI flag, or typed into the dashboard's
+/// acknowledgement field. Any other value (or none) is a refusal.
+const DANGER_ACK: &str = "i-understand-this-spends-real-xus";
+
+/// Default ceiling on the cumulative XUS principal the sweep may MOVE (Transfer +
+/// HTLC-lock amounts), in whole XUS. A real sweep moves ~18 XUS of principal; this
+/// caps a runaway before it can drain a wallet.
+const DEFAULT_MAX_SPEND_SOV: u128 = 100;
+
+/// Default ceiling on the fee of ANY single transaction, in whole XUS. Fees are
+/// `gas_used × gas_price` (0 on a fee-free testnet, real on mainnet); the sweep aborts
+/// the moment one transaction would cost more than this.
+const DEFAULT_MAX_FEE_SOV: u128 = 5;
+
+/// Deny-by-default mainnet decision, factored out so it is unit-tested in isolation.
+/// A sweep against the frozen mainnet genesis is refused unless the operator supplied
+/// the danger acknowledgement; every other chain (testnet, a local dev net) is allowed.
+fn mainnet_gate(genesis: &str, acknowledged: bool) -> Result<(), String> {
+    if genesis == MAINNET_GENESIS && !acknowledged {
+        return Err(format!(
+            "REFUSING to run against MAINNET (genesis {MAINNET_GENESIS}). This sweep moves \
+             REAL, irrecoverable XUS — helper funding, a 5-XUS HTLC lock, two permanent 1-XUS \
+             SNS registrations, and ~20 signed transactions whose fees cannot be refunded. To \
+             proceed anyway, pass --i-understand-this-spends-real-xus on the CLI, or type \
+             `{DANGER_ACK}` into the dashboard's acknowledgement field."
+        ));
+    }
+    Ok(())
+}
+
+/// The XUS principal (in grains) a transaction MOVES out of an account — the amount on
+/// a Transfer or an HTLC lock (and the inner action of a MultisigExec). Token / NFT /
+/// name / contract actions move no XUS principal (only fees), so they contribute
+/// nothing here; fees are metered separately against `--max-fee`.
+fn spend_grains(action: &Action) -> u128 {
+    match action {
+        Action::Transfer { amount, .. } => amount.grains(),
+        Action::HtlcLock { amount, .. } => amount.grains(),
+        Action::MultisigExec { action, .. } => spend_grains(action),
+        _ => 0,
+    }
+}
 
 fn main() {
     // Two modes:
@@ -68,6 +119,10 @@ fn main() {
             eprintln!("usage:");
             eprintln!("  sov-conformance serve [--addr 127.0.0.1:8700]   (web dashboard)");
             eprintln!("  sov-conformance --node-a <ip:port> --node-b <ip:port> (--phrase \"<24 words>\" | --seed-hex <64-hex>) [--account <id>]");
+            eprintln!(
+                "      [--max-spend <XUS>] [--max-fee <XUS>]   (ceilings; default 100 / 5 XUS)"
+            );
+            eprintln!("      [--i-understand-this-spends-real-xus]    (REQUIRED to run against live MAINNET — moves real, irrecoverable XUS)");
             std::process::exit(2);
         }
     };
@@ -76,6 +131,9 @@ fn main() {
         node_b: args.node_b,
         seed: args.seed,
         account: args.account,
+        acknowledged: args.acknowledged,
+        max_spend_grains: args.max_spend_grains,
+        max_fee_grains: args.max_fee_grains,
     };
     match cli_run(&cfg) {
         Ok(failed) => std::process::exit(if failed == 0 { 0 } else { 1 }),
@@ -90,28 +148,42 @@ fn main() {
 /// sov-station lets you copy) OR a raw 64-hex seed. The phrase derivation matches
 /// sov-station's wallet EXACTLY (`HdWallet::from_mnemonic(phrase, "").derive_seed(0, 0)`),
 /// so the same wallet yields the same on-chain account.
-fn resolve_seed(seed_hex: &str, phrase: &str) -> Result<[u8; 32], String> {
-    let phrase = phrase.trim();
+fn resolve_seed(seed_hex: &str, phrase: &str) -> Result<Zeroizing<[u8; 32]>, String> {
+    // The recovery phrase is itself a secret — hold it in a wiped buffer for the brief
+    // window it is needed to derive the seed.
+    let phrase = Zeroizing::new(phrase.trim().to_string());
     if !phrase.is_empty() {
-        let w = HdWallet::from_mnemonic(phrase, "")
+        let w = HdWallet::from_mnemonic(phrase.as_str(), "")
             .map_err(|e| format!("invalid recovery phrase: {e}"))?;
-        return Ok(w.derive_seed(0, 0));
+        return Ok(Zeroizing::new(w.derive_seed(0, 0)));
     }
     let h = seed_hex.trim();
     if h.is_empty() {
         return Err("provide a recovery phrase (24 words) or a 64-hex seed".into());
     }
-    let raw = hex::decode(h).map_err(|e| format!("seed must be hex: {e}"))?;
-    raw.try_into()
-        .map_err(|_| "seed must be exactly 32 bytes (64 hex chars)".to_string())
+    // The decoded bytes ARE the secret seed — keep them in a wiped buffer, and copy the
+    // fixed 32-byte array back out inside another wiped buffer.
+    let raw = Zeroizing::new(hex::decode(h).map_err(|e| format!("seed must be hex: {e}"))?);
+    let seed: [u8; 32] = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| "seed must be exactly 32 bytes (64 hex chars)".to_string())?;
+    Ok(Zeroizing::new(seed))
 }
 
 /// The inputs a sweep needs — shared by the CLI and the web server.
 struct Config {
     node_a: String,
     node_b: String,
-    seed: [u8; 32],
+    seed: Zeroizing<[u8; 32]>,
     account: Option<String>,
+    /// Whether the operator supplied the mainnet danger-acknowledgement. A sweep against
+    /// the frozen mainnet genesis is refused unless this is `true` (see [`mainnet_gate`]).
+    acknowledged: bool,
+    /// Ceiling on the cumulative XUS principal the sweep may move, in grains.
+    max_spend_grains: u128,
+    /// Ceiling on the fee of any single transaction, in grains.
+    max_fee_grains: u128,
 }
 
 /// `serve`'s bind address (default `127.0.0.1:8700`; override with `--addr`).
@@ -130,11 +202,18 @@ fn serve_addr() -> String {
 struct Args {
     node_a: String,
     node_b: String,
-    seed: [u8; 32],
+    seed: Zeroizing<[u8; 32]>,
     /// Optional explicit signer account. Defaults to the seed's implicit id
     /// (what sov-station wallets use); override for a NAMED genesis-bound account
     /// (e.g. `faucet.reserve.sov`, a miner like `val01.node.sov`).
     account: Option<String>,
+    /// Set by the `--i-understand-this-spends-real-xus` flag: the typed mainnet
+    /// danger-acknowledgement (see [`mainnet_gate`]).
+    acknowledged: bool,
+    /// Cumulative-spend ceiling in grains (`--max-spend`, whole XUS).
+    max_spend_grains: u128,
+    /// Per-transaction fee ceiling in grains (`--max-fee`, whole XUS).
+    max_fee_grains: u128,
 }
 
 impl Args {
@@ -144,6 +223,9 @@ impl Args {
         let mut seed_hex = None;
         let mut phrase = None;
         let mut account = None;
+        let mut acknowledged = false;
+        let mut max_spend_sov = DEFAULT_MAX_SPEND_SOV;
+        let mut max_fee_sov = DEFAULT_MAX_FEE_SOV;
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             let mut val = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -153,6 +235,21 @@ impl Args {
                 "--seed-hex" => seed_hex = Some(val()?),
                 "--phrase" => phrase = Some(val()?),
                 "--account" => account = Some(val()?),
+                // The literal, typed mainnet danger-acknowledgement (a bare flag — its
+                // very presence is the acknowledgement).
+                "--i-understand-this-spends-real-xus" => acknowledged = true,
+                "--max-spend" => {
+                    max_spend_sov = val()?
+                        .trim()
+                        .parse()
+                        .map_err(|e| format!("--max-spend must be a whole number of XUS: {e}"))?
+                }
+                "--max-fee" => {
+                    max_fee_sov = val()?
+                        .trim()
+                        .parse()
+                        .map_err(|e| format!("--max-fee must be a whole number of XUS: {e}"))?
+                }
                 "-h" | "--help" => return Err("help".into()),
                 other => return Err(format!("unknown flag {other}")),
             }
@@ -171,11 +268,20 @@ impl Args {
             seed_hex.as_deref().unwrap_or(""),
             phrase.as_deref().unwrap_or(""),
         )?;
+        let max_spend_grains = Balance::from_sov(max_spend_sov)
+            .map_err(|e| format!("--max-spend out of range: {e}"))?
+            .grains();
+        let max_fee_grains = Balance::from_sov(max_fee_sov)
+            .map_err(|e| format!("--max-fee out of range: {e}"))?
+            .grains();
         Ok(Args {
             node_a,
             node_b,
             seed,
             account,
+            acknowledged,
+            max_spend_grains,
+            max_fee_grains,
         })
     }
 }
@@ -187,7 +293,8 @@ struct Ctx {
     signer: Keypair,
     /// The signer's 32-byte seed, kept so helper subkeys derive deterministically
     /// (thread-safe — no thread-locals — so the web server can sweep on a worker).
-    seed: [u8; 32],
+    /// Wiped on drop (`Zeroizing`).
+    seed: Zeroizing<[u8; 32]>,
     account: AccountId,
     /// Genesis pre-mine in grains (`total − mined`, captured at preflight). The
     /// conservation invariant is policy-agnostic: `total − mined` must stay equal to
@@ -199,16 +306,30 @@ struct Ctx {
     /// sweep is RE-RUNNABLE against the same chain without colliding with state a
     /// prior run already created.
     run_id: u64,
+    /// The node's live gas price in grains (`gas_used × gas_price = fee`), captured at
+    /// preflight. 0 on a fee-free testnet; the real per-gas cost on mainnet.
+    gas_price_grains: u128,
+    /// Ceiling on the cumulative XUS principal (grains) the sweep may move — Transfer +
+    /// HTLC-lock amounts. The sweep aborts a transaction that would push past it.
+    max_spend_grains: u128,
+    /// Ceiling on the fee (grains) of any single transaction. A transaction whose
+    /// realized fee exceeds this aborts the sweep instead of quietly overspending.
+    max_fee_grains: u128,
+    /// Running total of XUS principal (grains) the sweep has moved so far, checked
+    /// against `max_spend_grains` before each spend. Behind a mutex because the web
+    /// server shares one `Ctx` across the worker thread.
+    spent_grains: Mutex<u128>,
 }
 
 impl Ctx {
     /// A deterministic helper keypair derived from the main seed and a label, so
     /// runs are reproducible and helper accounts don't collide across actions.
     fn subkey(&self, label: &str) -> Keypair {
-        let mut buf = Vec::with_capacity(32 + label.len());
-        buf.extend_from_slice(&self.seed);
+        // The buffer holds the raw seed — wipe it on drop.
+        let mut buf = Zeroizing::new(Vec::with_capacity(32 + label.len()));
+        buf.extend_from_slice(&self.seed[..]);
         buf.extend_from_slice(label.as_bytes());
-        let h = Hash::digest(&buf);
+        let h = Hash::digest(&buf[..]);
         Keypair::hybrid_from_seed(*h.as_bytes())
     }
 
@@ -234,7 +355,26 @@ impl Ctx {
 
     /// Submit to node A, wait for the receipt, and return `(height, receipt_json)`.
     /// Errors if it is not mined within [`MINE_TIMEOUT`].
+    ///
+    /// This is the single choke point EVERY transaction flows through, so the value
+    /// ceilings are enforced here: the XUS principal a tx moves is checked against the
+    /// cumulative `--max-spend` ceiling BEFORE broadcast, and its realized fee against
+    /// the per-tx `--max-fee` ceiling once mined. A breach aborts with an explicit error
+    /// rather than silently overspending real value.
     fn submit_mined(&self, stx: &SignedTransaction) -> Result<(u64, Value), String> {
+        // Pre-broadcast: would this tx's principal push cumulative spend past the cap?
+        let outgoing = spend_grains(&stx.transaction.action);
+        let projected = {
+            let spent = self.spent_grains.lock().unwrap();
+            spent.saturating_add(outgoing)
+        };
+        if projected > self.max_spend_grains {
+            return Err(format!(
+                "ABORT: spend ceiling exceeded — this tx moves {} grains, cumulative {} would \
+                 pass --max-spend {} grains",
+                outgoing, projected, self.max_spend_grains
+            ));
+        }
         let txid = self.a.submit_transaction(stx).map_err(|e| e.to_string())?;
         let deadline = Instant::now() + MINE_TIMEOUT;
         while Instant::now() < deadline {
@@ -243,6 +383,23 @@ impl Ctx {
                 .call("sov_getReceipt", json!({ "txId": txid.to_hex() }))
                 .map_err(|e| e.to_string())?;
             if let Some(h) = r.get("height").and_then(Value::as_u64) {
+                // Post-mine: charge the realized fee against the per-tx ceiling, and
+                // commit both principal and fee to the running spend total.
+                let gas_used = r.get("gas_used").and_then(Value::as_u64).unwrap_or(0);
+                let fee = u128::from(gas_used).saturating_mul(self.gas_price_grains);
+                if fee > self.max_fee_grains {
+                    return Err(format!(
+                        "ABORT: fee ceiling exceeded — tx {} cost {} grains (gas {} × price {}), \
+                         over --max-fee {} grains",
+                        txid.to_hex(),
+                        fee,
+                        gas_used,
+                        self.gas_price_grains,
+                        self.max_fee_grains
+                    ));
+                }
+                let mut spent = self.spent_grains.lock().unwrap();
+                *spent = spent.saturating_add(outgoing).saturating_add(fee);
                 return Ok((h, r));
             }
             std::thread::sleep(POLL);
@@ -360,7 +517,7 @@ struct Case {
 fn prepare(cfg: &Config) -> Result<(Ctx, Value), String> {
     let a = RpcClient::new(cfg.node_a.clone()).with_timeout(Duration::from_secs(20));
     let b = RpcClient::new(cfg.node_b.clone()).with_timeout(Duration::from_secs(20));
-    let signer = Keypair::hybrid_from_seed(cfg.seed);
+    let signer = Keypair::hybrid_from_seed(*cfg.seed);
     let account = match &cfg.account {
         Some(a) if !a.trim().is_empty() => {
             AccountId::new(a.trim()).map_err(|e| format!("bad account: {e}"))?
@@ -382,6 +539,21 @@ fn prepare(cfg: &Config) -> Result<(Ctx, Value), String> {
     if gen_a != gen_b {
         return Err(format!("nodes have different genesis: A={gen_a} B={gen_b}"));
     }
+    // Deny-by-default against LIVE MAINNET: this sweep moves real, irrecoverable value,
+    // so it refuses to run against the frozen mainnet genesis without an explicit,
+    // typed danger-acknowledgement (the CLI flag / the dashboard field).
+    mainnet_gate(&gen_a, cfg.acknowledged)?;
+    // The node's live gas price, so realized fees can be metered against `--max-fee`.
+    // `sov_estimateFee` reports it directly (0 on a fee-free testnet).
+    let gas_price_grains = a
+        .call("sov_estimateFee", json!({ "kind": "transfer" }))
+        .ok()
+        .and_then(|v| {
+            v.get("gasPriceGrains")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<u128>().ok())
+        })
+        .unwrap_or(0);
     let premine = {
         let (t, m) = supply_total_mined(&a).map_err(|e| format!("reading supply: {e}"))?;
         t - m
@@ -399,6 +571,10 @@ fn prepare(cfg: &Config) -> Result<(Ctx, Value), String> {
         "signer": account.to_string(),
         "balance": bal.to_string(),
         "cases": case_count(),
+        "mainnet": gen_a == MAINNET_GENESIS,
+        "gasPriceGrains": gas_price_grains.to_string(),
+        "maxSpendGrains": cfg.max_spend_grains.to_string(),
+        "maxFeeGrains": cfg.max_fee_grains.to_string(),
     });
     if bal.grains() == 0 {
         return Err(format!(
@@ -411,10 +587,14 @@ fn prepare(cfg: &Config) -> Result<(Ctx, Value), String> {
         a,
         b,
         signer,
-        seed: cfg.seed,
+        seed: cfg.seed.clone(),
         account,
         premine,
         run_id,
+        gas_price_grains,
+        max_spend_grains: cfg.max_spend_grains,
+        max_fee_grains: cfg.max_fee_grains,
+        spent_grains: Mutex::new(0),
     };
     Ok((ctx, preflight))
 }
@@ -473,6 +653,17 @@ fn cli_run(cfg: &Config) -> Result<usize, String> {
     println!(
         "  signer balance: {}",
         pre["balance"].as_str().unwrap_or("")
+    );
+    if pre["mainnet"].as_bool().unwrap_or(false) {
+        println!(
+            "  ⚠ MAINNET     : real XUS — acknowledged via --i-understand-this-spends-real-xus"
+        );
+    }
+    println!(
+        "  ceilings      : max-spend {} grains · max-fee {} grains/tx · gas price {} grains",
+        pre["maxSpendGrains"].as_str().unwrap_or("?"),
+        pre["maxFeeGrains"].as_str().unwrap_or("?"),
+        pre["gasPriceGrains"].as_str().unwrap_or("?")
     );
     println!();
     println!(
@@ -777,7 +968,7 @@ fn build_cases() -> Vec<Case> {
                 Action::HtlcLock {
                     recipient: rx_id.clone(),
                     amount: Balance::from_sov(1).map_err(|e| e.to_string())?,
-                    hashlock,
+                    hashlock: Hash::from_bytes(hashlock),
                     timeout_height: tip + 1000,
                 },
             )?;
@@ -806,7 +997,7 @@ fn build_cases() -> Vec<Case> {
                 Action::HtlcLock {
                     recipient: rx,
                     amount: Balance::from_sov(1).map_err(|e| e.to_string())?,
-                    hashlock,
+                    hashlock: Hash::from_bytes(hashlock),
                     timeout_height: timeout,
                 },
             )?;
@@ -1068,7 +1259,9 @@ fn handle_conn(mut stream: TcpStream, state: Arc<Mutex<Value>>) -> std::io::Resu
             content_length = v.trim().parse().unwrap_or(0);
         }
     }
-    let mut body = vec![0u8; content_length.min(1 << 20)];
+    // The POST body carries the wallet phrase/seed — hold it in a wiped buffer so the
+    // secret does not linger on the heap after the request is handled.
+    let mut body = Zeroizing::new(vec![0u8; content_length.min(1 << 20)]);
     if !body.is_empty() {
         reader.read_exact(&mut body)?;
     }
@@ -1085,7 +1278,7 @@ fn handle_conn(mut stream: TcpStream, state: Arc<Mutex<Value>>) -> std::io::Resu
             respond(&mut stream, "200 OK", "application/json", &payload)
         }
         ("POST", "/api/run") => {
-            let resp = start_run(&body, &state);
+            let resp = start_run(&body[..], &state);
             let payload = serde_json::to_vec(&resp).unwrap_or_default();
             respond(&mut stream, "200 OK", "application/json", &payload)
         }
@@ -1136,11 +1329,45 @@ fn start_run(body: &[u8], state: &Arc<Mutex<Value>>) -> Value {
         .as_str()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    // The mainnet danger-acknowledgement on the web path: the operator must type the
+    // exact literal into the `ack` field. Anything else is a refusal (the sweep will be
+    // denied by `mainnet_gate` only when the target IS mainnet).
+    let acknowledged = req["ack"].as_str().map(str::trim) == Some(DANGER_ACK);
+    // Ceilings default to the CLI defaults unless the form overrides them (whole XUS).
+    let sov_ceiling = |key: &str, default: u128| -> Result<u128, String> {
+        let sov = match &req[key] {
+            Value::Null => default,
+            Value::Number(n) => n
+                .as_u64()
+                .map(u128::from)
+                .ok_or_else(|| format!("{key} must be a whole number of XUS"))?,
+            Value::String(s) if s.trim().is_empty() => default,
+            Value::String(s) => s
+                .trim()
+                .parse()
+                .map_err(|e| format!("{key} must be a whole number of XUS: {e}"))?,
+            _ => return Err(format!("{key} must be a whole number of XUS")),
+        };
+        Balance::from_sov(sov)
+            .map(|b| b.grains())
+            .map_err(|e| format!("{key} out of range: {e}"))
+    };
+    let max_spend_grains = match sov_ceiling("maxSpend", DEFAULT_MAX_SPEND_SOV) {
+        Ok(g) => g,
+        Err(e) => return json!({ "ok": false, "error": e }),
+    };
+    let max_fee_grains = match sov_ceiling("maxFee", DEFAULT_MAX_FEE_SOV) {
+        Ok(g) => g,
+        Err(e) => return json!({ "ok": false, "error": e }),
+    };
     let cfg = Config {
         node_a,
         node_b,
         seed,
         account,
+        acknowledged,
+        max_spend_grains,
+        max_fee_grains,
     };
 
     *state.lock().unwrap() = json!({ "status": "running", "cases": [], "total": case_count() });
@@ -1181,4 +1408,84 @@ fn start_run(body: &[u8], state: &Arc<Mutex<Value>>) -> Value {
         }
     });
     json!({ "ok": true })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mainnet_denied_without_acknowledgement() {
+        // The frozen mainnet genesis with no acknowledgement → refused.
+        let denied = mainnet_gate(MAINNET_GENESIS, false);
+        assert!(denied.is_err(), "mainnet must be denied by default");
+        let msg = denied.unwrap_err();
+        assert!(
+            msg.contains("REFUSING"),
+            "message must name the refusal: {msg}"
+        );
+        assert!(
+            msg.contains(DANGER_ACK),
+            "message must tell the operator the exact literal to supply: {msg}"
+        );
+    }
+
+    #[test]
+    fn mainnet_allowed_with_acknowledgement() {
+        // Same genesis, but the operator typed the acknowledgement → allowed.
+        assert!(mainnet_gate(MAINNET_GENESIS, true).is_ok());
+    }
+
+    #[test]
+    fn non_mainnet_always_allowed() {
+        // Any other genesis (testnet, a local dev net) runs with or without the flag —
+        // the gate is mainnet-specific, not a blanket confirmation prompt.
+        let testnet = "0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(mainnet_gate(testnet, false).is_ok());
+        assert!(mainnet_gate(testnet, true).is_ok());
+        assert!(mainnet_gate("(unknown)", false).is_ok());
+    }
+
+    #[test]
+    fn spend_grains_counts_only_xus_principal() {
+        use sov_crypto::Keypair;
+        let to = Keypair::hybrid_from_seed([7u8; 32])
+            .public_key()
+            .implicit_account_id();
+        // Transfer + HTLC-lock amounts ARE counted.
+        assert_eq!(
+            spend_grains(&Action::Transfer {
+                to: to.clone(),
+                amount: Balance::from_sov(3).unwrap(),
+            }),
+            Balance::from_sov(3).unwrap().grains()
+        );
+        assert_eq!(
+            spend_grains(&Action::HtlcLock {
+                recipient: to.clone(),
+                amount: Balance::from_sov(5).unwrap(),
+                hashlock: Hash::digest(b"x"),
+                timeout_height: 10,
+            }),
+            Balance::from_sov(5).unwrap().grains()
+        );
+        // A MultisigExec is charged for its inner action's principal.
+        assert_eq!(
+            spend_grains(&Action::MultisigExec {
+                action: Box::new(Action::Transfer {
+                    to,
+                    amount: Balance::from_sov(2).unwrap(),
+                }),
+                approvals: vec![],
+            }),
+            Balance::from_sov(2).unwrap().grains()
+        );
+        // Token / name actions move no XUS principal.
+        assert_eq!(
+            spend_grains(&Action::RegisterName {
+                name: "x.sov".into()
+            }),
+            0
+        );
+    }
 }

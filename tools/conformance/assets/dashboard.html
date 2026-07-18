@@ -92,6 +92,20 @@
         <input id="account" placeholder="leave blank for the seed's wallet address" />
       </div>
     </div>
+    <div class="grid">
+      <div class="row">
+        <label for="maxSpend">Max spend — ceiling on XUS moved (default 100)</label>
+        <input id="maxSpend" placeholder="100" />
+      </div>
+      <div class="row">
+        <label for="maxFee">Max fee — ceiling per tx in XUS (default 5)</label>
+        <input id="maxFee" placeholder="5" />
+      </div>
+    </div>
+    <div class="row">
+      <label for="ack">MAINNET acknowledgement — required ONLY when the target is live mainnet</label>
+      <input id="ack" placeholder="type: i-understand-this-spends-real-xus (moves real, irrecoverable XUS)" />
+    </div>
     <div class="actions">
       <button id="run">Run sweep</button>
       <span id="status" class="hint"></span>
@@ -126,6 +140,7 @@ async function run() {
   const body = {
     nodeA: $('nodeA').value, nodeB: $('nodeB').value,
     phrase: $('phrase').value, seedHex: $('seed').value, account: $('account').value,
+    ack: $('ack').value, maxSpend: $('maxSpend').value, maxFee: $('maxFee').value,
   };
   $('run').disabled = true;
   $('status').innerHTML = '<span class="spinner"></span> starting…';

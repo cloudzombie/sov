@@ -1608,6 +1608,7 @@ dependencies = [
  "sov-state",
  "sov-types",
  "sov-wallet",
+ "zeroize",
 ]
 
 [[package]]
@@ -1725,6 +1726,7 @@ name = "sov-rpc"
 version = "0.0.0"
 dependencies = [
  "argon2",
+ "bip39",
  "borsh",
  "chacha20poly1305",
  "getrandom",
@@ -1753,6 +1755,7 @@ dependencies = [
 name = "sov-runtime"
 version = "0.0.0"
 dependencies = [
+ "borsh",
  "sha2 0.10.9",
  "sov-compliance",
  "sov-crypto",

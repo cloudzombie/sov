@@ -938,6 +938,26 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Clamp a wall-clock candidate timestamp so a block THIS node produces is always
+/// importable under the chain's OWN timestamp rules — strictly after its parent
+/// (`blockchain.rs` monotonic check) AND strictly after the branch median-time-past
+/// (BIP-113). When the wall clock is already ahead of both (the steady-state case)
+/// it is returned UNCHANGED, so the normal/KAT production path is byte-identical —
+/// this is purely a producer-side choice of `timestamp_ms`, never a consensus rule.
+///
+/// The clamp only bites when a peer's *accepted* future-dated tip (up to
+/// `MAX_FUTURE_DRIFT_MS` ahead — still valid at import) would otherwise force this
+/// producer to seal a block dated at/behind that parent. Without it the honest miner
+/// grinds a template the import path then rejects (`NonMonotonicTimestamp` /
+/// `TimestampNotAfterMedian`), spinning without ever committing until the wall clock
+/// passes the future tip — a real liveness stall. Lifting the timestamp to
+/// `parent_ts + 1` / `mtp + 1` lets it commit immediately, still within every rule a
+/// peer applies when importing our block.
+fn clamp_block_timestamp(now: u64, parent_ts: u64, mtp: u64) -> u64 {
+    now.max(parent_ts.saturating_add(1))
+        .max(mtp.saturating_add(1))
+}
+
 /// Nonces per inner micro-batch. Small, so the grind can stop near the end of a time
 /// SLICE for ANY algorithm — microseconds-per-hash Sha256d or milliseconds-per-hash
 /// RandomX alike — keeping the throttle and tip-following responsive.
@@ -1551,8 +1571,13 @@ impl Daemon {
                     let Ok(mut n) = node.lock() else { break };
                     let h = n.chain().height();
                     let parent_ts = n.chain().head().header.timestamp_ms;
+                    let mtp = n.chain().median_time_past();
                     let target_ms = n.chain().mining_policy().target_block_ms;
-                    match n.build_candidate(now_ms()) {
+                    // Producer-side timestamp clamp: never grind a template the import
+                    // path will reject as non-monotonic / not-after-MTP just because a
+                    // peer's accepted future-dated tip sits ahead of our wall clock.
+                    let candidate_ts = clamp_block_timestamp(now_ms(), parent_ts, mtp);
+                    match n.build_candidate(candidate_ts) {
                         Ok((c, excluded)) => {
                             // EVICT front-of-line unminable txs (their turn has come and
                             // they permanently fail — e.g. a sender who cannot afford
@@ -1769,6 +1794,29 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_block_timestamp_lifts_to_parent_and_mtp_but_never_lowers_a_leading_clock() {
+        // Steady state: the wall clock is already ahead of both the parent and the
+        // median-time-past — return it UNCHANGED so the normal/KAT production path is
+        // byte-identical (the clamp is invisible when there is nothing to fix).
+        assert_eq!(clamp_block_timestamp(10_000, 9_000, 8_000), 10_000);
+
+        // A peer's accepted future-dated tip: the parent is dated AHEAD of our wall
+        // clock, so a bare `now` would seal a non-monotonic block the import path
+        // rejects. Lift to parent + 1 so it commits immediately, still importable.
+        assert_eq!(clamp_block_timestamp(5_000, 9_000, 4_000), 9_001);
+
+        // MTP dominates: even when the parent is behind us, BIP-113 requires strictly
+        // after the median-time-past, so the higher of the two bounds wins.
+        assert_eq!(clamp_block_timestamp(5_000, 4_000, 9_000), 9_001);
+
+        // Exactly at the parent still advances by one (the monotonic check is strict).
+        assert_eq!(clamp_block_timestamp(9_000, 9_000, 0), 9_001);
+
+        // Saturating: a u64::MAX parent/MTP cannot overflow the +1.
+        assert_eq!(clamp_block_timestamp(0, u64::MAX, 0), u64::MAX);
+    }
 
     /// The committed, FROZEN testnet-1 chain-spec, embedded at compile time. This
     /// is the single source of truth both the macOS seed and the Windows validator

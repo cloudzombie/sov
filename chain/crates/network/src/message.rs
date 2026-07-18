@@ -220,13 +220,46 @@ impl NetMessage {
                 && public_key.verify(
                     &handshake_bytes(chain_id, genesis_hash, channel_binding),
                     signature,
-                ) =>
+                )
+                // Interim implicit-id guard (no wire-format change): the signed
+                // `handshake_bytes` do NOT yet cover `account`, so a valid keypair could
+                // otherwise CLAIM any account id (which drives peer dedup/identity). When
+                // the claimed id is an IMPLICIT (hash-of-pubkey) id, require it to derive
+                // from this very key — closing the spoof for implicit ids without the
+                // coordinated P2P v3 fork that would sign the account field. Named /
+                // ledger-bound ids are not implicit, so this never rejects them.
+                && !implicit_account_spoofed(account, public_key) =>
             {
                 Some(account)
             }
             _ => None,
         }
     }
+
+    /// Whether this `Hello` presents an **implicit** (key-derived) account id that does
+    /// NOT match the id derived from its own `public_key` — an interim spoof of an
+    /// implicit identity that [`authenticated_account`](Self::authenticated_account)
+    /// already rejects. Exposed so the P2P layer can log a precise reason and penalize
+    /// the peer. Returns `false` for a non-`Hello` message and for any non-implicit
+    /// (named / ledger-bound) account id, which this wire check does not police.
+    pub fn implicit_account_mismatch(&self) -> bool {
+        match self {
+            NetMessage::Hello {
+                account,
+                public_key,
+                ..
+            } => implicit_account_spoofed(account, public_key),
+            _ => false,
+        }
+    }
+}
+
+/// An implicit (64-hex, hash-of-pubkey) account id is only honest when it equals the
+/// id derived from `public_key`; a mismatch is a spoof. A non-implicit id (a named or
+/// ledger-bound account) is validated by its on-chain key binding, not here, so it is
+/// never flagged.
+fn implicit_account_spoofed(account: &AccountId, public_key: &PublicKey) -> bool {
+    account.is_implicit() && *account != public_key.implicit_account_id()
 }
 
 /// The canonical bytes a [`NetMessage::Hello`] signs: chain id, genesis hash, and
@@ -383,5 +416,51 @@ mod tests {
         assert!(h
             .authenticated_account("sov", &Hash::digest(b"other"), binding)
             .is_none());
+    }
+
+    #[test]
+    fn hello_with_a_spoofed_implicit_account_is_rejected() {
+        // Interim implicit-id guard: the handshake signature does not yet cover the
+        // `account` field, so a valid keypair could otherwise CLAIM any account id. When
+        // the claimed id is IMPLICIT (hash-of-pubkey), it must derive from this very key.
+        let kp = Keypair::from_seed([7; 32]);
+        let genesis = Hash::digest(b"genesis");
+        let binding = b"noise-handshake-hash-A";
+
+        // Honest: the implicit id derived from THIS key authenticates and is not flagged.
+        let honest_id = kp.public_key().implicit_account_id();
+        assert!(honest_id.is_implicit());
+        let honest = NetMessage::hello("sov", genesis, honest_id.clone(), binding, &kp);
+        assert!(!honest.implicit_account_mismatch());
+        assert_eq!(
+            honest.authenticated_account("sov", &genesis, binding),
+            Some(&honest_id),
+        );
+
+        // Spoof: a DIFFERENT key's implicit id, signed by `kp`. The signature verifies,
+        // but the implicit id does not derive from `kp`, so auth must fail.
+        let victim_id = Keypair::from_seed([9; 32])
+            .public_key()
+            .implicit_account_id();
+        assert_ne!(victim_id, honest_id);
+        let spoof = NetMessage::hello("sov", genesis, victim_id, binding, &kp);
+        assert!(spoof.implicit_account_mismatch());
+        assert!(
+            spoof
+                .authenticated_account("sov", &genesis, binding)
+                .is_none(),
+            "an implicit id that does not derive from the signing key must be rejected"
+        );
+
+        // A named (non-implicit) account is NOT policed by this wire check — it is
+        // validated by its on-chain key binding — so it still authenticates normally.
+        let named = AccountId::new("val01.node.sov").unwrap();
+        assert!(!named.is_implicit());
+        let named_hello = NetMessage::hello("sov", genesis, named.clone(), binding, &kp);
+        assert!(!named_hello.implicit_account_mismatch());
+        assert_eq!(
+            named_hello.authenticated_account("sov", &genesis, binding),
+            Some(&named),
+        );
     }
 }

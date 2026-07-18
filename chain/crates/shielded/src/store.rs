@@ -34,6 +34,17 @@ use crate::wallet::{recover_outputs, NoteWitnessTree, ReceivedNote};
 /// matches Zcash's reorg limit, so a deeper rollback should never be needed.
 const REORG_HORIZON: usize = 100;
 
+/// Magic tag stamped into a persisted note store so a blob written by an older,
+/// unversioned build is rejected on load (deserializes to `None`) and the caller
+/// falls back to a fresh rescan — which heals any phantom (value-0) or failed-tx
+/// contamination a pre-fix build may have stored. ASCII `"SNS1"`.
+const STORE_MAGIC: u32 = 0x534e_5331;
+
+/// Current on-disk note-store format version. Bump on any breaking change to
+/// [`Persisted`]; a blob whose `magic`/`version` do not match loads as `None`,
+/// forcing a clean rebuild from the wallet birthday.
+const STORE_VERSION: u16 = 1;
+
 /// One owned note, stored by its raw Orchard parts plus its tree position and
 /// (precomputed) nullifier — everything needed to spend it and to tell whether
 /// it has since been spent, without re-decrypting the chain.
@@ -62,8 +73,15 @@ struct Checkpoint {
 }
 
 /// The persisted (Borsh) portion of a wallet's shielded scan.
-#[derive(Clone, Default, BorshSerialize, BorshDeserialize)]
+///
+/// `magic`/`version` are the first fields so a blob written by an older,
+/// unversioned build is caught on load: either Borsh mis-parses the shifted
+/// layout (returning `None`), or the tag check in [`NoteStore::from_bytes`]
+/// rejects the mismatch — both paths force a clean rescan.
+#[derive(Clone, BorshSerialize, BorshDeserialize)]
 struct Persisted {
+    magic: u32,
+    version: u16,
     birthday: u64,
     scanned_height: u64,
     commitments: Vec<[u8; 32]>,
@@ -72,6 +90,24 @@ struct Persisted {
     /// Rolling window of the most recent block fingerprints, ascending by
     /// height, for reorg detection and rollback.
     checkpoints: Vec<Checkpoint>,
+}
+
+impl Default for Persisted {
+    /// A fresh, correctly-versioned store. Every construction path funnels
+    /// through here (via `..Persisted::default()`), so `magic`/`version` are
+    /// never left at a zeroed default that would fail its own load check.
+    fn default() -> Self {
+        Persisted {
+            magic: STORE_MAGIC,
+            version: STORE_VERSION,
+            birthday: 0,
+            scanned_height: 0,
+            commitments: Vec::new(),
+            owned: Vec::new(),
+            spent: Vec::new(),
+            checkpoints: Vec::new(),
+        }
+    }
 }
 
 /// A wallet's incremental shielded scan state (see module docs).
@@ -128,9 +164,16 @@ impl NoteStore {
         block_hash: [u8; 32],
         bundles: &[&ShieldedBundle],
     ) {
-        debug_assert!(
+        // Blocks MUST be folded in chain order: the commitment/owned/spent logs
+        // are append-only and their positions are global, so a gap or reorder
+        // would silently desync the witness tree from consensus. Enforce it in
+        // every build (a hard, always-on assertion — not a debug-only one), since
+        // a violated ordering is an unrecoverable caller bug, not a data anomaly.
+        assert!(
             height == self.data.scanned_height + 1 || self.data.scanned_height == 0,
-            "blocks must be ingested in order"
+            "blocks must be ingested in order: expected height {}, got {}",
+            self.data.scanned_height + 1,
+            height,
         );
         let decrypt = height >= self.data.birthday;
         for bundle in bundles {
@@ -155,16 +198,25 @@ impl NoteStore {
                 };
                 self.data.commitments.push(cmx);
                 if let Some(note) = mine.get(&cmx) {
-                    self.tree.mark();
-                    let (recipient, value, rho, rseed) = note.to_parts();
-                    self.data.owned.push(StoredNote {
-                        recipient,
-                        value,
-                        rho,
-                        rseed,
-                        position: pos,
-                        nullifier: note.nullifier(key),
-                    });
+                    // Skip a value-0 owned output. Spend selection requires
+                    // `value >= amount > 0`, so a zero-value note can never be
+                    // spent — its nullifier never publishes — and owning/marking
+                    // it only creates a phantom note that inflates the count
+                    // forever ("1 note, 0 XUS"). The commitment is still appended
+                    // above, so the tree stays aligned with consensus; rescanning
+                    // an existing store therefore heals any prior phantom.
+                    if note.value() > 0 {
+                        self.tree.mark();
+                        let (recipient, value, rho, rseed) = note.to_parts();
+                        self.data.owned.push(StoredNote {
+                            recipient,
+                            value,
+                            rho,
+                            rseed,
+                            position: pos,
+                            nullifier: note.nullifier(key),
+                        });
+                    }
                 }
             }
         }
@@ -294,6 +346,14 @@ impl NoteStore {
     /// commitment that fails to append (a corrupt log).
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let data: Persisted = borsh::from_slice(bytes).ok()?;
+        // Reject a blob from an older/unknown format. A pre-versioning build
+        // wrote no `magic`/`version`, so its bytes either fail to parse above or
+        // land here with a mismatched tag; either way we return `None` and the
+        // caller rebuilds from the birthday — purging any phantom/failed-tx
+        // contamination a pre-fix store may hold.
+        if data.magic != STORE_MAGIC || data.version != STORE_VERSION {
+            return None;
+        }
         let (tree, spent) = Self::derive(&data)?;
         Some(NoteStore { data, tree, spent })
     }
@@ -492,5 +552,147 @@ mod tests {
             !store.rollback_to(1),
             "height 1 is pruned beyond the horizon"
         );
+    }
+
+    /// An exact-value private send (amount == the note's whole value) must leave
+    /// the sender with a genuinely empty balance — no zero-value change "phantom"
+    /// note. Before the `if change > 0` gate in `shielded_transfer_with_change`,
+    /// this minted a value-0 change note back to the sender that the wallet
+    /// stored + counted forever ("1 note, 0 XUS"), so this test failed on
+    /// `unspent_count()`.
+    #[test]
+    fn exact_value_transfer_leaves_the_sender_with_no_phantom_note() {
+        let params = ShieldedParams::build();
+        let alice = ShieldedKey::from_seed([51u8; 32]).unwrap();
+        let bob = ShieldedKey::from_seed([52u8; 32]).unwrap();
+
+        // Shield 50 to alice; apply to consensus too for a real anchor.
+        let mut state = ShieldedState::new();
+        let shield = mint_to_shielded(&params, &alice.address(), 50).unwrap();
+        state.apply_bundle(&shield).unwrap();
+
+        let mut store = NoteStore::new(0);
+        store.ingest_block(&alice, 1, [1u8; 32], &[&shield]);
+        assert_eq!(store.balance(), 50);
+        assert_eq!(store.unspent_count(), 1);
+
+        // Alice sends the ENTIRE note value to bob — change is exactly 0.
+        let (note, pos) = store.unspent().into_iter().next().unwrap();
+        let (path, anchor) = store.witness(pos).unwrap();
+        let transfer =
+            shielded_transfer_with_change(&params, &alice, &note, path, anchor, &bob.address(), 50)
+                .unwrap();
+        state
+            .apply_bundle(&transfer)
+            .expect("consensus accepts the exact-value spend");
+
+        // Fold the spend block: alice's note is spent and NO zero-value change
+        // note is minted, so count and balance agree at zero.
+        store.ingest_block(&alice, 2, [2u8; 32], &[&transfer]);
+        assert_eq!(
+            store.unspent_count(),
+            0,
+            "no phantom zero-value change note is owned"
+        );
+        assert_eq!(store.balance(), 0);
+
+        // Bob receives the full 50 — value was preserved, not lost to the gate.
+        let mut bob_store = NoteStore::new(0);
+        bob_store.ingest_block(&bob, 1, [1u8; 32], &[&shield]);
+        bob_store.ingest_block(&bob, 2, [2u8; 32], &[&transfer]);
+        assert_eq!(bob_store.balance(), 50);
+    }
+
+    /// Ingesting a block whose owned output has value 0 must NOT increment the
+    /// owned/unspent count, yet the commitment MUST still be appended so the
+    /// witness tree stays aligned with consensus — proven here by the tree root
+    /// (the witness anchor of an earlier note) advancing after the zero-value
+    /// commitment is folded in. This heals any pre-fix phantom on rescan.
+    #[test]
+    fn a_value_zero_owned_output_is_not_owned_but_its_commitment_is_appended() {
+        let params = ShieldedParams::build();
+        let alice = ShieldedKey::from_seed([61u8; 32]).unwrap();
+
+        // Block 1: a real 30-value note to alice at position 0.
+        let real = mint_to_shielded(&params, &alice.address(), 30).unwrap();
+        let mut store = NoteStore::new(0);
+        store.ingest_block(&alice, 1, [1u8; 32], &[&real]);
+        assert_eq!(store.balance(), 30);
+        assert_eq!(store.unspent_count(), 1);
+        let (_, pos0) = store.unspent().into_iter().next().unwrap();
+        let (_, root_before) = store.witness(pos0).expect("witness the real note");
+
+        // Block 2: a value-0 output that alice CAN decrypt (a mint of 0 to her).
+        let zero = mint_to_shielded(&params, &alice.address(), 0).unwrap();
+        store.ingest_block(&alice, 2, [2u8; 32], &[&zero]);
+
+        // The zero-value note is not owned/counted...
+        assert_eq!(
+            store.unspent_count(),
+            1,
+            "a value-0 output must not be owned"
+        );
+        assert_eq!(
+            store.balance(),
+            30,
+            "balance unchanged by the value-0 output"
+        );
+
+        // ...but its commitment WAS appended: the tree grew, so the earlier
+        // note's witness anchor (the root) advanced. A skipped commitment would
+        // have left the root untouched.
+        let (_, root_after) = store.witness(pos0).expect("still witnessable");
+        assert_ne!(
+            root_before, root_after,
+            "the value-0 commitment must be appended, advancing the tree root"
+        );
+    }
+
+    /// A note store written by an older, unversioned build must fail to load and
+    /// return `None`, so the caller falls back to a clean rescan (which purges any
+    /// phantom/failed-tx contamination). A blob with an unknown version is
+    /// likewise rejected; a current, correctly-tagged blob still loads.
+    #[test]
+    fn a_versioned_store_rejects_old_or_unknown_blobs_forcing_a_rescan() {
+        let params = ShieldedParams::build();
+        let alice = ShieldedKey::from_seed([71u8; 32]).unwrap();
+
+        let shield = mint_to_shielded(&params, &alice.address(), 42).unwrap();
+        let mut store = NoteStore::new(0);
+        store.ingest_block(&alice, 1, [1u8; 32], &[&shield]);
+        assert_eq!(store.balance(), 42);
+
+        // Positive control: a current, correctly-tagged blob round-trips.
+        let good = store.to_bytes();
+        assert!(
+            NoteStore::from_bytes(&good).is_some(),
+            "a current blob loads"
+        );
+
+        // A pre-versioning blob carried no magic/version tag — its first bytes
+        // were the birthday (0 for a fresh store), i.e. NOT our magic. Simulate
+        // by clearing the tag region (magic: bytes 0..4, version: bytes 4..6).
+        let mut legacy = good.clone();
+        for b in legacy.iter_mut().take(6) {
+            *b = 0;
+        }
+        assert!(
+            NoteStore::from_bytes(&legacy).is_none(),
+            "an untagged/old blob is rejected"
+        );
+
+        // A blob tagged with an unknown (future) version is also rejected.
+        let mut future = good.clone();
+        future[4] = future[4].wrapping_add(1); // bump the low byte of `version`
+        assert!(
+            NoteStore::from_bytes(&future).is_none(),
+            "an unknown version is rejected"
+        );
+
+        // The documented fallback works: a from-birthday rescan rebuilds cleanly.
+        let mut rebuilt = NoteStore::new(0);
+        rebuilt.ingest_block(&alice, 1, [1u8; 32], &[&shield]);
+        assert_eq!(rebuilt.balance(), 42);
+        assert_eq!(rebuilt.unspent_count(), 1);
     }
 }

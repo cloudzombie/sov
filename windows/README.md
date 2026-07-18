@@ -1,10 +1,16 @@
-# SOV — Windows miner node package (testnet-1)
+# SOV — Windows miner node package (TESTNET-ONLY)
 
-Run a **real, revenue-earning SOV miner on Windows** that joins **testnet-1**
-alongside the Mac seed node. Consensus is **pure Bitcoin-style proof-of-work** —
-each node mines continuously, the heaviest-work chain wins, and a block settles
-by confirmation depth (6). There are no validators, no committee, no voting:
-only hashpower.
+> ⚠️ **TESTNET-ONLY tooling.** This package brings up a Windows miner on a
+> private **testnet-1** LAN alongside a Mac seed — a rehearsal harness for the
+> real thing. **Testnet coins carry no monetary value.** SOV **mainnet is live**
+> (genesis `cb0272ff…`, since 2026-07-04); joining mainnet is a *different*
+> path (real spec, real peers, encrypted keystore) — do NOT point these scripts
+> at mainnet.
+
+Run a **real SOV miner on Windows** that joins **testnet-1** alongside the Mac
+seed node. Consensus is **pure Bitcoin-style proof-of-work** — each node mines
+continuously, the heaviest-work chain wins, and a block settles by confirmation
+depth (6). There are no validators, no committee, no voting: only hashpower.
 
 > **Completely separate from chain code.** This folder ships only Windows scripts
 > + this runbook. It contains **no chain source** — `build.ps1` compiles the
@@ -27,21 +33,25 @@ windows/
   bundle/                            <- (git-ignored) this node's local config + keystore
 ```
 
-## How you earn here
+## How mining pays out here
 
 All real protocol mechanics (`chain/crates/runtime/src/execution.rs`). **Just
 running the node mines** — the daemon grinds each block header's proof-of-work on
 the block-time heartbeat and credits the coinbase to this node's keystore
 account (no separate miner process). Under Nakamoto consensus the node that mines
-a block collects the **miner share** of both the subsidy and that block's fees:
+a block takes **100%** of both the subsidy and that block's fees — there is no
+tax and nothing is burned (`distribute_fee` in `execution.rs` credits the whole
+fee to the block's miner):
 
 | Stream | What this node earns | Split |
 |---|---|---|
-| **PoW coinbase** | 12.5 XUS subsidy per block it mines | 93% miner / 5% founder / 2% dev — **no burn** |
-| **Fee share** | the 93% miner share of every tx fee in blocks it mines | same 93/5/2 tax applies to fees |
+| **PoW coinbase** | 12.5-XUS subsidy per block it mines | **100% to the miner** — no founder/dev tax, no burn |
+| **Fees** | every transaction fee in blocks it mines | **100% to the miner** — same, no tax, no burn |
 
-Emission halves every 840,000 blocks (mainnet schedule). The coinbase mints
-regardless of traffic; to see fees flow, drive transfers from the Mac.
+Emission halves every 840,000 blocks (the mainnet schedule: 12.5 XUS at 2.5-min
+blocks, ~4-year halvings, a 21M cap, no premine). The coinbase mints regardless
+of traffic; to see fees flow, drive transfers from the Mac. **On testnet these
+are valueless test coins** — the payout *mechanics* are real, the coins are not.
 
 ---
 

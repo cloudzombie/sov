@@ -17,13 +17,13 @@ jobs:
         # The Cargo workspace lives in chain/ (the explorer is a separate project).
         working-directory: chain
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: chain
       - name: Formatting
@@ -44,11 +44,11 @@ jobs:
       run:
         working-directory: chain
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.97.0
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: chain
       - name: Build all binaries
@@ -63,11 +63,11 @@ jobs:
     name: SOV Station app (node/)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: node
       - name: Formatting
@@ -88,9 +88,9 @@ jobs:
       run:
         working-directory: chain
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: chain
       - name: Verification suite
@@ -105,12 +105,12 @@ jobs:
       run:
         working-directory: chain/contracts
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: wasm32-unknown-unknown
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: chain/contracts
       - name: Clippy (deny warnings)
@@ -129,7 +129,7 @@ jobs:
     name: reproducible build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@1.97.0
       - name: Verify bit-for-bit reproducibility
         run: bash scripts/reproducible-build.sh
@@ -142,9 +142,9 @@ jobs:
     name: supply-chain (cargo-deny · advisories + zk floor)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: cargo-deny (advisories + bans)
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@e2f4ede4a4e60ea15ff31bc0647485d80c66cfba # v2.0.4
         with:
           manifest-path: chain/Cargo.toml
           command: check advisories bans
@@ -162,9 +162,9 @@ jobs:
       run:
         working-directory: chain
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: chain
       - name: Install cargo-fuzz
@@ -187,13 +187,13 @@ jobs:
     name: hygiene (shellcheck · typos · rustdoc)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: ShellCheck (release + build scripts)
         run: shellcheck scripts/*.sh
       - name: Spelling (typos)
-        uses: crate-ci/typos@master
+        uses: crate-ci/typos@685eb3d55be2f85191e8c84acb9f44d7756f84ab # v1.29.4
       - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: chain
       - name: Docs build clean (rustdoc -D warnings)
@@ -212,11 +212,11 @@ jobs:
       run:
         working-directory: chain
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src, miri
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: chain
       - name: AddressSanitizer (consensus · crypto · network)
@@ -239,9 +239,9 @@ jobs:
       run:
         working-directory: chain
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: chain
       - name: Build release daemon
@@ -259,3 +259,74 @@ jobs:
           # NX: GNU_STACK must not be executable (RW, not RWE).
           readelf -l "$BIN" | grep -A1 GNU_STACK | grep -q "RWE" && { echo "FAIL: executable stack"; exit 1; } || true
           echo "OK: PIE + non-exec stack (canary/FORTIFY are report-only for Rust)"
+
+  # The TypeScript SDK (sdk/) is SOV's consensus SECOND CLIENT: it re-derives keys,
+  # account ids, emission, the PoW seal, the STF and the KAT vectors independently of
+  # the Rust node. Its vitest suite (which loads sdk/vectors) must stay green so the
+  # two implementations can never silently diverge byte-for-byte.
+  sdk:
+    name: sdk (second client · vitest KAT)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Node
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: sdk/package-lock.json
+      - name: Install deps (locked)
+        run: npm ci
+      - name: Tests (vitest)
+        run: npm test
+
+  # Standalone operator tools (tools/conformance, tools/tx-cannon) are intentionally
+  # NOT chain-workspace members but depend on the real chain crates by path — so a
+  # chain API change can silently break them. Compile both here so they can't bit-rot;
+  # run tx-cannon's unit tests (the signed-tx Borsh round-trip).
+  tools:
+    name: tools (conformance · tx-cannon build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          workspaces: |
+            tools/conformance
+            tools/tx-cannon
+      # tx-cannon links eframe/egui; install the standard egui Linux build deps so the
+      # native GUI binary links on the headless runner.
+      - name: Install egui build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev
+      - name: Build conformance
+        run: cargo build --manifest-path tools/conformance/Cargo.toml
+      - name: Build tx-cannon
+        run: cargo build --manifest-path tools/tx-cannon/Cargo.toml
+      - name: Test tx-cannon
+        run: cargo test --manifest-path tools/tx-cannon/Cargo.toml
+
+  # The Windows validator package ships PowerShell operator scripts
+  # (windows/scripts/*.ps1). Lint them with PSScriptAnalyzer using the pwsh that ships
+  # on the Ubuntu runner so a broken join/miner/seed script can't reach a user.
+  # Trialed non-blocking (like sanitizers/hardening) until consistently green, then
+  # promoted to required.
+  powershell:
+    name: powershell (PSScriptAnalyzer) [trial]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: PSScriptAnalyzer (windows/scripts/*.ps1)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          # Print the full report for visibility, then fail on any diagnostic.
+          Invoke-ScriptAnalyzer -Path windows -Recurse | Format-Table -AutoSize
+          Invoke-ScriptAnalyzer -Path windows -Recurse -EnableExit

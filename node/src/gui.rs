@@ -1414,6 +1414,11 @@ pub struct Station {
     dark_mode: bool,
     // This machine's LAN address to hand to the OTHER machine (cached at launch).
     lan_addr: Option<String>,
+    // Whether the local node's JSON-RPC binds the LAN (0.0.0.0) instead of loopback.
+    // Default OFF: the RPC surface is unauthenticated, so it is reachable only from this
+    // machine unless the operator explicitly opts in (for the explorer / conformance
+    // tools). Persisted across launches; threaded into `build_and_run_node`.
+    expose_rpc_lan: bool,
     network: Network,
     // Wallet state (held in-session; secrets never leave this process).
     wallets: Vec<LoadedWallet>,
@@ -1476,6 +1481,7 @@ pub struct Station {
     names_by_account: Arc<Mutex<HashMap<String, Vec<String>>>>,
     names_refreshed_at: Option<Instant>, // last SNS-cache refresh (for periodic re-poll)
     shielded_scan_for: String,           // account auto-scanned for the shielded pool (debounce)
+    rescan_armed: bool, // "Rescan from scratch" confirmation is open (destructive cache wipe)
     action: Arc<Mutex<ActionState>>,
     params: Arc<Mutex<Option<Arc<ShieldedParams>>>>,
     shielded: Arc<Mutex<ShieldedView>>,
@@ -1686,6 +1692,7 @@ impl Station {
             peer_addr: read_saved_peer(Network::Mainnet),
             dark_mode: read_saved_theme(),
             lan_addr: lan_ipv4(),
+            expose_rpc_lan: read_expose_rpc_lan(),
             // Default to MAINNET — the live network (genesis cb0272ff). The top tab
             // opens on Mainnet; Testnet is an explicit opt-in sandbox from there.
             network: Network::Mainnet,
@@ -1742,6 +1749,7 @@ impl Station {
             names_by_account: Arc::new(Mutex::new(HashMap::new())),
             names_refreshed_at: None,
             shielded_scan_for: String::new(),
+            rescan_armed: false,
             action: Arc::new(Mutex::new(ActionState::default())),
             params: Arc::new(Mutex::new(None)),
             shielded: Arc::new(Mutex::new(ShieldedView::default())),
@@ -2266,6 +2274,49 @@ impl Station {
             }
             ctx.request_repaint();
         });
+    }
+
+    /// Wipe the active wallet's note-store cache file and re-scan the whole chain from
+    /// its birthday. The store is a rebuildable index (encrypted note secrets keyed by
+    /// this wallet's implicit id); deleting it forces `scan_store` to start from
+    /// `NoteStore::new(0)`, so a contaminated store (e.g. one written before the
+    /// receipt-status filter existed) is cleanly rebuilt from the canonical chain. The
+    /// on-chain shielded pool is untouched — this only rebuilds local wallet state.
+    fn rescan_shielded(&mut self, ctx: &egui::Context) {
+        if !self.require_signing() {
+            return; // watch-only has no shielded viewing key (no seed)
+        }
+        let Some(w) = self.wallets.get(self.selected) else {
+            return;
+        };
+        // Delete this wallet's cache file (keyed by its stable implicit id), matching the
+        // path `scan_store` writes. A missing file just forces a fresh full scan.
+        let store_id = Keypair::hybrid_from_seed(w.seed)
+            .public_key()
+            .implicit_account_id()
+            .to_string();
+        if let Ok(path) = note_store_path(&store_id) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                // Already gone ⇒ nothing to wipe; a fresh scan rebuilds it anyway.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    if let Ok(mut v) = self.shielded.lock() {
+                        v.message = format!("could not delete note cache: {e}");
+                    }
+                    return;
+                }
+            }
+        }
+        // Reset the in-memory view + the debounce so the auto-scan does not race, then
+        // kick off a full scan (now starting from an empty store on disk).
+        self.shielded_scan_for.clear();
+        if let Ok(mut v) = self.shielded.lock() {
+            *v = ShieldedView::default();
+            v.scanning = true;
+            v.message = "rescanning from scratch…".to_string();
+        }
+        self.scan_shielded(ctx);
     }
 
     /// De-shield the largest unspent note back to this wallet's transparent
@@ -3317,8 +3368,18 @@ impl Station {
         // The master passphrase seals the miner keystore at rest. Clone into a
         // Zeroizing so this copy is wiped when the build thread finishes.
         let passphrase = zeroize::Zeroizing::new(self.passphrase.clone());
+        let expose_lan = self.expose_rpc_lan;
         std::thread::spawn(move || {
-            let result = build_and_run_node(&spec, &net, &account, seed, &peer, &passphrase, &logs);
+            let result = build_and_run_node(
+                &spec,
+                &net,
+                &account,
+                seed,
+                &peer,
+                &passphrase,
+                expose_lan,
+                &logs,
+            );
             let mut slot = run.lock().unwrap();
             match result {
                 Ok(node) => {
@@ -3660,6 +3721,24 @@ impl Station {
                 ui.label(egui::RichText::new("node stopped").weak());
             }
         }
+        // RPC bind posture opt-in. The node's JSON-RPC is unauthenticated, so it binds
+        // LOOPBACK by default; only tick this to reach it from the OTHER machine / the
+        // explorer / the conformance sweep. Takes effect on the next node (re)start.
+        ui.add_space(2.0);
+        if ui
+            .checkbox(
+                &mut self.expose_rpc_lan,
+                "Expose node RPC on LAN (for explorer/conformance tools)",
+            )
+            .on_hover_text(
+                "Off (default): the node's RPC is reachable only from this machine (127.0.0.1). \
+                 On: binds 0.0.0.0 so LAN tools can reach it — the RPC is unauthenticated, so \
+                 only enable this on a trusted network. Applies on the next node start.",
+            )
+            .changed()
+        {
+            save_expose_rpc_lan(self.expose_rpc_lan);
+        }
         if let Some(ip) = &self.lan_addr {
             ui.add_space(2.0);
             ui.label(
@@ -3669,9 +3748,16 @@ impl Station {
                 .monospace()
                 .size(12.0),
             );
+            // Only advertise the LAN RPC address when the operator opted in; otherwise the
+            // node binds loopback and only 127.0.0.1 can reach it.
+            let rpc_disp = if self.expose_rpc_lan {
+                format!("{ip}:8645")
+            } else {
+                "127.0.0.1:8645".to_string()
+            };
             ui.label(
                 egui::RichText::new(format!(
-                    "RPC for tools/explorer (e.g. the conformance sweep): {ip}:8645",
+                    "RPC for tools/explorer (e.g. the conformance sweep): {rpc_disp}",
                 ))
                 .monospace()
                 .size(12.0)
@@ -3744,6 +3830,7 @@ impl Drop for Station {
         self.setup_pw.zeroize();
         self.setup_pw2.zeroize();
         self.import_mnemonic.zeroize();
+        self.htlc_preimage.zeroize();
         if let Some((_, phrase)) = self.backup_mnemonic.as_mut() {
             phrase.zeroize();
         }
@@ -5346,13 +5433,35 @@ impl Station {
         });
         ui.horizontal(|ui| {
             ui.label("Secret");
+            // Masked: the preimage is a secret until it is revealed by a claim. Generate
+            // fills it with 32 bytes of OS entropy (hex) — the safe default.
             ui.add(
                 egui::TextEdit::singleline(&mut self.htlc_preimage)
-                    .hint_text("the preimage (shared secret)")
+                    .hint_text("shared secret (≥16 bytes) — or Generate")
+                    .password(true)
                     .desired_width(220.0),
             );
-            ui.label("Timeout height");
-            ui.add(egui::TextEdit::singleline(&mut self.htlc_timeout).desired_width(90.0));
+            if ui
+                .button("Generate")
+                .on_hover_text("fill with 32 cryptographically-random bytes (OS RNG), hex-encoded")
+                .clicked()
+            {
+                self.htlc_preimage = random_secret_hex();
+                self.set_swap_msg(
+                    "secret generated — SAVE IT before locking: you need it to claim the \
+                     counterparty's leg, and it is not recoverable if lost",
+                );
+            }
+        });
+        ui.horizontal(|ui| {
+            // Relative timeout: blocks past the CURRENT tip (resolved at lock time), with an
+            // enforced floor — an absolute height is a foot-gun (easy to set in the past).
+            ui.label("Timeout (+blocks)");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.htlc_timeout)
+                    .hint_text(format!("≥ {HTLC_MIN_TIMEOUT_BLOCKS}"))
+                    .desired_width(90.0),
+            );
             if ui.button("Lock").clicked() {
                 do_lock = true;
             }
@@ -5428,17 +5537,27 @@ impl Station {
         }
     }
 
-    fn htlc_lock(&self, ctx: &egui::Context, signer: String, seed: [u8; 32]) {
+    fn htlc_lock(&mut self, ctx: &egui::Context, signer: String, seed: [u8; 32]) {
         let recipient = self.htlc_recipient.trim().to_string();
         let secret = self.htlc_preimage.trim().to_string();
         let Some(grains) = parse_xus(&self.htlc_amount) else {
             return self.set_swap_msg("amount must be a number (e.g. 1.5)");
         };
-        let Ok(timeout) = self.htlc_timeout.trim().parse::<u64>() else {
-            return self.set_swap_msg("timeout height must be a whole number");
+        // The timeout is now a RELATIVE offset in blocks past the live tip (resolved in
+        // the worker), with an enforced floor — an absolute height was a foot-gun.
+        let Ok(offset) = self.htlc_timeout.trim().parse::<u64>() else {
+            return self.set_swap_msg("timeout must be a whole number of blocks (e.g. 20)");
         };
-        if secret.is_empty() {
-            return self.set_swap_msg("enter a secret (preimage)");
+        if offset < HTLC_MIN_TIMEOUT_BLOCKS {
+            return self.set_swap_msg(&format!(
+                "timeout must be at least {HTLC_MIN_TIMEOUT_BLOCKS} blocks past the tip"
+            ));
+        }
+        // Reject a weak/guessable secret before it ever hits the chain as a hashlock.
+        if !htlc_secret_ok(&secret) {
+            return self.set_swap_msg(
+                "secret too weak — use ≥16 bytes of real entropy (or press Generate)",
+            );
         }
         let rpc = self
             .config
@@ -5448,21 +5567,51 @@ impl Station {
         let view = self.swaps_view.clone();
         let activity = self.activity.clone();
         let ctx = ctx.clone();
+        // NOTE: we deliberately do NOT wipe the persistent UI copy here. In an atomic
+        // swap the party who generated this preimage and locks first must RETAIN it to
+        // later claim the counterparty's leg — wiping on lock would strand the funds
+        // until refund. The worker's local clone is still scrubbed after it is folded
+        // into the hashlock (below), and the field is wiped on wallet lock / app close
+        // (Station::Drop) so its lifetime is still bounded. The claim path, by contrast,
+        // reveals the preimage on-chain, so it wipes the field immediately.
         std::thread::spawn(move || {
+            let mut secret = secret;
             let recipient_id = match AccountId::new(&recipient) {
                 Ok(id) => id,
                 Err(e) => {
-                    return set_swap_view_msg(&view, &ctx, &format!("invalid recipient: {e}"))
+                    secret.zeroize();
+                    return set_swap_view_msg(&view, &ctx, &format!("invalid recipient: {e}"));
                 }
             };
+            // Resolve the relative timeout against the live tip; never lock with a
+            // non-future (or past) expiry.
+            let client = RpcClient::new(rpc.clone()).with_timeout(Duration::from_secs(8));
+            let tip = match client.height() {
+                Ok(h) => h,
+                Err(e) => {
+                    secret.zeroize();
+                    return set_swap_view_msg(
+                        &view,
+                        &ctx,
+                        &format!("could not read tip height: {e}"),
+                    );
+                }
+            };
+            let timeout_height = tip.saturating_add(offset);
+            if timeout_height <= tip {
+                secret.zeroize();
+                return set_swap_view_msg(&view, &ctx, "timeout must be in the future");
+            }
             let action = Action::HtlcLock {
                 recipient: recipient_id,
                 amount: Balance::from_grains(grains),
                 hashlock: sov_primitives::Hash::from_bytes(sha256_bytes(secret.as_bytes())),
-                timeout_height: timeout,
+                timeout_height,
             };
-            let msg = submit_action(&rpc, seed, &signer, action)
-                .map(|id| format!("✓ HTLC opened — id = {id}"))
+            secret.zeroize(); // preimage captured into the hashlock; scrub the clone
+                              // Confirm on a real SUCCESS receipt, not mempool admission.
+            let msg = submit_and_confirm(&rpc, seed, &signer, action, 90)
+                .map(|id| format!("✓ HTLC opened (timeout at block {timeout_height}) — id = {id}"))
                 .unwrap_or_else(|e| format!("✗ lock failed: {e}"));
             record(&activity, &msg);
             set_swap_view_msg(&view, &ctx, &msg);
@@ -5516,7 +5665,7 @@ impl Station {
         });
     }
 
-    fn htlc_claim(&self, ctx: &egui::Context, signer: String, seed: [u8; 32]) {
+    fn htlc_claim(&mut self, ctx: &egui::Context, signer: String, seed: [u8; 32]) {
         let id_hex = self.htlc_lookup_id.trim().to_string();
         let secret = self.htlc_preimage.trim().to_string();
         let rpc = self
@@ -5527,16 +5676,25 @@ impl Station {
         let view = self.swaps_view.clone();
         let activity = self.activity.clone();
         let ctx = ctx.clone();
+        // The preimage is captured into the worker; wipe the persistent UI copy. (A
+        // claim reveals it on-chain anyway, so keeping it in the field buys nothing.)
+        self.htlc_preimage.zeroize();
         std::thread::spawn(move || {
+            let mut secret = secret;
             let htlc_id = match Hash::from_hex(&id_hex) {
                 Ok(h) => h,
-                Err(_) => return set_swap_view_msg(&view, &ctx, "HTLC id must be 64 hex chars"),
+                Err(_) => {
+                    secret.zeroize();
+                    return set_swap_view_msg(&view, &ctx, "HTLC id must be 64 hex chars");
+                }
             };
             let action = Action::HtlcClaim {
                 htlc_id,
-                preimage: secret.into_bytes(),
+                preimage: secret.as_bytes().to_vec(),
             };
-            let msg = submit_action(&rpc, seed, &signer, action)
+            secret.zeroize(); // preimage copied into the action; scrub the clone
+                              // Confirm on a real SUCCESS receipt, not mempool admission.
+            let msg = submit_and_confirm(&rpc, seed, &signer, action, 90)
                 .map(|id| format!("✓ HTLC claimed (tx {})", &id[..id.len().min(14)]))
                 .unwrap_or_else(|e| format!("✗ claim failed: {e}"));
             record(&activity, &msg);
@@ -5560,7 +5718,8 @@ impl Station {
                 Err(_) => return set_swap_view_msg(&view, &ctx, "HTLC id must be 64 hex chars"),
             };
             let action = Action::HtlcRefund { htlc_id };
-            let msg = submit_action(&rpc, seed, &signer, action)
+            // Confirm on a real SUCCESS receipt, not mempool admission.
+            let msg = submit_and_confirm(&rpc, seed, &signer, action, 90)
                 .map(|id| format!("✓ HTLC refunded (tx {})", &id[..id.len().min(14)]))
                 .unwrap_or_else(|e| format!("✗ refund failed: {e}"));
             record(&activity, &msg);
@@ -6415,6 +6574,7 @@ impl Station {
         let mut do_send = false;
         let mut do_private_send = false;
         let mut do_scan = false;
+        let mut do_rescan = false;
         let mut do_deshield = false;
         let mut do_build_unsigned = false;
         let mut do_sign_offline = false;
@@ -6874,6 +7034,22 @@ impl Station {
                 if ui.button("Scan pool").clicked() {
                     do_scan = true;
                 }
+                // Recovery path: wipe this wallet's note-store cache and re-scan the whole
+                // chain from its birthday. The cache is a rebuildable index; deleting it is
+                // how a contaminated store (e.g. one written before the receipt-status filter)
+                // is cleanly rebuilt from the canonical chain. Two-step confirm — destructive.
+                ui.add_enabled_ui(!sv.scanning, |ui| {
+                    if ui
+                        .button("Rescan from scratch")
+                        .on_hover_text(
+                            "Delete this wallet's local note-store cache and re-scan the entire \
+                             chain from its birthday. Safe (the cache is rebuildable) but slow.",
+                        )
+                        .clicked()
+                    {
+                        self.rescan_armed = true;
+                    }
+                });
                 ui.label("De-shield XUS");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.deshield_amount)
@@ -6900,6 +7076,23 @@ impl Station {
                     }
                 });
             });
+            // Confirmation for the destructive "Rescan from scratch": deleting the cache is
+            // safe (rebuildable) but a full re-scan is expensive, so require an explicit OK.
+            if self.rescan_armed {
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        palette::warning(),
+                        "Delete this wallet's note-store cache and re-scan the whole chain?",
+                    );
+                    if ui.button("Confirm rescan").clicked() {
+                        self.rescan_armed = false;
+                        do_rescan = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.rescan_armed = false;
+                    }
+                });
+            }
             // Show the live budget so the per-window drain limit is transparent — and,
             // when the window cap (not the balance) is the binding constraint, say so
             // LOUDLY with when it resets, so a limited/0 Max never reads as a broken
@@ -7521,6 +7714,9 @@ impl Station {
         if do_scan {
             self.scan_shielded(&ctx);
         }
+        if do_rescan {
+            self.rescan_shielded(&ctx);
+        }
         // Auto-scan the shielded pool the first time a (spendable) wallet is shown,
         // so its private balance + notes appear WITHOUT a manual "Scan pool" — this
         // is what lets "Send privately" enable on its own (you never need to
@@ -7816,6 +8012,25 @@ fn submit_action(
     Ok(txid.to_hex())
 }
 
+/// Submit `action`, then BLOCK until its receipt confirms — returning the tx id hex
+/// only on a real on-chain SUCCESS, or the failure reason for an included-but-rejected
+/// tx (or a pending timeout). This is the "don't report success on mere mempool
+/// admission" path for the HTLC swap actions, reusing [`await_receipt`].
+fn submit_and_confirm(
+    rpc: &str,
+    seed: [u8; 32],
+    signer: &str,
+    action: Action,
+    secs: u64,
+) -> Result<String, String> {
+    let txid_hex = submit_action(rpc, seed, signer, action)?;
+    let txid =
+        Hash::from_hex(&txid_hex).map_err(|_| "node returned a malformed tx id".to_string())?;
+    let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(15));
+    await_receipt(&client, &txid, secs)?;
+    Ok(txid_hex)
+}
+
 /// The live format + availability check for a name being typed, so the GUI can
 /// refuse to register a name that would not resolve (bad shape, already taken, or
 /// shadowing an existing account) — the "checksum" guard.
@@ -7957,6 +8172,40 @@ fn sha256_bytes(data: &[u8]) -> [u8; 32] {
 
 fn sha256_hex(data: &[u8]) -> String {
     hex_lower(&sha256_bytes(data))
+}
+
+/// The minimum HTLC timeout offset, in blocks past the current tip. A too-short
+/// timeout risks the refund window opening before the counterparty can claim (or a
+/// swap's other leg confirms), so the lock form enforces this floor on the relative
+/// offset the operator enters.
+const HTLC_MIN_TIMEOUT_BLOCKS: u64 = 20;
+
+/// A fresh 32-byte HTLC secret from the OS CSPRNG, rendered as lowercase hex. The
+/// secret's bytes are the preimage (hashlock = sha256(secret bytes)), so it must be
+/// unguessable — 256 bits of OS entropy is. Empty on the (near-impossible) RNG
+/// failure, so the entropy gate rejects it rather than let a weak secret through.
+fn random_secret_hex() -> String {
+    let mut buf = [0u8; 32];
+    if getrandom::getrandom(&mut buf).is_err() {
+        return String::new();
+    }
+    let s = hex_lower(&buf);
+    buf.zeroize();
+    s
+}
+
+/// Reject a weak HTLC secret. The secret's UTF-8 bytes ARE the preimage, so once the
+/// hashlock is on-chain a short/low-entropy secret is brute-forceable by the
+/// counterparty. Require at least 16 bytes AND several distinct byte values — this
+/// rejects a 1-char secret or a run of one repeated character, while accepting any
+/// Generate output (32 random bytes → 64 hex chars) and a real passphrase.
+fn htlc_secret_ok(secret: &str) -> bool {
+    let bytes = secret.as_bytes();
+    let distinct = bytes
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    bytes.len() >= 16 && distinct >= 8
 }
 
 /// Set the Tokens view's status line from a worker and repaint.
@@ -8187,11 +8436,29 @@ fn scan_store(rpc: &str, seed: [u8; 32]) -> Result<NoteStore, String> {
             // A missing block at h<=tip is a transient RPC gap; stop here and
             // resume next scan rather than desync the contiguous height.
             .ok_or_else(|| format!("block {h} unavailable; will resume"))?;
+        // Fetch this block's receipts (transaction order, 1:1 with `block.transactions`)
+        // so we ingest ONLY shielded bundles whose transaction actually APPLIED. A
+        // shielded tx can be mined but rejected during execution (a Failed receipt);
+        // ingesting its bundle would credit the wallet notes the chain never accepted,
+        // corrupting the store. A missing/short receipt list ⇒ that tx is treated as
+        // unconfirmed and skipped (fail-closed), never ingested unverified.
+        let receipts = client
+            .call("sov_getBlockReceipts", json!({ "height": h }))
+            .map_err(|e| e.to_string())?;
+        let receipts = receipts.as_array();
         let bundles: Vec<ShieldedBundle> = block
             .transactions
             .iter()
-            .filter_map(|stx| match &stx.transaction.action {
-                Action::Shielded { bundle } => ShieldedBundle::from_bytes(bundle).ok(),
+            .enumerate()
+            .filter_map(|(i, stx)| match &stx.transaction.action {
+                Action::Shielded { bundle }
+                    if receipts
+                        .and_then(|rs| rs.get(i))
+                        .map(receipt_succeeded)
+                        .unwrap_or(false) =>
+                {
+                    ShieldedBundle::from_bytes(bundle).ok()
+                }
                 _ => None,
             })
             .collect();
@@ -8211,6 +8478,18 @@ fn scan_store(rpc: &str, seed: [u8; 32]) -> Result<NoteStore, String> {
 
 /// De-shield the wallet's largest unspent note back to its transparent account
 /// (a real Halo2 spend, witnessed against a held anchor).
+/// Whether a receipt JSON value (as returned by `sov_getReceipt` /
+/// `sov_getBlockReceipts`) records a SUCCESSFUL execution. The execution status is a
+/// tagged object nested under `status`: `{"status":"success"}` on success, or
+/// `{"status":"failed","reason":…}` on a rejected-but-included transaction. Anything
+/// else (unmined, malformed) is treated as not-yet-successful.
+fn receipt_succeeded(v: &Value) -> bool {
+    v.get("status")
+        .and_then(|s| s.get("status"))
+        .and_then(Value::as_str)
+        == Some("success")
+}
+
 /// Poll the node for transaction `txid`'s receipt until it is mined, returning
 /// `Ok(())` only when it actually **applied**, or `Err(reason)` if it was included
 /// but rejected (e.g. the de-shield drain limit). This is what stops the GUI from
@@ -8778,6 +9057,28 @@ fn save_theme(dark: bool) {
     let _ = std::fs::write(theme_config_path(), if dark { "dark" } else { "light" });
 }
 
+/// Where the "expose node RPC on LAN" opt-in is persisted (next to the peer/theme files).
+fn expose_rpc_config_path() -> PathBuf {
+    peer_config_base().join(".sov-station-rpc-lan")
+}
+
+/// The saved RPC-bind posture. Loopback (false) unless the operator explicitly opted the
+/// node's unauthenticated RPC onto the LAN last time. Absent file ⇒ loopback (safe default).
+fn read_expose_rpc_lan() -> bool {
+    matches!(
+        std::fs::read_to_string(expose_rpc_config_path()).map(|s| s.trim().to_string()),
+        Ok(s) if s == "lan"
+    )
+}
+
+/// Persist the RPC-bind choice so it survives restarts.
+fn save_expose_rpc_lan(expose: bool) {
+    let _ = std::fs::write(
+        expose_rpc_config_path(),
+        if expose { "lan" } else { "loopback" },
+    );
+}
+
 /// Add an inbound Windows Defender Firewall allow-rule for this executable, so LAN
 /// peers can reach the P2P (9645/TCP) + discovery (9646/UDP) ports. Unsigned apps
 /// are inbound-blocked by default on Windows, which silently prevents peering; this
@@ -8984,6 +9285,11 @@ fn embedded_spec(spec_filename: &str) -> Result<&'static str, String> {
 /// writes the genesis spec + config) is a transient helper that runs and exits; the
 /// long-running node itself is embedded here via the [`sov_rpc`] library — no
 /// `sov-rpcd` subprocess, so nothing can outlive the GUI.
+// This is the node-startup wiring seam: it legitimately takes the full launch config
+// (spec, network, coinbase account, seed, bootstrap peer, keystore passphrase, the
+// LAN-RPC opt-in, and the shared log sink). Bundling these into a struct would only move
+// the argument list, not remove it, and adds churn to a mainnet start path — so allow it.
+#[allow(clippy::too_many_arguments)]
 fn build_and_run_node(
     spec_filename: &str,
     net: &str,
@@ -8991,6 +9297,7 @@ fn build_and_run_node(
     seed: [u8; 32],
     peer: &str,
     passphrase: &str,
+    expose_lan: bool,
     logs: &Arc<Mutex<Vec<String>>>,
 ) -> Result<EmbeddedNode, String> {
     // Breadcrumb the PRE-INDEXING startup so a hang here is never a silent black box:
@@ -9078,16 +9385,26 @@ fn build_and_run_node(
         .join(&config.data_dir)
         .to_string_lossy()
         .into_owned();
-    // Expose the JSON-RPC on the LAN (not just loopback), so the OTHER machine — and
-    // the two-node conformance dashboard / a remote explorer — can reach this node's
-    // RPC. The RPC surface is key-free (reads + submit of an ALREADY-signed tx; it
-    // never signs or holds wallet keys), and P2P is already 0.0.0.0, so this matches
-    // the node's posture. Migrated in place so existing installs pick it up with no reset.
-    if let Some(port) = config.rpc_addr.strip_prefix("127.0.0.1:") {
-        config.rpc_addr = format!("0.0.0.0:{port}");
-    } else if let Some(port) = config.rpc_addr.strip_prefix("localhost:") {
-        config.rpc_addr = format!("0.0.0.0:{port}");
-    }
+    // RPC bind posture. The JSON-RPC surface is key-free (reads + submit of an ALREADY-signed
+    // tx; it never signs or holds wallet keys) but it is UNAUTHENTICATED, so it binds LOOPBACK
+    // (127.0.0.1) by default — reachable only from this machine. The operator can opt in to a
+    // LAN bind (0.0.0.0) for the OTHER machine / the conformance dashboard / a remote explorer
+    // via the Node-tab "Expose node RPC on LAN" checkbox; that choice is persisted and threaded
+    // in as `expose_lan`. We NORMALIZE on every start (not migrate-once) so a legacy install
+    // that was force-migrated to 0.0.0.0 is pulled back to loopback unless the operator opted
+    // in. The per-IP RPC rate limiter applies in either posture.
+    let rpc_port = config
+        .rpc_addr
+        .rsplit(':')
+        .next()
+        .filter(|p| !p.is_empty())
+        .unwrap_or("8645")
+        .to_string();
+    config.rpc_addr = if expose_lan {
+        format!("0.0.0.0:{rpc_port}")
+    } else {
+        format!("127.0.0.1:{rpc_port}")
+    };
     // Seed/bootstrap peer (Bitcoin `addnode` style), scoped to THIS network. Replace
     // the persisted operator list on every start—even when empty—so a legacy testnet
     // peer can never survive in the mainnet node config. Stable spec seeds are merged
@@ -9369,6 +9686,56 @@ fn spawn_poller(snapshot: Arc<Mutex<Snapshot>>, config: Arc<Mutex<Config>>, ctx:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The receipt-status filter that gates shielded-note ingestion: only a
+    /// `{"status":"success"}` receipt may credit notes. A Failed receipt (a mined but
+    /// rejected shielded tx) must NOT ingest — that is the wallet-corruption class this
+    /// filter closes. Malformed/absent status is treated as not-yet-successful.
+    #[test]
+    fn receipt_succeeded_only_on_success() {
+        assert!(receipt_succeeded(
+            &json!({ "status": { "status": "success" }, "gas_used": 0 })
+        ));
+        assert!(!receipt_succeeded(&json!({
+            "status": { "status": "failed", "reason": "de-shield rate limit exceeded" }
+        })));
+        assert!(!receipt_succeeded(&json!({ "status": {} })));
+        assert!(!receipt_succeeded(&json!({})));
+        assert!(!receipt_succeeded(&Value::Null));
+    }
+
+    /// The HTLC secret-entropy gate: reject short or low-entropy secrets (the preimage
+    /// is brute-forceable once the hashlock is on-chain), accept a real passphrase and
+    /// any `Generate` output.
+    #[test]
+    fn htlc_secret_entropy_gate() {
+        assert!(!htlc_secret_ok(""), "empty rejected");
+        assert!(!htlc_secret_ok("x"), "1-char rejected");
+        assert!(
+            !htlc_secret_ok("aaaaaaaaaaaaaaaa"),
+            "16 identical bytes rejected"
+        );
+        assert!(!htlc_secret_ok("short"), "under 16 bytes rejected");
+        assert!(
+            htlc_secret_ok("correct horse battery staple"),
+            "a real passphrase passes"
+        );
+        // Generate produces 32 random bytes → 64 hex chars; always passes the gate.
+        let g = random_secret_hex();
+        assert_eq!(g.len(), 64, "generated secret is 32 bytes of hex");
+        assert!(htlc_secret_ok(&g), "generated secret passes the gate");
+    }
+
+    /// The relative-timeout floor: a lock's timeout resolves to `tip + offset`, and the
+    /// enforced floor keeps it comfortably in the future (never <= tip). This mirrors the
+    /// `htlc_lock` computation so the floor can't silently regress.
+    #[test]
+    fn htlc_timeout_floor_is_future() {
+        let tip = 6_800u64;
+        let timeout = tip.saturating_add(HTLC_MIN_TIMEOUT_BLOCKS);
+        assert!(timeout > tip, "the minimum offset still lands past the tip");
+        const { assert!(HTLC_MIN_TIMEOUT_BLOCKS >= 20, "floor is at least 20 blocks") };
+    }
 
     /// REGRESSION GUARD (v0.1.78): the desktop app's node setup must be fully
     /// SELF-CONTAINED — needing NO external helper binary — and the EMBEDDED spec

@@ -9,6 +9,12 @@
 //!   before anything else);
 //! - rejects transactions already past an account's current nonce (stale) or
 //!   already pooled (duplicates);
+//! - admits only *gap-free* nonces — a sender's tx must be contiguous with its
+//!   on-chain nonce plus what it already has pooled, so a hole that would strand
+//!   later nonces can never open in the pool (a client learns immediately via
+//!   `NonceGap` and resubmits the missing nonce);
+//! - time-evicts any entry stranded behind a pre-existing/edge-case gap after a
+//!   TTL, so such a gap self-clears instead of occupying the pool forever;
 //! - bounds its own size, so it cannot grow without limit; and
 //! - on request, returns transactions grouped by sender and ordered by nonce,
 //!   skipping any sender whose next expected nonce is missing — never proposing
@@ -48,6 +54,18 @@ pub enum MempoolError {
     Full {
         /// The configured capacity.
         capacity: usize,
+    },
+    /// The transaction's nonce is beyond the sender's contiguous pending run
+    /// (`current_nonce + pending_count`), so admitting it would leave a hole that
+    /// strands it — and every later nonce — until the missing one lands. Refusing
+    /// it here means a gap can never form in the pool; the client should submit
+    /// `expected` (the next mineable nonce) first, then resubmit.
+    #[error("nonce gap: next mineable nonce is {expected}, transaction used {got}")]
+    NonceGap {
+        /// The next contiguous nonce the pool will accept.
+        expected: u64,
+        /// The nonce the transaction carried.
+        got: u64,
     },
     /// A different transaction already occupies this `(signer, nonce)` slot.
     /// Replacing it in place would orphan the existing entry, so it is rejected.
@@ -99,12 +117,27 @@ fn default_per_sender(capacity: usize) -> usize {
     (capacity / 64).max(16)
 }
 
+/// Wall-clock milliseconds since the Unix epoch, used to age pooled entries for
+/// TTL-eviction. Non-monotonic, but the pool only needs a coarse "how long has
+/// this been stranded" and tolerates clock jitter (a saturating subtraction
+/// never under-flows). Zero on the (impossible) pre-epoch clock.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// A bounded pool of pending, validated transactions.
 pub struct Mempool {
     by_id: HashMap<Hash, SignedTransaction>,
     /// Index by `(signer, nonce)` so a sender's transactions are retrievable in
     /// nonce order.
     by_sender: BTreeMap<(AccountId, u64), Hash>,
+    /// When each pooled tx was admitted (Unix millis), for TTL-eviction of
+    /// entries stranded behind a gap. Keyed by tx id; kept in lockstep with
+    /// `by_id`.
+    inserted_at: HashMap<Hash, u64>,
     capacity: usize,
     /// Max transactions one sender may hold at once (anti-DoS fairness bound).
     max_per_sender: usize,
@@ -122,6 +155,7 @@ impl Mempool {
         Mempool {
             by_id: HashMap::new(),
             by_sender: BTreeMap::new(),
+            inserted_at: HashMap::new(),
             capacity,
             max_per_sender: max_per_sender.max(1),
         }
@@ -201,6 +235,22 @@ impl Mempool {
                 got: nonce,
             });
         }
+        // Gap-free admission: a tx may extend the sender's pending run by at most
+        // one — its nonce must be contiguous with the account's on-chain nonce plus
+        // what is already pooled (`current_nonce ..= current_nonce + pending_len`).
+        // A higher nonce would sit behind a hole and could never be mined until the
+        // hole fills, stranding it (and every later nonce). Refusing it here means a
+        // gap can never form in the pool in the first place; the client learns
+        // immediately and resubmits the missing nonce. (Slots at or below `expected`
+        // that are already taken are caught by the `NonceTaken`/`Duplicate` checks.)
+        let expected =
+            current_nonce.saturating_add(self.sender_count(&stx.transaction.signer) as u64);
+        if nonce > expected {
+            return Err(MempoolError::NonceGap {
+                expected,
+                got: nonce,
+            });
+        }
         let id = stx.id();
         if self.by_id.contains_key(&id) {
             return Err(MempoolError::Duplicate);
@@ -252,6 +302,7 @@ impl Mempool {
         }
         self.by_sender.insert(slot, id);
         self.by_id.insert(id, stx);
+        self.inserted_at.insert(id, now_millis());
         Ok(())
     }
 
@@ -261,6 +312,7 @@ impl Mempool {
         let stx = self.by_id.remove(id)?;
         self.by_sender
             .remove(&(stx.transaction.signer.clone(), stx.transaction.nonce));
+        self.inserted_at.remove(id);
         Some(stx)
     }
 
@@ -304,6 +356,49 @@ impl Mempool {
                 }
             }
         }
+    }
+
+    /// Time-evict transactions stranded behind a nonce gap. For each sender the
+    /// contiguous run starting at its `current_nonce` is walked; anything at or
+    /// beyond the first missing nonce sits behind a hole and can never be mined
+    /// until the hole fills. Any such entry that has been pooled longer than
+    /// `ttl_millis` is dropped, so a permanent gap self-clears and the account
+    /// recovers once the missing nonce is (re)submitted. Gap-free admission means
+    /// a fresh gap can't form; this drains any pre-existing or restored stranded
+    /// entry. Returns the number evicted. Run on the same maintenance tick as
+    /// `prune` (after every committed block / on restore).
+    pub fn evict_stranded<F: Fn(&AccountId) -> u64>(
+        &mut self,
+        current_nonce: F,
+        ttl_millis: u64,
+    ) -> usize {
+        let now = now_millis();
+        let senders: BTreeSet<AccountId> = self.by_sender.keys().map(|(s, _)| s.clone()).collect();
+        let mut stranded: Vec<Hash> = Vec::new();
+        for signer in senders {
+            // The first nonce missing from the pool (at or above the account's
+            // current nonce) marks the gap; anything strictly reachable below it
+            // is fine.
+            let mut nonce = current_nonce(&signer);
+            while self.by_sender.contains_key(&(signer.clone(), nonce)) {
+                nonce += 1;
+            }
+            // Everything from the gap upward is stranded — evict the aged ones.
+            for (_, id) in self
+                .by_sender
+                .range((signer.clone(), nonce)..=(signer.clone(), u64::MAX))
+            {
+                let age = now.saturating_sub(*self.inserted_at.get(id).unwrap_or(&now));
+                if age >= ttl_millis {
+                    stranded.push(*id);
+                }
+            }
+        }
+        let evicted = stranded.len();
+        for id in stranded {
+            self.remove(&id);
+        }
+        evicted
     }
 
     /// All pooled transactions, in `(signer, nonce)` order — the snapshot persisted to
@@ -574,19 +669,140 @@ mod tests {
 
     #[test]
     fn select_returns_contiguous_run_and_stops_at_gap() {
+        // Gap-free admission means a hole can't be *inserted* directly, so build one
+        // the only way it can now arise: admit a contiguous run, then remove an
+        // interior nonce (as if it were dropped some other way).
         let mut pool = Mempool::new(100);
         pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
             .unwrap();
         pool.insert(tx([1; 32], "usa.reserve.sov", 1), 0, big())
             .unwrap();
-        // Nonce 2 is missing; 3 should be unreachable.
+        let gap = tx([1; 32], "usa.reserve.sov", 2);
+        let gap_id = gap.id();
+        pool.insert(gap, 0, big()).unwrap();
         pool.insert(tx([1; 32], "usa.reserve.sov", 3), 0, big())
             .unwrap();
+        // Punch a hole at nonce 2; nonce 3 is now unreachable behind the gap.
+        assert!(pool.remove(&gap_id).is_some());
 
         let batch = pool.select(|_| 0, 10);
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0].transaction.nonce, 0);
         assert_eq!(batch[1].transaction.nonce, 1);
+    }
+
+    #[test]
+    fn rejects_nonce_gap_at_admission() {
+        // (a) A tx whose nonce leaps past the sender's contiguous pending run is
+        // refused at the door — a gap can never form in the pool.
+        let mut pool = Mempool::new(100);
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        // Account at nonce 0 with one pooled tx (nonce 0): the next mineable nonce
+        // is 1. Submitting nonce 2 would strand it behind the missing nonce 1.
+        assert_eq!(
+            pool.insert(tx([1; 32], "usa.reserve.sov", 2), 0, big()),
+            Err(MempoolError::NonceGap {
+                expected: 1,
+                got: 2,
+            })
+        );
+        assert_eq!(pool.len(), 1, "the gapped tx must not enter the pool");
+    }
+
+    #[test]
+    fn contiguous_fill_promotes_and_mines_in_order() {
+        // (b) Submitting exactly the next nonce each time is always accepted, and
+        // the whole run selects in ascending nonce order.
+        let mut pool = Mempool::new(100);
+        for n in 0..5 {
+            pool.insert(tx([1; 32], "usa.reserve.sov", n), 0, big())
+                .unwrap();
+        }
+        let batch = pool.select(|_| 0, 10);
+        assert_eq!(batch.len(), 5);
+        for (i, stx) in batch.iter().enumerate() {
+            assert_eq!(stx.transaction.nonce, i as u64);
+        }
+    }
+
+    #[test]
+    fn stranded_entry_is_ttl_evicted_and_account_recovers() {
+        // (c) A permanent gap: admit a contiguous run, then drop the head nonce (as
+        // if it were rejected/never mined) so the account's nonce stays at 0 while
+        // higher nonces sit stranded behind the hole.
+        let mut pool = Mempool::new(100);
+        let head = tx([1; 32], "usa.reserve.sov", 0);
+        let head_id = head.id();
+        pool.insert(head, 0, big()).unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 1), 0, big())
+            .unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 2), 0, big())
+            .unwrap();
+        assert!(pool.remove(&head_id).is_some());
+        // Nonces 1 and 2 are now stranded behind the gap at 0.
+        assert_eq!(pool.len(), 2);
+        assert_eq!(
+            pool.select(|_| 0, 10).len(),
+            0,
+            "nothing mineable behind the gap"
+        );
+
+        // A generous TTL keeps them: not yet expired, so nothing is evicted.
+        assert_eq!(pool.evict_stranded(|_| 0, u64::MAX), 0);
+        assert_eq!(pool.len(), 2);
+
+        // A zero TTL reaps every stranded entry immediately (the maintenance tick
+        // clearing a permanent gap).
+        assert_eq!(pool.evict_stranded(|_| 0, 0), 2);
+        assert!(pool.is_empty(), "the permanent gap self-cleared");
+
+        // The account recovers: resubmit the missing nonce, then the rest, and the
+        // run mines in order again.
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 1), 0, big())
+            .unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 2), 0, big())
+            .unwrap();
+        let batch = pool.select(|_| 0, 10);
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].transaction.nonce, 0);
+    }
+
+    #[test]
+    fn evict_stranded_keeps_the_contiguous_run() {
+        // A healthy contiguous run has no gap, so TTL-eviction never touches it —
+        // even at ttl 0.
+        let mut pool = Mempool::new(100);
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 1), 0, big())
+            .unwrap();
+        assert_eq!(pool.evict_stranded(|_| 0, 0), 0);
+        assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn select_never_proposes_a_gap_tx() {
+        // (d) Even with a stranded entry present, block-building selects only the
+        // contiguous prefix and never the tx behind the gap.
+        let mut pool = Mempool::new(100);
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 1), 0, big())
+            .unwrap();
+        let mid = tx([1; 32], "usa.reserve.sov", 2);
+        let mid_id = mid.id();
+        pool.insert(mid, 0, big()).unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 3), 0, big())
+            .unwrap();
+        // Drop nonce 2, stranding nonce 3.
+        assert!(pool.remove(&mid_id).is_some());
+
+        let batch = pool.select(|_| 0, 10);
+        assert!(batch.iter().all(|stx| stx.transaction.nonce < 2));
+        assert_eq!(batch.len(), 2, "only the gap-free prefix is proposed");
     }
 
     #[test]
