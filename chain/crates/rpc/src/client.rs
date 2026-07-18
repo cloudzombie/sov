@@ -78,11 +78,9 @@ impl RpcClient {
         // Bound the CONNECT too: `set_read_timeout`/`set_write_timeout` only govern
         // I/O after the handshake, so a saturated accept queue or black-holed SYN
         // would otherwise hang a caller for the OS default (a minute or more).
-        let addr = self
-            .addr
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| RpcClientError::Malformed(format!("unresolvable address {}", self.addr)))?;
+        let addr = self.addr.to_socket_addrs()?.next().ok_or_else(|| {
+            RpcClientError::Malformed(format!("unresolvable address {}", self.addr))
+        })?;
         let mut stream = TcpStream::connect_timeout(&addr, self.timeout)?;
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;

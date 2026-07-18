@@ -212,7 +212,7 @@ pub struct Htlc {
     pub recipient: AccountId,
     /// The escrowed amount.
     pub amount: Balance,
-    /// SHA-256 of the secret preimage that unlocks the funds. A [`Hash`] so `sov_getHtlc`
+    /// SHA-256 of the secret preimage that unlocks the funds. A [`struct@Hash`] so `sov_getHtlc`
     /// renders it as hex (consistent with other 32-byte fields); Borsh is byte-identical to
     /// a bare `[u8; 32]`, so the state root and genesis are unchanged.
     pub hashlock: Hash,
