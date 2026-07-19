@@ -86,6 +86,25 @@ Everything Phases 1–3 is additive: new RPC, new standalone crates, read-only a
 to any block/header/tx encoding, state root, emission, difficulty, chain spec, or KAT vector.
 `sov-verify` KAT + genesis pins must be green at every phase gate. Only Phase 4(a) is a fork.
 
+## Fable audit — 2026-07-19 (max-rigor, adversarial)
+**Verdict: no critical/high. Genesis `cb0272ff` + KAT byte-identical. Nothing blocks v0.1.94.**
+Confirmed safe: `sov_submitBlock` routes through the FULL validated import (re-exec, root re-check,
+PoW re-seal, future-drift) — no bad-block injection, no coinbase theft; stratum bridge is untrusted
+(node re-validates); duty-cycle math correct + off-lock (no priority inversion); `sov_getSigningDomain`
+read-only; version guards sound. Action items:
+- **M1 (medium):** `sov_getBlockTemplate`/`sov_submitBlock` are unauthenticated + expensive (full
+  build per call) + cache-churning. Mitigated by the 20/s rate-limit + "keep RPC off the internet"
+  guidance, but should be GATED PRIVILEGED (loopback/allowlist/shared-secret, separate from read RPCs)
+  before running any public-facing pool. Make the off-internet bind MANDATORY, not advisory. **The
+  droplets bind RPC on 0.0.0.0:8645 — verify ufw blocks 8645 from the public, or gate these methods.**
+- **M2 (medium, design open-item):** Phase 3 embedded PPLNS payout `Transfer`s MUST be built via
+  `sov_getSigningDomain` + `sign_in(domain)`, or they'll be rejected post-tx-domain-activation and
+  break payout at the fork boundary. Add a test: a network-target share with legacy-signed payouts is
+  rejected once the domain is active. Not live today (Phase 3 not built) — design before it ships.
+- **L1 (low):** template cache evicts live templates past 64 distinct coinbases (liveness) — raise cap.
+- **L2 (low):** frozen stratum job timestamp can outrun MTP within the 120s TTL (rare on 2.5-min chain).
+- **L3 (nit):** version guard pins only `node/Cargo.toml`; daemon version is safe via `SOV_BUILD_VERSION`.
+
 ## Immediate next actions (pick with the user)
 1. [ ] End-to-end acceptance of Phases 1–2 on a dev/throwaway context (accepted share → imported
    block → coinbase credit); record the xmrig-compat result.
