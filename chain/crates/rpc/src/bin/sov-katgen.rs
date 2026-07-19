@@ -382,6 +382,9 @@ fn stf_vector() -> Value {
         gas_price: mining.gas_price,
         miner: miner.clone(),
         pq: None,
+        // KAT vectors are generated on the legacy (pre-fork) signing path so they
+        // stay byte-identical across the `tx-domain` deployment.
+        tx_domain: None,
     };
     // The full block state transition the node performs: the coinbase mints the
     // scheduled subsidy to the miner FIRST (Bitcoin issuance), then the

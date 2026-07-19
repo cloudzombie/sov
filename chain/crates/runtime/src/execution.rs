@@ -51,6 +51,14 @@ pub struct BlockContext<'a> {
     /// `pq-sunset` deployment has activated (`None` before activation). See
     /// [`sov_mining::PqSchedule`] for the exact phase semantics.
     pub pq: Option<sov_mining::PqSchedule>,
+    /// The active network signing domain once the miner-signaled `tx-domain` hard
+    /// fork has activated (`None` before activation). When `Some`, transaction and
+    /// intent signatures must bind to this network (chain id + genesis), which
+    /// closes cross-network "ghost chain" replay; `None` verifies the legacy,
+    /// un-bound preimage — byte-identical to pre-fork execution. Resolved per block
+    /// height, so historical (pre-activation) blocks validate under `None` and only
+    /// blocks at/after activation require the binding.
+    pub tx_domain: Option<sov_primitives::SigningDomain>,
 }
 
 /// Reasons a transaction is *rejected* — not admitted to a block at all. These
@@ -123,7 +131,7 @@ pub fn apply_transaction(
     stx: &SignedTransaction,
     ctx: &BlockContext<'_>,
 ) -> Result<Receipt, ExecutionError> {
-    if !stx.verify_signature() {
+    if !stx.verify_signature_in(ctx.tx_domain.as_ref()) {
         return Err(ExecutionError::InvalidSignature);
     }
     let tx = &stx.transaction;
@@ -848,7 +856,7 @@ pub fn apply_transaction(
                     ExecutionStatus::Failed {
                         reason: "intent key is not the owner account's registered key".into(),
                     }
-                } else if !settlement.intent.verify() {
+                } else if !settlement.intent.verify_in(ctx.tx_domain.as_ref()) {
                     ExecutionStatus::Failed {
                         reason: "invalid intent signature".into(),
                     }
@@ -2014,6 +2022,7 @@ mod tests {
             gas_price: Balance::ZERO,
             miner: miner_id(),
             pq: None,
+            tx_domain: None,
         }
     }
     /// A context at a specific height (for staking/vesting tests).
@@ -2025,6 +2034,7 @@ mod tests {
             gas_price: Balance::ZERO,
             miner: miner_id(),
             pq: None,
+            tx_domain: None,
         }
     }
 
@@ -2568,6 +2578,7 @@ mod tests {
             gas_price: Balance::ZERO,
             miner: id("miner.sov"),
             pq: None,
+            tx_domain: None,
         };
 
         // Heights 1 & 2 mint 50 each (epoch 0); height 3 halves to 25
@@ -2692,6 +2703,7 @@ mod tests {
             gas_price: Balance::from_grains(1),
             miner: id("miner.sov"),
             pq: None,
+            tx_domain: None,
         };
 
         // Deploy from dev.sov.
@@ -2753,6 +2765,7 @@ mod tests {
             gas_price: Balance::from_grains(u128::MAX),
             miner: miner_id(),
             pq: None,
+            tx_domain: None,
         };
         let mut ledger = ledger_with_usa(1_000);
         let stx = transfer([1; 32], "usa.reserve.sov", "ecb.reserve.sov", 1, 0);
@@ -3426,6 +3439,7 @@ mod tests {
             gas_price: Balance::from_grains(1),
             miner: id("miner.sov"),
             pq: None,
+            tx_domain: None,
         };
         let mut ledger = ledger_with_usa(100);
         let sov_before = ledger.account(&id("usa.reserve.sov")).balance;
@@ -4721,6 +4735,7 @@ mod tests {
                 sunset_height: 200,
                 threshold_grains: Balance::from_sov(50).unwrap().grains(),
             }),
+            tx_domain: None,
         }
     }
 
@@ -4940,6 +4955,7 @@ mod tests {
             gas_price: Balance::from_grains(1),
             miner: miner_id(),
             pq: None,
+            tx_domain: None,
         };
 
         // A V1 transfer pays exactly the intrinsic gas — no envelope charge.

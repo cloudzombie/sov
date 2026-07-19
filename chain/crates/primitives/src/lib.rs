@@ -26,6 +26,7 @@ pub mod account;
 pub mod amount;
 pub mod hash;
 pub mod height;
+pub mod signing_domain;
 
 pub use account::{AccountId, AccountIdError};
 pub use amount::{
@@ -33,3 +34,4 @@ pub use amount::{
 };
 pub use hash::{Hash, HashParseError};
 pub use height::BlockHeight;
+pub use signing_domain::SigningDomain;

@@ -17,7 +17,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use sov_mining::{Difficulty, MiningPolicy, Target, Work};
-use sov_primitives::{AccountId, Balance, BlockHeight, Hash};
+use sov_primitives::{AccountId, Balance, BlockHeight, Hash, SigningDomain};
 use sov_runtime::{
     apply_coinbase, apply_transaction, apply_transactions, BlockContext, BlockExecutionError,
 };
@@ -77,6 +77,13 @@ pub struct Blockchain {
     /// The `pq-sunset` deployment and its enforcement parameters, if this
     /// chain schedules one (see [`sov_mining::PqSchedule`]).
     pq_deployment: Option<PqDeploymentConfig>,
+    /// The miner-signaled `tx-domain` deployment, if this chain schedules one.
+    /// When it activates, transaction and intent signatures must bind to this
+    /// chain's identity (`chain_id` + `genesis_hash`), closing cross-network
+    /// replay. `None` (the default) keeps signing byte-identical to pre-fork —
+    /// the genesis hash and every KAT vector are reproduced exactly — so a chain
+    /// that never schedules or activates it is completely unaffected.
+    tx_domain_deployment: Option<sov_governance::Deployment>,
     /// Transaction receipts for the **active chain**, indexed for RPC lookup.
     /// `active_receipts[h]` holds the receipts of the active block at height `h`
     /// (in transaction order); only heights with at least one transaction appear.
@@ -513,6 +520,7 @@ impl Blockchain {
             default_coinbase: genesis.coinbase,
             signals: sov_governance::SignalLog::new(),
             pq_deployment: None,
+            tx_domain_deployment: None,
             active_receipts: HashMap::new(),
             tx_height: HashMap::new(),
             undo_ring: VecDeque::new(),
@@ -624,6 +632,15 @@ impl Blockchain {
         self.pq_deployment = Some(config);
     }
 
+    /// Schedule the miner-signaled `tx-domain` hard fork: once `deployment`
+    /// activates under the BIP-9/8 state machine, transaction and intent
+    /// signatures must bind to this chain's identity (`chain_id` + genesis),
+    /// closing cross-network replay. Dormant until activation — pre-activation
+    /// signing (and thus the genesis hash and every KAT vector) is byte-identical.
+    pub fn set_tx_domain_deployment(&mut self, deployment: sov_governance::Deployment) {
+        self.tx_domain_deployment = Some(deployment);
+    }
+
     /// The live BIP-9/BIP-8 state of every registered governance deployment, evaluated
     /// over the ACTIVE chain's committed miner signals at the current height. This is
     /// read-only observability for `sov_getDeployments`; the exact same evaluation
@@ -636,6 +653,17 @@ impl Blockchain {
         let h = self.height();
         if let Some(cfg) = &self.pq_deployment {
             let d = &cfg.deployment;
+            out.push(DeploymentStatus {
+                name: d.name.clone(),
+                bit: d.bit,
+                state: sov_governance::state_at(d, BlockHeight::new(h), &self.signals),
+                start_height: d.start_height.get(),
+                timeout_height: d.timeout_height.get(),
+                period: d.period,
+                lockinontimeout: d.lockinontimeout,
+            });
+        }
+        if let Some(d) = &self.tx_domain_deployment {
             out.push(DeploymentStatus {
                 name: d.name.clone(),
                 bit: d.bit,
@@ -688,6 +716,48 @@ impl Blockchain {
                     sunset_height: boundary.saturating_add(cfg.sunset_delay_blocks),
                     threshold_grains: cfg.threshold_grains,
                 });
+            }
+            boundary += period;
+        }
+        None
+    }
+
+    /// The network [`SigningDomain`] a block at `height` verifies signatures under,
+    /// resolved over the active chain's committed miner signals. `Some(domain)`
+    /// once the miner-signaled `tx-domain` fork is active at `height` (signatures
+    /// must bind to `chain_id` + genesis); `None` before activation, or if no
+    /// `tx-domain` deployment is scheduled — the byte-identical, pre-fork path.
+    pub fn resolved_tx_domain(&self, height: u64) -> Option<SigningDomain> {
+        self.resolved_tx_domain_with(height, &self.signals)
+    }
+
+    /// As [`resolved_tx_domain`](Self::resolved_tx_domain), but resolved against an
+    /// explicit signal history — so fork-choice replay of a competing branch
+    /// evaluates activation over *that branch's* signals, exactly as
+    /// [`resolved_pq_with`](Self::resolved_pq_with) does. The domain itself
+    /// (`chain_id` + genesis) is branch-independent; only *whether* the fork is
+    /// active at `height` depends on the branch.
+    fn resolved_tx_domain_with(
+        &self,
+        height: u64,
+        signals: &sov_governance::SignalLog,
+    ) -> Option<SigningDomain> {
+        let deployment = self.tx_domain_deployment.as_ref()?;
+        let period = deployment.period;
+        // Walk window boundaries up to (and including) the one governing `height`;
+        // the first boundary whose state is Active is the activation height. States
+        // change only at boundaries and Active is terminal, so this is exact and
+        // monotone — identical in structure to `resolved_pq_with`.
+        let governing = height - (height % period);
+        let mut boundary = period; // genesis window (0) is always Defined.
+        while boundary <= governing {
+            if sov_governance::state_at(
+                deployment,
+                sov_primitives::BlockHeight::new(boundary),
+                signals,
+            ) == sov_governance::ThresholdState::Active
+            {
+                return Some(SigningDomain::new(self.chain_id.clone(), self.genesis_hash));
             }
             boundary += period;
         }
@@ -1046,6 +1116,7 @@ impl Blockchain {
             gas_price: policy.gas_price,
             miner: proposer.clone(),
             pq: self.resolved_pq(next_height),
+            tx_domain: self.resolved_tx_domain(next_height),
         };
         apply_coinbase(&mut probe, &selection_ctx)?;
         let mut included = Vec::new();
@@ -1081,6 +1152,7 @@ impl Blockchain {
             gas_price: policy.gas_price,
             miner: proposer.clone(),
             pq: self.resolved_pq(next_height),
+            tx_domain: self.resolved_tx_domain(next_height),
         };
         apply_coinbase(&mut scratch, &ctx)?;
         let receipts = apply_transactions(&mut scratch, &included, &ctx)?;
@@ -1325,7 +1397,14 @@ impl Blockchain {
         if !block.tx_root_matches() {
             return Err(ChainError::TxRootMismatch);
         }
-        if !block.all_signatures_valid() {
+        // Signatures are verified under the network signing domain resolved at this
+        // block's height: `None` (byte-identical to before) for every pre-activation
+        // height, and — once the miner-signaled `tx-domain` fork is active — the
+        // chain-bound domain, so a block carrying a cross-network-replayed (or legacy
+        // un-bound) signature fails validation. This block extends the active head,
+        // so the active chain's signals govern its activation state.
+        let tx_domain = self.resolved_tx_domain(block.header.height.get());
+        if !block.all_signatures_valid_in(tx_domain.as_ref()) {
             return Err(ChainError::BadSignatures);
         }
 
@@ -1735,6 +1814,7 @@ impl Blockchain {
             gas_price: policy.gas_price,
             miner: block.header.proposer.clone(),
             pq: self.resolved_pq_with(height, signals),
+            tx_domain: self.resolved_tx_domain_with(height, signals),
         };
         apply_coinbase(ledger, &ctx)?;
         Ok(apply_transactions(ledger, &block.transactions, &ctx)?)
@@ -2522,6 +2602,124 @@ mod tests {
             },
         };
         SignedTransaction::sign(tx, &kp).unwrap()
+    }
+
+    /// Like [`usa_transfer`], but signed under an optional network [`SigningDomain`]
+    /// (`None` = legacy). Used to drive the `tx-domain` fork tests.
+    fn usa_transfer_in(
+        to: &str,
+        sov: u128,
+        nonce: u64,
+        domain: Option<&SigningDomain>,
+    ) -> SignedTransaction {
+        let kp = Keypair::from_seed([2; 32]);
+        let tx = Transaction {
+            signer: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce,
+            action: Action::Transfer {
+                to: id(to),
+                amount: Balance::from_sov(sov).unwrap(),
+            },
+        };
+        SignedTransaction::sign_in(tx, &kp, domain).unwrap()
+    }
+
+    #[test]
+    fn tx_domain_is_dormant_by_default() {
+        // A chain with no `tx-domain` deployment scheduled resolves no domain at any
+        // height, so signatures are verified on the legacy (un-bound) preimage — the
+        // pre-fork, byte-identical path. A plain legacy transfer mines normally.
+        let mut chain = fresh_chain();
+        for h in [0u64, 1, 12, 100, 10_000] {
+            assert_eq!(chain.resolved_tx_domain(h), None, "dormant at height {h}");
+        }
+        let tx = usa_transfer("ecb.reserve.sov", 10, 0);
+        let block = chain.produce_block(vec![tx], 2_000).unwrap();
+        assert_eq!(block.transactions.len(), 1, "legacy tx mines while dormant");
+        chain.import_block(block).unwrap();
+    }
+
+    #[test]
+    fn miner_signaled_tx_domain_activates_and_binds_signatures_end_to_end() {
+        use sov_governance::{Deployment, Threshold};
+
+        // Deployment on bit 1: signaling opens at height 4, window length 4,
+        // 3-of-4 threshold, BIP-8 lock-in — same window math as the PQ test, so
+        // [4,8) signals 4/4 -> LockedIn at boundary 8 -> Active at boundary 12.
+        let mut chain = fresh_chain();
+        chain.set_tx_domain_deployment(
+            Deployment::new(
+                "tx-domain",
+                1,
+                BlockHeight::new(4),
+                BlockHeight::new(400),
+                4,
+                Threshold::new(3, 4).unwrap(),
+                BlockHeight::new(0),
+                true,
+            )
+            .unwrap(),
+        );
+        chain.set_signal_mask(1 << 1); // signal bit 1 in produced headers
+
+        let mut ts = 2_000u64;
+        for _ in 1..=11 {
+            let block = chain.produce_block(vec![], ts).unwrap();
+            assert_eq!(block.header.version_bits, 1 << 1, "blocks carry the signal");
+            chain.import_block(block).unwrap();
+            ts += 1_000;
+        }
+        // Dormant through height 11; ACTIVE for the block at height 12, bound to
+        // THIS chain's identity — derived purely from committed header bits.
+        assert_eq!(chain.resolved_tx_domain(11), None);
+        let domain = chain
+            .resolved_tx_domain(12)
+            .expect("tx-domain active at height 12");
+        assert_eq!(domain.chain_id(), chain.chain_id());
+        assert_eq!(domain.genesis(), chain.genesis_hash);
+
+        // Post-activation, a LEGACY (un-bound) transfer is excluded by the producer...
+        let legacy = usa_transfer("ecb.reserve.sov", 10, 0);
+        let empty = chain.produce_block(vec![legacy.clone()], ts).unwrap();
+        assert!(
+            empty.transactions.is_empty(),
+            "producer must exclude a legacy-signed tx once tx-domain is active"
+        );
+        // ...and a block that smuggles it in is REJECTED on import (consensus gate).
+        let smuggled = Block::assemble(
+            empty.header.height,
+            empty.header.prev_hash,
+            empty.header.state_root,
+            empty.header.receipts_root,
+            empty.header.timestamp_ms,
+            empty.header.proposer.clone(),
+            vec![legacy.clone()],
+        );
+        assert!(
+            chain.import_block(smuggled).is_err(),
+            "a cross-network / legacy signature must fail import once bound"
+        );
+
+        // A transfer signed under a DIFFERENT network's domain (cross-network replay)
+        // is likewise excluded — same key, same tx, wrong binding.
+        let foreign = SigningDomain::new("sov-otherchain", Hash::digest(b"foreign-genesis"));
+        let replayed = usa_transfer_in("ecb.reserve.sov", 10, 0, Some(&foreign));
+        let empty2 = chain.produce_block(vec![replayed], ts).unwrap();
+        assert!(
+            empty2.transactions.is_empty(),
+            "a signature bound to another chain must not be accepted here"
+        );
+
+        // The correctly-bound transfer (this chain's domain) IS included and imports.
+        let bound = usa_transfer_in("ecb.reserve.sov", 10, 0, Some(&domain));
+        let block = chain.produce_block(vec![bound], ts).unwrap();
+        assert_eq!(
+            block.transactions.len(),
+            1,
+            "a transaction bound to this chain is accepted post-activation"
+        );
+        chain.import_block(block).unwrap();
     }
 
     /// A chain like [`fresh_chain`] but with transaction fees switched on.

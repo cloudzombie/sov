@@ -40,11 +40,24 @@ impl Node {
     /// Create a node over `chain`, with a mempool of `mempool_capacity` and at
     /// most `max_block_txs` transactions per block.
     pub fn new(chain: Blockchain, mempool_capacity: usize, max_block_txs: usize) -> Self {
-        Node {
+        let mut node = Node {
             chain,
             mempool: Mempool::new(mempool_capacity),
             max_block_txs,
-        }
+        };
+        node.refresh_mempool_domain();
+        node
+    }
+
+    /// Refresh the mempool's signing domain to the one resolved at the next height,
+    /// so admission verifies signatures exactly as block execution will. `None`
+    /// while the miner-signaled `tx-domain` fork is dormant (byte-identical to
+    /// pre-fork admission); `Some(domain)` once it activates, at which point a
+    /// legacy or cross-network signature is refused at the door. Called after every
+    /// tip change so the pool tracks activation.
+    fn refresh_mempool_domain(&mut self) {
+        let domain = self.chain.resolved_tx_domain(self.chain.height() + 1);
+        self.mempool.set_domain(domain);
     }
 
     /// Name the account this node's mined blocks credit the coinbase to — the
@@ -223,6 +236,7 @@ impl Node {
             self.mempool
                 .prune(|a| ledger.account(a).nonce, |a| ledger.account(a).balance);
         }
+        self.refresh_mempool_domain();
         Ok(Produced { block, receipts })
     }
 
@@ -253,6 +267,9 @@ impl Node {
             .chain
             .import_block_tracked(block.clone())
             .map_err(NodeError::Chain)?;
+        // Tip advanced — refresh the pool's signing domain before re-admitting any
+        // reverted transactions, so admission checks them under the new tip's rules.
+        self.refresh_mempool_domain();
         // Drop transactions this block committed.
         for stx in &block.transactions {
             self.mempool.remove(&stx.id());

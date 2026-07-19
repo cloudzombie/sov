@@ -2260,7 +2260,14 @@ mod tests {
         let mut single_block_reqs = 0usize; // the legacy backtrack probe
         let mut batch_reqs = 0usize;
         let mut synced = false;
-        for _ in 0..3_000 {
+        // Generous ceiling (~60s): downloading ~80 blocks over the CPU-bound
+        // Noise+ML-KEM transport competes with parallel tests on a loaded macOS
+        // runner — the same contention the handshake loop above accounts for. The
+        // loop breaks the instant A is caught up, so the healthy path finishes in a
+        // fraction of a second; only a starved runner uses the headroom. Raising the
+        // ceiling changes no assertion (the request COUNTS are accumulated only
+        // until `synced` breaks, and the algorithm reaches the target well within).
+        for _ in 0..12_000 {
             state_a.request_missing(&tcp_a, &node_a);
             for (peer, msg) in tcp_b.drain() {
                 match &msg {

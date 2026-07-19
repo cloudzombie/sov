@@ -28,7 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use sov_primitives::{AccountId, Balance, Hash};
+use sov_primitives::{AccountId, Balance, Hash, SigningDomain};
 use sov_types::{Action, SignedTransaction};
 
 /// Reasons a transaction is not admitted to the pool.
@@ -141,6 +141,13 @@ pub struct Mempool {
     capacity: usize,
     /// Max transactions one sender may hold at once (anti-DoS fairness bound).
     max_per_sender: usize,
+    /// The active network signing domain once the miner-signaled `tx-domain` hard
+    /// fork has activated (`None` before activation, and until the node sets it via
+    /// [`set_domain`](Self::set_domain)). Admission verifies signatures under this
+    /// domain, so post-activation a legacy (un-bound) or cross-network-replayed
+    /// signature is refused at the door — matching what block execution enforces.
+    /// `None` is byte-identical to pre-fork admission.
+    domain: Option<SigningDomain>,
 }
 
 impl Mempool {
@@ -158,7 +165,17 @@ impl Mempool {
             inserted_at: HashMap::new(),
             capacity,
             max_per_sender: max_per_sender.max(1),
+            domain: None,
         }
+    }
+
+    /// Set the network signing domain used to verify admitted signatures. The node
+    /// refreshes this on every tip advance to the domain resolved at the next
+    /// height (`None` while the `tx-domain` fork is dormant). Once the fork is
+    /// active this is `Some`, and admission rejects legacy/cross-network signatures
+    /// exactly as block execution does.
+    pub fn set_domain(&mut self, domain: Option<SigningDomain>) {
+        self.domain = domain;
     }
 
     /// Number of pending transactions from `signer`.
@@ -225,7 +242,7 @@ impl Mempool {
         current_nonce: u64,
         balance: Balance,
     ) -> Result<(), MempoolError> {
-        if !stx.verify_signature() {
+        if !stx.verify_signature_in(self.domain.as_ref()) {
             return Err(MempoolError::InvalidSignature);
         }
         let nonce = stx.transaction.nonce;

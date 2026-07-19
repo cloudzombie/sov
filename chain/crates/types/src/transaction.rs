@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sov_compliance::CompliancePolicy;
 use sov_crypto::{Keypair, PublicKey, Signature};
 use sov_intents::{Intent, Settlement};
-use sov_primitives::{AccountId, Balance, Hash};
+use sov_primitives::{AccountId, Balance, Hash, SigningDomain};
 
 /// What a transaction does. Kept as a closed enum so every state transition is
 /// explicit; new capabilities (govern, bridge, assets) are added as variants in
@@ -418,14 +418,38 @@ pub struct Transaction {
     pub action: Action,
 }
 
+/// Domain tag for transaction signatures under the miner-signaled `tx-domain`
+/// hard fork: the framed signing preimage is
+/// `"sov:tx:v1" ‖ 0x00 ‖ chain_id ‖ 0x00 ‖ genesis(32) ‖ borsh(Transaction)`.
+/// Distinct from the intra-chain `sov:multisig:v1` / `sov:rotate:v1` tags and from
+/// [`sov_intents`]'s `sov:intent:v1`, so the four preimages can never collide.
+pub const TX_SIGNING_DOMAIN_TAG: &[u8] = b"sov:tx:v1";
+
 impl Transaction {
     /// The canonical signing/hashing payload: the deterministic Borsh encoding.
     pub fn signing_bytes(&self) -> Vec<u8> {
         borsh::to_vec(self).expect("Borsh serialization of a Transaction is infallible")
     }
 
+    /// The signing preimage under an optional network [`SigningDomain`].
+    ///
+    /// `None` reproduces [`signing_bytes`](Self::signing_bytes) **exactly** — the
+    /// pre-fork bytes — so pre-activation behavior (and the genesis hash and every
+    /// KAT vector) is byte-identical. `Some(domain)` binds the signature to that
+    /// network, closing cross-network replay. The transaction *id* is deliberately
+    /// unaffected — it stays the hash of the un-framed
+    /// [`signing_bytes`](Self::signing_bytes) — so ids remain stable across the
+    /// fork and only the *signature* gains the binding.
+    pub fn signing_bytes_in(&self, domain: Option<&SigningDomain>) -> Vec<u8> {
+        match domain {
+            None => self.signing_bytes(),
+            Some(d) => d.frame(TX_SIGNING_DOMAIN_TAG, &self.signing_bytes()),
+        }
+    }
+
     /// The transaction id: the Blake3 hash of [`Transaction::signing_bytes`].
-    /// Independent of the signature, so it is stable and non-malleable.
+    /// Independent of the signature (and of any signing domain), so it is stable
+    /// and non-malleable.
     pub fn id(&self) -> Hash {
         Hash::digest(&self.signing_bytes())
     }
@@ -447,10 +471,24 @@ impl SignedTransaction {
     /// transaction — refusing to produce a transaction that names one key but is
     /// signed by another.
     pub fn sign(transaction: Transaction, keypair: &Keypair) -> Result<Self, TxError> {
+        Self::sign_in(transaction, keypair, None)
+    }
+
+    /// Sign `transaction` under an optional network [`SigningDomain`].
+    ///
+    /// `None` is the legacy signature (byte-identical to [`sign`](Self::sign));
+    /// `Some(domain)` produces a signature bound to that network — required once
+    /// the `tx-domain` fork is active. Errors on the same key mismatch as
+    /// [`sign`](Self::sign).
+    pub fn sign_in(
+        transaction: Transaction,
+        keypair: &Keypair,
+        domain: Option<&SigningDomain>,
+    ) -> Result<Self, TxError> {
         if keypair.public_key() != transaction.public_key {
             return Err(TxError::KeyMismatch);
         }
-        let signature = keypair.sign(&transaction.signing_bytes());
+        let signature = keypair.sign(&transaction.signing_bytes_in(domain));
         Ok(Self {
             transaction,
             signature,
@@ -473,12 +511,24 @@ impl SignedTransaction {
     }
 
     /// Whether the signature verifies against the transaction's committed
-    /// public key over its canonical signing bytes.
+    /// public key over its canonical (legacy, un-bound) signing bytes.
     #[must_use]
     pub fn verify_signature(&self) -> bool {
+        self.verify_signature_in(None)
+    }
+
+    /// Whether the signature verifies under an optional network [`SigningDomain`].
+    ///
+    /// `None` verifies the legacy preimage — byte-identical to
+    /// [`verify_signature`](Self::verify_signature). `Some(domain)` requires the
+    /// signature to bind to that network: a legacy (un-bound) signature, or one
+    /// bound to a *different* network, is rejected — which is precisely what
+    /// closes cross-network replay once the `tx-domain` fork is active.
+    #[must_use]
+    pub fn verify_signature_in(&self, domain: Option<&SigningDomain>) -> bool {
         self.transaction
             .public_key
-            .verify(&self.transaction.signing_bytes(), &self.signature)
+            .verify(&self.transaction.signing_bytes_in(domain), &self.signature)
     }
 }
 
@@ -523,6 +573,110 @@ mod tests {
             SignedTransaction::sign(tx, &attacker),
             Err(TxError::KeyMismatch)
         );
+    }
+
+    #[test]
+    fn legacy_and_domain_none_are_byte_identical() {
+        // The dormant invariant: the pre-fork path (`verify_signature`) and the
+        // explicit `None` domain compute the SAME preimage and verdict, so a chain
+        // that never activates the fork is byte-identical to before it existed.
+        let (tx, kp) = transfer_tx([9u8; 32], 3);
+        assert_eq!(tx.signing_bytes(), tx.signing_bytes_in(None));
+        let signed = SignedTransaction::sign(tx, &kp).unwrap();
+        assert!(signed.verify_signature());
+        assert!(signed.verify_signature_in(None));
+    }
+
+    #[test]
+    fn domain_bound_signature_rejects_legacy_and_cross_network() {
+        let mainnet = SigningDomain::new("sov-mainnet", Hash::digest(b"genesis-main"));
+        let testnet = SigningDomain::new("sov-testnet", Hash::digest(b"genesis-test"));
+        let (tx, kp) = transfer_tx([7u8; 32], 0);
+
+        // Signed FOR mainnet.
+        let signed = SignedTransaction::sign_in(tx, &kp, Some(&mainnet)).unwrap();
+        // Verifies only under mainnet's domain.
+        assert!(signed.verify_signature_in(Some(&mainnet)));
+        // A post-activation node on ANOTHER network rejects it (cross-network replay).
+        assert!(!signed.verify_signature_in(Some(&testnet)));
+        // A post-activation node rejects it as a *legacy* (un-bound) signature too,
+        // and a legacy verifier rejects the bound signature — the fork is a clean
+        // break in both directions.
+        assert!(!signed.verify_signature_in(None));
+        assert!(!signed.verify_signature());
+    }
+
+    #[test]
+    fn domain_framing_is_byte_exact() {
+        // Byte-for-byte: the bound preimage is EXACTLY
+        // tag ‖ 0x00 ‖ chain_id ‖ 0x00 ‖ genesis(32) ‖ legacy-signing-bytes.
+        let (tx, _) = transfer_tx([2u8; 32], 4);
+        let genesis = Hash::digest(b"genesis");
+        let domain = SigningDomain::new("sov-mainnet", genesis);
+        let got = tx.signing_bytes_in(Some(&domain));
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(TX_SIGNING_DOMAIN_TAG);
+        expected.push(0x00);
+        expected.extend_from_slice(b"sov-mainnet");
+        expected.push(0x00);
+        expected.extend_from_slice(genesis.as_bytes());
+        expected.extend_from_slice(&tx.signing_bytes());
+        assert_eq!(got, expected);
+        // The legacy bytes are a suffix — the framing is a pure prefix, so the tx
+        // id (hash of the legacy bytes) is unaffected by the domain.
+        assert!(got.ends_with(&tx.signing_bytes()));
+    }
+
+    #[test]
+    fn signing_is_deterministic() {
+        // Pure functions: identical inputs → identical bytes and (per RFC 8032,
+        // Ed25519 is deterministic) identical signatures, every call.
+        let (tx, kp) = transfer_tx([6u8; 32], 2);
+        let domain = SigningDomain::new("sov-mainnet", Hash::digest(b"g"));
+        assert_eq!(
+            tx.signing_bytes_in(Some(&domain)),
+            tx.signing_bytes_in(Some(&domain))
+        );
+        let a = SignedTransaction::sign_in(tx.clone(), &kp, Some(&domain)).unwrap();
+        let b = SignedTransaction::sign_in(tx, &kp, Some(&domain)).unwrap();
+        assert_eq!(a.signature, b.signature, "signing is deterministic");
+    }
+
+    #[test]
+    fn concurrent_verification_is_race_free() {
+        // verify_signature_in takes &self and mutates nothing, so it is safe to
+        // fan out across threads: a shared signed tx verified concurrently under
+        // the same domain yields the same verdict every time, with no data race.
+        use std::sync::Arc;
+        let (tx, kp) = transfer_tx([8u8; 32], 0);
+        let domain = Arc::new(SigningDomain::new("sov-mainnet", Hash::digest(b"g")));
+        let signed = Arc::new(SignedTransaction::sign_in(tx, &kp, Some(&domain)).unwrap());
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let (s, d) = (Arc::clone(&signed), Arc::clone(&domain));
+            handles.push(std::thread::spawn(move || {
+                // `&*d` derefs Arc<SigningDomain> -> &SigningDomain unambiguously.
+                s.verify_signature_in(Some(&*d)) && !s.verify_signature_in(None)
+            }));
+        }
+        for h in handles {
+            assert!(
+                h.join().unwrap(),
+                "concurrent verification must be consistent"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_signature_is_rejected_once_domain_is_active() {
+        // A signature captured pre-activation must NOT slip through a post-activation
+        // verifier: no silent fallback to the legacy preimage.
+        let (tx, kp) = transfer_tx([5u8; 32], 1);
+        let legacy = SignedTransaction::sign(tx, &kp).unwrap();
+        let domain = SigningDomain::new("sov-mainnet", Hash::digest(b"g"));
+        assert!(legacy.verify_signature()); // still valid pre-activation
+        assert!(!legacy.verify_signature_in(Some(&domain))); // rejected post-activation
     }
 
     #[test]

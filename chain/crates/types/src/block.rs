@@ -14,7 +14,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use sov_crypto::merkle_root;
-use sov_primitives::{AccountId, BlockHeight, Hash};
+use sov_primitives::{AccountId, BlockHeight, Hash, SigningDomain};
 
 use crate::transaction::SignedTransaction;
 
@@ -156,12 +156,22 @@ impl Block {
         self.header.tx_root == compute_tx_root(&self.transactions)
     }
 
-    /// Validity check: every transaction's signature verifies.
+    /// Validity check: every transaction's signature verifies (legacy, un-bound).
     #[must_use]
     pub fn all_signatures_valid(&self) -> bool {
+        self.all_signatures_valid_in(None)
+    }
+
+    /// Validity check under an optional network [`SigningDomain`]: every
+    /// transaction's signature verifies against `domain`. `None` is byte-identical
+    /// to [`all_signatures_valid`](Self::all_signatures_valid); `Some(domain)` is
+    /// what a post-`tx-domain`-activation importer uses so a block carrying a
+    /// cross-network-replayed (or legacy un-bound) signature fails validation.
+    #[must_use]
+    pub fn all_signatures_valid_in(&self, domain: Option<&SigningDomain>) -> bool {
         self.transactions
             .iter()
-            .all(SignedTransaction::verify_signature)
+            .all(|s| s.verify_signature_in(domain))
     }
 }
 

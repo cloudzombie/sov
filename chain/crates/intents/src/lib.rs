@@ -24,7 +24,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use sov_crypto::{Keypair, Signature};
-use sov_primitives::AccountId;
+use sov_primitives::{AccountId, SigningDomain};
 
 /// An asset an intent can give or want: native SOV or an on-chain native asset
 /// (token).
@@ -93,10 +93,27 @@ pub struct Intent {
     pub expiry_height: u64,
 }
 
+/// Domain tag for intent signatures under the miner-signaled `tx-domain` hard
+/// fork: `"sov:intent:v1" ‖ 0x00 ‖ chain_id ‖ 0x00 ‖ genesis(32) ‖ borsh(Intent)`.
+/// Distinct from the transaction tag `sov:tx:v1`, so a signature over one can
+/// never be reinterpreted as the other.
+pub const INTENT_SIGNING_DOMAIN_TAG: &[u8] = b"sov:intent:v1";
+
 impl Intent {
     /// Canonical signing bytes: the deterministic Borsh encoding.
     pub fn signing_bytes(&self) -> Vec<u8> {
         borsh::to_vec(self).expect("Borsh serialization of an Intent is infallible")
+    }
+
+    /// The signing preimage under an optional network [`SigningDomain`]. `None`
+    /// reproduces [`signing_bytes`](Self::signing_bytes) exactly (pre-fork,
+    /// byte-identical); `Some(domain)` binds the signature to that network,
+    /// closing cross-network intent replay. The intent *id* is unaffected.
+    pub fn signing_bytes_in(&self, domain: Option<&SigningDomain>) -> Vec<u8> {
+        match domain {
+            None => self.signing_bytes(),
+            Some(d) => d.frame(INTENT_SIGNING_DOMAIN_TAG, &self.signing_bytes()),
+        }
     }
 
     /// The intent's id: the Blake3 hash of its canonical signing bytes —
@@ -108,10 +125,20 @@ impl Intent {
 
     /// Sign this intent with `keypair` (whose public key must match `public_key`).
     pub fn sign(self, keypair: &Keypair) -> Result<SignedIntent, IntentError> {
+        self.sign_in(keypair, None)
+    }
+
+    /// Sign this intent under an optional network [`SigningDomain`] (`None` =
+    /// legacy, byte-identical to [`sign`](Self::sign)).
+    pub fn sign_in(
+        self,
+        keypair: &Keypair,
+        domain: Option<&SigningDomain>,
+    ) -> Result<SignedIntent, IntentError> {
         if keypair.public_key() != self.public_key {
             return Err(IntentError::KeyMismatch);
         }
-        let signature = keypair.sign(&self.signing_bytes());
+        let signature = keypair.sign(&self.signing_bytes_in(domain));
         Ok(SignedIntent {
             intent: self,
             signature,
@@ -129,12 +156,22 @@ pub struct SignedIntent {
 }
 
 impl SignedIntent {
-    /// Whether the signature verifies against the intent's committed key.
+    /// Whether the signature verifies against the intent's committed key
+    /// (legacy, un-bound preimage).
     #[must_use]
     pub fn verify(&self) -> bool {
+        self.verify_in(None)
+    }
+
+    /// Whether the signature verifies under an optional network [`SigningDomain`].
+    /// `None` is byte-identical to [`verify`](Self::verify); `Some(domain)`
+    /// requires the signature to bind to that network, rejecting a legacy or
+    /// cross-network-replayed intent once the `tx-domain` fork is active.
+    #[must_use]
+    pub fn verify_in(&self, domain: Option<&SigningDomain>) -> bool {
         self.intent
             .public_key
-            .verify(&self.intent.signing_bytes(), &self.signature)
+            .verify(&self.intent.signing_bytes_in(domain), &self.signature)
     }
 }
 
@@ -309,6 +346,41 @@ mod tests {
         }
         .sign(&kp)
         .unwrap()
+    }
+
+    #[test]
+    fn intent_domain_binding_closes_cross_network_replay() {
+        use sov_primitives::{Hash, SigningDomain};
+        // Legacy (dormant) path is byte-identical, and the id is domain-independent.
+        let kp = Keypair::from_seed([1; 32]);
+        let intent = Intent {
+            owner: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce: 0,
+            give_asset: Asset::Sov,
+            give_amount: 1_000,
+            want_asset: token(),
+            min_receive: 5,
+            expiry_height: 100,
+        };
+        assert_eq!(intent.signing_bytes(), intent.signing_bytes_in(None));
+
+        // Bind to one network; a signature made for it verifies ONLY under it.
+        let mainnet = SigningDomain::new("sov-mainnet", Hash::digest(b"genesis-main"));
+        let testnet = SigningDomain::new("sov-testnet", Hash::digest(b"genesis-test"));
+        let signed = intent.clone().sign_in(&kp, Some(&mainnet)).unwrap();
+        assert!(signed.verify_in(Some(&mainnet)));
+        // Cross-network replay, a legacy verifier, and a legacy signature are all rejected.
+        assert!(!signed.verify_in(Some(&testnet)));
+        assert!(!signed.verify_in(None));
+        let legacy = intent.sign(&kp).unwrap();
+        assert!(legacy.verify()); // valid while dormant
+        assert!(!legacy.verify_in(Some(&mainnet))); // rejected once active — no fallback
+                                                    // The bound preimage never collides with the transaction domain (distinct tags).
+        assert!(signed
+            .intent
+            .signing_bytes_in(Some(&mainnet))
+            .starts_with(INTENT_SIGNING_DOMAIN_TAG));
     }
 
     #[test]
