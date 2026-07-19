@@ -23,9 +23,10 @@ chain. Nothing is armed.
 ### 1. tx-domain hard fork — cross-network ("ghost chain") replay
 **State:** v0.1.93 shipped DORMANT (commit `25b3b5d`, tag `v0.1.93`). Full machinery present +
 tested; `tx_domain_deployment` defaults `None` → byte-identical, inactive.
-**NEXT ACTION:** **Phase-2 client signing** (v0.1.94, additive/dormant) — make every signer
-domain-aware via an RPC that reports the chain's resolved signing domain. See
-[activation-tx-domain.md](activation-tx-domain.md).
+**NEXT ACTION:** **Phase-2 client signing** (v0.1.94, additive/dormant). Foundation DONE: the
+read-only `sov_getSigningDomain` RPC (returns `active:false`/null while dormant) — landed +
+tested. **Remaining: the 5 client signers query it and call `sign_in(domain)`** — TS SDK, Rust
+wallet, SOV Station, conformance, tx-cannon. See [activation-tx-domain.md](activation-tx-domain.md).
 **Then (NOT yet, in order):** grace-window gate refinement → confirm all nodes/clients on v0.1.94
 → Fable audit of `25b3b5d` → schedule activation on a GENEROUS horizon (NOT ~250 blocks / 10h) →
 miners signal / flag day.

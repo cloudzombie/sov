@@ -94,6 +94,24 @@ fn rejects_oversized_request_body() {
 }
 
 #[test]
+fn get_signing_domain_reports_dormant_by_default() {
+    // With no tx-domain deployment scheduled (the live-chain state), the RPC reports
+    // the fork inactive and a null domain, so clients sign the legacy (un-bound) way
+    // — byte-identical to pre-fork. This is the signal Phase-2 signers read.
+    let node = Arc::new(Mutex::new(node()));
+    let handle = RpcServer::new(Arc::clone(&node))
+        .start("127.0.0.1:0", 2)
+        .expect("server binds");
+    let addr = handle.local_addr();
+    let res = rpc(addr, "sov_getSigningDomain", json!({}));
+    let r = &res["result"];
+    assert_eq!(r["active"], false);
+    assert_eq!(r["chainId"], Value::Null);
+    assert_eq!(r["genesis"], Value::Null);
+    assert_eq!(r["height"], 1); // resolved at next height (genesis tip 0 + 1)
+}
+
+#[test]
 fn rpc_server_serves_real_chain_state_and_accepts_transactions() {
     let node = Arc::new(Mutex::new(node()));
     let handle = RpcServer::new(Arc::clone(&node))

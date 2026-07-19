@@ -20,10 +20,12 @@ un-upgraded node **rejects** a correctly-bound tx (so it forks off). Therefore:
 
 ## The safe activation order (do NOT reorder)
 1. **Phase-2 client signing** (v0.1.94, additive/DORMANT) — every signer becomes domain-aware.
-   Design: add a read-only RPC (e.g. `sov_getSigningDomain`) that returns the node's resolved
-   signing domain (`chain_id` + genesis, or null) for the next height. Each client queries it and
-   calls `sign_in(Some(domain))` when non-null, else `sign()`. While dormant the RPC returns null →
-   clients sign legacy → byte-identical behavior. Clients to update:
+   Design: a read-only RPC `sov_getSigningDomain` returns the node's resolved signing domain
+   (`chainId` + genesis, or null) for the next height. Each client queries it and calls
+   `sign_in(Some(domain))` when non-null, else `sign()`. While dormant the RPC returns
+   `active:false`/null → clients sign legacy → byte-identical behavior.
+   - [x] **`sov_getSigningDomain` RPC** — landed + tested (`get_signing_domain_reports_dormant_by_default`)
+   Clients to update:
    - [ ] TS SDK (`sdk/`) — the KAT second client
    - [ ] Rust wallet (`chain/crates/wallet`)
    - [ ] SOV Station (`node/`)

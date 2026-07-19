@@ -1101,6 +1101,32 @@ fn call(
                 "deployments": deployments,
             }))
         }
+        "sov_getSigningDomain" => {
+            // The network signing domain a client should bind a NEW transaction or
+            // intent signature to, resolved at the next height (the earliest a
+            // just-submitted tx could be mined). While the miner-signaled
+            // `tx-domain` hard fork is dormant this is `active:false` / null, and
+            // clients sign the legacy (un-bound) way — byte-identical to pre-fork.
+            // Once the fork is active it returns this chain's {chainId, genesis},
+            // and clients must `sign_in(domain)` or their transactions are rejected.
+            let next_height = node.chain().height() + 1;
+            match node.chain().resolved_tx_domain(next_height) {
+                Some(domain) => Ok(json!({
+                    "active": true,
+                    "height": next_height,
+                    "chainId": domain.chain_id(),
+                    "genesis": domain.genesis().to_hex(),
+                    "txTag": "sov:tx:v1",
+                    "intentTag": "sov:intent:v1",
+                })),
+                None => Ok(json!({
+                    "active": false,
+                    "height": next_height,
+                    "chainId": Value::Null,
+                    "genesis": Value::Null,
+                })),
+            }
+        }
         "sov_submitTransaction" => {
             let stx: SignedTransaction = serde_json::from_value(params.clone())
                 .map_err(|e| RpcError::invalid_params(format!("invalid SignedTransaction: {e}")))?;
