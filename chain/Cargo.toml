@@ -44,3 +44,9 @@ thiserror = "2"
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# Test/CI builds don't need full debuginfo. Line tables keep backtraces readable
+# (file:line on a panic) while cutting compile time and target/cache size. The
+# release profile above — the shipped binary — is unchanged.
+[profile.test]
+debug = "line-tables-only"

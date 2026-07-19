@@ -51,8 +51,13 @@ jobs:
         uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: chain
-      - name: Build all binaries
-        run: cargo build --workspace --release
+      # Debug build, not --release: the release profile is codegen-units=1 + thin-LTO
+      # (slowest-possible compile) and the tests below run in debug anyway, so a
+      # per-commit release build was ~10 min/OS of pure overhead. The optimized
+      # release binaries are still fully built + verified on every tag by the
+      # release workflow (release-gate --strict + reproducible build).
+      - name: Build all binaries (debug)
+        run: cargo build --workspace
       - name: Tests
         run: cargo test --workspace
 
@@ -148,6 +153,12 @@ jobs:
         with:
           manifest-path: chain/Cargo.toml
           command: check advisories bans
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit standalone Stratum bridge
+        working-directory: tools/sov-stratum
+        run: cargo audit --deny warnings
 
   # The coverage-guided fuzz targets must compile (fuzzing itself runs out-of-band
   # on nightly; this gates that the targets don't bit-rot).
@@ -283,12 +294,13 @@ jobs:
       - name: Tests (vitest)
         run: npm test
 
-  # Standalone operator tools (tools/conformance, tools/tx-cannon) are intentionally
+  # Standalone operator tools (tools/conformance, tools/tx-cannon, tools/sov-stratum) are intentionally
   # NOT chain-workspace members but depend on the real chain crates by path — so a
-  # chain API change can silently break them. Compile both here so they can't bit-rot;
-  # run tx-cannon's unit tests (the signed-tx Borsh round-trip).
+  # chain API change can silently break them. Compile them here so they can't bit-rot;
+  # fully gate the Stratum bridge because it accepts untrusted miner input and is the
+  # first practical path to external hashpower.
   tools:
-    name: tools (conformance · tx-cannon build)
+    name: tools (conformance · tx-cannon · sov-stratum)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -298,6 +310,7 @@ jobs:
           workspaces: |
             tools/conformance
             tools/tx-cannon
+            tools/sov-stratum
       # tx-cannon links eframe/egui; install the standard egui Linux build deps so the
       # native GUI binary links on the headless runner.
       - name: Install egui build deps
@@ -311,6 +324,12 @@ jobs:
         run: cargo build --manifest-path tools/tx-cannon/Cargo.toml
       - name: Test tx-cannon
         run: cargo test --manifest-path tools/tx-cannon/Cargo.toml
+      - name: Format sov-stratum
+        run: cargo fmt --manifest-path tools/sov-stratum/Cargo.toml --all -- --check
+      - name: Clippy sov-stratum (deny warnings)
+        run: cargo clippy --manifest-path tools/sov-stratum/Cargo.toml --all-targets -- -D warnings
+      - name: Test sov-stratum
+        run: cargo test --manifest-path tools/sov-stratum/Cargo.toml
 
   # The Windows validator package ships PowerShell operator scripts
   # (windows/scripts/*.ps1). Lint them with PSScriptAnalyzer using the pwsh that ships
