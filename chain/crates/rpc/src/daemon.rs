@@ -830,6 +830,20 @@ const MAINNET_CHECKPOINTS: &[(u64, &str)] = &[
         6800,
         "e91b89c6a1764a686dacf4028ab5487d6cac9e69b62210c56ebd85d2939bdd89",
     ),
+    // Pinned 2026-07-19 at tip 8494 (this block is ~194 deep — far past finality).
+    // The canonical hash was independently confirmed IDENTICAL on all three live
+    // relays (SFO/Frankfurt/Singapore) before pinning. The 6800 anchor had gone
+    // STALE as the chain grew to ~8500: a fresh node fast-synced only to 6800, then
+    // had to re-run RandomX for ~1,700 blocks above it — CPU-bound work that starves
+    // the P2P thread, so peers time out and drop (the "syncs to ~7168 then loops on 0
+    // connections" field failure on macOS/Windows). Moving the anchor to 8300 cuts
+    // that to ~200 blocks, so a fresh node reaches the tip without the validation
+    // backlog choking networking. Weak-subjectivity anchor, genesis-safe, additive —
+    // a chain reaching 8300 with a different hash is still rejected by the hash-pin.
+    (
+        8300,
+        "98a4763ac0379f31aa1bfa861544979024d6bf3690ba92a88fff98346af40a4a",
+    ),
 ];
 
 /// The baked checkpoints for a chain, parsed to `(height, Hash)`. Empty for any non-
@@ -2523,7 +2537,7 @@ mod tests {
         .unwrap()
         .with_sync_status(Arc::clone(&sync));
         // Fast cadence so the test is quick; the node mines empty blocks each interval.
-        let handle = daemon.run("127.0.0.1:0", 1, 20, true, 100).unwrap();
+        let handle = daemon.run("127.0.0.1:0", 1, 20, true, 25).unwrap();
 
         // Across many intervals while "behind", the chain must NOT advance past genesis.
         thread::sleep(Duration::from_millis(300));
@@ -2573,7 +2587,7 @@ mod tests {
             )],
         )
         .unwrap();
-        let handle = daemon.run("127.0.0.1:0", 1, 20, true, 100).unwrap();
+        let handle = daemon.run("127.0.0.1:0", 1, 20, true, 25).unwrap();
         let mut mined = false;
         for _ in 0..200 {
             if handle.node().lock().unwrap().chain().height() > 0 {

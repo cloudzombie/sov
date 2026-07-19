@@ -2260,14 +2260,16 @@ mod tests {
         let mut single_block_reqs = 0usize; // the legacy backtrack probe
         let mut batch_reqs = 0usize;
         let mut synced = false;
-        // Generous ceiling (~60s): downloading ~80 blocks over the CPU-bound
+        // Generous ceiling (~120s): downloading ~80 blocks over the CPU-bound
         // Noise+ML-KEM transport competes with parallel tests on a loaded macOS
-        // runner — the same contention the handshake loop above accounts for. The
-        // loop breaks the instant A is caught up, so the healthy path finishes in a
-        // fraction of a second; only a starved runner uses the headroom. Raising the
-        // ceiling changes no assertion (the request COUNTS are accumulated only
-        // until `synced` breaks, and the algorithm reaches the target well within).
-        for _ in 0..12_000 {
+        // runner. The other mining unit tests in THIS same test binary
+        // (`daemon::tests`) grind at a modest duty (25%) precisely so they don't peg
+        // the runner and starve this sync — but on a heavily-loaded runner give it
+        // extra headroom regardless. The loop breaks the instant A is caught up, so
+        // the healthy path finishes in a fraction of a second; only a starved runner
+        // uses the headroom. Raising the ceiling changes no assertion (the request
+        // COUNTS accumulate only until `synced` breaks, reached well within).
+        for _ in 0..24_000 {
             state_a.request_missing(&tcp_a, &node_a);
             for (peer, msg) in tcp_b.drain() {
                 match &msg {
