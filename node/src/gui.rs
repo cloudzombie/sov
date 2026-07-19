@@ -9101,6 +9101,7 @@ fn setup_node_dir(node_dir: &Path, spec_filename: &str) -> Result<(), String> {
         // thing that starved sync on slow machines). Mining is an explicit opt-in from
         // the Mining tab, flipped live via `DaemonHandle::set_mining` — no restart.
         mine: false,
+        mining_duty_pct: None, // adaptive: ~90% on this multi-core desktop, ~50% single-core
         p2p_addr: Some("0.0.0.0:9645".to_string()),
         bootstrap_peers: Vec::new(),
         checkpoints: Vec::new(),
@@ -9716,6 +9717,7 @@ fn build_and_run_node(
             config.rpc_workers,
             config.block_time_ms,
             config.mine,
+            config.resolved_mining_duty(),
         )
         .map_err(|e| format!("run: {e}"))?;
     push_log(

@@ -420,6 +420,7 @@ fn cmd_gen(flags: &Flags) -> Result<(), Box<dyn Error>> {
             mempool_capacity: 16_384,
             max_block_txs: 4_096,
             mine: true,
+            mining_duty_pct: None,
             p2p_addr: Some(node_entries[idx].p2p_addr.clone()),
             // Node 1 is the seed (no bootstrap); the rest dial it on loopback. On a
             // real LAN, edit the peer's bootstrap to the seed machine's IP:port.
@@ -540,6 +541,7 @@ fn cmd_join(flags: &Flags) -> Result<(), Box<dyn Error>> {
         mempool_capacity: 16_384,
         max_block_txs: 4_096,
         mine: true,
+        mining_duty_pct: None,
         p2p_addr: Some(p2p_addr.clone()),
         bootstrap_peers,
         checkpoints: Vec::new(),

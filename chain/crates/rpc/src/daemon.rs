@@ -308,6 +308,19 @@ pub struct NodeConfig {
     /// blocks itself — so the actual miner clients are the ones that find blocks.
     #[serde(default = "default_true")]
     pub mine: bool,
+    /// Mining CPU duty cycle, as a percentage in `10..=100`. The miner grinds a
+    /// time slice on ONE core, then yields the CPU for `(100 - duty)/duty` of that
+    /// slice so the P2P/RPC threads always get scheduled. Higher = more hashrate,
+    /// less networking headroom; `100` pegs the mining core (no yield).
+    ///
+    /// Unset (recommended) resolves adaptively: on a multi-core host the single
+    /// mining thread runs at ~90% because networking has the OTHER cores, so a
+    /// 2-vCPU box mines hard on one core and stays responsive on the other; on a
+    /// single-core host it stays at ~50% so mining never starves peer connections.
+    /// (The default was a flat ~50% before, which under-used multi-core miners —
+    /// the effective network hashrate was ~half of what the hardware could do.)
+    #[serde(default)]
+    pub mining_duty_pct: Option<u8>,
     /// Address to bind the P2P gossip transport (e.g. `0.0.0.0:9645`). If unset,
     /// the node runs standalone — it produces blocks and serves RPC, but does not
     /// peer with anyone.
@@ -972,6 +985,37 @@ const GRIND_MICRO_BATCH: u64 = 64;
 /// so block time is unaffected; rewards still split by each miner's *relative* hashpower.
 const GRIND_SLICE: Duration = Duration::from_millis(15);
 
+/// Resolve the effective mining duty-cycle percent (clamped to `10..=100`) from a
+/// config override, or adaptively when it is unset. Adaptive picks a HIGH duty on a
+/// multi-core host — the single mining thread runs at ~90% while networking uses the
+/// OTHER cores — and a conservative ~50% on a single-core host so mining never
+/// starves peer connections. This is why a 2-vCPU miner now mines hard on one core
+/// yet stays responsive, instead of the old flat 50% that halved its hashrate.
+pub fn resolve_mining_duty(configured: Option<u8>) -> u8 {
+    match configured {
+        Some(d) => d.clamp(10, 100),
+        None => {
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            if cores >= 2 {
+                90
+            } else {
+                50
+            }
+        }
+    }
+}
+
+impl NodeConfig {
+    /// The effective mining duty-cycle percent for this config: the
+    /// `mining_duty_pct` override, or the adaptive default. See
+    /// [`resolve_mining_duty`].
+    pub fn resolved_mining_duty(&self) -> u8 {
+        resolve_mining_duty(self.mining_duty_pct)
+    }
+}
+
 /// How often the miner logs a "still searching" heartbeat while grinding a block, so the
 /// Node log shows live activity between blocks (which are ~`target_block_ms` apart)
 /// instead of going silent and looking hung.
@@ -1431,7 +1475,10 @@ impl Daemon {
         workers: usize,
         block_time_ms: u64,
         mine: bool,
+        mining_duty: u8,
     ) -> Result<DaemonHandle, DaemonError> {
+        // The mining thread grinds at this duty on ONE core (clamped for safety).
+        let mining_duty = mining_duty.clamp(10, 100);
         // Only a MINING node produces a coinbase — gate the C001 binding check on it so
         // a relay (mine=false) with a named account still starts normally. The check was
         // computed at construction, when the miner keys + chain were in hand.
@@ -1695,9 +1742,21 @@ impl Daemon {
                             break 'grind;
                         }
                     }
-                    // YIELD: sleep ~the slice's own grind time (≈50% duty), capped, so the
-                    // miner never starves the rest of the node. THE peer-drop fix.
-                    thread::sleep(slice_start.elapsed().min(Duration::from_millis(250)));
+                    // YIELD: sleep `(100 - duty)/duty` of the slice's own grind time, so the
+                    // miner runs at ~`mining_duty`% on ONE core and the P2P/RPC threads (and,
+                    // on a multi-core box, the other cores) always get scheduled — THE
+                    // peer-drop fix, now tunable. `duty == 50` reproduces the old flat behavior
+                    // (sleep == grind); higher duty mines harder (a 2-vCPU miner defaults to
+                    // ~90%); `duty == 100` pegs the core with no yield. Capped so one long
+                    // slice can't balloon the sleep.
+                    if mining_duty < 100 {
+                        let grind_ms = slice_start.elapsed().as_millis() as u64;
+                        let yield_ms = grind_ms.saturating_mul((100 - mining_duty) as u64)
+                            / mining_duty as u64;
+                        thread::sleep(
+                            Duration::from_millis(yield_ms).min(Duration::from_millis(250)),
+                        );
+                    }
                     // Publish the measured hashrate ~1×/s (H/s = hashes / elapsed).
                     if rate_clock.elapsed() >= Duration::from_secs(1) {
                         let ms = rate_clock.elapsed().as_millis().max(1) as u64;
@@ -2401,7 +2460,7 @@ mod tests {
             )],
         )
         .unwrap();
-        let handle = daemon.run("127.0.0.1:0", 1, 20, false).unwrap();
+        let handle = daemon.run("127.0.0.1:0", 1, 20, false, 50).unwrap();
 
         let kp = Keypair::from_seed([9; 32]);
         let overspend = SignedTransaction::sign(
@@ -2464,7 +2523,7 @@ mod tests {
         .unwrap()
         .with_sync_status(Arc::clone(&sync));
         // Fast cadence so the test is quick; the node mines empty blocks each interval.
-        let handle = daemon.run("127.0.0.1:0", 1, 20, true).unwrap();
+        let handle = daemon.run("127.0.0.1:0", 1, 20, true, 100).unwrap();
 
         // Across many intervals while "behind", the chain must NOT advance past genesis.
         thread::sleep(Duration::from_millis(300));
@@ -2514,7 +2573,7 @@ mod tests {
             )],
         )
         .unwrap();
-        let handle = daemon.run("127.0.0.1:0", 1, 20, true).unwrap();
+        let handle = daemon.run("127.0.0.1:0", 1, 20, true, 100).unwrap();
         let mut mined = false;
         for _ in 0..200 {
             if handle.node().lock().unwrap().chain().height() > 0 {
@@ -2553,7 +2612,7 @@ mod tests {
         )
         .unwrap();
         // Start with mining OFF.
-        let handle = daemon.run("127.0.0.1:0", 1, 20, false).unwrap();
+        let handle = daemon.run("127.0.0.1:0", 1, 20, false, 50).unwrap();
         assert!(!handle.is_mining(), "starts in sync-only mode");
 
         // With mining off, a solo node must NOT extend the chain even given ample time.

@@ -233,6 +233,7 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
             config.rpc_workers,
             config.block_time_ms,
             config.mine,
+            config.resolved_mining_duty(),
         )?;
     log(
         &logs,
