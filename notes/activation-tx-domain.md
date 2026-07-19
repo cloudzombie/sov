@@ -1,5 +1,13 @@
 # Runbook — tx-domain hard fork (cross-network replay) activation
 
+> ★★★ FIRM TARGET (user directive 2026-07-19): **v0.1.95 IS THE ACTIVATION RELEASE — set the
+> activation height in v0.1.95. NO leaving it for later.** v0.1.95 must deliver the full, SAFE
+> activation: Phase-2 client signing → grace-window gate → a concrete activation height in the
+> mainnet config (GENEROUS horizon, days — not the vetoed ~10h rush) → whole fleet on v0.1.95 →
+> Fable audit → activate. The height cannot precede Phase-2 (else the flag day breaks all txs), so
+> v0.1.95 bundles them. Do the safe order below; just do it IN the v0.1.95 line, not "someday".
+
+
 _Closes "ghost chain" cross-network signature replay by binding each tx/intent signature to
 `{chain_id, genesis}`. Shipped DORMANT in v0.1.93 (`25b3b5d`). Reference:
 `.github/RELEASE-0.1.93.md`, memory `v0193-tx-domain-fork.md`._

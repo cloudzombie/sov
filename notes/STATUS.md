@@ -27,11 +27,19 @@ tested; `tx_domain_deployment` defaults `None` → byte-identical, inactive.
 read-only `sov_getSigningDomain` RPC (returns `active:false`/null while dormant) — landed +
 tested. **Remaining: the 5 client signers query it and call `sign_in(domain)`** — TS SDK, Rust
 wallet, SOV Station, conformance, tx-cannon. See [activation-tx-domain.md](activation-tx-domain.md).
-**Then (NOT yet, in order):** grace-window gate refinement → confirm all nodes/clients on v0.1.94
-→ Fable audit of `25b3b5d` → schedule activation on a GENEROUS horizon (NOT ~250 blocks / 10h) →
-miners signal / flag day.
-**Blocking dependency:** you cannot schedule activation until Phase-2 clients sign the new way and
-are deployed everywhere, or the flag day rejects every legacy-signed transaction.
+**★ FIRM TARGET — v0.1.95 = THE tx-domain ACTIVATION RELEASE. Do NOT defer / leave for later
+(user directive 2026-07-19).** v0.1.95 must SET the activation height and ship the whole safe
+activation, in this order (all IN the v0.1.95 line):
+  1. Phase-2 client signing complete (5 signers query `sov_getSigningDomain` → `sign_in`).
+  2. Grace-window gate refinement (accept legacy OR bound in `[H_a, H_a+G)` so there's no cliff).
+  3. Wire the concrete activation height into the mainnet config (a GENEROUS horizon — days, not
+     the vetoed ~10h/250-block rush; height = tip + wide margin, set at release time).
+  4. Fleet on v0.1.95 (every node + wallet + tool) confirmed BEFORE the height.
+  5. Fable audit of the activation change.
+**Blocking dependency (still true):** the height cannot go live until Phase-2 clients sign the new
+way and are deployed everywhere, or the flag day rejects every legacy-signed tx. So v0.1.95 bundles
+Phase-2 + grace-window + the height together — that's what "implement the activation height for
+0.1.95" means done safely.
 
 ### 2. Pool mining — stratum + `sov_getBlockTemplate`
 **State:** Phases 1–2 BUILT in v0.1.92 (`sov_getBlockTemplate`/`sov_submitBlock` RPC + TemplateCache;
