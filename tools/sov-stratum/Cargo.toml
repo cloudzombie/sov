@@ -7,7 +7,8 @@ publish = false
 description = "Monero-lineage RandomX Stratum bridge for SOV: distributes sov_getBlockTemplate work to RandomX miners, verifies every share with the real seal, and submits network-difficulty winners via sov_submitBlock."
 
 # Standalone tool — intentionally NOT a member of the chain workspace, so it never
-# affects `chain/` builds, tests, or CI. It depends on the real chain crates by path
+# affects `chain/` builds or consensus artifacts. The root release gate and CI tools
+# job explicitly run its fmt, clippy, and tests. It depends on the real chain crates by path
 # (the same JSON-RPC client SOV tools use and the same `pow_seal` the importer runs —
 # no reimplemented proof-of-work anywhere in this crate). It has no consensus surface:
 # it can only relay a nonce the node independently re-seals and fully re-validates.

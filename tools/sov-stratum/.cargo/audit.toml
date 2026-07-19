@@ -1,0 +1,18 @@
+# cargo-audit baseline for the standalone Stratum bridge.
+#
+# Policy: zero vulnerabilities and zero yanked crates. These narrowly scoped
+# informational waivers mirror the reviewed chain-workspace baseline because
+# sov-stratum depends on the same chain crates by path. Re-review them whenever
+# the upstream dependencies change; never replace them with a blanket waiver.
+
+[advisories]
+ignore = [
+  # atomic-polyfill 1.0.3 — unmaintained. It is reachable only through the
+  # feature-gated bare-metal heapless/postcard path and is not compiled into
+  # supported macOS, Windows, or Linux artifacts with native atomics.
+  "RUSTSEC-2023-0089",
+
+  # proc-macro-error2 2.0.1 — unmaintained. This is a build-time proc macro
+  # pulled through the upstream Orchard stack and ships in no runtime binary.
+  "RUSTSEC-2026-0173",
+]
