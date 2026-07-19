@@ -158,6 +158,19 @@ cargo clippy --manifest-path node/Cargo.toml --all-targets -- -D warnings || fai
 cargo test --manifest-path node/Cargo.toml || fail "node app: tests failed"
 ok "sov-station app builds, lints, and tests clean"
 
+# ── 6d. the external-mining bridge (tools/sov-stratum/) ─────────────────────
+# sov-stratum is a SEPARATE cargo workspace. It is the first practical path for
+# outside RandomX hashpower, so letting it bypass the gate would turn a
+# decentralization improvement into an unverified mining surface.
+banner "Stratum bridge (tools/sov-stratum/): fmt · clippy · tests"
+cargo fmt --manifest-path tools/sov-stratum/Cargo.toml --all -- --check \
+  || fail "sov-stratum: formatting drift"
+cargo clippy --manifest-path tools/sov-stratum/Cargo.toml --all-targets -- -D warnings \
+  || fail "sov-stratum: clippy issues"
+cargo test --manifest-path tools/sov-stratum/Cargo.toml \
+  || fail "sov-stratum: tests failed"
+ok "sov-stratum bridge builds, lints, and tests clean"
+
 # ── 7. wasm contracts (mirror CI's `contracts` job exactly) ──────────────────
 # Scoped to chain/contracts — the no_std guest crate — NOT the whole workspace.
 # A workspace-wide wasm build pulls in std-only deps (getrandom without `js`) that
@@ -201,8 +214,10 @@ banner "Dependency advisories (cargo-audit --deny warnings)"
 if ! command -v cargo-audit >/dev/null; then
   cargo install cargo-audit --locked >/dev/null 2>&1 || fail "could not install cargo-audit"
 fi
-( cd chain && cargo audit --deny warnings ) || fail "cargo-audit found advisories (see chain/.cargo/audit.toml)"
-ok "cargo-audit: clean under the reviewed waiver set"
+( cd chain && cargo audit --deny warnings ) || fail "chain cargo-audit found advisories (see chain/.cargo/audit.toml)"
+( cd tools/sov-stratum && cargo audit --deny warnings ) \
+  || fail "sov-stratum cargo-audit found advisories (see tools/sov-stratum/.cargo/audit.toml)"
+ok "cargo-audit: chain + sov-stratum clean under their reviewed waiver sets"
 
 # ── cleared ──────────────────────────────────────────────────────────────────
 echo
@@ -219,6 +234,12 @@ if [ -n "$CUT_TAG" ]; then
     v[0-9]*) : ;;
     *) fail "--cut tag must look like vX.Y.Z (got '$CUT_TAG')" ;;
   esac
+  # VERSION GUARD: the tag MUST equal node/Cargo.toml's version — that is what SOV
+  # Station displays (CARGO_PKG_VERSION). Cutting a tag while it is stale ships an app
+  # whose in-app version lies (the v0.1.93/0.1.91 mismatch). Refuse it here, and the
+  # release workflow's gate re-checks it so a bare `git tag` can't sneak past either.
+  CARGO_VER="$(grep -m1 '^version' node/Cargo.toml | cut -d'"' -f2)"
+  [ "$CUT_TAG" = "v$CARGO_VER" ] || fail "version mismatch: node/Cargo.toml is $CARGO_VER but --cut is $CUT_TAG. Bump node/Cargo.toml to ${CUT_TAG#v} (refresh node/Cargo.lock), commit, then re-cut."
   echo
   echo "${BOLD}Cutting release $CUT_TAG …${RST}"
   git tag -a "$CUT_TAG" -m "Release $CUT_TAG (release-gate: genesis frozen, all checks green)"

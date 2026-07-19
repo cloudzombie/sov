@@ -18,6 +18,16 @@ on:
 permissions:
   contents: write
 
+# VERSION CONSISTENCY: bake the release tag into the node daemon's reported version
+# (`SOV_VERSION`, used by the P2P agent string `sov/vX.Y.Z`, `sov_version`, and
+# `sov_getPeerInfo`). `chain/crates/rpc/build.rs` prefers this explicit override over
+# `git describe` (which the rust-cache can defeat, shipping a stale version — the exact
+# bug that made a v0.1.93 build advertise `sov/v0.1.89`). Combined with the gate's
+# `tag == node/Cargo.toml` guard (Station shows CARGO_PKG_VERSION), EVERY version the
+# software broadcasts — app, daemon, RPC, handshake — equals the tag. Consistent, always.
+env:
+  SOV_BUILD_VERSION: ${{ github.ref_name }}
+
 jobs:
   # HARD GATE — nothing builds or publishes unless the genesis is byte-for-byte
   # frozen (double-locked: the pinned hashes are unchanged AND genesis rebuilds to
@@ -27,6 +37,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # VERSION GUARD — the release tag MUST equal node/Cargo.toml's version, because
+      # SOV Station displays CARGO_PKG_VERSION (from node/Cargo.toml). A tag cut while
+      # that version is stale ships an app whose in-app version lies (e.g. a v0.1.93
+      # tag on a 0.1.91 binary). Every build job `needs: gate`, so failing here blocks
+      # the whole release — no matter whether the tag was cut via release-gate.sh or by
+      # a bare `git tag`. This makes the glaring "wrong version in the app" impossible.
+      - name: Version guard (tag == node/Cargo.toml == what SOV Station shows)
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          CARGO_VER="$(grep -m1 '^version' node/Cargo.toml | cut -d'"' -f2)"
+          echo "release tag: $TAG   node/Cargo.toml: $CARGO_VER"
+          if [ "$TAG" != "v$CARGO_VER" ]; then
+            echo "::error::Release tag '$TAG' != node/Cargo.toml version '$CARGO_VER'. SOV Station would display '$CARGO_VER'. Bump node/Cargo.toml to '${TAG#v}' (and refresh node/Cargo.lock), commit, then re-cut the tag."
+            exit 1
+          fi
+          echo "OK — SOV Station will display $CARGO_VER, matching tag $TAG"
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: wasm32-unknown-unknown
