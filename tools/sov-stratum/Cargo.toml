@@ -1,0 +1,39 @@
+[package]
+name = "sov-stratum"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Monero-lineage RandomX Stratum bridge for SOV: distributes sov_getBlockTemplate work to RandomX miners, verifies every share with the real seal, and submits network-difficulty winners via sov_submitBlock."
+
+# Standalone tool — intentionally NOT a member of the chain workspace, so it never
+# affects `chain/` builds, tests, or CI. It depends on the real chain crates by path
+# (the same JSON-RPC client SOV tools use and the same `pow_seal` the importer runs —
+# no reimplemented proof-of-work anywhere in this crate). It has no consensus surface:
+# it can only relay a nonce the node independently re-seals and fully re-validates.
+#
+# No secret material is handled: the coinbase account id is public, miners authenticate
+# with nothing, and no keys or seeds ever enter this process — so there is nothing to
+# zeroize (deliberate; see README).
+[[bin]]
+name = "sov-stratum"
+path = "src/main.rs"
+
+[dependencies]
+# The std-only HTTP/1.1 JSON-RPC client (`RpcClient`) — how this bridge talks to a node.
+sov-rpc = { path = "../../chain/crates/rpc" }
+# The REAL seal: `pow_seal` (light verify VM) + `pow_seal_mining` (fast VM) + `PowAlgo`.
+# Share validation recomputes every submitted hash with the exact function the importer
+# uses — the miner's `result` field is never trusted.
+sov-pow = { path = "../../chain/crates/pow" }
+sov-primitives = { path = "../../chain/crates/primitives" }
+serde_json = "1"
+hex = "0.4"
+
+[dev-dependencies]
+# The splice-equivalence test proves "splice LE nonce at nonceOffset" == "Borsh re-encode
+# of the header with that nonce" from the bridge side (Phase 1 proved it node-side).
+sov-types = { path = "../../chain/crates/types" }
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -931,7 +931,7 @@ fn load_snapshot(path: &Path) -> Option<(Ledger, Vec<(u64, Vec<Receipt>)>, Hash,
     Some((ledger, active_receipts, head_hash, head_height))
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -953,7 +953,7 @@ fn now_ms() -> u64 {
 /// passes the future tip — a real liveness stall. Lifting the timestamp to
 /// `parent_ts + 1` / `mtp + 1` lets it commit immediately, still within every rule a
 /// peer applies when importing our block.
-fn clamp_block_timestamp(now: u64, parent_ts: u64, mtp: u64) -> u64 {
+pub(crate) fn clamp_block_timestamp(now: u64, parent_ts: u64, mtp: u64) -> u64 {
     now.max(parent_ts.saturating_add(1))
         .max(mtp.saturating_add(1))
 }
@@ -1391,6 +1391,10 @@ impl Daemon {
         RpcServer::new(self.node())
             .with_gossip(self.gossip.clone())
             .with_sync_status(self.sync_status.clone())
+            // Hand the block log to the RPC so a block accepted via `sov_submitBlock`
+            // (out-of-process/Stratum mining) is appended + fsynced durably, exactly
+            // like a self-mined or peer block — never committed to memory alone.
+            .with_block_log(Arc::clone(&self.block_log))
             .start(addr, workers)
     }
 

@@ -40,21 +40,26 @@
 //! reason for an included-but-rejected tx): `sov_getReceipt` (by `txId`),
 //! `sov_getBlockReceipts` (by `height`). Shielded pool + de-shield drain-limiter
 //! state: `sov_getShieldedInfo`.
-//! Write: `sov_submitTransaction`.
+//! Write: `sov_submitTransaction`. Mining work-distribution (out-of-process /
+//! Stratum): `sov_getBlockTemplate` (build + cache a candidate, return the header
+//! preimage to grind) and `sov_submitBlock` (verify a submitted nonce's seal and
+//! import through the validated path).
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use sov_chain::MiningCandidate;
 use sov_node::Node;
 use sov_primitives::{AccountId, Balance, Hash};
-use sov_types::SignedTransaction;
+use sov_types::{Block, BlockHeader, SignedTransaction};
 
 pub mod client;
 pub use client::{RpcClient, RpcClientError};
@@ -140,6 +145,66 @@ impl RpcRateLimiter {
 /// bounded response (the client pages through with `offset`).
 const MAX_TOKEN_PAGE: usize = 200;
 
+/// How long a mining template cached by `sov_getBlockTemplate` remains submittable.
+/// Generous relative to the 2.5-minute target block time, but short enough that a
+/// stale template (built on a now-buried tip) expires rather than lingering: a miner
+/// polls a fresh template each tip change, and an old one simply fails `sov_submitBlock`
+/// with a clear "expired" error so the miner refetches.
+const TEMPLATE_TTL: Duration = Duration::from_secs(120);
+
+/// Maximum number of live templates cached at once. A template holds a full candidate
+/// block (its transaction set), so the cache is bounded in count; the oldest is evicted
+/// past this. Ample for many concurrent out-of-process miners polling one node.
+const MAX_CACHED_TEMPLATES: usize = 64;
+
+/// A bounded, short-TTL cache of built mining candidates, keyed by template id (the
+/// unsealed header's hash). `sov_getBlockTemplate` inserts a candidate and returns its
+/// id + the header preimage a miner grinds; `sov_submitBlock` looks the candidate back
+/// up by id (or by `tx_root` for the whole-header submit form) so the full transaction
+/// set never has to travel the wire. Purely a work-distribution convenience on top of
+/// the existing template producer — it holds no consensus authority; every submitted
+/// block is re-validated in full by the import path.
+#[derive(Default)]
+struct TemplateCache {
+    inner: Mutex<HashMap<Hash, (Instant, MiningCandidate)>>,
+}
+
+impl TemplateCache {
+    /// Cache `candidate` under `id`, first dropping expired entries and, if still at
+    /// capacity, the single oldest — so the map is bounded in both age and count.
+    fn insert(&self, id: Hash, candidate: MiningCandidate) {
+        let now = Instant::now();
+        let mut m = self.inner.lock().unwrap();
+        m.retain(|_, (t, _)| now.duration_since(*t) < TEMPLATE_TTL);
+        if m.len() >= MAX_CACHED_TEMPLATES {
+            if let Some(oldest) = m.iter().min_by_key(|(_, (t, _))| *t).map(|(k, _)| *k) {
+                m.remove(&oldest);
+            }
+        }
+        m.insert(id, (now, candidate));
+    }
+
+    /// Fetch a still-live candidate by template id, expiring stale entries first.
+    fn get(&self, id: &Hash) -> Option<MiningCandidate> {
+        let now = Instant::now();
+        let mut m = self.inner.lock().unwrap();
+        m.retain(|_, (t, _)| now.duration_since(*t) < TEMPLATE_TTL);
+        m.get(id).map(|(_, c)| c.clone())
+    }
+
+    /// Fetch a still-live candidate whose block commits to `tx_root` — the lookup the
+    /// whole-header submit form uses (a caller that has the full header but not the
+    /// template id it came from). Expires stale entries first.
+    fn get_by_tx_root(&self, tx_root: &Hash) -> Option<MiningCandidate> {
+        let now = Instant::now();
+        let mut m = self.inner.lock().unwrap();
+        m.retain(|_, (t, _)| now.duration_since(*t) < TEMPLATE_TTL);
+        m.values()
+            .find(|(_, c)| &c.block().header.tx_root == tx_root)
+            .map(|(_, c)| c.clone())
+    }
+}
+
 /// A JSON-RPC 2.0 error (code + message), mapped onto the standard code space.
 #[derive(Debug, Clone)]
 pub struct RpcError {
@@ -183,6 +248,10 @@ pub struct RpcServer {
     /// Live peering/sync telemetry, so `sov_getPeerInfo` can report the real-time
     /// network picture (authenticated peers, best peer height, behind/IBD) over RPC.
     sync: Option<Arc<crate::SyncShared>>,
+    /// If set, a block accepted via `sov_submitBlock` (out-of-process/Stratum mining) is
+    /// appended + fsynced here for durability — exactly like a self-mined or peer block,
+    /// never committed to memory alone (audit SOV-H001).
+    block_log: Option<Arc<BlockLog>>,
 }
 
 /// The live network state the RPC handlers need beyond the node itself: the gossip
@@ -193,6 +262,11 @@ pub struct RpcServer {
 struct RpcCtx {
     gossip: Option<Arc<sov_network::TcpNode>>,
     sync: Option<Arc<crate::SyncShared>>,
+    /// Durable block log for `sov_submitBlock` (see [`RpcServer::block_log`]).
+    block_log: Option<Arc<BlockLog>>,
+    /// Server-side cache of built mining templates (`sov_getBlockTemplate` /
+    /// `sov_submitBlock`), shared across worker threads via `Arc`.
+    templates: Arc<TemplateCache>,
 }
 
 /// A running server: its bound address and the means to stop it gracefully.
@@ -224,6 +298,7 @@ impl RpcServer {
             node,
             gossip: None,
             sync: None,
+            block_log: None,
         }
     }
 
@@ -242,6 +317,14 @@ impl RpcServer {
         self
     }
 
+    /// Attach the durable block log so a block accepted via `sov_submitBlock` is
+    /// appended + fsynced (fail-closed) exactly like a self-mined or peer block — the
+    /// out-of-process/Stratum mining path is then as durable as the in-process one.
+    pub fn with_block_log(mut self, block_log: Arc<BlockLog>) -> Self {
+        self.block_log = Some(block_log);
+        self
+    }
+
     /// Bind `addr` and start `workers` accept threads. Returns immediately with a
     /// [`RpcHandle`]; the server runs until [`RpcHandle::shutdown`].
     pub fn start(self, addr: impl ToSocketAddrs, workers: usize) -> io::Result<RpcHandle> {
@@ -256,6 +339,8 @@ impl RpcServer {
         let ctx = RpcCtx {
             gossip: self.gossip.clone(),
             sync: self.sync.clone(),
+            block_log: self.block_log.clone(),
+            templates: Arc::new(TemplateCache::default()),
         };
         let limiter = Arc::new(RpcRateLimiter::default());
         let mut handles = Vec::new();
@@ -512,6 +597,34 @@ fn param_token_id(params: &Value) -> Result<Vec<u8>, RpcError> {
         .and_then(Value::as_str)
         .ok_or_else(|| RpcError::invalid_params("missing string param `tokenId`"))?;
     hex::decode(s).map_err(|e| RpcError::invalid_params(format!("invalid tokenId hex: {e}")))
+}
+
+/// Parse a required `u64` param that may be given either as a JSON number or as a hex
+/// string (`"0x…"` or bare hex) — the flexible form a miner sends a 64-bit nonce in.
+fn param_u64_flexible(params: &Value, key: &str) -> Result<u64, RpcError> {
+    match params.get(key) {
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| RpcError::invalid_params(format!("`{key}` must be a u64"))),
+        Some(Value::String(s)) => {
+            let t = s.strip_prefix("0x").unwrap_or(s);
+            u64::from_str_radix(t, 16)
+                .map_err(|e| RpcError::invalid_params(format!("invalid `{key}` hex: {e}")))
+        }
+        _ => Err(RpcError::invalid_params(format!(
+            "missing `{key}` (u64 or hex string)"
+        ))),
+    }
+}
+
+/// Like [`param_u64_flexible`], but the param is optional: `Ok(None)` when absent,
+/// `Err` only when present-but-malformed.
+fn opt_u64_flexible(params: &Value, key: &str) -> Result<Option<u64>, RpcError> {
+    if params.get(key).map(Value::is_null).unwrap_or(true) {
+        Ok(None)
+    } else {
+        param_u64_flexible(params, key).map(Some)
+    }
 }
 
 /// Bound a list response with `offset`/`limit` so a read RPC can never return an
@@ -1226,6 +1339,143 @@ fn call(
             let has_more = page.len() > limit;
             page.truncate(limit);
             Ok(json!({ "nfts": page, "offset": offset, "limit": limit, "hasMore": has_more }))
+        }
+        // ── Mining work-distribution (getBlockTemplate / submitBlock) ─────────
+        // ADDITIVE + genesis-safe: these expose the EXISTING template producer
+        // (`build_candidate`) and validated import path (`import_block`) over RPC so an
+        // out-of-process miner (a Stratum bridge) can grind a nonce and submit a block.
+        // No new consensus rule — every submitted block is re-validated in full on import.
+        "sov_getBlockTemplate" => {
+            // Optional coinbase override: direct this block's reward to a chosen account
+            // (a pool's), else the node's configured miner identity.
+            let coinbase = match params.get("coinbaseAccount").and_then(Value::as_str) {
+                Some(s) => Some(AccountId::new(s).map_err(|e| {
+                    RpcError::invalid_params(format!("invalid coinbaseAccount: {e}"))
+                })?),
+                None => None,
+            };
+            // Clamp the timestamp exactly as the in-process mining loop does
+            // (max(now, parent+1, mtp+1)), so a template we hand out is one import accepts.
+            let (parent_ts, mtp) = {
+                let c = node.chain();
+                (c.head().header.timestamp_ms, c.median_time_past())
+            };
+            let ts = crate::daemon::clamp_block_timestamp(crate::daemon::now_ms(), parent_ts, mtp);
+            // The consensus floor: strictly after the parent AND after MTP (BIP-113).
+            let min_ts = parent_ts.saturating_add(1).max(mtp.saturating_add(1));
+            let (candidate, _excluded) = match coinbase {
+                Some(cb) => node.build_candidate_for(ts, cb),
+                None => node.build_candidate(ts),
+            }
+            .map_err(|e| RpcError::server(format!("build template failed: {e}")))?;
+
+            let header = candidate.block().header.clone();
+            let template_id = header.hash();
+            // The exact bytes a miner grinds: the Borsh header preimage. The `nonce` is
+            // the trailing u64, so its byte offset within the blob is `len - 8` (a miner
+            // can splice a candidate nonce in place without re-encoding the header).
+            let preimage = header.pow_preimage();
+            let nonce_offset = preimage.len().saturating_sub(8);
+            let resp = json!({
+                "templateId": template_id.to_hex(),
+                "height": header.height.get(),
+                "prevHash": header.prev_hash.to_hex(),
+                "txRoot": header.tx_root.to_hex(),
+                "stateRoot": header.state_root.to_hex(),
+                "receiptsRoot": header.receipts_root.to_hex(),
+                "timestampMs": header.timestamp_ms,
+                "minTimestampMs": min_ts,
+                "bits": header.bits,
+                "target": candidate.target().as_hash().to_hex(),
+                "powAlgo": format!("{:?}", candidate.pow_algo()),
+                "powKey": candidate.pow_key().to_hex(),
+                "proposer": header.proposer.as_str(),
+                "versionBits": header.version_bits,
+                "blob": hex::encode(&preimage),
+                "nonceOffset": nonce_offset,
+            });
+            ctx.templates.insert(template_id, candidate);
+            Ok(resp)
+        }
+        "sov_submitBlock" => {
+            // Two accepted forms:
+            //  (a) { templateId, nonce, timestampMs? } — the normal path.
+            //  (b) { header: {…full header incl nonce…} } — a caller that already holds
+            //      the whole header; its body is recovered from the cached candidate
+            //      matched by `tx_root` (the full tx set never had to cross the wire).
+            let sealed: Block = if let Some(hv) = params.get("header") {
+                let header: BlockHeader = serde_json::from_value(hv.clone())
+                    .map_err(|e| RpcError::invalid_params(format!("invalid header: {e}")))?;
+                let cand = ctx
+                    .templates
+                    .get_by_tx_root(&header.tx_root)
+                    .ok_or_else(|| {
+                        RpcError::server(
+                            "no cached template matches header.txRoot (unknown or expired) — \
+                         call sov_getBlockTemplate again",
+                        )
+                    })?;
+                cand.seal_from_header(header).ok_or_else(|| {
+                    RpcError::server("submitted header does not meet the proof-of-work target")
+                })?
+            } else {
+                let id_s = params
+                    .get("templateId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RpcError::invalid_params("missing string param `templateId`"))?;
+                let template_id = Hash::from_hex(id_s)
+                    .map_err(|e| RpcError::invalid_params(format!("invalid templateId: {e}")))?;
+                let nonce = param_u64_flexible(params, "nonce")?;
+                let timestamp_ms = opt_u64_flexible(params, "timestampMs")?;
+                let cand = ctx.templates.get(&template_id).ok_or_else(|| {
+                    RpcError::server(
+                        "unknown or expired templateId — call sov_getBlockTemplate again",
+                    )
+                })?;
+                cand.seal_with_nonce(nonce, timestamp_ms).ok_or_else(|| {
+                    RpcError::server("submitted nonce does not meet the proof-of-work target")
+                })?
+            };
+
+            let hash = sealed.hash();
+            let height = sealed.header.height.get();
+            // Import through the UNTRUSTED-SOURCE path (`import_block`, not `commit_mined`):
+            // a block arriving over the RPC came from an external miner, so it must clear
+            // the SAME acceptance policy every peer applies on gossip — including the
+            // 2-hour future-timestamp bound (MAX_FUTURE_DRIFT_MS). Committing it via the
+            // self-mine path would skip that bound and let a crafted far-future submit be
+            // accepted + gossiped locally yet rejected by every peer, self-forking this
+            // node onto a branch no one extends. This path also returns a reorg's reverted
+            // txs to the mempool. Full re-execution + heaviest-work fork choice as before.
+            match node.import_block(sealed.clone()) {
+                Ok(_) => {
+                    // Durability (audit SOV-H001): append + fsync before advertising it.
+                    // Fail closed — never gossip a block we could not persist.
+                    if let Some(log) = &ctx.block_log {
+                        if let Err(e) = log.append(&sealed) {
+                            return Ok(json!({
+                                "accepted": false,
+                                "hash": hash.to_hex(),
+                                "height": height,
+                                "error": format!("committed to memory but log append/fsync failed: {e}"),
+                            }));
+                        }
+                    }
+                    // Release the node lock before network I/O (mirror the tx-gossip path),
+                    // then flood the block so the whole network builds on it.
+                    drop(node);
+                    if let Some(g) = &ctx.gossip {
+                        g.broadcast(&sov_network::NetMessage::NewBlock(sealed));
+                    }
+                    Ok(json!({ "accepted": true, "hash": hash.to_hex(), "height": height }))
+                }
+                Err(e) => Ok(json!({
+                    "accepted": false,
+                    "hash": hash.to_hex(),
+                    "height": height,
+                    "error": format!("import rejected: {e}"),
+                })),
+            }
         }
         other => Err(RpcError::method_not_found(other)),
     }

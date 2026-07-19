@@ -178,6 +178,12 @@ impl Imported {
 /// the candidate's own header), so a node grinds it **off the chain lock** —
 /// keeping its JSON-RPC responsive while it mines — then commits the sealed
 /// block via the normal validated import path.
+///
+/// `Clone` so a node can cache a built template server-side (keyed by its
+/// header hash) and hand an out-of-process miner just the header preimage to
+/// grind — the full transaction set never has to cross the wire
+/// (`sov_getBlockTemplate` / `sov_submitBlock`).
+#[derive(Clone)]
 pub struct MiningCandidate {
     /// The block being built; its `nonce` is filled in by the grind.
     block: Block,
@@ -237,6 +243,70 @@ impl MiningCandidate {
             }
         }
         None
+    }
+
+    /// The proof-of-work target this candidate must be sealed against — the 256-bit
+    /// threshold a submitted nonce's seal must meet (smaller = more work). Exposed so
+    /// an out-of-process miner (`sov_getBlockTemplate`) can verify its own work.
+    pub fn target(&self) -> Target {
+        self.target
+    }
+
+    /// The proof-of-work seal algorithm in force (SHA-256d on dev/test, RandomX on
+    /// mainnet) — a miner needs it to compute the seal identically to the node.
+    pub fn pow_algo(&self) -> sov_mining::PowAlgo {
+        self.pow_algo
+    }
+
+    /// The RandomX key/seed (the chain's genesis hash) selecting the RandomX dataset;
+    /// ignored by SHA-256d. Part of what a miner needs to reproduce the seal.
+    pub fn pow_key(&self) -> Hash {
+        self.pow_key
+    }
+
+    /// Seal this candidate with an externally-found `nonce` (and optionally a rolled
+    /// `timestamp_ms`), returning the finished block **iff** the resulting proof-of-work
+    /// seal meets the target. This is the submit side of the work-distribution path
+    /// (`sov_submitBlock`): a miner grinds a nonce over the header preimage off-node,
+    /// then hands it back to be verified and imported. `None` if the seal does not meet
+    /// the target (stale/invalid work). Uses the VERIFY seal (`pow_seal`), byte-identical
+    /// to what a light-VM importer computes; the block is still re-validated in full by
+    /// [`import_block`](Blockchain::import_block).
+    pub fn seal_with_nonce(&self, nonce: u64, timestamp_ms: Option<u64>) -> Option<Block> {
+        let mut block = self.block.clone();
+        block.header.nonce = nonce;
+        if let Some(ts) = timestamp_ms {
+            block.header.timestamp_ms = ts;
+        }
+        let seal = Hash::from_bytes(sov_pow::pow_seal(
+            self.pow_algo,
+            self.pow_key.as_bytes(),
+            &block.header.pow_preimage(),
+        ));
+        self.target.is_met_by(&seal).then_some(block)
+    }
+
+    /// Seal this candidate from a FULLY-FORMED `header` (the fallback submit form: a
+    /// caller that already holds the whole header, incl. its nonce/timestamp). The header
+    /// must commit to this candidate's transaction set (`tx_root` match) — that is how the
+    /// caller located this template. Returns the finished block iff `tx_root` matches AND
+    /// the header's proof-of-work seal meets the target; `None` otherwise. As with
+    /// [`seal_with_nonce`](Self::seal_with_nonce), full validation still happens on import.
+    pub fn seal_from_header(&self, header: sov_types::BlockHeader) -> Option<Block> {
+        if header.tx_root != self.block.header.tx_root {
+            return None;
+        }
+        let seal = Hash::from_bytes(sov_pow::pow_seal(
+            self.pow_algo,
+            self.pow_key.as_bytes(),
+            &header.pow_preimage(),
+        ));
+        if !self.target.is_met_by(&seal) {
+            return None;
+        }
+        let mut block = self.block.clone();
+        block.header = header;
+        Some(block)
     }
 }
 
@@ -914,7 +984,6 @@ impl Blockchain {
         transactions: Vec<SignedTransaction>,
         timestamp_ms: u64,
     ) -> Result<(MiningCandidate, Vec<(SignedTransaction, String)>), ChainError> {
-        let next_height = self.height() + 1;
         // The coinbase recipient this block credits: this node's configured
         // miner account if one is set, else the genesis default (a deterministic
         // fallback for nodes that never configure a miner identity — e.g. unit
@@ -924,6 +993,24 @@ impl Blockchain {
             .coinbase_account
             .clone()
             .unwrap_or_else(|| self.default_coinbase.clone());
+        self.build_candidate_for(transactions, timestamp_ms, proposer)
+    }
+
+    /// Like [`build_candidate`](Self::build_candidate), but credits the coinbase to an
+    /// EXPLICIT `proposer` account instead of the node's configured miner identity — the
+    /// work-distribution path (`sov_getBlockTemplate`): a pool/out-of-process miner asks
+    /// the node to build a template paying a chosen account, grinds the nonce off-node,
+    /// then submits it back through the normal validated import path. Genesis-safe and
+    /// additive: identical builder, roots, and difficulty — only the caller-named coinbase
+    /// recipient differs (and `build_candidate` is now a thin wrapper over it that supplies
+    /// the node's default proposer, so existing production is byte-for-byte unchanged).
+    pub fn build_candidate_for(
+        &self,
+        transactions: Vec<SignedTransaction>,
+        timestamp_ms: u64,
+        proposer: AccountId,
+    ) -> Result<(MiningCandidate, Vec<(SignedTransaction, String)>), ChainError> {
+        let next_height = self.height() + 1;
 
         // Meter and seal against the targets in force for a block extending the
         // head — derived from the head's branch, exactly as `import_block` will

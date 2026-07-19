@@ -169,6 +169,26 @@ impl Node {
             .map_err(NodeError::Chain)
     }
 
+    /// Like [`build_candidate`](Self::build_candidate), but credits the coinbase to an
+    /// EXPLICIT `coinbase` account rather than this node's configured miner identity —
+    /// the work-distribution path (`sov_getBlockTemplate`), so a pool/out-of-process
+    /// miner can direct the coinbase to its own account. Selects the same executable
+    /// mempool batch; the sealed result is committed through the normal validated path.
+    pub fn build_candidate_for(
+        &self,
+        timestamp_ms: u64,
+        coinbase: AccountId,
+    ) -> Result<(MiningCandidate, Vec<(SignedTransaction, String)>), NodeError> {
+        let batch = {
+            let ledger = self.chain.ledger();
+            self.mempool
+                .select(|a| ledger.account(a).nonce, self.max_block_txs)
+        };
+        self.chain
+            .build_candidate_for(batch, timestamp_ms, coinbase)
+            .map_err(NodeError::Chain)
+    }
+
     /// Drop a transaction from the mempool by id. Used to EVICT a transaction the
     /// block-builder found unminable (it failed execution against current state, so
     /// it would be silently excluded from every block) — together with the reason

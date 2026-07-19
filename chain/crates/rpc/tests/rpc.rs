@@ -247,3 +247,131 @@ fn rpc_server_serves_real_chain_state_and_accepts_transactions() {
 
     handle.shutdown();
 }
+
+/// End-to-end work-distribution: `sov_getBlockTemplate` hands out a candidate, an
+/// out-of-process "miner" grinds the trailing-u64 nonce over the returned header blob
+/// against the returned target (SHA-256d at trivial test difficulty), and
+/// `sov_submitBlock` verifies the seal and imports it through the validated path — the
+/// chain height advances by one. Proves the two RPCs form a real closed loop.
+#[test]
+fn get_block_template_and_submit_block_round_trip_advances_height() {
+    let mut n = node();
+    n.set_coinbase(id("val01.node.sov"));
+    let node = Arc::new(Mutex::new(n));
+    let handle = RpcServer::new(Arc::clone(&node))
+        .start("127.0.0.1:0", 2)
+        .expect("server binds");
+    let addr = handle.local_addr();
+
+    assert_eq!(rpc(addr, "sov_getHeight", json!({}))["result"], 0);
+
+    let tmpl = rpc(addr, "sov_getBlockTemplate", json!({}));
+    let r = &tmpl["result"];
+    assert_eq!(r["height"], 1, "template extends the tip: {tmpl}");
+    assert_eq!(r["powAlgo"], "Sha256d");
+    assert_eq!(r["proposer"], "val01.node.sov");
+    let template_id = r["templateId"].as_str().unwrap().to_string();
+    let nonce_offset = r["nonceOffset"].as_u64().unwrap() as usize;
+    let target = sov_mining::Target::from_hash(
+        sov_primitives::Hash::from_hex(r["target"].as_str().unwrap()).unwrap(),
+    );
+    let mut preimage = hex::decode(r["blob"].as_str().unwrap()).unwrap();
+    // The nonce is the trailing u64 of the Borsh header (little-endian), so nonceOffset
+    // is exactly len - 8; splice candidate nonces in place and re-seal.
+    assert_eq!(nonce_offset, preimage.len() - 8);
+
+    let nonce = grind(&mut preimage, nonce_offset, &target);
+    let submit = rpc(
+        addr,
+        "sov_submitBlock",
+        json!({ "templateId": template_id, "nonce": nonce }),
+    );
+    let s = &submit["result"];
+    assert_eq!(s["accepted"], true, "submit rejected: {submit}");
+    assert_eq!(s["height"], 1);
+    assert!(s["hash"].as_str().unwrap().len() == 64);
+
+    // The block imported through the validated path: height advanced.
+    assert_eq!(rpc(addr, "sov_getHeight", json!({}))["result"], 1);
+
+    handle.shutdown();
+}
+
+/// `sov_submitBlock` also accepts the whole-header fallback form and directs the
+/// coinbase to an explicit `coinbaseAccount`; an unknown `templateId` is a clean error
+/// that leaves the chain untouched.
+#[test]
+fn submit_block_whole_header_form_and_coinbase_override_and_unknown_template() {
+    let mut n = node();
+    n.set_coinbase(id("val01.node.sov"));
+    let node = Arc::new(Mutex::new(n));
+    let handle = RpcServer::new(Arc::clone(&node))
+        .start("127.0.0.1:0", 2)
+        .expect("server binds");
+    let addr = handle.local_addr();
+
+    // Unknown templateId → clear error, chain unchanged.
+    let bad = rpc(
+        addr,
+        "sov_submitBlock",
+        json!({ "templateId": sov_primitives::Hash::ZERO.to_hex(), "nonce": 0 }),
+    );
+    assert!(
+        bad["error"].is_object(),
+        "unknown template must error: {bad}"
+    );
+    assert_eq!(rpc(addr, "sov_getHeight", json!({}))["result"], 0);
+
+    // Template paying an explicit (overridden) coinbase account.
+    let tmpl = rpc(
+        addr,
+        "sov_getBlockTemplate",
+        json!({ "coinbaseAccount": "usa.reserve.sov" }),
+    );
+    let r = &tmpl["result"];
+    assert_eq!(
+        r["proposer"], "usa.reserve.sov",
+        "coinbase override: {tmpl}"
+    );
+    let nonce_offset = r["nonceOffset"].as_u64().unwrap() as usize;
+    let target = sov_mining::Target::from_hash(
+        sov_primitives::Hash::from_hex(r["target"].as_str().unwrap()).unwrap(),
+    );
+    let mut preimage = hex::decode(r["blob"].as_str().unwrap()).unwrap();
+    grind(&mut preimage, nonce_offset, &target);
+
+    // Reconstruct the full sealed header from the grind and submit via the header form.
+    let header: sov_types::BlockHeader = borsh::from_slice(&preimage).unwrap();
+    let submit = rpc(
+        addr,
+        "sov_submitBlock",
+        json!({ "header": serde_json::to_value(&header).unwrap() }),
+    );
+    assert_eq!(
+        submit["result"]["accepted"], true,
+        "whole-header submit rejected: {submit}"
+    );
+    assert_eq!(rpc(addr, "sov_getHeight", json!({}))["result"], 1);
+    // The imported block's coinbase claim (header proposer) is the overridden account.
+    let blk = rpc(addr, "sov_getBlockByHeight", json!({ "height": 1 }));
+    assert_eq!(
+        blk["result"]["header"]["proposer"], "usa.reserve.sov",
+        "imported block credits the overridden coinbase: {blk}"
+    );
+
+    handle.shutdown();
+}
+
+/// Grind the trailing-u64 nonce (`offset`) in `preimage` until its SHA-256d seal meets
+/// `target` (trivial at test difficulty), returning the winning nonce and leaving it
+/// spliced into `preimage`.
+fn grind(preimage: &mut [u8], offset: usize, target: &sov_mining::Target) -> u64 {
+    for nonce in 0u64..50_000_000 {
+        preimage[offset..offset + 8].copy_from_slice(&nonce.to_le_bytes());
+        let seal = sov_primitives::Hash::from_bytes(sov_pow::sha256d(preimage));
+        if target.is_met_by(&seal) {
+            return nonce;
+        }
+    }
+    panic!("no valid nonce found within budget at test difficulty");
+}
