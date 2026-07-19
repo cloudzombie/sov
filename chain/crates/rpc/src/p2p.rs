@@ -1943,6 +1943,9 @@ mod tests {
 
     #[test]
     fn sweep_spares_a_recently_connected_unauthenticated_peer() {
+        let _serial = crate::NET_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // A peer that just connected but hasn't sent its Hello yet is given time
         // (HELLO_TIMEOUT) — the sweep records when it was first seen and does NOT drop
         // it immediately, so honest inbound peers aren't churned mid-handshake.
@@ -1990,6 +1993,9 @@ mod tests {
 
     #[test]
     fn reaps_a_dead_silent_peer_but_spares_an_active_one() {
+        let _serial = crate::NET_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // The fix for "2 ghost peers when the remote is offline" AND "connected but
         // never indexing": a peer silent past PEER_INACTIVITY_TIMEOUT (a half-open
         // connection to a vanished host) is reaped, freeing the slot and removing it
@@ -2164,6 +2170,12 @@ mod tests {
     /// (legacy-backtrack) requests, and a couple of forward batches.
     #[test]
     fn stale_tip_node_finds_fork_point_in_one_headers_exchange_and_catches_up() {
+        // Run this real-TCP sync test WITHOUT the crate's mining/daemon tests
+        // grinding in parallel and starving its dispatch threads — the macOS-CI
+        // flake. Held for the whole test (poison-tolerant).
+        let _serial = crate::NET_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         const FORK: u64 = 40; // last common height
         const STALE: u64 = 3; // A's short divergent branch beyond the fork
         const B_HEIGHT: u64 = 120; // the canonical chain A must catch up to

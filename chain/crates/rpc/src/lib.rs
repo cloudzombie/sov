@@ -61,6 +61,16 @@ use sov_node::Node;
 use sov_primitives::{AccountId, Balance, Hash};
 use sov_types::{Block, BlockHeader, SignedTransaction};
 
+/// Serializes the CPU-/scheduler-heavy networking tests in this crate (real
+/// `TcpNode` sync + daemon mining) so they never run concurrently. `cargo test`
+/// runs a binary's tests in parallel; on a slow/contended CI runner (notably
+/// macOS) those tests starve each other's TCP dispatch threads, making the
+/// headers-first sync test flaky. Each heavy test takes this lock for its
+/// duration (poison-tolerant), so they run one-at-a-time and each gets the whole
+/// machine — deterministic, no new dependency. Test-only.
+#[cfg(test)]
+pub(crate) static NET_TEST_SERIAL: Mutex<()> = Mutex::new(());
+
 pub mod client;
 pub use client::{RpcClient, RpcClientError};
 

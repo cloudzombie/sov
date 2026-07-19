@@ -2474,6 +2474,9 @@ mod tests {
             )],
         )
         .unwrap();
+        let _serial = crate::NET_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let handle = daemon.run("127.0.0.1:0", 1, 20, false, 50).unwrap();
 
         let kp = Keypair::from_seed([9; 32]);
@@ -2537,6 +2540,9 @@ mod tests {
         .unwrap()
         .with_sync_status(Arc::clone(&sync));
         // Fast cadence so the test is quick; the node mines empty blocks each interval.
+        let _serial = crate::NET_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let handle = daemon.run("127.0.0.1:0", 1, 20, true, 25).unwrap();
 
         // Across many intervals while "behind", the chain must NOT advance past genesis.
@@ -2587,6 +2593,9 @@ mod tests {
             )],
         )
         .unwrap();
+        let _serial = crate::NET_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let handle = daemon.run("127.0.0.1:0", 1, 20, true, 25).unwrap();
         let mut mined = false;
         for _ in 0..200 {
@@ -2626,6 +2635,9 @@ mod tests {
         )
         .unwrap();
         // Start with mining OFF.
+        let _serial = crate::NET_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let handle = daemon.run("127.0.0.1:0", 1, 20, false, 50).unwrap();
         assert!(!handle.is_mining(), "starts in sync-only mode");
 
