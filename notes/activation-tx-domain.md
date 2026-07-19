@@ -52,6 +52,27 @@ un-upgraded node **rejects** a correctly-bound tx (so it forks off). Therefore:
   `Block::all_signatures_valid_in` at `validate_candidate` import; mempool admission
   (`Mempool.domain`, refreshed by the node on tip advance). `Blockchain::resolved_tx_domain`.
 
+## Cloud-miner + operator checklist AT ACTIVATION (do it WITH the user)
+
+### A. Every mining node (cloud droplets + home rig + laptop) — BINARY UPGRADE only
+Pure mining needs NO "signing command": the coinbase is part of the block state transition, not a
+signed transaction, so it is untouched by the fork. The node just needs the activation binary so it
+validates the new signature rule.
+1. SSH to each droplet (per `~/.claude` `do-node-ops` runbook): pull/build the activation release
+   (v0.1.94+), replace the `sov-rpcd` binary, `systemctl restart`.
+2. Confirm it re-syncs and, via `sov_getDeployments`, that it sees the `tx-domain` deployment.
+3. Do the home rig + laptop the same way. **All nodes must be upgraded BEFORE the activation
+   height** or an un-upgraded node forks off / builds invalid templates.
+
+### B. Sweeping / sending from a cloud miner via sov-station — AUTOMATIC after Phase-2
+There is deliberately NO manual "sign the miners" command. After Phase-2:
+1. Import the miner key into sov-station (raw 64-hex seed from
+   `~/Desktop/keys/sov-cloud-miner-<region>.txt`).
+2. Enter recipient + amount → **Send**. Station calls `sov_getSigningDomain` and signs bound (post-
+   activation) or legacy (before) automatically — no command to type. Identical UX to today.
+3. If ever sweeping via a script/CLI instead of the GUI, that path must also query
+   `sov_getSigningDomain` and `sign_in(domain)` — same rule (Phase-2 covers tx-cannon/conformance).
+
 ## Immediate next action
-Build **Phase-2 client signing** (step 1) — additive, dormant, activates nothing. Start with the
-`sov_getSigningDomain` RPC, then the SDK (second client), then the Rust signers.
+Build **Phase-2 client signing** (step 1) — additive, dormant, activates nothing. `sov_getSigningDomain`
+RPC is DONE; next the SDK (second client), then the Rust signers (wallet, Station, conformance, tx-cannon).
