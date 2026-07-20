@@ -1051,7 +1051,9 @@ impl SyncState {
                                 n.chain().block_by_height(h).map(|b| b.serialized_size())
                             });
                             (0..take)
-                                .filter_map(|i| n.chain().block_by_height(start + i as u64).cloned())
+                                .filter_map(|i| {
+                                    n.chain().block_by_height(start + i as u64).cloned()
+                                })
                                 .collect()
                         })
                         .unwrap_or_default()
@@ -1777,7 +1779,10 @@ mod tests {
         let two_mib = 2 * 1024 * 1024;
         let n = size_capped_batch_len(SYNC_BATCH as usize, 7169, |_| Some(two_mib));
         assert_eq!(n, 3, "byte budget must cut the batch below the count cap");
-        assert!(n * two_mib <= FRAME_CEILING, "served batch must fit the frame");
+        assert!(
+            n * two_mib <= FRAME_CEILING,
+            "served batch must fit the frame"
+        );
     }
 
     #[test]
