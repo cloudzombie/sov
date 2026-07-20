@@ -402,6 +402,49 @@ const BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// a newer/older peer simply serves the smaller of the two.
 const SYNC_BATCH: u16 = 256;
 
+/// Serialized-byte ceiling for one [`BlocksResponse`](NetMessage::BlocksResponse):
+/// the served batch stops once adding another block would cross this, EVEN if fewer
+/// than [`SYNC_BATCH`] blocks have been gathered. A count-only cap is not enough — a
+/// run of large blocks (real transaction activity) can push 256 blocks well past the
+/// transport's 8 MiB `MAX_FRAME`, which makes the encrypted frame un-sendable: the
+/// serving node's write fails, it drops the link, and a COLD-syncing peer that always
+/// re-requests that same batch is wedged there forever (the "stuck at the same height,
+/// drops all peers, loops on 0 connections" cold-sync failure). 6 MiB leaves generous
+/// headroom under `MAX_FRAME` for the enum/vec framing and the PQ+Noise seal. At least
+/// one block is always served, so sync makes progress even across an outsized block.
+const SYNC_BATCH_MAX_BYTES: usize = 6 * 1024 * 1024;
+
+/// How many consecutive blocks a [`GetBlocks`](NetMessage::GetBlocks) starting at
+/// `start` should serve: at most `want`, and never so many that their cumulative
+/// serialized size would cross [`SYNC_BATCH_MAX_BYTES`] — but ALWAYS at least one
+/// available block, so catch-up advances even across a block bigger than the whole
+/// budget. `size_at(h)` yields the serialized size of the block at height `h`, or
+/// `None` once past the served chain's tip. Pure and total, so it is unit-tested
+/// directly against the transport frame ceiling without standing up a node.
+fn size_capped_batch_len(
+    want: usize,
+    start: u64,
+    mut size_at: impl FnMut(u64) -> Option<usize>,
+) -> usize {
+    let mut taken = 0usize;
+    let mut bytes = 0usize;
+    let mut h = start;
+    while taken < want {
+        match size_at(h) {
+            Some(sz) => {
+                if taken > 0 && bytes.saturating_add(sz) > SYNC_BATCH_MAX_BYTES {
+                    break;
+                }
+                bytes = bytes.saturating_add(sz);
+                taken += 1;
+                h += 1;
+            }
+            None => break,
+        }
+    }
+    taken
+}
+
 /// Poll cadence while a block request is in flight (actively catching up): batches
 /// stream back-to-back instead of one per idle tick, so a long initial sync is bound by
 /// import + network, not by a fixed sleep.
@@ -1000,18 +1043,16 @@ impl SyncState {
                     node.lock()
                         .ok()
                         .map(|n| {
-                            let mut v = Vec::with_capacity(want);
-                            let mut h = start;
-                            while v.len() < want {
-                                match n.chain().block_by_height(h) {
-                                    Some(b) => {
-                                        v.push(b.clone());
-                                        h += 1;
-                                    }
-                                    None => break,
-                                }
-                            }
-                            v
+                            // Cap the batch by SERIALIZED SIZE as well as count, so the
+                            // encoded BlocksResponse never exceeds the transport frame and
+                            // becomes un-sendable (see SYNC_BATCH_MAX_BYTES). Count first
+                            // (cheap O(1) height lookups), then clone exactly that many.
+                            let take = size_capped_batch_len(want, start, |h| {
+                                n.chain().block_by_height(h).map(|b| b.serialized_size())
+                            });
+                            (0..take)
+                                .filter_map(|i| n.chain().block_by_height(start + i as u64).cloned())
+                                .collect()
                         })
                         .unwrap_or_default()
                 };
@@ -1712,6 +1753,63 @@ mod tests {
             chain_work: [work; 32],
             received_at: Instant::now(),
         }
+    }
+
+    /// The transport hard limit a served batch must never exceed. Kept in sync with
+    /// `tcp::MAX_FRAME` (a private const); the assertions below prove the size cap
+    /// keeps every batch strictly under it.
+    const FRAME_CEILING: usize = 8 * 1024 * 1024;
+
+    #[test]
+    fn batch_is_count_bounded_when_blocks_are_small() {
+        // 1 KiB blocks: 256 of them are ~256 KiB, far under the byte budget, so the
+        // count cap (SYNC_BATCH) governs and a full batch is served.
+        let n = size_capped_batch_len(SYNC_BATCH as usize, 1, |_| Some(1024));
+        assert_eq!(n, SYNC_BATCH as usize);
+    }
+
+    #[test]
+    fn batch_is_byte_bounded_when_blocks_are_large() {
+        // 2 MiB blocks: three fit within the 6 MiB budget, a fourth would cross it, so
+        // the batch is cut to three EVEN THOUGH the count cap would allow 256 — and the
+        // three-block frame (~6 MiB) stays under the 8 MiB transport ceiling. This is
+        // the exact regression: the 7169+ large-block region that wedged cold sync.
+        let two_mib = 2 * 1024 * 1024;
+        let n = size_capped_batch_len(SYNC_BATCH as usize, 7169, |_| Some(two_mib));
+        assert_eq!(n, 3, "byte budget must cut the batch below the count cap");
+        assert!(n * two_mib <= FRAME_CEILING, "served batch must fit the frame");
+    }
+
+    #[test]
+    fn batch_always_serves_at_least_one_even_if_it_exceeds_the_budget() {
+        // A single block larger than the whole budget (but still under the frame ceiling)
+        // must still be served alone — otherwise sync could never cross it and would
+        // stall permanently, which is the very failure this cap exists to prevent.
+        let seven_mib = 7 * 1024 * 1024;
+        let n = size_capped_batch_len(SYNC_BATCH as usize, 0, |_| Some(seven_mib));
+        assert_eq!(n, 1, "must always make progress with at least one block");
+        assert!(seven_mib <= FRAME_CEILING);
+    }
+
+    #[test]
+    fn batch_stops_at_the_served_tip() {
+        // Only 5 blocks exist from `start`; a request for 256 serves exactly those 5.
+        let n = size_capped_batch_len(256, 100, |h| (h < 105).then_some(512));
+        assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn batch_never_exceeds_the_frame_across_mixed_sizes() {
+        // Mixed small/large blocks (a realistic post-activity chain): whatever the cut,
+        // the cumulative served bytes must never reach the transport frame ceiling.
+        let size_at = |h: u64| Some(if h % 7 == 0 { 3 * 1024 * 1024 } else { 4096 });
+        let n = size_capped_batch_len(SYNC_BATCH as usize, 7169, size_at);
+        let bytes: usize = (0..n).map(|i| size_at(7169 + i as u64).unwrap()).sum();
+        assert!(n >= 1);
+        assert!(
+            bytes <= FRAME_CEILING,
+            "served {n} blocks = {bytes} bytes must stay under the {FRAME_CEILING} frame"
+        );
     }
 
     #[test]
