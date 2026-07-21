@@ -591,9 +591,15 @@ impl Blockchain {
         if head_h < 2 {
             return None;
         }
-        // Bitcoin uses a 120-block window; use what we have on a young chain, but never
-        // reach back to genesis (height 0) — its timestamp isn't a mining time.
-        let start_h = head_h.saturating_sub(120).max(1);
+        // A trailing window of recent blocks. Bitcoin defaults to 120, but at SOV's
+        // 150s block time 120 blocks span ~5h, which badly lags a small, fast-growing
+        // network's real hashrate (a recent doubling shows up only ~half-smoothed for
+        // hours). 30 blocks (~1.2h here) tracks the live rate far more closely while
+        // still averaging out per-block solve-time variance. Use what we have on a young
+        // chain, but never reach back to genesis (height 0) — its timestamp isn't a
+        // mining time. Display-only (sov_getDifficulty); NOT a consensus input.
+        const HASHRATE_WINDOW: u64 = 30;
+        let start_h = head_h.saturating_sub(HASHRATE_WINDOW).max(1);
         let t_start = self.block_by_height(start_h)?.header.timestamp_ms;
         let t_head = self.block_by_height(head_h)?.header.timestamp_ms;
         if t_head <= t_start {
