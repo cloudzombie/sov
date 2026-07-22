@@ -59,6 +59,15 @@ pub struct BlockContext<'a> {
     /// height, so historical (pre-activation) blocks validate under `None` and only
     /// blocks at/after activation require the binding.
     pub tx_domain: Option<sov_primitives::SigningDomain>,
+    /// Whether the miner-signaled `fee-auction` deployment is `Active` at this
+    /// block's height. When `false` (the pre-activation default), a fee-auction
+    /// envelope ([`sov_types::Action::Tipped`]) is a HARD execution error
+    /// ([`ExecutionError::FeatureInactive`]) — byte-identical dormant behavior.
+    /// When `true`, the envelope charges its tip (signer → miner, a pure
+    /// transfer; nothing minted or burned) and executes its inner action.
+    /// Resolved per block height, so historical (pre-activation) blocks always
+    /// validate under `false`.
+    pub fee_auction_active: bool,
 }
 
 /// Reasons a transaction is *rejected* — not admitted to a block at all. These
@@ -133,6 +142,12 @@ pub enum ExecutionError {
     /// the inner action must be an ordinary action.
     #[error("fee-auction envelopes cannot be nested")]
     NestedTip,
+    /// A fee-auction envelope wrapped an action that may not be tipped
+    /// (`MultisigExec` / `RotateKey`) — mirroring the multisig inner-action
+    /// guard, but as a HARD error: a block carrying such a transaction is
+    /// invalid, so an illegal envelope can never be mined.
+    #[error("fee-auction envelope: inner action may not be MultisigExec or RotateKey")]
+    TipInnerNotAllowed,
 }
 
 /// Apply one signed transaction to `ledger` in `ctx`, returning its [`Receipt`].
@@ -309,54 +324,94 @@ pub fn apply_transaction(
     // `(account, nonce, inner)` message; everything else executes directly. A
     // pre-execution failure (illegal inner, or too few valid approvals) is carried
     // in `ms_error` and short-circuits to a Failed receipt (the fee is still paid).
+    //
+    // A `Tipped` envelope unwraps here ONLY while the `fee-auction` deployment is
+    // Active (`ctx.fee_auction_active`); otherwise it falls through to the dispatch
+    // arm below, which hard-rejects it as `FeatureInactive` — the dormant path,
+    // byte-identical to pre-fork execution. When active, the tip is debited from
+    // the signer's LOCAL copy right here (a hard `CannotAffordFee` reject if
+    // unaffordable — before any ledger write, so nothing is committed) and credited
+    // to the miner only at the very end, after the signer's write-back, exactly
+    // like the intrinsic fee: a pure signer→miner transfer, atomic with the rest.
+    let mut tip_paid = Balance::ZERO;
     let mut ms_error: Option<String> = None;
-    let effective_action: &Action = match &tx.action {
-        Action::MultisigExec { action, approvals } => {
-            let inner = action.as_ref();
-            if matches!(
-                inner,
-                Action::MultisigExec { .. } | Action::RotateKey { .. }
-            ) {
-                ms_error =
-                    Some("multisig: inner action may not be MultisigExec or RotateKey".into());
-            } else if let Some(policy) = ledger.multisig_of(&tx.signer).cloned() {
-                let msg = sov_types::multisig_signing_bytes(&tx.signer, tx_nonce, inner);
-                // Count DISTINCT signer indices with a valid signature (a repeated
-                // index cannot inflate the count toward the threshold).
-                let mut approved = std::collections::BTreeSet::new();
-                for ap in approvals {
-                    if let Some(pk) = policy.signers.get(ap.signer as usize) {
-                        if pk.verify(&msg, &ap.signature) {
-                            approved.insert(ap.signer);
+    let effective_action: &Action =
+        match &tx.action {
+            Action::Tipped { tip, inner } if ctx.fee_auction_active => {
+                let inner = inner.as_ref();
+                // Tips do not nest: a tipped tip is a HARD error (block-invalid),
+                // never a mineable Failed receipt.
+                if matches!(inner, Action::Tipped { .. }) {
+                    return Err(ExecutionError::NestedTip);
+                }
+                // Mirror the multisig inner-action guard, but HARD: an envelope may
+                // not wrap authorization-changing / approval-carrying actions.
+                if matches!(
+                    inner,
+                    Action::MultisigExec { .. } | Action::RotateKey { .. }
+                ) {
+                    return Err(ExecutionError::TipInnerNotAllowed);
+                }
+                // Charge the tip: the signer must afford intrinsic_fee (already
+                // reserved above) + tip. Unaffordable ⇒ hard reject, so a block
+                // including it is invalid and no partial effect is ever committed.
+                if *tip != Balance::ZERO {
+                    signer.balance = signer.balance.checked_sub(*tip).ok_or(
+                        ExecutionError::CannotAffordFee {
+                            account: tx.signer.to_string(),
+                        },
+                    )?;
+                    tip_paid = *tip;
+                }
+                inner
+            }
+            Action::MultisigExec { action, approvals } => {
+                let inner = action.as_ref();
+                if matches!(
+                    inner,
+                    Action::MultisigExec { .. } | Action::RotateKey { .. }
+                ) {
+                    ms_error =
+                        Some("multisig: inner action may not be MultisigExec or RotateKey".into());
+                } else if let Some(policy) = ledger.multisig_of(&tx.signer).cloned() {
+                    let msg = sov_types::multisig_signing_bytes(&tx.signer, tx_nonce, inner);
+                    // Count DISTINCT signer indices with a valid signature (a repeated
+                    // index cannot inflate the count toward the threshold).
+                    let mut approved = std::collections::BTreeSet::new();
+                    for ap in approvals {
+                        if let Some(pk) = policy.signers.get(ap.signer as usize) {
+                            if pk.verify(&msg, &ap.signature) {
+                                approved.insert(ap.signer);
+                            }
                         }
                     }
+                    if (approved.len() as u16) < policy.threshold {
+                        ms_error = Some(format!(
+                            "multisig: {} valid approval(s), need {}",
+                            approved.len(),
+                            policy.threshold
+                        ));
+                    }
+                } else {
+                    ms_error = Some("multisig: account has no multisig policy".into());
                 }
-                if (approved.len() as u16) < policy.threshold {
-                    ms_error = Some(format!(
-                        "multisig: {} valid approval(s), need {}",
-                        approved.len(),
-                        policy.threshold
-                    ));
-                }
-            } else {
-                ms_error = Some("multisig: account has no multisig policy".into());
+                inner
             }
-            inner
-        }
-        other => other,
-    };
+            other => other,
+        };
 
     let status = if let Some(reason) = ms_error {
         ExecutionStatus::Failed { reason }
     } else {
         match effective_action {
             // Fee-auction envelope — DORMANT until the `fee-auction` deployment is
-            // Active. Until then it is rejected here as a HARD error, which propagates
-            // to BlockExecutionError::InvalidTransaction and invalidates any block
-            // carrying it, uniformly on every node. (The activation path — gate on
-            // ctx.fee_auction_active, reject nesting, charge `tip` to the miner, then
-            // execute `inner` — lands in a later, separately-audited slice; keeping it
-            // inert here means genesis and every KAT vector stay byte-identical.)
+            // Active. This arm is reached only when `ctx.fee_auction_active` is false
+            // (the activation path unwraps the envelope during action resolution
+            // above) or when a `Tipped` arrives wrapped inside a `MultisigExec`
+            // (never legal). Either way it is a HARD error, which propagates to
+            // BlockExecutionError::InvalidTransaction and invalidates any block
+            // carrying it, uniformly on every node — genesis and every KAT vector
+            // stay byte-identical.
             Action::Tipped { .. } => {
                 return Err(ExecutionError::FeatureInactive {
                     feature: "fee-auction",
@@ -1484,6 +1539,11 @@ pub fn apply_transaction(
     // proposer. Reads are fresh, so self-crediting and miner==proposer aliasing
     // are handled correctly.
     distribute_fee(ledger, ctx, fee_paid)?;
+    // Pay any fee-auction tip to the miner, exactly like the fee: a fresh
+    // read-modify-write AFTER the signer's (already tip-debited) write-back, so
+    // miner==signer aliasing nets correctly and the tip is a pure signer→miner
+    // transfer — total supply is unchanged. Zero when no active envelope ran.
+    credit(ledger, &ctx.miner, tip_paid)?;
     Ok(Receipt {
         tx_id: stx.id(),
         status,
@@ -2049,6 +2109,7 @@ mod tests {
             miner: miner_id(),
             pq: None,
             tx_domain: None,
+            fee_auction_active: false,
         }
     }
     /// A context at a specific height (for staking/vesting tests).
@@ -2061,6 +2122,7 @@ mod tests {
             miner: miner_id(),
             pq: None,
             tx_domain: None,
+            fee_auction_active: false,
         }
     }
 
@@ -2124,6 +2186,276 @@ mod tests {
         assert!(matches!(
             apply_transactions(&mut ledger, std::slice::from_ref(&stx), &ctx(&p)),
             Err(BlockExecutionError::InvalidTransaction { index: 0, .. })
+        ));
+    }
+
+    // ---- Fee auction (v0.1.98 slice 2b): the Tipped envelope when Active ----
+
+    /// A context with the `fee-auction` deployment ACTIVE and fees charged at
+    /// `price_grains` per gas unit — the post-activation execution environment.
+    fn auction_ctx(p: &MiningPolicy, price_grains: u128) -> BlockContext<'_> {
+        BlockContext {
+            height: 1,
+            prev_hash: Hash::ZERO,
+            mining: p,
+            gas_price: Balance::from_grains(price_grains),
+            miner: miner_id(),
+            pq: None,
+            tx_domain: None,
+            fee_auction_active: true,
+        }
+    }
+
+    /// A signed `Tipped{tip, Transfer{to, amount}}` from `usa.reserve.sov`.
+    fn tipped_transfer(tip: Balance, to: &str, amount: Balance, nonce: u64) -> SignedTransaction {
+        let kp = Keypair::from_seed([1; 32]);
+        let tx = Transaction {
+            signer: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce,
+            action: Action::Tipped {
+                tip,
+                inner: Box::new(Action::Transfer { to: id(to), amount }),
+            },
+        };
+        SignedTransaction::sign(tx, &kp).unwrap()
+    }
+
+    #[test]
+    fn active_tipped_transfer_conserves_total_balance_exactly() {
+        // I4 CONSERVATION — the #1 property: a tip is a PURE signer→miner transfer.
+        // Nothing is minted or burned, so Σ balances (total supply) is bit-exact
+        // unchanged, the per-account deltas are exactly (signer −(tip+fee+amount),
+        // miner +(tip+fee), recipient +amount), and the REAL block-import invariant
+        // (`sov_verify::check_transition`) holds on the before→after states.
+        use sov_verify::check_transition;
+        let p = policy();
+        let price: u128 = 3; // grains per gas unit (fees ON, non-trivial price)
+        let amount = Balance::from_sov(5).unwrap();
+
+        // Measure the deterministic intrinsic fee of this envelope on a scratch,
+        // so the near-balance case below can be constructed exactly.
+        let fee = {
+            let mut scratch = ledger_with_usa(100);
+            let r = apply_transaction(
+                &mut scratch,
+                &tipped_transfer(Balance::ZERO, "ecb.reserve.sov", amount, 0),
+                &auction_ctx(&p, price),
+            )
+            .unwrap();
+            Balance::from_grains(r.gas_used as u128 * price)
+        };
+        let start = Balance::from_sov(100).unwrap();
+        let near_balance_tip = start.checked_sub(fee).unwrap().checked_sub(amount).unwrap(); // leaves the signer at exactly zero
+
+        for tip in [
+            Balance::ZERO,
+            Balance::from_grains(1),
+            Balance::from_sov(7).unwrap(),
+            near_balance_tip,
+        ] {
+            let mut ledger = ledger_with_usa(100);
+            let before = ledger.clone();
+            let supply_before = ledger.total_supply().unwrap();
+
+            let stx = tipped_transfer(tip, "ecb.reserve.sov", amount, 0);
+            let receipt = apply_transaction(&mut ledger, &stx, &auction_ctx(&p, price)).unwrap();
+            assert!(receipt.succeeded(), "tip {tip:?}: inner transfer succeeds");
+
+            // Σ balances is EXACTLY unchanged: the tip+fee moved, none was created.
+            assert_eq!(
+                ledger.total_supply().unwrap(),
+                supply_before,
+                "tip {tip:?}: total supply must be conserved to the grain"
+            );
+            // Exact per-account deltas.
+            let outflow = tip.checked_add(fee).unwrap().checked_add(amount).unwrap();
+            assert_eq!(
+                ledger.account(&id("usa.reserve.sov")).balance,
+                start.checked_sub(outflow).unwrap(),
+                "tip {tip:?}: signer pays exactly tip + fee + amount"
+            );
+            assert_eq!(
+                ledger.account(&miner_id()).balance,
+                tip.checked_add(fee).unwrap(),
+                "tip {tip:?}: miner receives exactly tip + fee"
+            );
+            assert_eq!(
+                ledger.account(&id("ecb.reserve.sov")).balance,
+                amount,
+                "tip {tip:?}: recipient receives exactly the transfer amount"
+            );
+            // The REAL block-import supply invariant holds across the transition.
+            check_transition(&before, &ledger).unwrap();
+        }
+    }
+
+    #[test]
+    fn active_tipped_transfer_pays_miner_and_executes_inner_once() {
+        // The activation semantics end-to-end at the tx layer: tip credited to the
+        // miner, inner Transfer executed, the nonce consumed exactly once, and a
+        // succeeded receipt (the envelope is not a Failed path).
+        let mut ledger = ledger_with_usa(100);
+        let p = policy();
+        let tip = Balance::from_sov(2).unwrap();
+        let stx = tipped_transfer(tip, "ecb.reserve.sov", Balance::from_sov(5).unwrap(), 0);
+        // Fees OFF here to isolate the tip flow itself.
+        let receipt = apply_transaction(&mut ledger, &stx, &auction_ctx(&p, 0)).unwrap();
+        assert!(receipt.succeeded());
+        assert_eq!(
+            ledger.account(&miner_id()).balance,
+            tip,
+            "the tip alone reaches the miner"
+        );
+        assert_eq!(
+            ledger.account(&id("ecb.reserve.sov")).balance,
+            Balance::from_sov(5).unwrap(),
+            "the inner transfer really executed"
+        );
+        assert_eq!(
+            ledger.account(&id("usa.reserve.sov")).balance,
+            Balance::from_sov(93).unwrap(),
+            "signer paid tip + amount"
+        );
+        assert_eq!(
+            ledger.account(&id("usa.reserve.sov")).nonce,
+            1,
+            "nonce consumed exactly once"
+        );
+    }
+
+    #[test]
+    fn nested_tipped_envelope_is_a_hard_error_even_when_active() {
+        // Tips do not nest: Tipped{Tipped{..}} is a HARD NestedTip error (block-
+        // invalid), never a mineable Failed receipt — and nothing is committed.
+        let mut ledger = ledger_with_usa(100);
+        let before = ledger.clone();
+        let p = policy();
+        let kp = Keypair::from_seed([1; 32]);
+        let tx = Transaction {
+            signer: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce: 0,
+            action: Action::Tipped {
+                tip: Balance::from_sov(1).unwrap(),
+                inner: Box::new(Action::Tipped {
+                    tip: Balance::from_sov(1).unwrap(),
+                    inner: Box::new(Action::Transfer {
+                        to: id("ecb.reserve.sov"),
+                        amount: Balance::from_sov(5).unwrap(),
+                    }),
+                }),
+            },
+        };
+        let stx = SignedTransaction::sign(tx, &kp).unwrap();
+        assert_eq!(
+            apply_transaction(&mut ledger, &stx, &auction_ctx(&p, 1)),
+            Err(ExecutionError::NestedTip)
+        );
+        assert_eq!(
+            ledger.state_root(),
+            before.state_root(),
+            "hard reject commits nothing"
+        );
+        // And it invalidates the whole block at the batch layer.
+        assert!(matches!(
+            apply_transactions(&mut ledger, std::slice::from_ref(&stx), &auction_ctx(&p, 1)),
+            Err(BlockExecutionError::InvalidTransaction { index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn unaffordable_tip_is_a_hard_reject_with_no_partial_effect() {
+        // A tip the signer cannot afford is a HARD CannotAffordFee (block-invalid,
+        // NOT a Failed receipt): an unaffordable bid must never be mineable, the
+        // nonce is not consumed, and the ledger is bit-identical afterward.
+        let mut ledger = ledger_with_usa(100);
+        let before = ledger.clone();
+        let p = policy();
+        let stx = tipped_transfer(
+            Balance::from_sov(101).unwrap(), // > the signer's 100 SOV
+            "ecb.reserve.sov",
+            Balance::from_sov(1).unwrap(),
+            0,
+        );
+        assert!(matches!(
+            apply_transaction(&mut ledger, &stx, &auction_ctx(&p, 1)),
+            Err(ExecutionError::CannotAffordFee { .. })
+        ));
+        assert_eq!(
+            ledger.state_root(),
+            before.state_root(),
+            "no partial effect: nothing committed"
+        );
+        assert_eq!(ledger.account(&id("usa.reserve.sov")).nonce, 0);
+        assert!(matches!(
+            apply_transactions(&mut ledger, std::slice::from_ref(&stx), &auction_ctx(&p, 1)),
+            Err(BlockExecutionError::InvalidTransaction { index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn tipped_envelope_may_not_wrap_multisig_or_rotate_key() {
+        // The envelope may not wrap authorization-changing / approval-carrying
+        // actions — HARD TipInnerNotAllowed, mirroring the multisig inner guard.
+        let p = policy();
+        let kp = Keypair::from_seed([1; 32]);
+        let inners: Vec<Action> = vec![
+            Action::MultisigExec {
+                action: Box::new(Action::Transfer {
+                    to: id("ecb.reserve.sov"),
+                    amount: Balance::from_sov(1).unwrap(),
+                }),
+                approvals: vec![],
+            },
+            Action::RotateKey {
+                new_key: Keypair::from_seed([9; 32]).public_key(),
+                proof: kp.sign(b"not-a-real-proof"),
+            },
+        ];
+        for inner in inners {
+            let mut ledger = ledger_with_usa(100);
+            let before = ledger.clone();
+            let tx = Transaction {
+                signer: id("usa.reserve.sov"),
+                public_key: kp.public_key(),
+                nonce: 0,
+                action: Action::Tipped {
+                    tip: Balance::from_sov(1).unwrap(),
+                    inner: Box::new(inner),
+                },
+            };
+            let stx = SignedTransaction::sign(tx, &kp).unwrap();
+            assert_eq!(
+                apply_transaction(&mut ledger, &stx, &auction_ctx(&p, 1)),
+                Err(ExecutionError::TipInnerNotAllowed)
+            );
+            assert_eq!(
+                ledger.state_root(),
+                before.state_root(),
+                "hard reject commits nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn tipped_envelope_stays_feature_inactive_when_not_active() {
+        // The dormant gate is UNCHANGED by the activation plumbing: with
+        // `fee_auction_active = false` (the live-chain default) the envelope is
+        // still a hard FeatureInactive reject — even a zero-tip one.
+        let mut ledger = ledger_with_usa(100);
+        let p = policy();
+        let stx = tipped_transfer(
+            Balance::ZERO,
+            "ecb.reserve.sov",
+            Balance::from_sov(1).unwrap(),
+            0,
+        );
+        assert!(matches!(
+            apply_transaction(&mut ledger, &stx, &ctx(&p)),
+            Err(ExecutionError::FeatureInactive {
+                feature: "fee-auction"
+            })
         ));
     }
 
@@ -2641,6 +2973,7 @@ mod tests {
             miner: id("miner.sov"),
             pq: None,
             tx_domain: None,
+            fee_auction_active: false,
         };
 
         // Heights 1 & 2 mint 50 each (epoch 0); height 3 halves to 25
@@ -2766,6 +3099,7 @@ mod tests {
             miner: id("miner.sov"),
             pq: None,
             tx_domain: None,
+            fee_auction_active: false,
         };
 
         // Deploy from dev.sov.
@@ -2828,6 +3162,7 @@ mod tests {
             miner: miner_id(),
             pq: None,
             tx_domain: None,
+            fee_auction_active: false,
         };
         let mut ledger = ledger_with_usa(1_000);
         let stx = transfer([1; 32], "usa.reserve.sov", "ecb.reserve.sov", 1, 0);
@@ -3502,6 +3837,7 @@ mod tests {
             miner: id("miner.sov"),
             pq: None,
             tx_domain: None,
+            fee_auction_active: false,
         };
         let mut ledger = ledger_with_usa(100);
         let sov_before = ledger.account(&id("usa.reserve.sov")).balance;
@@ -4798,6 +5134,7 @@ mod tests {
                 threshold_grains: Balance::from_sov(50).unwrap().grains(),
             }),
             tx_domain: None,
+            fee_auction_active: false,
         }
     }
 
@@ -5018,6 +5355,7 @@ mod tests {
             miner: miner_id(),
             pq: None,
             tx_domain: None,
+            fee_auction_active: false,
         };
 
         // A V1 transfer pays exactly the intrinsic gas — no envelope charge.

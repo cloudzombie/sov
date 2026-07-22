@@ -385,6 +385,9 @@ fn stf_vector() -> Value {
         // KAT vectors are generated on the legacy (pre-fork) signing path so they
         // stay byte-identical across the `tx-domain` deployment.
         tx_domain: None,
+        // KAT vectors execute on the dormant (pre-activation) fee-auction path so
+        // they stay byte-identical across the `fee-auction` deployment.
+        fee_auction_active: false,
     };
     // The full block state transition the node performs: the coinbase mints the
     // scheduled subsidy to the miner FIRST (Bitcoin issuance), then the

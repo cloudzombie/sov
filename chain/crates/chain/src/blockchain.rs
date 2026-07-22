@@ -84,6 +84,13 @@ pub struct Blockchain {
     /// the genesis hash and every KAT vector are reproduced exactly — so a chain
     /// that never schedules or activates it is completely unaffected.
     tx_domain_deployment: Option<sov_governance::Deployment>,
+    /// The miner-signaled `fee-auction` deployment, if this chain schedules one.
+    /// When it activates, the `Action::Tipped` fee-auction envelope becomes
+    /// executable (tip paid signer→miner, inner action runs). `None` (the
+    /// default) keeps the envelope a hard `FeatureInactive` reject — execution
+    /// byte-identical to pre-fork, so the genesis hash and every KAT vector are
+    /// reproduced exactly and a chain that never schedules it is unaffected.
+    fee_auction_deployment: Option<sov_governance::Deployment>,
     /// Transaction receipts for the **active chain**, indexed for RPC lookup.
     /// `active_receipts[h]` holds the receipts of the active block at height `h`
     /// (in transaction order); only heights with at least one transaction appear.
@@ -521,6 +528,7 @@ impl Blockchain {
             signals: sov_governance::SignalLog::new(),
             pq_deployment: None,
             tx_domain_deployment: None,
+            fee_auction_deployment: None,
             active_receipts: HashMap::new(),
             tx_height: HashMap::new(),
             undo_ring: VecDeque::new(),
@@ -647,6 +655,15 @@ impl Blockchain {
         self.tx_domain_deployment = Some(deployment);
     }
 
+    /// Schedule the miner-signaled `fee-auction` soft fork: once `deployment`
+    /// activates under the BIP-9/8 state machine, the `Action::Tipped` envelope
+    /// executes (tip paid signer→miner, inner action runs). Dormant until
+    /// activation — pre-activation execution (and thus the genesis hash and every
+    /// KAT vector) is byte-identical: the envelope stays a hard reject.
+    pub fn set_fee_auction_deployment(&mut self, deployment: sov_governance::Deployment) {
+        self.fee_auction_deployment = Some(deployment);
+    }
+
     /// The live BIP-9/BIP-8 state of every registered governance deployment, evaluated
     /// over the ACTIVE chain's committed miner signals at the current height. This is
     /// read-only observability for `sov_getDeployments`; the exact same evaluation
@@ -670,6 +687,17 @@ impl Blockchain {
             });
         }
         if let Some(d) = &self.tx_domain_deployment {
+            out.push(DeploymentStatus {
+                name: d.name.clone(),
+                bit: d.bit,
+                state: sov_governance::state_at(d, BlockHeight::new(h), &self.signals),
+                start_height: d.start_height.get(),
+                timeout_height: d.timeout_height.get(),
+                period: d.period,
+                lockinontimeout: d.lockinontimeout,
+            });
+        }
+        if let Some(d) = &self.fee_auction_deployment {
             out.push(DeploymentStatus {
                 name: d.name.clone(),
                 bit: d.bit,
@@ -768,6 +796,44 @@ impl Blockchain {
             boundary += period;
         }
         None
+    }
+
+    /// Whether the miner-signaled `fee-auction` deployment is `Active` for a block
+    /// at `height`, resolved over the active chain's committed miner signals.
+    /// `false` before activation, or if no deployment is scheduled — the
+    /// byte-identical, pre-fork path (the `Action::Tipped` envelope stays a hard
+    /// reject).
+    pub fn fee_auction_active(&self, height: u64) -> bool {
+        self.fee_auction_active_with(height, &self.signals)
+    }
+
+    /// As [`fee_auction_active`](Self::fee_auction_active), but resolved against an
+    /// explicit signal history — so fork-choice replay of a competing branch
+    /// evaluates activation over *that branch's* signals, exactly as
+    /// [`resolved_tx_domain_with`](Self::resolved_tx_domain_with) does.
+    fn fee_auction_active_with(&self, height: u64, signals: &sov_governance::SignalLog) -> bool {
+        let Some(deployment) = self.fee_auction_deployment.as_ref() else {
+            return false;
+        };
+        let period = deployment.period;
+        // Walk window boundaries up to (and including) the one governing `height`;
+        // the first boundary whose state is Active is the activation height. States
+        // change only at boundaries and Active is terminal, so this is exact and
+        // monotone — identical in structure to `resolved_tx_domain_with`.
+        let governing = height - (height % period);
+        let mut boundary = period; // genesis window (0) is always Defined.
+        while boundary <= governing {
+            if sov_governance::state_at(
+                deployment,
+                sov_primitives::BlockHeight::new(boundary),
+                signals,
+            ) == sov_governance::ThresholdState::Active
+            {
+                return true;
+            }
+            boundary += period;
+        }
+        false
     }
 
     /// The mining policy a block extending `sha_target` is metered against — the
@@ -1123,6 +1189,7 @@ impl Blockchain {
             miner: proposer.clone(),
             pq: self.resolved_pq(next_height),
             tx_domain: self.resolved_tx_domain(next_height),
+            fee_auction_active: self.fee_auction_active(next_height),
         };
         apply_coinbase(&mut probe, &selection_ctx)?;
         let mut included = Vec::new();
@@ -1159,6 +1226,7 @@ impl Blockchain {
             miner: proposer.clone(),
             pq: self.resolved_pq(next_height),
             tx_domain: self.resolved_tx_domain(next_height),
+            fee_auction_active: self.fee_auction_active(next_height),
         };
         apply_coinbase(&mut scratch, &ctx)?;
         let receipts = apply_transactions(&mut scratch, &included, &ctx)?;
@@ -1821,6 +1889,7 @@ impl Blockchain {
             miner: block.header.proposer.clone(),
             pq: self.resolved_pq_with(height, signals),
             tx_domain: self.resolved_tx_domain_with(height, signals),
+            fee_auction_active: self.fee_auction_active_with(height, signals),
         };
         apply_coinbase(ledger, &ctx)?;
         Ok(apply_transactions(ledger, &block.transactions, &ctx)?)
@@ -2726,6 +2795,177 @@ mod tests {
             "a transaction bound to this chain is accepted post-activation"
         );
         chain.import_block(block).unwrap();
+    }
+
+    #[test]
+    fn fee_auction_is_dormant_by_default() {
+        // A chain with no `fee-auction` deployment scheduled never activates the
+        // envelope: a Tipped tx is excluded by the producer and a block smuggling
+        // one in is rejected on import — pre-fork behavior, byte-identical.
+        let mut chain = fresh_chain();
+        for h in [0u64, 1, 12, 100, 10_000] {
+            assert!(!chain.fee_auction_active(h), "dormant at height {h}");
+        }
+        let tipped = usa_tipped_transfer(1, "ecb.reserve.sov", 10, 0);
+        let empty = chain.produce_block(vec![tipped.clone()], 2_000).unwrap();
+        assert!(
+            empty.transactions.is_empty(),
+            "producer must exclude a Tipped tx while dormant"
+        );
+        let smuggled = Block::assemble(
+            empty.header.height,
+            empty.header.prev_hash,
+            empty.header.state_root,
+            empty.header.receipts_root,
+            empty.header.timestamp_ms,
+            empty.header.proposer.clone(),
+            vec![tipped],
+        );
+        assert!(
+            chain.import_block(smuggled).is_err(),
+            "a dormant Tipped tx must invalidate any block carrying it"
+        );
+    }
+
+    /// A signed `Tipped{tip, Transfer{to, amount}}` from `usa.reserve.sov`.
+    fn usa_tipped_transfer(tip_sov: u128, to: &str, sov: u128, nonce: u64) -> SignedTransaction {
+        let kp = Keypair::from_seed([2; 32]);
+        let tx = Transaction {
+            signer: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce,
+            action: Action::Tipped {
+                tip: Balance::from_sov(tip_sov).unwrap(),
+                inner: Box::new(Action::Transfer {
+                    to: id(to),
+                    amount: Balance::from_sov(sov).unwrap(),
+                }),
+            },
+        };
+        SignedTransaction::sign(tx, &kp).unwrap()
+    }
+
+    #[test]
+    fn miner_signaled_fee_auction_activates_and_tipped_tx_mines_conserving_supply() {
+        use sov_governance::{Deployment, Threshold};
+
+        // Same window math as the tx-domain test: signaling opens at height 4,
+        // window length 4, 3-of-4 threshold — [4,8) signals 4/4 -> LockedIn at
+        // boundary 8 -> Active at boundary 12.
+        let mut chain = fresh_chain();
+        chain.set_fee_auction_deployment(
+            Deployment::new(
+                "fee-auction",
+                2,
+                BlockHeight::new(4),
+                BlockHeight::new(400),
+                4,
+                Threshold::new(3, 4).unwrap(),
+                BlockHeight::new(0),
+                true,
+            )
+            .unwrap(),
+        );
+        chain.set_signal_mask(1 << 2);
+
+        let mut ts = 2_000u64;
+        for _ in 1..=11 {
+            let block = chain.produce_block(vec![], ts).unwrap();
+            assert_eq!(block.header.version_bits, 1 << 2, "blocks carry the signal");
+            chain.import_block(block).unwrap();
+            ts += 1_000;
+        }
+        // Dormant through height 11; ACTIVE for the block at height 12 — derived
+        // purely from committed header bits.
+        assert!(!chain.fee_auction_active(11));
+        assert!(chain.fee_auction_active(12));
+
+        // Post-activation, a tipped transfer is INCLUDED, imports through the real
+        // consensus gate (check_transition/check_ledger run on import), the tip
+        // reaches the miner, and supply moves by EXACTLY the coinbase — the tip
+        // itself is a pure signer→miner transfer.
+        let miner = id("val01.node.sov");
+        let miner_before = chain.ledger().account(&miner).balance;
+        let supply_before = chain.ledger().total_supply().unwrap();
+        let reward = chain.mint_reward();
+
+        let tipped = usa_tipped_transfer(3, "ecb.reserve.sov", 10, 0);
+        let block = chain.produce_block(vec![tipped], ts).unwrap();
+        assert_eq!(
+            block.transactions.len(),
+            1,
+            "a Tipped tx is mineable once fee-auction is active"
+        );
+        chain.import_block(block).unwrap();
+
+        let l = chain.ledger();
+        assert_eq!(
+            l.total_supply().unwrap(),
+            supply_before.checked_add(reward).unwrap(),
+            "supply rose by exactly the coinbase — the tip minted nothing"
+        );
+        assert_eq!(
+            l.account(&miner).balance,
+            miner_before
+                .checked_add(reward)
+                .unwrap()
+                .checked_add(Balance::from_sov(3).unwrap())
+                .unwrap(),
+            "the miner earned the coinbase plus the 3 SOV tip"
+        );
+        assert_eq!(
+            l.account(&id("ecb.reserve.sov")).balance,
+            Balance::from_sov(10).unwrap(),
+            "the inner transfer executed"
+        );
+        assert_eq!(
+            l.account(&id("usa.reserve.sov")).balance,
+            Balance::from_sov(1_000 - 3 - 10).unwrap(),
+            "the signer paid exactly tip + amount (fees are off in this policy)"
+        );
+        assert_eq!(l.account(&id("usa.reserve.sov")).nonce, 1);
+
+        // A NESTED tip is still block-invalid post-activation: the producer excludes
+        // it and a smuggled block is rejected by import re-execution.
+        let kp = Keypair::from_seed([2; 32]);
+        let nested = SignedTransaction::sign(
+            Transaction {
+                signer: id("usa.reserve.sov"),
+                public_key: kp.public_key(),
+                nonce: 1,
+                action: Action::Tipped {
+                    tip: Balance::from_sov(1).unwrap(),
+                    inner: Box::new(Action::Tipped {
+                        tip: Balance::from_sov(1).unwrap(),
+                        inner: Box::new(Action::Transfer {
+                            to: id("ecb.reserve.sov"),
+                            amount: Balance::from_sov(1).unwrap(),
+                        }),
+                    }),
+                },
+            },
+            &kp,
+        )
+        .unwrap();
+        ts += 1_000;
+        let empty = chain.produce_block(vec![nested.clone()], ts).unwrap();
+        assert!(
+            empty.transactions.is_empty(),
+            "a nested tip is never mineable"
+        );
+        let smuggled = Block::assemble(
+            empty.header.height,
+            empty.header.prev_hash,
+            empty.header.state_root,
+            empty.header.receipts_root,
+            empty.header.timestamp_ms,
+            empty.header.proposer.clone(),
+            vec![nested],
+        );
+        assert!(
+            chain.import_block(smuggled).is_err(),
+            "a block smuggling a nested tip must be rejected on import"
+        );
     }
 
     /// A chain like [`fresh_chain`] but with transaction fees switched on.
