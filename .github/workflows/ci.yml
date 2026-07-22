@@ -4,10 +4,27 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  repository-boundaries:
+    name: repository boundaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: XUS Miner remains external
+        run: |
+          if test -n "$(git ls-files 'xus-miner/**')"; then
+            echo "xus-miner belongs in https://github.com/cloudzombie/xus-miner" >&2
+            exit 1
+          fi
+
   # Platform-agnostic checks: run once on Linux.
   lint:
     name: fmt · clippy
