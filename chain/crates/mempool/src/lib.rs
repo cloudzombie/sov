@@ -1592,9 +1592,12 @@ mod tests {
         // BelowFloor must NEVER quote a floor of 0: a full pool of single-tx, zero-tip
         // senders refuses a zero-tip newcomer with the legacy `Full`, not `BelowFloor{0}`.
         let mut pool = Mempool::with_limits(3, 10);
-        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big()).unwrap();
-        pool.insert(tx([2; 32], "ecb.reserve.sov", 0), 0, big()).unwrap();
-        pool.insert(tx([3; 32], "boj.reserve.sov", 0), 0, big()).unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(tx([2; 32], "ecb.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(tx([3; 32], "boj.reserve.sov", 0), 0, big())
+            .unwrap();
         assert!(matches!(
             pool.insert(tx([9; 32], "rba.reserve.sov", 0), 0, big()),
             Err(MempoolError::Full { .. })
@@ -1614,7 +1617,11 @@ mod tests {
         let bumped = tipped([1; 32], "usa.reserve.sov", 0, 5 + MIN_RBF_BUMP_GRAINS);
         let bumped_id = bumped.id();
         pool.insert(bumped, 0, big()).unwrap();
-        assert_eq!(pool.len(), 2, "RBF is one-for-one; capacity is not consumed");
+        assert_eq!(
+            pool.len(),
+            2,
+            "RBF is one-for-one; capacity is not consumed"
+        );
         assert!(pool.contains(&bumped_id), "the bumped tx replaced its slot");
     }
 
