@@ -15,10 +15,20 @@
 //!   `NonceGap` and resubmits the missing nonce);
 //! - time-evicts any entry stranded behind a pre-existing/edge-case gap after a
 //!   TTL, so such a gap self-clears instead of occupying the pool forever;
-//! - bounds its own size, so it cannot grow without limit; and
-//! - on request, returns transactions grouped by sender and ordered by nonce,
-//!   skipping any sender whose next expected nonce is missing — never proposing
-//!   a transaction that would be rejected for a nonce gap.
+//! - bounds its own size — and at capacity runs a blockspace AUCTION: a new tx
+//!   that outbids (tips more than) the pool's cheapest safely-evictable tx
+//!   displaces it, so "mempool full" is economically impossible for an adequate
+//!   bid, while an underbid gets the actionable [`MempoolError::BelowFloor`];
+//! - supports replace-by-fee: a same-`(signer, nonce)` resubmission that raises
+//!   the tip by [`MIN_RBF_BUMP_GRAINS`] replaces the pooled original — the
+//!   unstick/cancel path; and
+//! - on request, returns a block template batch by the auction: highest
+//!   [`effective_tip`] first across signers, ascending nonce within a signer (a
+//!   nonce package — a later nonce never jumps its own signer's earlier one),
+//!   never proposing a transaction that would be rejected for a nonce gap. A
+//!   low- or zero-tip tx is never *rejected* for being cheap (the auction is
+//!   ordering, not admission): it waits, and with no tips anywhere the schedule
+//!   is byte-identical to the legacy fair nonce ordering.
 //!
 //! The pool deliberately does *not* check balances: balances change as a block
 //! executes, so affordability is the execution layer's call. The pool's
@@ -56,11 +66,41 @@ pub enum MempoolError {
     /// An identical transaction (same id) is already pooled.
     #[error("transaction already in the pool")]
     Duplicate,
-    /// The pool is at capacity.
+    /// The pool is at capacity and no displacement is possible at this bid: either
+    /// every evictable transaction belongs to the submitting signer itself (evicting
+    /// one would strand the newcomer behind its own hole), or — with a zero bid
+    /// against a zero floor — the pool is fairly shared with no over-represented
+    /// sender to trim. With the blockspace auction this is only reachable when the
+    /// floor is zero (or self-displacement is the sole option); any bid ABOVE the
+    /// floor displaces instead of erroring, and an inadequate bid against a nonzero
+    /// floor gets the actionable [`MempoolError::BelowFloor`] instead.
     #[error("mempool is full ({capacity} transactions)")]
     Full {
         /// The configured capacity.
         capacity: usize,
+    },
+    /// The pool is at capacity and the transaction's tip does not BEAT the current
+    /// mempool floor — the lowest tip among evictable (per-signer highest-nonce)
+    /// pooled transactions, i.e. the emergent market price of a pool slot. The
+    /// transaction is not "too cheap to be valid" — it is outbid *right now*: raise
+    /// the tip above `floor` (or wait for demand to fall) and resubmit. This is the
+    /// auction's only refusal; a bid above the floor always finds room (Rule B).
+    #[error(
+        "mempool at capacity: tip does not beat the current floor of {floor} — raise the tip and resubmit"
+    )]
+    BelowFloor {
+        /// The lowest tip currently protecting a pool slot; a new tx must bid
+        /// strictly more than this to displace it.
+        floor: Balance,
+    },
+    /// A replace-by-fee attempt raised the tip, but not by the anti-churn minimum
+    /// bump: a replacement for a pooled `(signer, nonce)` must tip at least
+    /// `required` (= old tip + [`MIN_RBF_BUMP_GRAINS`]). Prevents zero-cost
+    /// replacement spam while keeping the unstick/cancel path open.
+    #[error("replacement underpriced: this (signer, nonce) slot requires a tip of at least {required} to replace")]
+    RbfUnderpriced {
+        /// The minimum tip a successful replacement must carry.
+        required: Balance,
     },
     /// The transaction's nonce is beyond the sender's contiguous pending run
     /// (`current_nonce + pending_count`), so admitting it would leave a hole that
@@ -112,14 +152,41 @@ pub enum MempoolError {
 fn base_outflow(action: &Action) -> u128 {
     match action {
         Action::Transfer { amount, .. } => amount.grains(),
+        // A fee-auction envelope debits the TIP from the signer (to the miner) on top
+        // of whatever its inner action moves — both must be affordable or the tx can
+        // never execute. `Tipped` never nests (rejected at decode and execution), so
+        // this recursion is depth-1 in practice and decode-bounded regardless.
+        Action::Tipped { tip, inner } => tip.grains().saturating_add(base_outflow(inner)),
         _ => 0,
     }
 }
 
+/// The priority bid a transaction carries in the blockspace auction: the `tip` of a
+/// top-level [`Action::Tipped`] envelope, else zero. Exactly ONE level is unwrapped —
+/// a `Tipped` is never nested (execution and decode both reject nesting), and even if
+/// one slipped in, the outer tip alone is the bid. An untipped (legacy v1) transaction
+/// bids zero: it is never *rejected* for that (Rule A) — it simply waits its turn
+/// behind funded bids when blockspace or pool slots are contested.
+pub fn effective_tip(stx: &SignedTransaction) -> Balance {
+    match &stx.transaction.action {
+        Action::Tipped { tip, .. } => *tip,
+        _ => Balance::ZERO,
+    }
+}
+
+/// Minimum tip increase (in grains, 10⁻⁸ XUS) a replace-by-fee must add over the
+/// pooled transaction it displaces: `new_tip ≥ old_tip + MIN_RBF_BUMP_GRAINS`.
+/// 1_000 grains = 0.00001 XUS — economically negligible for a genuine repricing, but
+/// nonzero so an attacker cannot churn the pool (and the relay layer) with an endless
+/// stream of free equal-tip replacements. Same rationale as Bitcoin's BIP-125 rule 4
+/// incremental-relay-fee bump.
+pub const MIN_RBF_BUMP_GRAINS: u128 = 1_000;
+
 /// One sender may occupy at most this fraction of the pool (1/64), floored at 16,
 /// so a single account cannot crowd everyone else out — the anti-DoS fairness
-/// bound for SOV's *fixed-gas-price* fee model (there is no fee auction to bid for
-/// priority, so the mempool's job under pressure is fairness, not fee-bidding).
+/// bound that complements the blockspace auction: tips decide WHO WINS contested
+/// slots ([`effective_tip`]), this cap bounds how many slots one account may
+/// contest at all.
 fn default_per_sender(capacity: usize) -> usize {
     (capacity / 64).max(16)
 }
@@ -133,6 +200,18 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// The safely-evictable pooled transaction a full pool would displace first — the
+/// auction's marginal slot. See [`Mempool::eviction_victim`].
+struct EvictionVictim {
+    /// The victim's tx id.
+    id: Hash,
+    /// The victim's [`effective_tip`], in grains — the pool's current price floor.
+    tip: u128,
+    /// How many transactions the victim's sender holds (legacy-fairness tie-break;
+    /// a zero-tip tie only displaces a sender holding more than one).
+    sender_count: usize,
 }
 
 /// A bounded pool of pending, validated transactions.
@@ -230,16 +309,53 @@ impl Mempool {
         n
     }
 
-    /// The signer holding the most pending transactions, with that count.
-    fn heaviest_sender(&self) -> Option<(AccountId, usize)> {
-        let mut counts: HashMap<&AccountId, usize> = HashMap::new();
-        for (signer, _) in self.by_sender.keys() {
-            *counts.entry(signer).or_default() += 1;
+    /// The transaction a full pool would evict to make room — the auction's
+    /// marginal slot — or `None` if nothing is safely evictable.
+    ///
+    /// Candidates are restricted to each signer's TAIL (its highest pooled nonce):
+    /// evicting an interior nonce would open a hole that strands every later nonce
+    /// of that signer (the no-stranding rule), so only tails are ever displaced.
+    /// The victim is the tail with the LOWEST [`effective_tip`] — its tip is the
+    /// pool's emergent price floor. Ties on tip prefer the tail of the sender
+    /// holding the MOST pooled transactions (the legacy fairness rule, which makes
+    /// the all-zero-tip case byte-identical to the pre-auction
+    /// heaviest-sender/highest-nonce eviction), then the first sender in id order
+    /// (deterministic).
+    ///
+    /// `exclude`'s tails are never candidates: evicting the submitting signer's own
+    /// tail (nonce t) to admit its next nonce (t+1) would trade one tx for another
+    /// AND leave the newcomer stranded behind the hole at t — a pure loss.
+    fn eviction_victim(&self, exclude: &AccountId) -> Option<EvictionVictim> {
+        let mut best: Option<EvictionVictim> = None;
+        let senders: BTreeSet<&AccountId> = self.by_sender.keys().map(|(s, _)| s).collect();
+        for signer in senders {
+            if signer == exclude {
+                continue;
+            }
+            let Some((_, id)) = self
+                .by_sender
+                .range((signer.clone(), 0)..=(signer.clone(), u64::MAX))
+                .next_back()
+            else {
+                continue;
+            };
+            let tip = effective_tip(&self.by_id[id]).grains();
+            let count = self.sender_count(signer);
+            // Strictly-better comparisons keep the FIRST (lowest-id) sender on full
+            // ties, making the choice deterministic.
+            let better = match &best {
+                None => true,
+                Some(b) => tip < b.tip || (tip == b.tip && count > b.sender_count),
+            };
+            if better {
+                best = Some(EvictionVictim {
+                    id: *id,
+                    tip,
+                    sender_count: count,
+                });
+            }
         }
-        counts
-            .into_iter()
-            .max_by_key(|(_, n)| *n)
-            .map(|(s, n)| (s.clone(), n))
+        best
     }
 
     /// Evict `signer`'s highest-nonce pending transaction (the least likely to be
@@ -317,15 +433,55 @@ impl Mempool {
         if self.by_id.contains_key(&id) {
             return Err(MempoolError::Duplicate);
         }
-        // Reject a *different* transaction for an already-occupied (signer, nonce):
-        // overwriting `by_sender` in place would orphan the existing id in `by_id`
-        // (unselectable and unprunable), silently leaking capacity.
+        // An already-occupied (signer, nonce) slot: this is either replace-by-fee
+        // (the unstick/cancel path — reprice a stuck tx, or cancel it by replacing
+        // it with a self-transfer) or a collision. A replacement must RAISE the tip
+        // by at least the anti-churn bump to displace the incumbent:
+        //   new_tip ≥ old_tip + MIN_RBF_BUMP_GRAINS  →  atomically replace;
+        //   old_tip < new_tip < required             →  RbfUnderpriced (raise more);
+        //   new_tip ≤ old_tip                        →  NonceTaken (not a bid at all
+        //                                               — byte-identical to the
+        //                                               pre-auction behavior for
+        //                                               untipped 0-vs-0 collisions).
+        // Silent in-place overwrite is never allowed: it would orphan the old id in
+        // `by_id` (unselectable, unprunable), silently leaking capacity.
         let slot = (stx.transaction.signer.clone(), nonce);
-        if self.by_sender.contains_key(&slot) {
-            return Err(MempoolError::NonceTaken {
-                signer: stx.transaction.signer.clone(),
-                nonce,
-            });
+        if let Some(old_id) = self.by_sender.get(&slot).copied() {
+            let old_tip = effective_tip(&self.by_id[&old_id]).grains();
+            let new_tip = effective_tip(&stx).grains();
+            if new_tip <= old_tip {
+                return Err(MempoolError::NonceTaken {
+                    signer: stx.transaction.signer.clone(),
+                    nonce,
+                });
+            }
+            let required = old_tip.saturating_add(MIN_RBF_BUMP_GRAINS);
+            if new_tip < required {
+                return Err(MempoolError::RbfUnderpriced {
+                    required: Balance::from_grains(required),
+                });
+            }
+            // Affordability of the post-replacement pool: the incumbent's outflow is
+            // released and the replacement's reserved, atomically.
+            let old_outflow = base_outflow(&self.by_id[&old_id].transaction.action);
+            let committed = self
+                .pending_outflow(&stx.transaction.signer)
+                .saturating_sub(old_outflow)
+                .saturating_add(base_outflow(&stx.transaction.action));
+            if committed > balance.grains() {
+                return Err(MempoolError::Insufficient {
+                    available: balance.grains(),
+                    committed,
+                });
+            }
+            // Replace atomically: pool size and the sender's slot count are
+            // unchanged, so neither the capacity auction nor the per-sender cap
+            // applies, and the gap-free invariant is untouched (same slot).
+            self.remove(&old_id);
+            self.by_sender.insert(slot, id);
+            self.by_id.insert(id, stx);
+            self.inserted_at.insert(id, now_millis());
+            return Ok(());
         }
         // Affordability: the signer's pooled transfers, plus this one, may not move more
         // base XUS than the signer holds. An over-balance transfer can never be mined
@@ -348,17 +504,37 @@ impl Mempool {
                 limit: self.max_per_sender,
             });
         }
-        // At capacity: rather than hard-reject, EVICT one transaction from the
-        // most over-represented sender (its highest nonce — least executable) to
-        // make room. Only evict from a sender holding more than one, so a full,
-        // fairly-shared pool rejects new entries instead of thrashing.
+        // At capacity: the blockspace auction (Rule B — "full" must be economically
+        // impossible for an adequate bid). The victim is the lowest-tip TAIL in the
+        // pool (see `eviction_victim`; only tails are displaced, so no signer's run
+        // is ever holed — the no-stranding rule) and its tip is the pool's emergent
+        // price floor:
+        //   new_tip > floor  →  the newcomer OUTBIDS the marginal slot: evict the
+        //                       victim (it can rebid with a higher tip) and admit;
+        //   new_tip == floor →  not an outbid; the legacy FAIRNESS rule decides the
+        //                       tie: displace only a sender holding more than one tx
+        //                       (with all tips zero this is byte-identical to the
+        //                       pre-auction heaviest-sender/highest-nonce eviction);
+        //   otherwise        →  refuse — BelowFloor (raise the tip) when a nonzero
+        //                       price exists, the legacy Full when the floor is zero
+        //                       (a zero bid against a fairly-shared zero-tip pool)
+        //                       or nothing is evictable at all (every tail is the
+        //                       submitting signer's own).
         if self.by_id.len() >= self.capacity {
-            match self.heaviest_sender() {
-                Some((victim, n)) if n > 1 => self.evict_highest_nonce(&victim),
+            let new_tip = effective_tip(&stx).grains();
+            match self.eviction_victim(&stx.transaction.signer) {
+                Some(v) if new_tip > v.tip || (new_tip == v.tip && v.sender_count > 1) => {
+                    self.remove(&v.id);
+                }
+                Some(v) if v.tip > 0 => {
+                    return Err(MempoolError::BelowFloor {
+                        floor: Balance::from_grains(v.tip),
+                    });
+                }
                 _ => {
                     return Err(MempoolError::Full {
                         capacity: self.capacity,
-                    })
+                    });
                 }
             }
         }
@@ -486,30 +662,66 @@ impl Mempool {
         }
     }
 
-    /// Select an executable batch of up to `max` transactions: for each sender,
-    /// a contiguous run of nonces starting at its `current_nonce`, stopping at
-    /// the first gap. Transactions are returned grouped by sender (in id order)
-    /// and ascending by nonce, ready to apply in sequence.
+    /// Select an executable batch of up to `max` transactions by the blockspace
+    /// AUCTION: highest-tip-first across signers, per-signer nonce order within.
+    ///
+    /// Each signer contributes its contiguous mineable run (nonces from its
+    /// `current_nonce` up to the first gap) as an ordered NONCE PACKAGE — nonce
+    /// N+1 is only ever mineable after N, so a later nonce can never jump its own
+    /// signer's earlier one, whatever its tip. The batch is then filled greedily:
+    /// each step takes, across all signers, the one whose HEAD (lowest unselected)
+    /// transaction carries the highest [`effective_tip`], appends that head, and
+    /// advances the signer. A signer's head tip reprices at every step (a cheap
+    /// nonce ahead of an expensive one holds the package to the cheap head's bid —
+    /// the account-model equivalent of ancestor-feerate scoring).
+    ///
+    /// Ties on the head tip go to the FIRST signer in id order; with every tip
+    /// zero (the no-demand / pre-activation case) this therefore degenerates to
+    /// EXACTLY the legacy fair schedule — signers in ascending id order, each
+    /// contributing its full contiguous run — byte-identical output, so untipped
+    /// behavior is unchanged.
+    ///
+    /// A low- or zero-tip transaction is never dropped here (Rule A): it simply
+    /// sorts later, stays pooled when the block fills, and is picked up by a
+    /// future template once demand clears.
     pub fn select<F: Fn(&AccountId) -> u64>(
         &self,
         current_nonce: F,
         max: usize,
     ) -> Vec<SignedTransaction> {
-        let mut out = Vec::new();
+        // Per-signer mineable queues: the contiguous run from the on-chain nonce,
+        // in nonce order. BTreeMap keeps signers in ascending id order for the
+        // deterministic (and legacy-identical) tie-break below.
+        let mut queues: BTreeMap<&AccountId, std::collections::VecDeque<&SignedTransaction>> =
+            BTreeMap::new();
         let signers: BTreeSet<&AccountId> = self.by_sender.keys().map(|(s, _)| s).collect();
         for signer in signers {
             let mut nonce = current_nonce(signer);
-            while out.len() < max {
-                match self.by_sender.get(&(signer.clone(), nonce)) {
-                    Some(id) => {
-                        out.push(self.by_id[id].clone());
-                        nonce += 1;
-                    }
-                    None => break,
+            let mut queue = std::collections::VecDeque::new();
+            while let Some(id) = self.by_sender.get(&(signer.clone(), nonce)) {
+                queue.push_back(&self.by_id[id]);
+                nonce += 1;
+            }
+            if !queue.is_empty() {
+                queues.insert(signer, queue);
+            }
+        }
+        let mut out = Vec::new();
+        while out.len() < max && !queues.is_empty() {
+            // Head-tip greedy: the signer whose NEXT mineable tx bids highest.
+            // Strict `>` keeps the first (lowest-id) signer on ties.
+            let mut best: Option<(&AccountId, u128)> = None;
+            for (signer, queue) in &queues {
+                let head_tip = effective_tip(queue.front().expect("queues are non-empty")).grains();
+                if best.is_none_or(|(_, t)| head_tip > t) {
+                    best = Some((*signer, head_tip));
                 }
             }
-            if out.len() >= max {
-                break;
+            let winner = best.expect("queues is non-empty").0;
+            let queue = queues.get_mut(&winner).expect("winner is present");
+            out.push(queue.pop_front().expect("queues are non-empty").clone());
+            if queue.is_empty() {
+                queues.remove(&winner);
             }
         }
         out
@@ -575,7 +787,11 @@ mod tests {
         // both select in ascending nonce order. Same signer/key, back-to-back sends.
         let mut pool = Mempool::new(100);
         let signer = id("usa.reserve.sov");
-        assert_eq!(pool.next_nonce(&signer, 0), 0, "empty pool → on-chain nonce");
+        assert_eq!(
+            pool.next_nonce(&signer, 0),
+            0,
+            "empty pool → on-chain nonce"
+        );
 
         pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
             .unwrap();
@@ -1055,5 +1271,333 @@ mod tests {
         let newcomer = pool.insert(tx([3; 32], "boj.reserve.sov", 0), 0, big());
         assert!(matches!(newcomer, Err(MempoolError::Full { capacity: 2 })));
         assert_eq!(pool.len(), 2);
+    }
+
+    // ── Blockspace auction (v0.1.98 slice 3) ────────────────────────────────────
+
+    /// A signed `Tipped { tip, Transfer(1 XUS) }` from `from` at `nonce`, bidding
+    /// `tip_grains` for priority.
+    fn tipped(seed: [u8; 32], from: &str, nonce: u64, tip_grains: u128) -> SignedTransaction {
+        let kp = Keypair::from_seed(seed);
+        let t = Transaction {
+            signer: id(from),
+            public_key: kp.public_key(),
+            nonce,
+            action: Action::Tipped {
+                tip: Balance::from_grains(tip_grains),
+                inner: Box::new(Action::Transfer {
+                    to: id("ecb.reserve.sov"),
+                    amount: Balance::from_sov(1).unwrap(),
+                }),
+            },
+        };
+        SignedTransaction::sign(t, &kp).unwrap()
+    }
+
+    #[test]
+    fn effective_tip_reads_the_envelope_else_zero() {
+        assert_eq!(
+            effective_tip(&tipped([1; 32], "usa.reserve.sov", 0, 777)),
+            Balance::from_grains(777)
+        );
+        assert_eq!(
+            effective_tip(&tx([1; 32], "usa.reserve.sov", 0)),
+            Balance::ZERO,
+            "an untipped tx bids zero"
+        );
+    }
+
+    #[test]
+    fn low_tip_waits_behind_high_tip_in_the_template() {
+        // Rule A: both admit without error; the auction ORDERS them. With room for
+        // only 1 tx, the high bid is templated first and the low bid stays pooled.
+        let mut pool = Mempool::new(100);
+        let low = tx([1; 32], "usa.reserve.sov", 0); // tip 0
+        let low_id = low.id();
+        pool.insert(low, 0, big()).unwrap();
+        pool.insert(tipped([2; 32], "ecb.reserve.sov", 0, 5_000), 0, big())
+            .unwrap();
+
+        let template = pool.select(|_| 0, 1);
+        assert_eq!(template.len(), 1);
+        assert_eq!(
+            template[0].transaction.signer,
+            id("ecb.reserve.sov"),
+            "the high bid wins the contested slot"
+        );
+        assert!(
+            pool.contains(&low_id),
+            "the low bid WAITS — still pooled, never errored"
+        );
+        // With room for both, the low bid rides along after the high one.
+        let both = pool.select(|_| 0, 2);
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[1].transaction.signer, id("usa.reserve.sov"));
+    }
+
+    #[test]
+    fn nonce_package_never_jumps_its_own_earlier_nonce() {
+        // Signer A: nonce 0 bids low, nonce 1 bids huge. The package rule holds:
+        // A's nonce 0 must still be selected before A's nonce 1 — the huge bid can
+        // never leapfrog its own predecessor. A middling other-signer bid slots
+        // between packages, not inside one.
+        let mut pool = Mempool::new(100);
+        pool.insert(tipped([1; 32], "usa.reserve.sov", 0, 1), 0, big())
+            .unwrap();
+        pool.insert(tipped([1; 32], "usa.reserve.sov", 1, 1_000_000), 0, big())
+            .unwrap();
+        pool.insert(tipped([2; 32], "ecb.reserve.sov", 0, 500), 0, big())
+            .unwrap();
+
+        let batch = pool.select(|_| 0, 3);
+        assert_eq!(batch.len(), 3);
+        // ecb's 500 beats usa's HEAD (1), so it goes first; then usa 0 unlocks usa 1.
+        assert_eq!(batch[0].transaction.signer, id("ecb.reserve.sov"));
+        assert_eq!(batch[1].transaction.signer, id("usa.reserve.sov"));
+        assert_eq!(
+            batch[1].transaction.nonce, 0,
+            "own nonce order is inviolable"
+        );
+        assert_eq!(batch[2].transaction.nonce, 1);
+    }
+
+    #[test]
+    fn capacity_outbid_evicts_the_cheapest_tail_and_admits() {
+        // Rule B: a full pool is not "full" to a better bid. Three tip=1 txs fill
+        // it; a tip=5 newcomer displaces one tip=1 TAIL, pool size unchanged.
+        let mut pool = Mempool::with_limits(3, 10);
+        pool.insert(tipped([1; 32], "usa.reserve.sov", 0, 1), 0, big())
+            .unwrap();
+        pool.insert(tipped([2; 32], "ecb.reserve.sov", 0, 1), 0, big())
+            .unwrap();
+        pool.insert(tipped([3; 32], "boj.reserve.sov", 0, 1), 0, big())
+            .unwrap();
+        assert_eq!(pool.len(), 3);
+
+        let winner = tipped([4; 32], "rba.reserve.sov", 0, 5);
+        let winner_id = winner.id();
+        pool.insert(winner, 0, big()).unwrap();
+        assert_eq!(pool.len(), 3, "one-in, one-out: capacity is preserved");
+        assert!(pool.contains(&winner_id), "the outbidder is admitted");
+        // Exactly one tip=1 tx was displaced (it can rebid with a higher tip).
+        let survivors = pool.select(|_| 0, 10);
+        assert_eq!(
+            survivors
+                .iter()
+                .filter(|stx| effective_tip(stx).grains() == 1)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn capacity_underbid_is_refused_below_floor_not_full() {
+        // Rule B's flip side: a bid under the floor is refused with the actionable
+        // BelowFloor (carrying the price to beat) — never the dead-end Full.
+        let mut pool = Mempool::with_limits(2, 10);
+        pool.insert(tipped([1; 32], "usa.reserve.sov", 0, 5), 0, big())
+            .unwrap();
+        pool.insert(tipped([2; 32], "ecb.reserve.sov", 0, 5), 0, big())
+            .unwrap();
+
+        let underbid = tipped([3; 32], "boj.reserve.sov", 0, 1);
+        let underbid_id = underbid.id();
+        assert_eq!(
+            pool.insert(underbid, 0, big()),
+            Err(MempoolError::BelowFloor {
+                floor: Balance::from_grains(5),
+            })
+        );
+        assert!(!pool.contains(&underbid_id), "the underbid is not admitted");
+        assert_eq!(pool.len(), 2, "nothing was evicted for an underbid");
+    }
+
+    #[test]
+    fn rule_a_zero_tip_is_admitted_under_capacity_and_waits() {
+        // Rule A is absolute: with room in the pool, a zero-tip tx is ADMITTED —
+        // no error for being cheap — and remains selectable.
+        let mut pool = Mempool::new(100);
+        let cheap = tx([1; 32], "usa.reserve.sov", 0);
+        let cheap_id = cheap.id();
+        pool.insert(cheap, 0, big()).unwrap();
+        assert!(pool.contains(&cheap_id));
+        assert_eq!(pool.select(|_| 0, 10).len(), 1, "it waits and gets mined");
+    }
+
+    #[test]
+    fn eviction_never_strands_a_package_and_the_floor_is_the_tail_price() {
+        // Signer A holds [n0 tip 0, n1 tip 9]: its n0 is NOT evictable (a hole at
+        // n0 would strand n1) — only tails are. Signer B holds [n0 tip 3].
+        // Entry price (floor) is therefore min over TAILS = 3, not the global min 0.
+        let mut pool = Mempool::with_limits(3, 10);
+        pool.insert(tipped([1; 32], "usa.reserve.sov", 0, 0), 0, big())
+            .unwrap();
+        pool.insert(tipped([1; 32], "usa.reserve.sov", 1, 9), 0, big())
+            .unwrap();
+        pool.insert(tipped([2; 32], "ecb.reserve.sov", 0, 3), 0, big())
+            .unwrap();
+
+        // An underbid is priced against the TAIL floor (3), not the buried 0.
+        assert_eq!(
+            pool.insert(tipped([3; 32], "boj.reserve.sov", 0, 1), 0, big()),
+            Err(MempoolError::BelowFloor {
+                floor: Balance::from_grains(3),
+            })
+        );
+        // A tip-5 bid beats the 3-tip tail: B is displaced; A's package is intact.
+        pool.insert(tipped([3; 32], "boj.reserve.sov", 0, 5), 0, big())
+            .unwrap();
+        assert_eq!(pool.len(), 3);
+        let batch = pool.select(|_| 0, 10);
+        let usa: Vec<u64> = batch
+            .iter()
+            .filter(|s| s.transaction.signer == id("usa.reserve.sov"))
+            .map(|s| s.transaction.nonce)
+            .collect();
+        assert_eq!(usa, vec![0, 1], "A's nonce package was never holed");
+        assert!(!batch
+            .iter()
+            .any(|s| s.transaction.signer == id("ecb.reserve.sov")));
+    }
+
+    #[test]
+    fn own_tail_is_never_evicted_to_admit_own_next_nonce() {
+        // A signer that filled the pool alone cannot displace its OWN tail to admit
+        // its next nonce — that would hole its package (net loss). It gets Full.
+        let mut pool = Mempool::with_limits(2, 10);
+        pool.insert(tipped([1; 32], "usa.reserve.sov", 0, 5), 0, big())
+            .unwrap();
+        pool.insert(tipped([1; 32], "usa.reserve.sov", 1, 5), 0, big())
+            .unwrap();
+        assert_eq!(
+            pool.insert(tipped([1; 32], "usa.reserve.sov", 2, 50), 0, big()),
+            Err(MempoolError::Full { capacity: 2 })
+        );
+        // A DIFFERENT signer outbidding the floor still gets in normally.
+        pool.insert(tipped([2; 32], "ecb.reserve.sov", 0, 9), 0, big())
+            .unwrap();
+        assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn rbf_replaces_at_the_bump_and_rejects_below_it() {
+        // The unstick/cancel path: same (signer, nonce), tip raised by the minimum
+        // bump ⇒ atomic replacement. Raised but under the bump ⇒ RbfUnderpriced.
+        // Not raised at all ⇒ the legacy NonceTaken.
+        let mut pool = Mempool::new(100);
+        let original = tipped([1; 32], "usa.reserve.sov", 0, 100);
+        let original_id = original.id();
+        pool.insert(original, 0, big()).unwrap();
+
+        // Raised, but under old + MIN_RBF_BUMP_GRAINS: refused with the price.
+        assert_eq!(
+            pool.insert(
+                tipped([1; 32], "usa.reserve.sov", 0, 100 + MIN_RBF_BUMP_GRAINS - 1),
+                0,
+                big()
+            ),
+            Err(MempoolError::RbfUnderpriced {
+                required: Balance::from_grains(100 + MIN_RBF_BUMP_GRAINS),
+            })
+        );
+        assert!(
+            pool.contains(&original_id),
+            "underpriced RBF changes nothing"
+        );
+
+        // Exactly old + bump: replaces atomically — old id gone, new id in, len 1.
+        let replacement = tipped([1; 32], "usa.reserve.sov", 0, 100 + MIN_RBF_BUMP_GRAINS);
+        let replacement_id = replacement.id();
+        pool.insert(replacement, 0, big()).unwrap();
+        assert!(!pool.contains(&original_id), "the incumbent was displaced");
+        assert!(pool.contains(&replacement_id));
+        assert_eq!(pool.len(), 1, "replacement is one-for-one");
+        // The replacement is what mines.
+        assert_eq!(
+            effective_tip(&pool.select(|_| 0, 1)[0]).grains(),
+            100 + MIN_RBF_BUMP_GRAINS
+        );
+    }
+
+    #[test]
+    fn rbf_without_a_raise_is_still_nonce_taken() {
+        // Equal (or lower) tip is not a bid: the legacy NonceTaken stands — which
+        // also pins the untipped 0-vs-0 collision to its pre-auction behavior.
+        let mut pool = Mempool::new(100);
+        pool.insert(tipped([1; 32], "usa.reserve.sov", 0, 100), 0, big())
+            .unwrap();
+        assert_eq!(
+            pool.insert(tipped([1; 32], "usa.reserve.sov", 0, 50), 0, big()),
+            Err(MempoolError::NonceTaken {
+                signer: id("usa.reserve.sov"),
+                nonce: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn tipped_affordability_reserves_tip_plus_transfer() {
+        // The affordability gate counts tip + inner outflow: 2 XUS tip + 1 XUS
+        // transfer needs 3 XUS. A 2.5-XUS account refuses it; 3 XUS admits it.
+        let mut pool = Mempool::new(100);
+        let need = Balance::from_sov(3).unwrap();
+        let short = Balance::from_grains(need.grains() - 1);
+        let bid = tipped(
+            [1; 32],
+            "usa.reserve.sov",
+            0,
+            Balance::from_sov(2).unwrap().grains(),
+        );
+        assert!(matches!(
+            pool.insert(bid.clone(), 0, short),
+            Err(MempoolError::Insufficient { .. })
+        ));
+        pool.insert(bid, 0, need).unwrap();
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn no_tips_select_is_byte_identical_to_the_legacy_fair_order() {
+        // THE regression pin: with zero tips everywhere, the auction MUST degenerate
+        // to the legacy schedule — signers in ascending id order, each contributing
+        // its full contiguous nonce run, truncated at `max`. Pinned explicitly.
+        let mut pool = Mempool::new(100);
+        // Insert in a scrambled order to prove ordering comes from the pool.
+        pool.insert(tx([3; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(tx([1; 32], "boj.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(tx([2; 32], "ecb.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(tx([1; 32], "boj.reserve.sov", 1), 0, big())
+            .unwrap();
+        pool.insert(tx([3; 32], "usa.reserve.sov", 1), 0, big())
+            .unwrap();
+
+        let picked = pool.select(|_| 0, 10);
+        let order: Vec<(AccountId, u64)> = picked
+            .iter()
+            .map(|s| (s.transaction.signer.clone(), s.transaction.nonce))
+            .collect();
+        // Legacy `select`: BTreeSet of signers (ascending id), full run each.
+        assert_eq!(
+            order,
+            vec![
+                (id("boj.reserve.sov"), 0),
+                (id("boj.reserve.sov"), 1),
+                (id("ecb.reserve.sov"), 0),
+                (id("usa.reserve.sov"), 0),
+                (id("usa.reserve.sov"), 1),
+            ],
+            "zero tips ⇒ byte-identical legacy fair ordering"
+        );
+        // And truncation at `max` cuts the same prefix as before.
+        assert_eq!(
+            pool.select(|_| 0, 3)
+                .iter()
+                .map(|s| (s.transaction.signer.clone(), s.transaction.nonce))
+                .collect::<Vec<_>>(),
+            order[..3].to_vec()
+        );
     }
 }

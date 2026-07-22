@@ -408,7 +408,11 @@ mod tests {
         // Mine them; the on-chain nonce advances and next_nonce follows it.
         node.produce(1_000).unwrap();
         assert_eq!(node.chain().ledger().account(&usa).nonce, 2);
-        assert_eq!(node.next_nonce(&usa), 2, "pool drained → pure on-chain nonce");
+        assert_eq!(
+            node.next_nonce(&usa),
+            2,
+            "pool drained → pure on-chain nonce"
+        );
     }
 
     #[test]

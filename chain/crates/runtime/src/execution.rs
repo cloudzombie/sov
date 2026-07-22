@@ -2408,7 +2408,11 @@ mod tests {
 
     /// An active auction context whose block miner is `miner` — for the aliasing
     /// conservation cases (miner == signer, miner == recipient).
-    fn auction_ctx_miner(p: &MiningPolicy, price_grains: u128, miner: AccountId) -> BlockContext<'_> {
+    fn auction_ctx_miner(
+        p: &MiningPolicy,
+        price_grains: u128,
+        miner: AccountId,
+    ) -> BlockContext<'_> {
         let mut c = auction_ctx(p, price_grains);
         c.miner = miner;
         c
@@ -2431,8 +2435,14 @@ mod tests {
             Balance::from_sov(5).unwrap(),
             0,
         );
-        assert!(apply_transaction(&mut ledger, &stx, &ctx).unwrap().succeeded());
-        assert_eq!(ledger.total_supply().unwrap(), supply_before, "self-tip conserves supply");
+        assert!(apply_transaction(&mut ledger, &stx, &ctx)
+            .unwrap()
+            .succeeded());
+        assert_eq!(
+            ledger.total_supply().unwrap(),
+            supply_before,
+            "self-tip conserves supply"
+        );
         assert_eq!(
             ledger.account(&id("usa.reserve.sov")).balance,
             Balance::from_sov(95).unwrap(),
@@ -2453,7 +2463,12 @@ mod tests {
         let miner = id("ecb.reserve.sov");
         let (tip, amount) = (Balance::from_sov(2).unwrap(), Balance::from_sov(5).unwrap());
         let ctx = auction_ctx_miner(&p, 3, miner.clone());
-        let r = apply_transaction(&mut ledger, &tipped_transfer(tip, "ecb.reserve.sov", amount, 0), &ctx).unwrap();
+        let r = apply_transaction(
+            &mut ledger,
+            &tipped_transfer(tip, "ecb.reserve.sov", amount, 0),
+            &ctx,
+        )
+        .unwrap();
         assert!(r.succeeded());
         assert_eq!(ledger.total_supply().unwrap(), supply_before);
         let fee = Balance::from_grains(r.gas_used as u128 * 3);
@@ -2478,12 +2493,24 @@ mod tests {
         let ctx = auction_ctx(&p, 3);
         let r = apply_transaction(
             &mut ledger,
-            &tipped_transfer(Balance::from_sov(3).unwrap(), "ecb.reserve.sov", Balance::from_sov(100).unwrap(), 0),
+            &tipped_transfer(
+                Balance::from_sov(3).unwrap(),
+                "ecb.reserve.sov",
+                Balance::from_sov(100).unwrap(),
+                0,
+            ),
             &ctx,
         )
         .unwrap();
-        assert!(!r.succeeded(), "inner transfer of 100 from a 10 balance fails");
-        assert_eq!(ledger.total_supply().unwrap(), supply_before, "tip-paid-on-failure conserves supply");
+        assert!(
+            !r.succeeded(),
+            "inner transfer of 100 from a 10 balance fails"
+        );
+        assert_eq!(
+            ledger.total_supply().unwrap(),
+            supply_before,
+            "tip-paid-on-failure conserves supply"
+        );
         assert_eq!(
             ledger.account(&id("ecb.reserve.sov")).balance,
             Balance::ZERO,
