@@ -523,7 +523,16 @@ impl Mempool {
         if self.by_id.len() >= self.capacity {
             let new_tip = effective_tip(&stx).grains();
             match self.eviction_victim(&stx.transaction.signer) {
-                Some(v) if new_tip > v.tip || (new_tip == v.tip && v.sender_count > 1) => {
+                // Displace either by STRICTLY outbidding the cheapest displaceable tail,
+                // OR — only at a ZERO floor — by the legacy heaviest-sender fairness tie
+                // (a sender holding >1 tx yields a slot). Gating the tie on `v.tip == 0`
+                // keeps the no-tips path byte-identical to the pre-auction eviction AND
+                // closes an equal-tip sybil displacement: at any NONZERO tip a newcomer
+                // must strictly outbid (new_tip > v.tip), never merely match, to evict.
+                Some(v)
+                    if new_tip > v.tip
+                        || (new_tip == v.tip && v.tip == 0 && v.sender_count > 1) =>
+                {
                     self.remove(&v.id);
                 }
                 Some(v) if v.tip > 0 => {
@@ -1554,6 +1563,59 @@ mod tests {
         ));
         pool.insert(bid, 0, need).unwrap();
         assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn equal_tip_cannot_displace_at_a_nonzero_floor_must_strictly_outbid() {
+        // Finding 3 (Fable audit): at a NONZERO floor, matching the tip is NOT enough
+        // — a newcomer must STRICTLY outbid to evict. Closes zero-premium sybil
+        // displacement of an honest multi-tx sender.
+        let mut pool = Mempool::with_limits(3, 10);
+        for n in 0..3 {
+            pool.insert(tipped([1; 32], "usa.reserve.sov", n, 5), 0, big())
+                .unwrap();
+        }
+        // A distinct signer MATCHING the tip (5) is refused — must outbid, not match.
+        assert!(matches!(
+            pool.insert(tipped([2; 32], "ecb.reserve.sov", 0, 5), 0, big()),
+            Err(MempoolError::BelowFloor { .. })
+        ));
+        assert_eq!(pool.len(), 3, "equal tip did not displace");
+        // A strict outbid (6) does get in.
+        pool.insert(tipped([2; 32], "ecb.reserve.sov", 0, 6), 0, big())
+            .unwrap();
+        assert_eq!(pool.len(), 3);
+    }
+
+    #[test]
+    fn a_zero_floor_refusal_is_full_never_belowfloor_zero() {
+        // BelowFloor must NEVER quote a floor of 0: a full pool of single-tx, zero-tip
+        // senders refuses a zero-tip newcomer with the legacy `Full`, not `BelowFloor{0}`.
+        let mut pool = Mempool::with_limits(3, 10);
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big()).unwrap();
+        pool.insert(tx([2; 32], "ecb.reserve.sov", 0), 0, big()).unwrap();
+        pool.insert(tx([3; 32], "boj.reserve.sov", 0), 0, big()).unwrap();
+        assert!(matches!(
+            pool.insert(tx([9; 32], "rba.reserve.sov", 0), 0, big()),
+            Err(MempoolError::Full { .. })
+        ));
+    }
+
+    #[test]
+    fn rbf_at_capacity_replaces_in_place_without_touching_the_floor() {
+        // A same-slot RBF is one-for-one, so it replaces even at capacity — bypassing
+        // the floor/eviction path entirely; pool size is unchanged.
+        let mut pool = Mempool::with_limits(2, 10);
+        pool.insert(tipped([1; 32], "usa.reserve.sov", 0, 5), 0, big())
+            .unwrap();
+        pool.insert(tipped([2; 32], "ecb.reserve.sov", 0, 5_000), 0, big())
+            .unwrap();
+        assert_eq!(pool.len(), 2);
+        let bumped = tipped([1; 32], "usa.reserve.sov", 0, 5 + MIN_RBF_BUMP_GRAINS);
+        let bumped_id = bumped.id();
+        pool.insert(bumped, 0, big()).unwrap();
+        assert_eq!(pool.len(), 2, "RBF is one-for-one; capacity is not consumed");
+        assert!(pool.contains(&bumped_id), "the bumped tx replaced its slot");
     }
 
     #[test]

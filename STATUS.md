@@ -1,7 +1,7 @@
 # SOV — Project Status
 
 _Ticker **XUS**. Pure Nakamoto proof-of-work, post-quantum, privacy-enabled Layer-1 in Rust._
-_Last updated: 2026-07-04._
+_Last updated: 2026-07-19._
 
 ## 🎇 Mainnet is LIVE
 
@@ -53,3 +53,6 @@ Both seeds are **relay/bootstrap** nodes (like Bitcoin's DNS seeds), not the cha
 - External audit + public bug bounty (pre-code-freeze maturity).
 - 2–3 additional mainnet seeds (bootstrap resilience).
 - Deferred perf: incremental reorg (O(N) rebuild-from-genesis), batch×100 ledger-scan RPC amplification.
+- Reserve readiness remains **not met**. Evidence status and the non-marketing
+  acceptance standard are maintained in
+  [`chain/docs/reserve-readiness.md`](chain/docs/reserve-readiness.md).
