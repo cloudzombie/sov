@@ -73,6 +73,73 @@ impl SigningDomain {
     }
 }
 
+/// The signature-verification regime in force for a block at a given height —
+/// the three-state resolution of the miner-signaled `tx-domain` hard fork,
+/// including its post-activation **grace window**.
+///
+/// Activation is not a cliff. At the activation height `H_a` enforcement enters
+/// a grace window of `G` blocks during which a transaction (or intent) is valid
+/// if its signature verifies under EITHER preimage — legacy (un-bound) or
+/// chain-bound — so anything legacy-signed and in flight when the fork
+/// activates still confirms. Only after the window does verification become
+/// bound-only, at which point cross-network replay is fully closed.
+///
+/// Exact boundaries (`G` = the configured grace length in blocks):
+///
+/// - [`Legacy`](Self::Legacy) — `height < H_a` (or the fork is dormant /
+///   unscheduled): verify the legacy preimage ONLY. Byte-identical to the
+///   pre-fork path (`signing_bytes_in(None)`).
+/// - [`Grace`](Self::Grace) — `H_a <= height < H_a + G`: legacy OR bound
+///   accepted. (Replay protection is not yet fully in force inside the window —
+///   the accepted, bounded cost of a smooth cutover.)
+/// - [`Bound`](Self::Bound) — `height >= H_a + G`: bound ONLY; a legacy
+///   signature is rejected.
+///
+/// The mode is a pure function of (deployment schedule, grace length, height,
+/// committed miner signals), so the producer and every importer resolve the
+/// same mode for the same block. `G = 0` degenerates to the original cliff
+/// (`Bound` immediately at `H_a`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TxDomainMode {
+    /// Pre-activation (or dormant): verify the legacy, un-bound preimage only.
+    #[default]
+    Legacy,
+    /// The post-activation grace window: a signature verifying under EITHER the
+    /// legacy preimage or the bound preimage (this domain) is accepted.
+    Grace(SigningDomain),
+    /// Post-grace steady state: only a signature bound to this domain verifies.
+    Bound(SigningDomain),
+}
+
+impl TxDomainMode {
+    /// Run `verify` under this mode's accepted preimage(s): `verify(None)`
+    /// checks the legacy preimage, `verify(Some(domain))` the chain-bound one.
+    ///
+    /// - `Legacy` → `verify(None)` — exactly the pre-fork call, nothing else.
+    /// - `Grace(d)` → `verify(Some(d)) || verify(None)` — either accepted.
+    /// - `Bound(d)` → `verify(Some(d))` — legacy rejected.
+    ///
+    /// Centralizing the OR here keeps every verification site (execution,
+    /// mempool admission, block import) in exact agreement.
+    pub fn verifies(&self, verify: impl Fn(Option<&SigningDomain>) -> bool) -> bool {
+        match self {
+            TxDomainMode::Legacy => verify(None),
+            TxDomainMode::Grace(domain) => verify(Some(domain)) || verify(None),
+            TxDomainMode::Bound(domain) => verify(Some(domain)),
+        }
+    }
+
+    /// The domain new signatures should bind to under this mode: `Some` from
+    /// activation onward (grace included — wallets should switch to bound
+    /// signing immediately), `None` while legacy-only.
+    pub fn bound_domain(&self) -> Option<&SigningDomain> {
+        match self {
+            TxDomainMode::Legacy => None,
+            TxDomainMode::Grace(domain) | TxDomainMode::Bound(domain) => Some(domain),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +181,47 @@ mod tests {
     fn different_tag_yields_different_bytes() {
         let d = domain("sov");
         assert_ne!(d.frame(b"sov:tx:v1", b"x"), d.frame(b"sov:intent:v1", b"x"),);
+    }
+
+    #[test]
+    fn mode_legacy_calls_verify_exactly_once_with_none() {
+        // The dormant guard: Legacy must be indistinguishable from the pre-fork
+        // path — a single `verify(None)`, never a domain probe.
+        use std::cell::RefCell;
+        let calls = RefCell::new(Vec::new());
+        let ok = TxDomainMode::Legacy.verifies(|d| {
+            calls.borrow_mut().push(d.cloned());
+            true
+        });
+        assert!(ok);
+        assert_eq!(*calls.borrow(), vec![None]);
+    }
+
+    #[test]
+    fn mode_grace_accepts_either_preimage() {
+        let d = domain("sov-mainnet");
+        let grace = TxDomainMode::Grace(d.clone());
+        // legacy-only signature: bound check fails, legacy passes -> accepted
+        assert!(grace.verifies(|dom| dom.is_none()));
+        // bound-only signature: bound passes -> accepted
+        assert!(grace.verifies(|dom| dom == Some(&d)));
+        // neither verifies -> rejected
+        assert!(!grace.verifies(|_| false));
+    }
+
+    #[test]
+    fn mode_bound_rejects_legacy() {
+        let d = domain("sov-mainnet");
+        let bound = TxDomainMode::Bound(d.clone());
+        assert!(!bound.verifies(|dom| dom.is_none()), "legacy must fail");
+        assert!(bound.verifies(|dom| dom == Some(&d)));
+    }
+
+    #[test]
+    fn mode_bound_domain_surface() {
+        let d = domain("sov-mainnet");
+        assert_eq!(TxDomainMode::Legacy.bound_domain(), None);
+        assert_eq!(TxDomainMode::Grace(d.clone()).bound_domain(), Some(&d));
+        assert_eq!(TxDomainMode::Bound(d.clone()).bound_domain(), Some(&d));
     }
 }

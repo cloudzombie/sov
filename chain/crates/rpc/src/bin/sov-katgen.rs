@@ -384,7 +384,7 @@ fn stf_vector() -> Value {
         pq: None,
         // KAT vectors are generated on the legacy (pre-fork) signing path so they
         // stay byte-identical across the `tx-domain` deployment.
-        tx_domain: None,
+        tx_domain: sov_primitives::TxDomainMode::Legacy,
         // KAT vectors execute on the dormant (pre-activation) fee-auction path so
         // they stay byte-identical across the `fee-auction` deployment.
         fee_auction_active: false,

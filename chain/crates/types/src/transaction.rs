@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sov_compliance::CompliancePolicy;
 use sov_crypto::{Keypair, PublicKey, Signature};
 use sov_intents::{Intent, Settlement};
-use sov_primitives::{AccountId, Balance, Hash, SigningDomain};
+use sov_primitives::{AccountId, Balance, Hash, SigningDomain, TxDomainMode};
 
 /// What a transaction does. Kept as a closed enum so every state transition is
 /// explicit; new capabilities (govern, bridge, assets) are added as variants in
@@ -610,6 +610,17 @@ impl SignedTransaction {
         self.transaction
             .public_key
             .verify(&self.transaction.signing_bytes_in(domain), &self.signature)
+    }
+
+    /// Whether the signature verifies under a resolved [`TxDomainMode`] — the
+    /// three-state (`Legacy` / `Grace` / `Bound`) regime of the `tx-domain`
+    /// fork's grace window. `Legacy` is byte-identical to
+    /// [`verify_signature_in`](Self::verify_signature_in)`(None)`; `Grace(d)`
+    /// accepts a legacy OR a `d`-bound signature; `Bound(d)` accepts only a
+    /// `d`-bound signature.
+    #[must_use]
+    pub fn verify_signature_mode(&self, mode: &TxDomainMode) -> bool {
+        mode.verifies(|domain| self.verify_signature_in(domain))
     }
 }
 

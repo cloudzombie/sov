@@ -14,7 +14,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use sov_crypto::merkle_root;
-use sov_primitives::{AccountId, BlockHeight, Hash, SigningDomain};
+use sov_primitives::{AccountId, BlockHeight, Hash, SigningDomain, TxDomainMode};
 
 use crate::transaction::SignedTransaction;
 
@@ -172,6 +172,20 @@ impl Block {
         self.transactions
             .iter()
             .all(|s| s.verify_signature_in(domain))
+    }
+
+    /// Validity check under a resolved [`TxDomainMode`] — the three-state
+    /// (`Legacy` / `Grace` / `Bound`) regime of the `tx-domain` fork's grace
+    /// window. The mode is applied **per transaction** (each may independently
+    /// verify as legacy or as bound during `Grace` — a block may legitimately
+    /// mix both while the window is open). `Legacy` is byte-identical to
+    /// [`all_signatures_valid_in`](Self::all_signatures_valid_in)`(None)`, the
+    /// pre-fork import path.
+    #[must_use]
+    pub fn all_signatures_valid_mode(&self, mode: &TxDomainMode) -> bool {
+        self.transactions
+            .iter()
+            .all(|s| s.verify_signature_mode(mode))
     }
 }
 

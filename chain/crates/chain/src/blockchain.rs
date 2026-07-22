@@ -17,7 +17,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use sov_mining::{Difficulty, MiningPolicy, Target, Work};
-use sov_primitives::{AccountId, Balance, BlockHeight, Hash, SigningDomain};
+use sov_primitives::{AccountId, Balance, BlockHeight, Hash, SigningDomain, TxDomainMode};
 use sov_runtime::{
     apply_coinbase, apply_transaction, apply_transactions, BlockContext, BlockExecutionError,
 };
@@ -84,6 +84,17 @@ pub struct Blockchain {
     /// the genesis hash and every KAT vector are reproduced exactly — so a chain
     /// that never schedules or activates it is completely unaffected.
     tx_domain_deployment: Option<sov_governance::Deployment>,
+    /// The `tx-domain` fork's **grace window** length, in blocks. For the first
+    /// `tx_domain_grace_blocks` blocks at/after the activation height a
+    /// transaction (or intent) signature verifies as EITHER legacy (un-bound) or
+    /// chain-bound, so anything legacy-signed and in flight at activation still
+    /// confirms; from `activation + grace` onward verification is bound-only.
+    /// `0` degenerates to the original activation cliff. Consensus-relevant once
+    /// the fork activates: every node must run the same value (it is part of the
+    /// coordinated fork parameters, exactly like the deployment schedule
+    /// itself). Irrelevant while dormant. Defaults to
+    /// [`TX_DOMAIN_GRACE_BLOCKS`].
+    tx_domain_grace_blocks: u64,
     /// The miner-signaled `fee-auction` deployment, if this chain schedules one.
     /// When it activates, the `Action::Tipped` fee-auction envelope becomes
     /// executable (tip paid signer→miner, inner action runs). `None` (the
@@ -472,6 +483,20 @@ pub const EDA_ACTIVATION_MS: u64 = 1_784_239_200_000;
 /// the window is cheap — its memory is bounded and independent of chain length.
 const REORG_UNDO_WINDOW: usize = 256;
 
+/// Default **grace window** for the miner-signaled `tx-domain` hard fork, in
+/// blocks: for this many blocks at/after the activation height a transaction
+/// (or intent) signature verifies as EITHER legacy (un-bound) or chain-bound,
+/// so legacy-signed transactions in flight at activation still confirm instead
+/// of dying on an enforcement cliff. From `activation + grace` onward,
+/// verification is bound-only (full cross-network-replay protection). 576
+/// blocks ≈ one day at the 2.5-minute block target — ample for every pooled or
+/// just-submitted legacy transaction to clear, while keeping the
+/// partially-protected window short and bounded. Consensus-relevant once the
+/// fork activates (every node must use the same value — it is part of the
+/// coordinated fork parameters, like the deployment schedule itself);
+/// irrelevant while the fork is dormant.
+pub const TX_DOMAIN_GRACE_BLOCKS: u64 = 576;
+
 /// Producer-side nonce budget for sealing one block. Generous: at any sane
 /// difficulty a solution is found in a vanishing fraction of this; it exists
 /// only so a misconfigured (absurdly hard) target fails loudly instead of
@@ -528,6 +553,7 @@ impl Blockchain {
             signals: sov_governance::SignalLog::new(),
             pq_deployment: None,
             tx_domain_deployment: None,
+            tx_domain_grace_blocks: TX_DOMAIN_GRACE_BLOCKS,
             fee_auction_deployment: None,
             active_receipts: HashMap::new(),
             tx_height: HashMap::new(),
@@ -655,6 +681,16 @@ impl Blockchain {
         self.tx_domain_deployment = Some(deployment);
     }
 
+    /// Configure the `tx-domain` fork's grace-window length in blocks
+    /// (default [`TX_DOMAIN_GRACE_BLOCKS`]): for `grace_blocks` blocks at/after
+    /// activation a legacy OR a chain-bound signature verifies; after the window
+    /// verification is bound-only. `0` restores the original activation cliff.
+    /// Consensus-relevant once the fork activates — every node must run the same
+    /// value, exactly like the deployment schedule itself.
+    pub fn set_tx_domain_grace_blocks(&mut self, grace_blocks: u64) {
+        self.tx_domain_grace_blocks = grace_blocks;
+    }
+
     /// Schedule the miner-signaled `fee-auction` soft fork: once `deployment`
     /// activates under the BIP-9/8 state machine, the `Action::Tipped` envelope
     /// executes (tip paid signer→miner, inner action runs). Dormant until
@@ -776,6 +812,21 @@ impl Blockchain {
         height: u64,
         signals: &sov_governance::SignalLog,
     ) -> Option<SigningDomain> {
+        self.tx_domain_activation_with(height, signals)
+            .map(|_| SigningDomain::new(self.chain_id.clone(), self.genesis_hash))
+    }
+
+    /// The `tx-domain` fork's **activation height** `H_a` if the deployment is
+    /// `Active` at `height` (i.e. `H_a <= height`), else `None`. This is the
+    /// shared core of both [`resolved_tx_domain_with`](Self::resolved_tx_domain_with)
+    /// (signer-facing: which domain new signatures should bind to) and
+    /// [`resolved_tx_domain_mode_with`](Self::resolved_tx_domain_mode_with)
+    /// (verifier-facing: which signatures a block accepts).
+    fn tx_domain_activation_with(
+        &self,
+        height: u64,
+        signals: &sov_governance::SignalLog,
+    ) -> Option<u64> {
         let deployment = self.tx_domain_deployment.as_ref()?;
         let period = deployment.period;
         // Walk window boundaries up to (and including) the one governing `height`;
@@ -791,11 +842,55 @@ impl Blockchain {
                 signals,
             ) == sov_governance::ThresholdState::Active
             {
-                return Some(SigningDomain::new(self.chain_id.clone(), self.genesis_hash));
+                return Some(boundary);
             }
             boundary += period;
         }
         None
+    }
+
+    /// The signature-verification regime ([`TxDomainMode`]) a block at `height`
+    /// enforces, resolved over the active chain's committed miner signals. With
+    /// `H_a` the activation height and `G` = `tx_domain_grace_blocks`:
+    ///
+    /// - `Legacy` — fork dormant/unscheduled, or `height < H_a`: legacy
+    ///   signatures ONLY, byte-identical to the pre-fork path.
+    /// - `Grace(domain)` — `H_a <= height < H_a + G`: a legacy OR a chain-bound
+    ///   signature verifies (per transaction), so legacy-signed transactions in
+    ///   flight at activation still confirm.
+    /// - `Bound(domain)` — `height >= H_a + G`: chain-bound ONLY; legacy
+    ///   rejected — full cross-network-replay protection.
+    ///
+    /// A pure function of (deployment, grace length, height, signals): the
+    /// producer and every importer resolve the same mode for the same block.
+    pub fn resolved_tx_domain_mode(&self, height: u64) -> TxDomainMode {
+        self.resolved_tx_domain_mode_with(height, &self.signals)
+    }
+
+    /// As [`resolved_tx_domain_mode`](Self::resolved_tx_domain_mode), but over an
+    /// explicit signal history — fork-choice replay of a competing branch
+    /// evaluates activation over *that branch's* signals, exactly as
+    /// [`resolved_tx_domain_with`](Self::resolved_tx_domain_with) does.
+    fn resolved_tx_domain_mode_with(
+        &self,
+        height: u64,
+        signals: &sov_governance::SignalLog,
+    ) -> TxDomainMode {
+        match self.tx_domain_activation_with(height, signals) {
+            // Dormant, or `height` precedes activation: the pre-fork path.
+            None => TxDomainMode::Legacy,
+            Some(activation) => {
+                let domain = SigningDomain::new(self.chain_id.clone(), self.genesis_hash);
+                // Grace window is [activation, activation + grace); bound-only
+                // from activation + grace onward. saturating_add: a huge grace
+                // never wraps into an accidental early cliff.
+                if height < activation.saturating_add(self.tx_domain_grace_blocks) {
+                    TxDomainMode::Grace(domain)
+                } else {
+                    TxDomainMode::Bound(domain)
+                }
+            }
+        }
     }
 
     /// Whether the miner-signaled `fee-auction` deployment is `Active` for a block
@@ -1188,7 +1283,7 @@ impl Blockchain {
             gas_price: policy.gas_price,
             miner: proposer.clone(),
             pq: self.resolved_pq(next_height),
-            tx_domain: self.resolved_tx_domain(next_height),
+            tx_domain: self.resolved_tx_domain_mode(next_height),
             fee_auction_active: self.fee_auction_active(next_height),
         };
         apply_coinbase(&mut probe, &selection_ctx)?;
@@ -1225,7 +1320,7 @@ impl Blockchain {
             gas_price: policy.gas_price,
             miner: proposer.clone(),
             pq: self.resolved_pq(next_height),
-            tx_domain: self.resolved_tx_domain(next_height),
+            tx_domain: self.resolved_tx_domain_mode(next_height),
             fee_auction_active: self.fee_auction_active(next_height),
         };
         apply_coinbase(&mut scratch, &ctx)?;
@@ -1471,14 +1566,17 @@ impl Blockchain {
         if !block.tx_root_matches() {
             return Err(ChainError::TxRootMismatch);
         }
-        // Signatures are verified under the network signing domain resolved at this
-        // block's height: `None` (byte-identical to before) for every pre-activation
-        // height, and — once the miner-signaled `tx-domain` fork is active — the
-        // chain-bound domain, so a block carrying a cross-network-replayed (or legacy
-        // un-bound) signature fails validation. This block extends the active head,
-        // so the active chain's signals govern its activation state.
-        let tx_domain = self.resolved_tx_domain(block.header.height.get());
-        if !block.all_signatures_valid_in(tx_domain.as_ref()) {
+        // Signatures are verified under the tx-domain MODE resolved at this block's
+        // height: `Legacy` (byte-identical to before) for every pre-activation
+        // height; `Grace` — legacy OR chain-bound accepted, per transaction — for
+        // the grace window at/after activation; `Bound` afterwards, so a block
+        // carrying a cross-network-replayed (or legacy un-bound) signature fails
+        // validation. This block extends the active head, so the active chain's
+        // signals govern its activation state. Execution (`apply_transaction`)
+        // resolves the identical mode for the same height, so the two consensus
+        // verification sites can never disagree.
+        let tx_domain = self.resolved_tx_domain_mode(block.header.height.get());
+        if !block.all_signatures_valid_mode(&tx_domain) {
             return Err(ChainError::BadSignatures);
         }
 
@@ -1888,7 +1986,7 @@ impl Blockchain {
             gas_price: policy.gas_price,
             miner: block.header.proposer.clone(),
             pq: self.resolved_pq_with(height, signals),
-            tx_domain: self.resolved_tx_domain_with(height, signals),
+            tx_domain: self.resolved_tx_domain_mode_with(height, signals),
             fee_auction_active: self.fee_auction_active_with(height, signals),
         };
         apply_coinbase(ledger, &ctx)?;
@@ -2736,6 +2834,11 @@ mod tests {
             )
             .unwrap(),
         );
+        // Grace window 0: the original activation CLIFF — enforcement is
+        // bound-only from the very first active block. This also pins the G=0
+        // degenerate boundary (`Bound` exactly at `H_a`); the grace-window tests
+        // below cover G > 0.
+        chain.set_tx_domain_grace_blocks(0);
         chain.set_signal_mask(1 << 1); // signal bit 1 in produced headers
 
         let mut ts = 2_000u64;
@@ -2748,11 +2851,17 @@ mod tests {
         // Dormant through height 11; ACTIVE for the block at height 12, bound to
         // THIS chain's identity — derived purely from committed header bits.
         assert_eq!(chain.resolved_tx_domain(11), None);
+        assert_eq!(chain.resolved_tx_domain_mode(11), TxDomainMode::Legacy);
         let domain = chain
             .resolved_tx_domain(12)
             .expect("tx-domain active at height 12");
         assert_eq!(domain.chain_id(), chain.chain_id());
         assert_eq!(domain.genesis(), chain.genesis_hash);
+        assert_eq!(
+            chain.resolved_tx_domain_mode(12),
+            TxDomainMode::Bound(domain.clone()),
+            "grace 0 => Bound at the activation height itself (the original cliff)"
+        );
 
         // Post-activation, a LEGACY (un-bound) transfer is excluded by the producer...
         let legacy = usa_transfer("ecb.reserve.sov", 10, 0);
@@ -2795,6 +2904,151 @@ mod tests {
             "a transaction bound to this chain is accepted post-activation"
         );
         chain.import_block(block).unwrap();
+    }
+
+    /// Schedule the standard test `tx-domain` deployment (activation boundary at
+    /// height 12), set the signal bit, and mine through height 11 so the fork is
+    /// Active for the block at height 12. Returns the chain and the next
+    /// timestamp to mine with.
+    fn chain_at_tx_domain_activation() -> (Blockchain, u64) {
+        use sov_governance::{Deployment, Threshold};
+        let mut chain = fresh_chain();
+        chain.set_tx_domain_deployment(
+            Deployment::new(
+                "tx-domain",
+                1,
+                BlockHeight::new(4),
+                BlockHeight::new(400),
+                4,
+                Threshold::new(3, 4).unwrap(),
+                BlockHeight::new(0),
+                true,
+            )
+            .unwrap(),
+        );
+        chain.set_signal_mask(1 << 1);
+        let mut ts = 2_000u64;
+        for _ in 1..=11 {
+            let block = chain.produce_block(vec![], ts).unwrap();
+            chain.import_block(block).unwrap();
+            ts += 1_000;
+        }
+        (chain, ts)
+    }
+
+    #[test]
+    fn tx_domain_grace_window_defaults_on_and_has_exact_boundaries() {
+        // Default grace (TX_DOMAIN_GRACE_BLOCKS = 576 ≈ one day): activation at
+        // H_a = 12 gives Grace on [12, 588) and Bound from 588 — the mode is a
+        // pure function of height, so every boundary is pinned exactly:
+        //   H_a - 1        -> Legacy
+        //   H_a            -> Grace   (window START is inclusive)
+        //   H_a + G - 1    -> Grace   (last grace block)
+        //   H_a + G        -> Bound   (window END is exclusive)
+        let (chain, _ts) = chain_at_tx_domain_activation();
+        let domain = chain.resolved_tx_domain(12).expect("active at 12");
+        assert_eq!(TX_DOMAIN_GRACE_BLOCKS, 576, "default ≈ one day of blocks");
+        assert_eq!(chain.resolved_tx_domain_mode(11), TxDomainMode::Legacy);
+        assert_eq!(
+            chain.resolved_tx_domain_mode(12),
+            TxDomainMode::Grace(domain.clone())
+        );
+        assert_eq!(
+            chain.resolved_tx_domain_mode(12 + TX_DOMAIN_GRACE_BLOCKS - 1),
+            TxDomainMode::Grace(domain.clone())
+        );
+        assert_eq!(
+            chain.resolved_tx_domain_mode(12 + TX_DOMAIN_GRACE_BLOCKS),
+            TxDomainMode::Bound(domain.clone())
+        );
+        // The signer-facing resolver is unchanged by the grace window: from
+        // activation onward it reports the domain new signatures should bind to
+        // (wallets switch to bound signing immediately, grace or not).
+        assert_eq!(chain.resolved_tx_domain(12), Some(domain));
+    }
+
+    #[test]
+    fn tx_domain_grace_window_accepts_both_then_binds_end_to_end() {
+        // Grace = 4 blocks on top of activation at H_a = 12: Grace on [12, 16),
+        // Bound from 16 — driven through REAL block production and import.
+        let (mut chain, mut ts) = chain_at_tx_domain_activation();
+        chain.set_tx_domain_grace_blocks(4);
+        let domain = chain.resolved_tx_domain(12).expect("active at 12");
+        assert_eq!(chain.resolved_tx_domain_mode(11), TxDomainMode::Legacy);
+        assert_eq!(
+            chain.resolved_tx_domain_mode(12),
+            TxDomainMode::Grace(domain.clone())
+        );
+        assert_eq!(
+            chain.resolved_tx_domain_mode(15),
+            TxDomainMode::Grace(domain.clone())
+        );
+        assert_eq!(
+            chain.resolved_tx_domain_mode(16),
+            TxDomainMode::Bound(domain.clone())
+        );
+
+        // Height 12 (first grace block): a LEGACY-signed and a BOUND-signed
+        // transfer of the same shape — the OR is real: BOTH are selected into the
+        // same block, and the block imports (execution + import agree).
+        let legacy0 = usa_transfer("ecb.reserve.sov", 10, 0);
+        let bound1 = usa_transfer_in("ecb.reserve.sov", 10, 1, Some(&domain));
+        let block12 = chain
+            .produce_block(vec![legacy0.clone(), bound1], ts)
+            .unwrap();
+        assert_eq!(
+            block12.transactions.len(),
+            2,
+            "grace: legacy AND bound must both mine into one block"
+        );
+        chain.import_block(block12).unwrap();
+        ts += 1_000;
+
+        // Heights 13–14: advance through the window.
+        for _ in 13..=14 {
+            let b = chain.produce_block(vec![], ts).unwrap();
+            chain.import_block(b).unwrap();
+            ts += 1_000;
+        }
+
+        // Height 15 = H_a + G - 1, the LAST grace block: legacy still confirms.
+        let legacy2 = usa_transfer("ecb.reserve.sov", 10, 2);
+        let block15 = chain.produce_block(vec![legacy2], ts).unwrap();
+        assert_eq!(
+            block15.transactions.len(),
+            1,
+            "the last grace block must still accept a legacy signature"
+        );
+        chain.import_block(block15).unwrap();
+        ts += 1_000;
+
+        // Height 16 = H_a + G, the first BOUND block: legacy is excluded by the
+        // producer...
+        let legacy3 = usa_transfer("ecb.reserve.sov", 10, 3);
+        let empty = chain.produce_block(vec![legacy3.clone()], ts).unwrap();
+        assert!(
+            empty.transactions.is_empty(),
+            "post-grace, the producer must exclude a legacy-signed tx"
+        );
+        // ...and a block that smuggles it in is REJECTED on import (consensus gate).
+        let smuggled = Block::assemble(
+            empty.header.height,
+            empty.header.prev_hash,
+            empty.header.state_root,
+            empty.header.receipts_root,
+            empty.header.timestamp_ms,
+            empty.header.proposer.clone(),
+            vec![legacy3],
+        );
+        assert!(
+            chain.import_block(smuggled).is_err(),
+            "post-grace, a legacy signature must fail import"
+        );
+        // The bound-signed equivalent mines and imports normally.
+        let bound3 = usa_transfer_in("ecb.reserve.sov", 10, 3, Some(&domain));
+        let block16 = chain.produce_block(vec![bound3], ts).unwrap();
+        assert_eq!(block16.transactions.len(), 1);
+        chain.import_block(block16).unwrap();
     }
 
     #[test]

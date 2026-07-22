@@ -24,7 +24,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use sov_crypto::{Keypair, Signature};
-use sov_primitives::{AccountId, SigningDomain};
+use sov_primitives::{AccountId, SigningDomain, TxDomainMode};
 
 /// An asset an intent can give or want: native SOV or an on-chain native asset
 /// (token).
@@ -172,6 +172,17 @@ impl SignedIntent {
         self.intent
             .public_key
             .verify(&self.intent.signing_bytes_in(domain), &self.signature)
+    }
+
+    /// Whether the signature verifies under a resolved [`TxDomainMode`] — the
+    /// three-state (`Legacy` / `Grace` / `Bound`) regime of the `tx-domain`
+    /// fork's grace window. Intents share the transaction resolver, so they get
+    /// the exact same grace treatment: `Legacy` is byte-identical to
+    /// [`verify_in`](Self::verify_in)`(None)`; `Grace(d)` accepts a legacy OR a
+    /// `d`-bound intent signature; `Bound(d)` accepts only a bound one.
+    #[must_use]
+    pub fn verify_mode(&self, mode: &TxDomainMode) -> bool {
+        mode.verifies(|domain| self.verify_in(domain))
     }
 }
 
@@ -381,6 +392,35 @@ mod tests {
             .intent
             .signing_bytes_in(Some(&mainnet))
             .starts_with(INTENT_SIGNING_DOMAIN_TAG));
+    }
+
+    #[test]
+    fn intent_grace_window_accepts_either_preimage_then_binds() {
+        // Intents share the transaction resolver's three-state mode, so they get
+        // the same grace treatment: Legacy = legacy-only (dormant, pre-fork
+        // byte-identical); Grace = legacy OR bound; Bound = bound-only.
+        use sov_primitives::{Hash, SigningDomain, TxDomainMode};
+        let kp = Keypair::from_seed([1; 32]);
+        let intent = Intent {
+            owner: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce: 0,
+            give_asset: Asset::Sov,
+            give_amount: 1_000,
+            want_asset: token(),
+            min_receive: 5,
+            expiry_height: 100,
+        };
+        let mainnet = SigningDomain::new("sov-mainnet", Hash::digest(b"genesis-main"));
+        let legacy = intent.clone().sign(&kp).unwrap();
+        let bound = intent.sign_in(&kp, Some(&mainnet)).unwrap();
+
+        let l = TxDomainMode::Legacy;
+        let g = TxDomainMode::Grace(mainnet.clone());
+        let b = TxDomainMode::Bound(mainnet.clone());
+        assert!(legacy.verify_mode(&l) && !bound.verify_mode(&l));
+        assert!(legacy.verify_mode(&g) && bound.verify_mode(&g));
+        assert!(!legacy.verify_mode(&b) && bound.verify_mode(&b));
     }
 
     #[test]

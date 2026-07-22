@@ -34,4 +34,4 @@ pub use amount::{
 };
 pub use hash::{Hash, HashParseError};
 pub use height::BlockHeight;
-pub use signing_domain::SigningDomain;
+pub use signing_domain::{SigningDomain, TxDomainMode};

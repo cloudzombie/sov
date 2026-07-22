@@ -49,15 +49,18 @@ impl Node {
         node
     }
 
-    /// Refresh the mempool's signing domain to the one resolved at the next height,
-    /// so admission verifies signatures exactly as block execution will. `None`
-    /// while the miner-signaled `tx-domain` fork is dormant (byte-identical to
-    /// pre-fork admission); `Some(domain)` once it activates, at which point a
-    /// legacy or cross-network signature is refused at the door. Called after every
-    /// tip change so the pool tracks activation.
+    /// Refresh the mempool's `tx-domain` verification mode to the one resolved at
+    /// the next height, so admission verifies signatures exactly as block
+    /// execution will. `Legacy` while the miner-signaled `tx-domain` fork is
+    /// dormant (byte-identical to pre-fork admission); `Grace(domain)` for the
+    /// grace window at/after activation (legacy OR chain-bound admitted, so
+    /// in-flight legacy transactions still confirm); `Bound(domain)` once the
+    /// window closes, at which point a legacy or cross-network signature is
+    /// refused at the door. Called after every tip change so the pool tracks the
+    /// rollout.
     fn refresh_mempool_domain(&mut self) {
-        let domain = self.chain.resolved_tx_domain(self.chain.height() + 1);
-        self.mempool.set_domain(domain);
+        let mode = self.chain.resolved_tx_domain_mode(self.chain.height() + 1);
+        self.mempool.set_mode(mode);
     }
 
     /// Name the account this node's mined blocks credit the coinbase to — the

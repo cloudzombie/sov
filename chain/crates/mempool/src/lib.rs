@@ -38,7 +38,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use sov_primitives::{AccountId, Balance, Hash, SigningDomain};
+use sov_primitives::{AccountId, Balance, Hash, TxDomainMode};
 use sov_types::{Action, SignedTransaction};
 
 /// TTL for [`Mempool::evict_stranded`]: an entry left behind a nonce hole (only
@@ -227,13 +227,15 @@ pub struct Mempool {
     capacity: usize,
     /// Max transactions one sender may hold at once (anti-DoS fairness bound).
     max_per_sender: usize,
-    /// The active network signing domain once the miner-signaled `tx-domain` hard
-    /// fork has activated (`None` before activation, and until the node sets it via
-    /// [`set_domain`](Self::set_domain)). Admission verifies signatures under this
-    /// domain, so post-activation a legacy (un-bound) or cross-network-replayed
-    /// signature is refused at the door — matching what block execution enforces.
-    /// `None` is byte-identical to pre-fork admission.
-    domain: Option<SigningDomain>,
+    /// The `tx-domain` verification regime admission checks signatures under
+    /// (set by the node via [`set_mode`](Self::set_mode) on every tip advance,
+    /// to the mode resolved at the next height). `Legacy` — the default, and
+    /// while the fork is dormant — is byte-identical to pre-fork admission.
+    /// `Grace(domain)` (the post-activation grace window) admits a legacy OR a
+    /// chain-bound signature; `Bound(domain)` refuses legacy/cross-network
+    /// signatures at the door — matching what block execution enforces at each
+    /// stage of the rollout.
+    mode: TxDomainMode,
 }
 
 impl Mempool {
@@ -251,17 +253,19 @@ impl Mempool {
             inserted_at: HashMap::new(),
             capacity,
             max_per_sender: max_per_sender.max(1),
-            domain: None,
+            mode: TxDomainMode::Legacy,
         }
     }
 
-    /// Set the network signing domain used to verify admitted signatures. The node
-    /// refreshes this on every tip advance to the domain resolved at the next
-    /// height (`None` while the `tx-domain` fork is dormant). Once the fork is
-    /// active this is `Some`, and admission rejects legacy/cross-network signatures
-    /// exactly as block execution does.
-    pub fn set_domain(&mut self, domain: Option<SigningDomain>) {
-        self.domain = domain;
+    /// Set the `tx-domain` verification mode used to verify admitted signatures.
+    /// The node refreshes this on every tip advance to the mode resolved at the
+    /// next height (`Legacy` while the `tx-domain` fork is dormant — byte-identical
+    /// to pre-fork admission). During the post-activation grace window (`Grace`)
+    /// admission accepts a legacy OR a chain-bound signature; once the window
+    /// closes (`Bound`) it rejects legacy/cross-network signatures exactly as
+    /// block execution does.
+    pub fn set_mode(&mut self, mode: TxDomainMode) {
+        self.mode = mode;
     }
 
     /// Number of pending transactions from `signer`.
@@ -403,7 +407,7 @@ impl Mempool {
         current_nonce: u64,
         balance: Balance,
     ) -> Result<(), MempoolError> {
-        if !stx.verify_signature_in(self.domain.as_ref()) {
+        if !stx.verify_signature_mode(&self.mode) {
             return Err(MempoolError::InvalidSignature);
         }
         let nonce = stx.transaction.nonce;
@@ -780,6 +784,76 @@ mod tests {
             },
         };
         SignedTransaction::sign(t, &kp).unwrap()
+    }
+
+    /// Like [`tx`], but signed under an optional network domain (`None` = legacy).
+    fn tx_in(
+        seed: [u8; 32],
+        from: &str,
+        nonce: u64,
+        domain: Option<&sov_primitives::SigningDomain>,
+    ) -> SignedTransaction {
+        let kp = Keypair::from_seed(seed);
+        let t = Transaction {
+            signer: id(from),
+            public_key: kp.public_key(),
+            nonce,
+            action: Action::Transfer {
+                to: id("ecb.reserve.sov"),
+                amount: Balance::from_sov(1).unwrap(),
+            },
+        };
+        SignedTransaction::sign_in(t, &kp, domain).unwrap()
+    }
+
+    #[test]
+    fn admission_honors_the_tx_domain_grace_window() {
+        // Mirror of consensus's grace window at the admission door: under
+        // `Grace(domain)` a legacy OR a bound signature is admitted (so an
+        // in-flight legacy tx is not refused mid-cutover); under `Bound(domain)`
+        // legacy is refused; the default (`Legacy`) is byte-identical to
+        // pre-fork admission — it refuses a bound signature.
+        use sov_primitives::SigningDomain;
+        let domain = SigningDomain::new("sov-mainnet", Hash::digest(b"genesis"));
+
+        // Default (dormant): legacy admitted, bound refused — pre-fork behavior.
+        let mut pool = Mempool::new(100);
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        assert_eq!(
+            pool.insert(
+                tx_in([1; 32], "usa.reserve.sov", 1, Some(&domain)),
+                0,
+                big()
+            ),
+            Err(MempoolError::InvalidSignature)
+        );
+
+        // Grace: BOTH preimages admitted.
+        let mut pool = Mempool::new(100);
+        pool.set_mode(TxDomainMode::Grace(domain.clone()));
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(
+            tx_in([1; 32], "usa.reserve.sov", 1, Some(&domain)),
+            0,
+            big(),
+        )
+        .unwrap();
+
+        // Bound: legacy refused, bound admitted.
+        let mut pool = Mempool::new(100);
+        pool.set_mode(TxDomainMode::Bound(domain.clone()));
+        assert_eq!(
+            pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big()),
+            Err(MempoolError::InvalidSignature)
+        );
+        pool.insert(
+            tx_in([1; 32], "usa.reserve.sov", 0, Some(&domain)),
+            0,
+            big(),
+        )
+        .unwrap();
     }
 
     #[test]

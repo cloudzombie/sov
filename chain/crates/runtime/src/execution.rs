@@ -51,14 +51,17 @@ pub struct BlockContext<'a> {
     /// `pq-sunset` deployment has activated (`None` before activation). See
     /// [`sov_mining::PqSchedule`] for the exact phase semantics.
     pub pq: Option<sov_mining::PqSchedule>,
-    /// The active network signing domain once the miner-signaled `tx-domain` hard
-    /// fork has activated (`None` before activation). When `Some`, transaction and
-    /// intent signatures must bind to this network (chain id + genesis), which
-    /// closes cross-network "ghost chain" replay; `None` verifies the legacy,
-    /// un-bound preimage — byte-identical to pre-fork execution. Resolved per block
-    /// height, so historical (pre-activation) blocks validate under `None` and only
-    /// blocks at/after activation require the binding.
-    pub tx_domain: Option<sov_primitives::SigningDomain>,
+    /// The signature-verification regime of the miner-signaled `tx-domain` hard
+    /// fork at this block's height (see [`sov_primitives::TxDomainMode`]):
+    /// `Legacy` before activation (or while dormant) — verify the legacy,
+    /// un-bound preimage, byte-identical to pre-fork execution; `Grace(domain)`
+    /// during the post-activation grace window — a legacy OR a chain-bound
+    /// signature verifies, so in-flight legacy transactions still confirm;
+    /// `Bound(domain)` after the window — signatures must bind to this network
+    /// (chain id + genesis), closing cross-network "ghost chain" replay.
+    /// Resolved per block height, so historical (pre-activation) blocks always
+    /// validate under `Legacy`.
+    pub tx_domain: sov_primitives::TxDomainMode,
     /// Whether the miner-signaled `fee-auction` deployment is `Active` at this
     /// block's height. When `false` (the pre-activation default), a fee-auction
     /// envelope ([`sov_types::Action::Tipped`]) is a HARD execution error
@@ -160,7 +163,7 @@ pub fn apply_transaction(
     stx: &SignedTransaction,
     ctx: &BlockContext<'_>,
 ) -> Result<Receipt, ExecutionError> {
-    if !stx.verify_signature_in(ctx.tx_domain.as_ref()) {
+    if !stx.verify_signature_mode(&ctx.tx_domain) {
         return Err(ExecutionError::InvalidSignature);
     }
     let tx = &stx.transaction;
@@ -949,7 +952,7 @@ pub fn apply_transaction(
                     ExecutionStatus::Failed {
                         reason: "intent key is not the owner account's registered key".into(),
                     }
-                } else if !settlement.intent.verify_in(ctx.tx_domain.as_ref()) {
+                } else if !settlement.intent.verify_mode(&ctx.tx_domain) {
                     ExecutionStatus::Failed {
                         reason: "invalid intent signature".into(),
                     }
@@ -2120,7 +2123,7 @@ mod tests {
             gas_price: Balance::ZERO,
             miner: miner_id(),
             pq: None,
-            tx_domain: None,
+            tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
         }
     }
@@ -2133,7 +2136,7 @@ mod tests {
             gas_price: Balance::ZERO,
             miner: miner_id(),
             pq: None,
-            tx_domain: None,
+            tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
         }
     }
@@ -2163,6 +2166,84 @@ mod tests {
             Account::new(key, Balance::from_sov(sov).unwrap()),
         );
         ledger
+    }
+
+    /// A context under an explicit `tx-domain` verification mode (grace-window
+    /// tests).
+    fn ctx_mode(p: &MiningPolicy, mode: sov_primitives::TxDomainMode) -> BlockContext<'_> {
+        BlockContext {
+            height: 0,
+            prev_hash: Hash::ZERO,
+            mining: p,
+            gas_price: Balance::ZERO,
+            miner: miner_id(),
+            pq: None,
+            tx_domain: mode,
+            fee_auction_active: false,
+        }
+    }
+
+    /// A transfer from `usa.reserve.sov` signed under an optional network
+    /// domain (`None` = legacy preimage).
+    fn usa_transfer_in(
+        to: &str,
+        sov: u128,
+        nonce: u64,
+        domain: Option<&sov_primitives::SigningDomain>,
+    ) -> SignedTransaction {
+        let kp = Keypair::from_seed([1; 32]);
+        let tx = Transaction {
+            signer: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce,
+            action: Action::Transfer {
+                to: id(to),
+                amount: Balance::from_sov(sov).unwrap(),
+            },
+        };
+        SignedTransaction::sign_in(tx, &kp, domain).unwrap()
+    }
+
+    #[test]
+    fn tx_domain_grace_mode_executes_legacy_and_bound_in_one_block() {
+        // The `tx-domain` grace window at the execution site: under
+        // `Grace(domain)`, a legacy-signed and a bound-signed transaction BOTH
+        // execute (in the same batch); under `Bound(domain)` the legacy one is
+        // rejected with InvalidSignature while the bound one still executes;
+        // and `Legacy` — the dormant default — rejects the bound one exactly as
+        // the pre-fork path would (its signature does not verify on the legacy
+        // preimage).
+        use sov_primitives::{SigningDomain, TxDomainMode};
+        let p = policy();
+        let domain = SigningDomain::new("sov-mainnet", Hash::digest(b"genesis"));
+        let legacy = usa_transfer_in("ecb.reserve.sov", 5, 0, None);
+        let bound = usa_transfer_in("ecb.reserve.sov", 5, 1, Some(&domain));
+
+        // Grace: both execute in one batch.
+        let mut ledger = ledger_with_usa(100);
+        let grace = ctx_mode(&p, TxDomainMode::Grace(domain.clone()));
+        apply_transactions(&mut ledger, &[legacy.clone(), bound.clone()], &grace)
+            .expect("grace accepts legacy AND bound in the same block");
+
+        // Bound: legacy rejected, bound (at nonce 0) accepted.
+        let mut ledger = ledger_with_usa(100);
+        let bound_ctx = ctx_mode(&p, TxDomainMode::Bound(domain.clone()));
+        assert_eq!(
+            apply_transaction(&mut ledger, &legacy, &bound_ctx),
+            Err(ExecutionError::InvalidSignature),
+            "post-grace, a legacy signature must be rejected"
+        );
+        let bound0 = usa_transfer_in("ecb.reserve.sov", 5, 0, Some(&domain));
+        apply_transaction(&mut ledger, &bound0, &bound_ctx).expect("bound executes post-grace");
+
+        // Legacy (dormant): the bound-signed tx fails exactly as pre-fork.
+        let mut ledger = ledger_with_usa(100);
+        assert_eq!(
+            apply_transaction(&mut ledger, &bound0, &ctx(&p)),
+            Err(ExecutionError::InvalidSignature),
+            "while dormant, a domain-bound signature does not verify (pre-fork behavior)"
+        );
+        apply_transaction(&mut ledger, &legacy, &ctx(&p)).expect("legacy executes while dormant");
     }
 
     #[test]
@@ -2213,7 +2294,7 @@ mod tests {
             gas_price: Balance::from_grains(price_grains),
             miner: miner_id(),
             pq: None,
-            tx_domain: None,
+            tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: true,
         }
     }
@@ -3097,7 +3178,7 @@ mod tests {
             gas_price: Balance::ZERO,
             miner: id("miner.sov"),
             pq: None,
-            tx_domain: None,
+            tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
         };
 
@@ -3223,7 +3304,7 @@ mod tests {
             gas_price: Balance::from_grains(1),
             miner: id("miner.sov"),
             pq: None,
-            tx_domain: None,
+            tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
         };
 
@@ -3286,7 +3367,7 @@ mod tests {
             gas_price: Balance::from_grains(u128::MAX),
             miner: miner_id(),
             pq: None,
-            tx_domain: None,
+            tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
         };
         let mut ledger = ledger_with_usa(1_000);
@@ -3961,7 +4042,7 @@ mod tests {
             gas_price: Balance::from_grains(1),
             miner: id("miner.sov"),
             pq: None,
-            tx_domain: None,
+            tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
         };
         let mut ledger = ledger_with_usa(100);
@@ -5258,7 +5339,7 @@ mod tests {
                 sunset_height: 200,
                 threshold_grains: Balance::from_sov(50).unwrap().grains(),
             }),
-            tx_domain: None,
+            tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
         }
     }
@@ -5479,7 +5560,7 @@ mod tests {
             gas_price: Balance::from_grains(1),
             miner: miner_id(),
             pq: None,
-            tx_domain: None,
+            tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
         };
 
