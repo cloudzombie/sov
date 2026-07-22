@@ -279,7 +279,8 @@ struct MinerApp {
     job_id: String,
     coinbase: Option<String>,
     expected_hashes: Option<f64>,
-    height_start_hashes: u64,
+    round_hashes: u64,
+    round_probability: Option<f64>,
     height_started_at: Option<Instant>,
     network_hashrate: Option<f64>,
     target_block_ms: Option<u64>,
@@ -314,7 +315,8 @@ impl Default for MinerApp {
             job_id: "Waiting for work".into(),
             coinbase: None,
             expected_hashes: None,
-            height_start_hashes: 0,
+            round_hashes: 0,
+            round_probability: None,
             height_started_at: None,
             network_hashrate: None,
             target_block_ms: None,
@@ -348,7 +350,8 @@ impl MinerApp {
         self.job_id = "Waiting for work".into();
         self.coinbase = None;
         self.expected_hashes = None;
-        self.height_start_hashes = 0;
+        self.round_hashes = 0;
+        self.round_probability = None;
         self.height_started_at = None;
         self.network_hashrate = None;
         self.target_block_ms = None;
@@ -565,6 +568,8 @@ impl MinerApp {
             self.child = None;
             self.receiver = None;
             self.hashrate = 0.0;
+            self.smoothed_hashrate = 0.0;
+            self.last_metrics_at = None;
             if self.requested_stop {
                 self.phase = Phase::Idle;
                 self.push_log("Mining stopped.", false);
@@ -624,7 +629,8 @@ impl MinerApp {
                 self.phase = Phase::Mining;
                 let next_height = value.get("height").and_then(Value::as_u64);
                 if next_height.is_some() && next_height != self.height {
-                    self.height_start_hashes = self.total_hashes;
+                    self.round_hashes = 0;
+                    self.round_probability = Some(0.0);
                     self.height_started_at = Some(Instant::now());
                 }
                 self.height = next_height;
@@ -647,6 +653,9 @@ impl MinerApp {
                     .get("expected_hashes")
                     .and_then(Value::as_f64)
                     .filter(|expected| expected.is_finite() && *expected > 0.0);
+                if self.expected_hashes.is_none() {
+                    self.round_probability = None;
+                }
             }
             Some("network") => {
                 self.network_hashrate = value
@@ -691,21 +700,33 @@ impl MinerApp {
                     .get("rejected")
                     .and_then(Value::as_u64)
                     .unwrap_or(self.rejected);
-                self.height = value.get("height").and_then(Value::as_u64).or(self.height);
+                let metrics_height = value.get("height").and_then(Value::as_u64);
+                if self.height.is_none() {
+                    self.height = metrics_height;
+                }
+                let round_height = value.get("round_height").and_then(Value::as_u64);
+                if round_height == metrics_height && metrics_height == self.height {
+                    self.round_hashes = value
+                        .get("round_hashes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(self.round_hashes);
+                    self.round_probability = self.expected_hashes.and_then(|_| {
+                        value
+                            .get("round_probability")
+                            .and_then(Value::as_f64)
+                            .filter(|probability| probability.is_finite())
+                            .map(|probability| probability.clamp(0.0, 1.0))
+                    });
+                }
                 if let Some(size) = value.get("mempool_size").and_then(Value::as_u64) {
                     self.mempool_size = Some(size);
                 }
-                let round_probability = self.expected_hashes.map(|expected| {
-                    let round_hashes =
-                        self.total_hashes.saturating_sub(self.height_start_hashes) as f64;
-                    -(-round_hashes / expected).exp_m1()
-                });
                 self.meter_history.push_back(MeterSample {
                     hashrate: self.hashrate,
                     smoothed_hashrate: self.smoothed_hashrate,
                     mempool: self.mempool_size,
                     height: self.height,
-                    round_probability,
+                    round_probability: self.round_probability,
                 });
                 while self.meter_history.len() > MAX_METER_SAMPLES {
                     self.meter_history.pop_front();
@@ -727,6 +748,9 @@ impl MinerApp {
             }
             Some("session_error") => {
                 self.phase = Phase::Reconnecting;
+                self.hashrate = 0.0;
+                self.smoothed_hashrate = 0.0;
+                self.last_metrics_at = None;
                 self.last_error = value
                     .get("message")
                     .and_then(Value::as_str)
@@ -738,19 +762,30 @@ impl MinerApp {
     }
 
     fn solo_block_eta_seconds(&self) -> Option<f64> {
+        if !self.telemetry_is_fresh() || !matches!(self.phase, Phase::Mining) {
+            return None;
+        }
         let expected = self.expected_hashes?;
         (self.smoothed_hashrate > 0.0).then_some(expected / self.smoothed_hashrate)
     }
 
     fn current_round_probability(&self) -> Option<f64> {
-        self.expected_hashes.map(|expected| {
-            let hashes = self.total_hashes.saturating_sub(self.height_start_hashes) as f64;
-            -(-hashes / expected).exp_m1()
-        })
+        self.expected_hashes?;
+        (self.telemetry_is_fresh() && matches!(self.phase, Phase::Mining))
+            .then_some(self.round_probability)
+            .flatten()
     }
 
     fn current_round_elapsed(&self) -> Option<Duration> {
-        self.height_started_at.map(|started| started.elapsed())
+        (self.telemetry_is_fresh() && matches!(self.phase, Phase::Mining))
+            .then(|| self.height_started_at.map(|started| started.elapsed()))
+            .flatten()
+    }
+
+    fn telemetry_is_fresh(&self) -> bool {
+        self.last_metrics_at.is_some_and(|at| {
+            at.elapsed() < Duration::from_secs(self.settings.report_secs.saturating_mul(3).max(8))
+        })
     }
 
     fn uptime(&self) -> String {
@@ -1168,9 +1203,7 @@ impl MinerApp {
     }
 
     fn status_rail(&self, ui: &mut egui::Ui) {
-        let metrics_fresh = self.last_metrics_at.is_some_and(|at| {
-            at.elapsed() < Duration::from_secs(self.settings.report_secs.saturating_mul(3).max(8))
-        });
+        let metrics_fresh = self.telemetry_is_fresh();
         let connected = matches!(self.phase, Phase::Mining) && self.height.is_some();
         let hashing = connected && metrics_fresh && self.hashrate > 0.0;
         let has_job = connected && self.job_id != "Waiting for work";
@@ -1236,7 +1269,13 @@ impl MinerApp {
                             "Block #{height} • {}",
                             self.solo_block_eta_seconds()
                                 .map(format_eta)
-                                .unwrap_or_else(|| "ETA locking".into())
+                                .unwrap_or_else(|| {
+                                    if self.expected_hashes.is_none() {
+                                        "ETA unavailable".into()
+                                    } else {
+                                        "ETA locking".into()
+                                    }
+                                })
                         )
                     },
                 ),
@@ -1286,7 +1325,13 @@ impl MinerApp {
                 &self
                     .solo_block_eta_seconds()
                     .map(format_eta)
-                    .unwrap_or_else(|| "LOCKING…".into()),
+                    .unwrap_or_else(|| {
+                        if self.height.is_some() && self.expected_hashes.is_none() {
+                            "N/A (POOL)".into()
+                        } else {
+                            "LOCKING…".into()
+                        }
+                    }),
                 GREEN,
             );
             metric_card(&mut columns[3], "UPTIME", &self.uptime(), AMBER);
@@ -1375,12 +1420,41 @@ impl MinerApp {
                         );
                     });
                 ui.add_space(7.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    Frame::new()
+                        .fill(PURPLE.gamma_multiply(0.18))
+                        .stroke(Stroke::new(1.0, PURPLE.gamma_multiply(0.72)))
+                        .corner_radius(CornerRadius::same(7))
+                        .inner_margin(Margin::symmetric(9, 5))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("●").size(8.0).color(PURPLE));
+                                ui.label(
+                                    RichText::new("NETWORK HASHRATE")
+                                        .size(9.0)
+                                        .strong()
+                                        .color(TEXT),
+                                );
+                                ui.label(
+                                    RichText::new(
+                                        self.network_hashrate
+                                            .map(format_hashrate)
+                                            .unwrap_or_else(|| "—".into()),
+                                    )
+                                    .size(11.0)
+                                    .strong()
+                                    .monospace()
+                                    .color(PURPLE),
+                                );
+                            });
+                        })
+                        .response
+                        .on_hover_text("Estimated by the connected SOV node; separate from this miner's local hashrate.");
                     ui.label(
                         RichText::new(format!(
-                            "NETWORK {}",
-                            self.network_hashrate
-                                .map(format_hashrate)
+                            "TARGET CADENCE {}",
+                            self.target_block_ms
+                                .map(|ms| format_eta(ms as f64 / 1_000.0))
                                 .unwrap_or_else(|| "—".into())
                         ))
                         .size(9.0)
@@ -1390,9 +1464,9 @@ impl MinerApp {
                     ui.label(RichText::new("•").size(9.0).color(BORDER));
                     ui.label(
                         RichText::new(format!(
-                            "TARGET CADENCE {}",
-                            self.target_block_ms
-                                .map(|ms| format_eta(ms as f64 / 1_000.0))
+                            "WORK / BLOCK {}",
+                            self.expected_hashes
+                                .map(format_count_f64)
                                 .unwrap_or_else(|| "—".into())
                         ))
                         .size(9.0)
@@ -2223,6 +2297,9 @@ mod tests {
             "height": 42,
             "hashrate": 100.0,
             "total_hashes": 100,
+            "round_height": 42,
+            "round_hashes": 100,
+            "round_probability": 1.0 - (-0.1_f64).exp(),
             "mempool_size": 3,
         }));
 
@@ -2242,7 +2319,7 @@ mod tests {
             "job_id": "job-42-b",
             "expected_hashes": 1_000.0,
         }));
-        assert_eq!(app.height_start_hashes, 0);
+        assert_eq!(app.round_hashes, 100);
         app.apply_telemetry(&json!({
             "event": "job",
             "height": 43,
@@ -2250,8 +2327,26 @@ mod tests {
             "job_id": "job-43",
             "expected_hashes": 2_000.0,
         }));
-        assert_eq!(app.height_start_hashes, 100);
+        assert_eq!(app.round_hashes, 0);
         assert_eq!(app.current_round_probability(), Some(0.0));
+
+        // A reporter sample assembled across a height transition must not
+        // restore the previous round's counters after the new job event.
+        app.apply_telemetry(&json!({
+            "event": "metrics",
+            "height": 43,
+            "hashrate": 100.0,
+            "total_hashes": 200,
+            "round_height": 42,
+            "round_hashes": 200,
+            "round_probability": 0.2,
+        }));
+        assert_eq!(app.round_hashes, 0);
+        assert_eq!(app.current_round_probability(), Some(0.0));
+
+        app.apply_telemetry(&json!({"event": "session_error", "message": "offline"}));
+        assert_eq!(app.solo_block_eta_seconds(), None);
+        assert_eq!(app.current_round_probability(), None);
     }
 
     #[test]

@@ -131,7 +131,10 @@ struct Job {
     id: String,
     blob: Vec<u8>,
     nonce_offset: usize,
+    /// Threshold used to decide whether a submitted share/block is valid.
     target: [u8; 32],
+    /// Consensus block target when disclosed separately from a pool share target.
+    block_target: Option<[u8; 32]>,
     algo: PowAlgo,
     pow_key: Vec<u8>,
     height: u64,
@@ -184,6 +187,19 @@ impl Job {
         let target: [u8; 32] = target_bytes
             .try_into()
             .map_err(|v: Vec<u8>| format!("target_full is {} bytes, want 32", v.len()))?;
+        let block_target = value
+            .get("network_target_full")
+            .or_else(|| value.get("network_target"))
+            .and_then(Value::as_str)
+            .map(|encoded| {
+                hex::decode(encoded)
+                    .map_err(|e| format!("invalid network block target hex: {e}"))?
+                    .try_into()
+                    .map_err(|v: Vec<u8>| {
+                        format!("network block target is {} bytes, want 32", v.len())
+                    })
+            })
+            .transpose()?;
 
         let algo = match string("algo")? {
             "rx/0" => PowAlgo::RandomX,
@@ -204,6 +220,7 @@ impl Job {
             blob,
             nonce_offset,
             target,
+            block_target,
             algo,
             pow_key,
             height: number("height")?,
@@ -285,6 +302,7 @@ impl Job {
             blob,
             nonce_offset,
             target,
+            block_target: Some(target),
             algo,
             pow_key,
             height,
@@ -311,6 +329,13 @@ fn expected_hashes_for_target(target: &[u8; 32]) -> f64 {
     success_probability.recip()
 }
 
+#[derive(Default)]
+struct RoundStats {
+    height: Option<u64>,
+    hashes: u64,
+    hazard: f64,
+}
+
 struct State {
     job: RwLock<Option<Arc<Job>>>,
     connection: RwLock<Option<Arc<Connection>>>,
@@ -324,6 +349,7 @@ struct State {
     rejected: AtomicU64,
     mempool_size: AtomicU64,
     mempool_known: AtomicBool,
+    round: Mutex<RoundStats>,
     confirmed_coinbase: RwLock<Option<String>>,
     json_events: bool,
 }
@@ -343,6 +369,7 @@ impl State {
             rejected: AtomicU64::new(0),
             mempool_size: AtomicU64::new(0),
             mempool_known: AtomicBool::new(false),
+            round: Mutex::new(RoundStats::default()),
             confirmed_coinbase: RwLock::new(None),
             json_events,
         }
@@ -356,6 +383,15 @@ impl State {
 
     fn install_job(&self, job: Job) {
         eprintln!("job {}: height {} ({:?})", job.id, job.height, job.algo);
+        {
+            let mut round = self.round.lock().expect("round telemetry lock");
+            if round.height != Some(job.height) {
+                *round = RoundStats {
+                    height: Some(job.height),
+                    ..RoundStats::default()
+                };
+            }
+        }
         if let Some(account) = job.coinbase.as_deref() {
             let mut confirmed = self
                 .confirmed_coinbase
@@ -369,8 +405,9 @@ impl State {
                 *confirmed = Some(account.to_owned());
             }
         }
-        let expected_hashes = expected_hashes_for_target(&job.target);
-        self.emit(json!({
+        let expected_hashes = job.block_target.as_ref().map(expected_hashes_for_target);
+        let network_target = job.block_target.map(hex::encode);
+        let event = json!({
             "event": "job",
             "job_id": job.id,
             "height": job.height,
@@ -379,11 +416,33 @@ impl State {
                 PowAlgo::Sha256d => "SHA-256d",
             },
             "coinbase": job.coinbase,
-            "network_target": hex::encode(job.target),
+            "network_target": network_target,
             "expected_hashes": expected_hashes,
-        }));
-        *self.job.write().expect("job lock") = Some(Arc::new(job));
+        });
+        let mut job_slot = self.job.write().expect("job lock");
+        *job_slot = Some(Arc::new(job));
+        // Emit while holding the slot write lock: the reporter cannot publish a
+        // new-height metrics line ahead of this job event, and workers are not
+        // released onto the new generation until after the event is visible.
+        self.emit(event);
+        drop(job_slot);
         self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    fn record_round_hashes(&self, job: &Job, completed: u64) {
+        let Some(block_target) = job.block_target.as_ref() else {
+            return;
+        };
+        let mut round = self.round.lock().expect("round telemetry lock");
+        if round.height == Some(job.height) {
+            round.hashes = round.hashes.saturating_add(completed);
+            round.hazard += completed as f64 / expected_hashes_for_target(block_target);
+        }
+    }
+
+    fn round_snapshot(&self) -> (Option<u64>, u64, f64) {
+        let round = self.round.lock().expect("round telemetry lock");
+        (round.height, round.hashes, -(-round.hazard).exp_m1())
     }
 
     fn clear_connection(&self, connection: &Arc<Connection>) {
@@ -532,6 +591,15 @@ fn is_direct_rpc(raw: &str) -> bool {
 }
 
 fn rpc_call(endpoint: &str, method: &str, params: Value) -> io::Result<Value> {
+    rpc_call_with_timeout(endpoint, method, params, Duration::from_secs(30))
+}
+
+fn rpc_call_with_timeout(
+    endpoint: &str,
+    method: &str,
+    params: Value,
+    read_timeout: Duration,
+) -> io::Result<Value> {
     let address = endpoint_address(endpoint);
     let mut stream = connect(address).map_err(|e| {
         if e.kind() == io::ErrorKind::ConnectionRefused {
@@ -540,7 +608,7 @@ fn rpc_call(endpoint: &str, method: &str, params: Value) -> io::Result<Value> {
             ))
         } else { e }
     })?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(read_timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let request = json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params});
     let body = request.to_string();
@@ -642,7 +710,18 @@ fn run_rpc_session(cfg: &Config, state: &Arc<State>) -> io::Result<()> {
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 validate_rpc_coinbase(requested, &job)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                if let Ok(network) = rpc_call(&cfg.pool, "sov_getDifficulty", json!({})) {
+                previous_id = job.id.clone();
+                state.install_job(job);
+                chain_height = Some(current_height);
+                refreshed = Instant::now();
+                // Optional dashboard enrichment comes after work installation so
+                // an older/slow node can never delay hashing a valid template.
+                if let Ok(network) = rpc_call_with_timeout(
+                    &cfg.pool,
+                    "sov_getDifficulty",
+                    json!({}),
+                    Duration::from_secs(2),
+                ) {
                     state.emit(json!({
                         "event": "network",
                         "hashrate": network.get("hashrate").cloned().unwrap_or(Value::Null),
@@ -650,10 +729,6 @@ fn run_rpc_session(cfg: &Config, state: &Arc<State>) -> io::Result<()> {
                         "difficulty": network.get("sha256d").cloned().unwrap_or(Value::Null),
                     }));
                 }
-                previous_id = job.id.clone();
-                state.install_job(job);
-                chain_height = Some(current_height);
-                refreshed = Instant::now();
             }
             thread::sleep(Duration::from_secs(2));
         }
@@ -857,6 +932,7 @@ fn worker_loop(state: Arc<State>, worker: u64) {
             .interval_hashes
             .fetch_add(completed, Ordering::Relaxed);
         state.total_hashes.fetch_add(completed, Ordering::Relaxed);
+        state.record_round_hashes(current, completed);
     }
 }
 
@@ -868,6 +944,7 @@ fn reporter_loop(state: Arc<State>, every: Duration) {
         previous = Instant::now();
         let hashes = state.interval_hashes.swap(0, Ordering::Relaxed);
         let rate = hashes as f64 / elapsed.max(f64::EPSILON);
+        let (round_height, round_hashes, round_probability) = state.round_snapshot();
         let height = state
             .job
             .read()
@@ -891,6 +968,9 @@ fn reporter_loop(state: Arc<State>, every: Duration) {
                 .as_ref()
                 .map(|job| job.height),
             "total_hashes": state.total_hashes.load(Ordering::Relaxed),
+            "round_height": round_height,
+            "round_hashes": round_hashes,
+            "round_probability": round_probability,
             "submitted": state.submitted.load(Ordering::Relaxed),
             "accepted": state.accepted.load(Ordering::Relaxed),
             "rejected": state.rejected.load(Ordering::Relaxed),
@@ -1051,6 +1131,7 @@ mod tests {
         assert_eq!(job.height, 42);
         assert_eq!(job.nonce_offset, 56);
         assert_eq!(job.target, [0xff; 32]);
+        assert_eq!(job.block_target, None);
         assert_eq!(job.algo, PowAlgo::Sha256d);
     }
 
@@ -1058,6 +1139,7 @@ mod tests {
     fn rpc_template_confirms_header_coinbase() {
         let job = Job::from_rpc(&valid_rpc_template()).unwrap();
         assert_eq!(job.coinbase.as_deref(), Some("sov-coinbase-account"));
+        assert_eq!(job.block_target, Some([0xff; 32]));
         assert!(validate_rpc_coinbase(None, &job).is_ok());
         assert!(validate_rpc_coinbase(Some("sov-coinbase-account"), &job).is_ok());
     }
@@ -1094,6 +1176,38 @@ mod tests {
             expected_hashes_for_target(&impossible_except_zero),
             2.0_f64.powi(256)
         );
+    }
+
+    #[test]
+    fn round_probability_segments_target_changes_and_rejects_stale_height_work() {
+        let state = State::new(false);
+        let first = Job::from_rpc(&valid_rpc_template()).unwrap();
+        state.install_job(first.clone());
+        state.record_round_hashes(&first, 1);
+        assert_eq!(
+            state.round_snapshot(),
+            (Some(first.height), 1, 1.0 - (-1.0_f64).exp())
+        );
+
+        let mut harder_refresh = first.clone();
+        harder_refresh.block_target = Some({
+            let mut target = [0xff; 32];
+            target[0] = 0;
+            target
+        });
+        state.install_job(harder_refresh.clone());
+        state.record_round_hashes(&harder_refresh, 256);
+        let (height, hashes, probability) = state.round_snapshot();
+        assert_eq!(height, Some(first.height));
+        assert_eq!(hashes, 257);
+        assert!((probability - (1.0 - (-2.0_f64).exp())).abs() < 1e-12);
+
+        let mut next_height = harder_refresh.clone();
+        next_height.height += 1;
+        let next_height_value = next_height.height;
+        state.install_job(next_height);
+        state.record_round_hashes(&harder_refresh, 256);
+        assert_eq!(state.round_snapshot(), (Some(next_height_value), 0, 0.0));
     }
 
     #[test]

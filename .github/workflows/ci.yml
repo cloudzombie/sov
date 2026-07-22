@@ -305,6 +305,11 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          # This job runs `cargo fmt` + `cargo clippy` on the tool crates, so the
+          # toolchain must carry both components (the default minimal profile omits them,
+          # which failed the "Format sov-stratum" step with "cargo-fmt is not installed").
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: |

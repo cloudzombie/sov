@@ -61,8 +61,12 @@ releases its RandomX worker memory.
 
 Mining is probabilistic: the displayed solo block ETA is `expected hashes ÷
 smoothed local hashes/second`, not a guaranteed countdown. The round meter uses
-`1 − exp(−hashes tried ÷ expected hashes)` and resets only when chain height
-advances; a routine template refresh at the same height does not fake a reset.
+`1 − exp(−Σ(hashes tried ÷ expected hashes at that target))` and resets only
+when chain height advances; a routine template refresh at the same height does
+not fake a reset or retroactively reprice earlier work.
+For a Stratum pool, the ordinary job target is a variable-difficulty share
+target, not the consensus block target, so block ETA remains unavailable unless
+the bridge explicitly supplies `network_target_full`/`network_target`.
 
 The GUI makes reward routing explicit:
 
