@@ -303,5 +303,34 @@ two forks = double the coordination risk on reserve mainnet.
 Everything above is on a BRANCH, dormant/additive, nothing armed, genesis frozen — safe for
 morning review. No mainnet touch until the fleet + audits + explicit go.
 
+- **Slice 6 — tx-domain activation GRACE WINDOW** — ✅ DONE (`7249292`, Fable-built + audited).
+  `TxDomainMode { Legacy, Grace(domain), Bound(domain) }`; `[H_a, H_a+G)` accepts legacy OR
+  bound so in-flight legacy txs aren't rejected at the flag-day height; `G =
+  TX_DOMAIN_GRACE_BLOCKS = 576` (~1 day). DORMANT byte-identical (resolver can only return
+  Legacy while deployment=None; Legacy = the exact old `verify(None)` path; genesis cb0272ff +
+  KAT untouched). Wired identically into execution, import, mempool, intents (one shared
+  resolver). Fable audit VERDICT: **SOUND-WITH-NITS, ship dormant.** Verified: dormant identity
+  exact, producer/import/execution/mempool mode-agreement, boundary + G=0 + H_a+G-overflow
+  exact (saturates → permanent Grace, deterministic), reorg/replay agree.
+
+## ★ PRE-ACTIVATION HARDENING (must clear BEFORE arming the tx-domain fork — NOT v0.1.98 blockers; dormant now)
+- **F1 (MEDIUM, PRE-EXISTING in the tx-domain fork, found by the slice-6 grace audit
+  2026-07-22):** `validate_candidate` (`chain/crates/chain/src/blockchain.rs:~1578`) resolves the
+  signature-gate mode from the **active-chain** signals even for a block extending a SIDE
+  BRANCH, while branch execution uses branch signals. If a reorg spans a signaling-window
+  boundary where lock-in state diverges between branches, a node could reject (`BadSignatures`)
+  a heavier-branch tip its own branch's mode accepts → never index it → partition. **The
+  pre-grace code had the identical shape — the grace window does NOT worsen it** (Grace even
+  shrinks the exposure since either preimage passes in-window). Unreachable while dormant. FIX
+  before arming: resolve the side-branch pre-check along the PARENT BRANCH's signal history (or
+  defer the signature gate to execution for non-head-extending blocks). Add a red-team reorg
+  test across a boundary. See memory [[action-decode-dos]]/[[assumevalid-ancestry-hardening]] class.
+- **F2 (config coordination):** `tx_domain_grace_blocks` defaults to the compiled constant 576
+  and its only setter (`set_tx_domain_grace_blocks`) is test-only (no config/CLI/RPC wiring), so
+  no per-node divergence is possible TODAY. But `G` MUST be baked into the SAME coordinated
+  activation preset as the deployment schedule before arming — two nodes with different G split
+  at `H_a+G` (Grace vs Bound on the same block). Treat `G` as a consensus parameter of the
+  activation release, like the height/threshold.
+
 ## Immediate next action
 Slice 2b (above) — the activation logic — with the conservation invariant test first.
