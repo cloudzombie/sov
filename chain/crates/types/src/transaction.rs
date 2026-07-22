@@ -351,6 +351,19 @@ pub enum Action {
         /// The new price: USD per 1 XUS in 10^8 fixed point.
         price: u128,
     },
+    /// A **fee-auction envelope** (v0.1.98): pay `tip` to the block's miner ON TOP of
+    /// the normal fixed intrinsic fee, bidding for earlier inclusion, then execute
+    /// `inner`. Appended LAST so every existing action's Borsh discriminant — and thus
+    /// genesis `cb0272ff` and every KAT vector — is byte-identical. Dormant until the
+    /// miner-signaled `fee-auction` deployment is `Active`: rejected at mempool
+    /// admission, block import, and execution before then, so pre-activation behavior
+    /// is unchanged. `inner` must NOT itself be `Tipped` (no nested tips).
+    Tipped {
+        /// Priority tip paid to the block's miner, on top of the intrinsic fee.
+        tip: Balance,
+        /// The action actually performed once the tip is charged.
+        inner: Box<Action>,
+    },
 }
 
 /// One signer's approval of a [`Action::MultisigExec`]: the signer's index into

@@ -119,6 +119,20 @@ pub enum ExecutionError {
         /// The frozen account.
         account: String,
     },
+    /// A miner-signaled feature was used before it activated. A block carrying such a
+    /// transaction is INVALID (this propagates to `BlockExecutionError`), so every
+    /// node running the same deployment schedule rejects it uniformly — the dormant
+    /// half of an activation gate. Currently: the `fee-auction` envelope
+    /// (`Action::Tipped`) before its deployment is `Active`.
+    #[error("feature `{feature}` is not active at this height")]
+    FeatureInactive {
+        /// The deployment/feature name that is not yet active.
+        feature: &'static str,
+    },
+    /// A fee-auction envelope wrapped another fee-auction envelope. Tips do not nest —
+    /// the inner action must be an ordinary action.
+    #[error("fee-auction envelopes cannot be nested")]
+    NestedTip,
 }
 
 /// Apply one signed transaction to `ledger` in `ctx`, returning its [`Receipt`].
@@ -336,6 +350,18 @@ pub fn apply_transaction(
         ExecutionStatus::Failed { reason }
     } else {
         match effective_action {
+            // Fee-auction envelope — DORMANT until the `fee-auction` deployment is
+            // Active. Until then it is rejected here as a HARD error, which propagates
+            // to BlockExecutionError::InvalidTransaction and invalidates any block
+            // carrying it, uniformly on every node. (The activation path — gate on
+            // ctx.fee_auction_active, reject nesting, charge `tip` to the miner, then
+            // execute `inner` — lands in a later, separately-audited slice; keeping it
+            // inert here means genesis and every KAT vector stay byte-identical.)
+            Action::Tipped { .. } => {
+                return Err(ExecutionError::FeatureInactive {
+                    feature: "fee-auction",
+                })
+            }
             Action::Transfer { to, amount } => {
                 do_transfer(ledger, &tx.signer, &mut signer, to, *amount)?
             }
@@ -2063,6 +2089,42 @@ mod tests {
             Account::new(key, Balance::from_sov(sov).unwrap()),
         );
         ledger
+    }
+
+    #[test]
+    fn dormant_tipped_envelope_is_rejected_as_feature_inactive() {
+        // v0.1.98 keystone, dormant phase: the fee-auction envelope is inert until its
+        // deployment activates. `Action::Tipped` is a HARD execution error, which
+        // `apply_transactions` maps to BlockExecutionError::InvalidTransaction — so any
+        // block carrying one is rejected uniformly on every node, and genesis + all
+        // existing behavior are unaffected (proven separately by the genesis/KAT gate).
+        let mut ledger = ledger_with_usa(100);
+        let p = policy();
+        let kp = Keypair::from_seed([1; 32]);
+        let tx = Transaction {
+            signer: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce: 0,
+            action: Action::Tipped {
+                tip: Balance::from_sov(1).unwrap(),
+                inner: Box::new(Action::Transfer {
+                    to: id("ecb.reserve.sov"),
+                    amount: Balance::from_sov(5).unwrap(),
+                }),
+            },
+        };
+        let stx = SignedTransaction::sign(tx, &kp).unwrap();
+        assert!(matches!(
+            apply_transaction(&mut ledger, &stx, &ctx(&p)),
+            Err(ExecutionError::FeatureInactive {
+                feature: "fee-auction"
+            })
+        ));
+        // It also invalidates the block at the batch layer.
+        assert!(matches!(
+            apply_transactions(&mut ledger, std::slice::from_ref(&stx), &ctx(&p)),
+            Err(BlockExecutionError::InvalidTransaction { index: 0, .. })
+        ));
     }
 
     #[test]

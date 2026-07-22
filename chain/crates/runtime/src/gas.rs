@@ -122,6 +122,10 @@ pub fn gas_for(action: &Action) -> u64 {
         | Action::VaultBurn { .. }
         | Action::VaultWithdraw { .. }
         | Action::OracleUpdate { .. } => INTRINSIC_GAS + BOOKKEEPING_GAS,
+        // A fee-auction envelope: the inner action's own gas plus one bookkeeping unit
+        // for charging the tip. The tip itself is a value transfer to the miner, not a
+        // gas cost. (Nesting is rejected in execution, so `inner` is never `Tipped`.)
+        Action::Tipped { inner, .. } => gas_for(inner).saturating_add(BOOKKEEPING_GAS),
     }
 }
 
