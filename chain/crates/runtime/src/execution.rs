@@ -413,9 +413,21 @@ pub fn apply_transaction(
             // carrying it, uniformly on every node — genesis and every KAT vector
             // stay byte-identical.
             Action::Tipped { .. } => {
-                return Err(ExecutionError::FeatureInactive {
-                    feature: "fee-auction",
-                })
+                // A `Tipped` reaches the DISPATCH match only two ways: (a) the fee
+                // auction is inactive (a direct tipped tx is not unwrapped by the
+                // active-tip arm) → the honest reason is FeatureInactive; or (b) the
+                // auction IS active but the tip arrived nested inside a `MultisigExec`
+                // (whose unwrap sets effective_action = the inner `Tipped`) — tips may
+                // not be wrapped in a multisig, so the honest reason is
+                // TipInnerNotAllowed, not the misleading "feature inactive". Either way
+                // it is a HARD, block-invalidating error; only the diagnostic differs.
+                return Err(if ctx.fee_auction_active {
+                    ExecutionError::TipInnerNotAllowed
+                } else {
+                    ExecutionError::FeatureInactive {
+                        feature: "fee-auction",
+                    }
+                });
             }
             Action::Transfer { to, amount } => {
                 do_transfer(ledger, &tx.signer, &mut signer, to, *amount)?
@@ -2392,6 +2404,92 @@ mod tests {
             apply_transactions(&mut ledger, std::slice::from_ref(&stx), &auction_ctx(&p, 1)),
             Err(BlockExecutionError::InvalidTransaction { index: 0, .. })
         ));
+    }
+
+    /// An active auction context whose block miner is `miner` — for the aliasing
+    /// conservation cases (miner == signer, miner == recipient).
+    fn auction_ctx_miner(p: &MiningPolicy, price_grains: u128, miner: AccountId) -> BlockContext<'_> {
+        let mut c = auction_ctx(p, price_grains);
+        c.miner = miner;
+        c
+    }
+
+    #[test]
+    fn tip_conserves_when_miner_tips_itself() {
+        // Aliasing (Fable audit): the signer IS the block miner. The fee+tip it pays
+        // round-trip back to it, so ONLY the inner transfer amount leaves — supply is
+        // bit-exact conserved and the real check_transition invariant holds.
+        use sov_verify::check_transition;
+        let p = policy();
+        let mut ledger = ledger_with_usa(100);
+        let before = ledger.clone();
+        let supply_before = ledger.total_supply().unwrap();
+        let ctx = auction_ctx_miner(&p, 3, id("usa.reserve.sov"));
+        let stx = tipped_transfer(
+            Balance::from_sov(2).unwrap(),
+            "ecb.reserve.sov",
+            Balance::from_sov(5).unwrap(),
+            0,
+        );
+        assert!(apply_transaction(&mut ledger, &stx, &ctx).unwrap().succeeded());
+        assert_eq!(ledger.total_supply().unwrap(), supply_before, "self-tip conserves supply");
+        assert_eq!(
+            ledger.account(&id("usa.reserve.sov")).balance,
+            Balance::from_sov(95).unwrap(),
+            "miner==signer: fee+tip net to zero; only the 5 SOV amount leaves"
+        );
+        assert!(check_transition(&before, &ledger).is_ok());
+    }
+
+    #[test]
+    fn tip_conserves_when_inner_transfers_to_the_miner() {
+        // Aliasing (Fable audit): the inner Transfer's recipient IS the miner. It must
+        // receive amount + tip + fee, each exactly once; supply conserved.
+        use sov_verify::check_transition;
+        let p = policy();
+        let mut ledger = ledger_with_usa(100);
+        let before = ledger.clone();
+        let supply_before = ledger.total_supply().unwrap();
+        let miner = id("ecb.reserve.sov");
+        let (tip, amount) = (Balance::from_sov(2).unwrap(), Balance::from_sov(5).unwrap());
+        let ctx = auction_ctx_miner(&p, 3, miner.clone());
+        let r = apply_transaction(&mut ledger, &tipped_transfer(tip, "ecb.reserve.sov", amount, 0), &ctx).unwrap();
+        assert!(r.succeeded());
+        assert_eq!(ledger.total_supply().unwrap(), supply_before);
+        let fee = Balance::from_grains(r.gas_used as u128 * 3);
+        assert_eq!(
+            ledger.account(&miner).balance,
+            amount.checked_add(tip).unwrap().checked_add(fee).unwrap(),
+            "miner==recipient gets amount + tip + fee, once each"
+        );
+        assert!(check_transition(&before, &ledger).is_ok());
+    }
+
+    #[test]
+    fn tip_is_paid_even_when_inner_transfer_fails_and_stays_conserved() {
+        // Fee-like semantics (Fable audit): the tip+fee are affordable but the inner
+        // transfer amount is NOT — so the inner is a Failed receipt while the tip+fee
+        // are still paid to the miner. Money is conserved to the grain either way.
+        use sov_verify::check_transition;
+        let p = policy();
+        let mut ledger = ledger_with_usa(10);
+        let before = ledger.clone();
+        let supply_before = ledger.total_supply().unwrap();
+        let ctx = auction_ctx(&p, 3);
+        let r = apply_transaction(
+            &mut ledger,
+            &tipped_transfer(Balance::from_sov(3).unwrap(), "ecb.reserve.sov", Balance::from_sov(100).unwrap(), 0),
+            &ctx,
+        )
+        .unwrap();
+        assert!(!r.succeeded(), "inner transfer of 100 from a 10 balance fails");
+        assert_eq!(ledger.total_supply().unwrap(), supply_before, "tip-paid-on-failure conserves supply");
+        assert_eq!(
+            ledger.account(&id("ecb.reserve.sov")).balance,
+            Balance::ZERO,
+            "recipient receives nothing when the inner fails"
+        );
+        assert!(check_transition(&before, &ledger).is_ok());
     }
 
     #[test]
