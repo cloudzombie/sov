@@ -245,6 +245,11 @@ impl Node {
             let ledger = self.chain.ledger();
             self.mempool
                 .prune(|a| ledger.account(a).nonce, |a| ledger.account(a).balance);
+            // Drain any tx stranded behind a nonce hole (a reorg can leave one when a
+            // reverted low-nonce tx fails re-admission while higher nonces stay pooled),
+            // so `next_nonce` and mining recover instead of the account wedging.
+            self.mempool
+                .evict_stranded(|a| ledger.account(a).nonce, sov_mempool::STRANDED_TTL_MS);
         }
         self.refresh_mempool_domain();
         Ok(Produced { block, receipts })
@@ -375,6 +380,29 @@ mod tests {
             },
         };
         SignedTransaction::sign(tx, &kp).unwrap()
+    }
+
+    #[test]
+    fn next_nonce_composes_on_chain_and_pending_end_to_end() {
+        // End-to-end for sov_getNextNonce: the value a wallet must sign with is the
+        // committed on-chain nonce PLUS what the account has pending here. Queuing a
+        // second send at that nonce is admitted (not NonceTaken); once mined, the
+        // value tracks the advanced on-chain nonce.
+        let mut node = devnet_node();
+        let usa = id("usa.reserve.sov");
+        assert_eq!(node.next_nonce(&usa), 0, "empty: on-chain nonce");
+
+        node.submit(usa_transfer("ecb.reserve.sov", 1, 0)).unwrap();
+        assert_eq!(node.next_nonce(&usa), 1, "one pending → queue at N+1");
+
+        // The queued send at the advised nonce is accepted (would collide at 0).
+        node.submit(usa_transfer("ecb.reserve.sov", 1, 1)).unwrap();
+        assert_eq!(node.next_nonce(&usa), 2);
+
+        // Mine them; the on-chain nonce advances and next_nonce follows it.
+        node.produce(1_000).unwrap();
+        assert_eq!(node.chain().ledger().account(&usa).nonce, 2);
+        assert_eq!(node.next_nonce(&usa), 2, "pool drained → pure on-chain nonce");
     }
 
     #[test]

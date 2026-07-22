@@ -143,11 +143,17 @@ impl RpcClient {
     /// (not [`nonce`](Self::nonce)) lets several sends be in flight at once — each
     /// queues behind the last and they mine in order — instead of the second send
     /// colliding with the first's slot and being rejected (`NonceTaken`). Falls back
-    /// to the plain on-chain nonce if the node predates `sov_getNextNonce`.
+    /// to the plain on-chain nonce ONLY if the node predates `sov_getNextNonce`
+    /// (JSON-RPC `-32601` method-not-found). Any other error (transport, timeout,
+    /// malformed) is propagated — silently degrading on a flaky link would reintroduce
+    /// the very `NonceTaken` collision this method exists to prevent, and mask the
+    /// real failure.
     pub fn next_nonce(&self, account: &AccountId) -> Result<u64, RpcClientError> {
         match self.call_typed("sov_getNextNonce", json!({ "account": account.as_str() })) {
             Ok(n) => Ok(n),
-            Err(_) => self.nonce(account),
+            // -32601 = method not found: an older node without this RPC. Fall back.
+            Err(RpcClientError::Rpc { code: -32601, .. }) => self.nonce(account),
+            Err(e) => Err(e),
         }
     }
 

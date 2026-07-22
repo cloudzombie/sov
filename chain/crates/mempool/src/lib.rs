@@ -31,6 +31,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use sov_primitives::{AccountId, Balance, Hash, SigningDomain};
 use sov_types::{Action, SignedTransaction};
 
+/// TTL for [`Mempool::evict_stranded`]: an entry left behind a nonce hole (only
+/// possible via reorg re-admission — gap-free admission prevents fresh holes) that
+/// has been stuck this long is dropped so the account self-heals. 30 minutes is far
+/// longer than any honest confirmation wait, so a live, soon-mineable tx is never
+/// evicted, while a genuinely stranded one clears.
+pub const STRANDED_TTL_MS: u64 = 30 * 60 * 1000;
+
 /// Reasons a transaction is not admitted to the pool.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MempoolError {
@@ -198,8 +205,28 @@ impl Mempool {
     /// with THIS value instead queues the new transaction behind the pending one, so
     /// several sends can be in flight at once and mine in order. Pure read; changes
     /// no consensus rule — the pool already accepts this nonce today.
+    ///
+    /// Implemented as a first-FREE-slot walk from `on_chain_nonce`, NOT
+    /// `on_chain_nonce + count`. When the sender's pooled run is contiguous (the
+    /// normal case, since admission is gap-free) the two are identical. But a reorg
+    /// re-admission can leave a HOLE below the run (a reverted low-nonce tx that fails
+    /// re-admission while higher nonces stay pooled); the count formula would then
+    /// point AT a taken slot and wedge the wallet permanently, whereas the walk
+    /// returns the hole — the exact nonce the wallet must fill to unstick itself. The
+    /// walk is bounded: a sender holds at most `max_per_sender` entries, so the first
+    /// free slot is within `on_chain_nonce ..= on_chain_nonce + max_per_sender`.
     pub fn next_nonce(&self, signer: &AccountId, on_chain_nonce: u64) -> u64 {
-        on_chain_nonce.saturating_add(self.sender_count(signer) as u64)
+        let mut n = on_chain_nonce;
+        // `max_per_sender + 1` steps suffice: with at most `max_per_sender` occupied
+        // slots for this signer, at least one of the first `max_per_sender + 1` nonces
+        // from `on_chain_nonce` is free. The `+1` bound also guarantees termination.
+        for _ in 0..=self.max_per_sender {
+            if !self.by_sender.contains_key(&(signer.clone(), n)) {
+                return n;
+            }
+            n = n.saturating_add(1);
+        }
+        n
     }
 
     /// The signer holding the most pending transactions, with that count.
@@ -562,6 +589,65 @@ mod tests {
         assert_eq!(picked.len(), 2, "both queued sends are mineable");
         assert_eq!(picked[0].transaction.nonce, 0);
         assert_eq!(picked[1].transaction.nonce, 1);
+    }
+
+    #[test]
+    fn next_nonce_returns_the_hole_when_a_reorg_strands_higher_nonces() {
+        // Finding 1 (Fable audit): a reorg can leave {5,6} pooled with on-chain nonce
+        // still 3 (the reverted low nonces 3,4 failed re-admission). The OLD count
+        // formula (3 + 2 pending = 5) points AT a taken slot → NonceTaken → permanent
+        // wedge. The first-free-slot walk returns 3 — the exact hole to fill to unstick.
+        let mut pool = Mempool::new(100);
+        let signer = id("usa.reserve.sov");
+        for n in 3..=6 {
+            pool.insert(tx([1; 32], "usa.reserve.sov", n), 3, big())
+                .unwrap();
+        }
+        // Strand: drop nonces 3 and 4, leaving {5,6} with on-chain still 3.
+        pool.remove(&tx([1; 32], "usa.reserve.sov", 3).id());
+        pool.remove(&tx([1; 32], "usa.reserve.sov", 4).id());
+        assert_eq!(
+            pool.next_nonce(&signer, 3),
+            3,
+            "walk returns the hole nonce, not the count-formula's taken slot"
+        );
+        // And the hole is immediately fillable (admission accepts it → self-heal).
+        pool.insert(tx([1; 32], "usa.reserve.sov", 3), 3, big())
+            .unwrap();
+        assert_eq!(pool.next_nonce(&signer, 3), 4);
+    }
+
+    #[test]
+    fn next_nonce_drops_back_after_eviction_restores_contiguity() {
+        // Eviction always removes the HIGHEST nonce, so contiguity from the bottom is
+        // preserved and next_nonce falls back to the freed slot.
+        let mut pool = Mempool::new(100);
+        let signer = id("usa.reserve.sov");
+        for n in 0..3 {
+            pool.insert(tx([1; 32], "usa.reserve.sov", n), 0, big())
+                .unwrap();
+        }
+        assert_eq!(pool.next_nonce(&signer, 0), 3);
+        pool.evict_highest_nonce(&signer); // drops nonce 2
+        assert_eq!(pool.next_nonce(&signer, 0), 2);
+    }
+
+    #[test]
+    fn next_nonce_is_bounded_at_the_sender_limit() {
+        // A full sender run returns the slot just past the limit; that nonce will be
+        // rejected SenderLimit at insert — the wallet is correctly told the queue is full,
+        // and the walk still terminates (no unbounded loop).
+        let mut pool = Mempool::with_limits(100, 3);
+        let signer = id("usa.reserve.sov");
+        for n in 0..3 {
+            pool.insert(tx([1; 32], "usa.reserve.sov", n), 0, big())
+                .unwrap();
+        }
+        assert_eq!(pool.next_nonce(&signer, 0), 3);
+        assert!(matches!(
+            pool.insert(tx([1; 32], "usa.reserve.sov", 3), 0, big()),
+            Err(MempoolError::SenderLimit { .. })
+        ));
     }
 
     #[test]

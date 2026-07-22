@@ -1983,11 +1983,12 @@ impl Station {
             let to_id = AccountId::new(&to).map_err(|e| e.to_string())?;
             let public_key: PublicKey = serde_json::from_value(serde_json::Value::String(pk_str))
                 .map_err(|e| e.to_string())?;
-            // The signer's current on-chain nonce (so the offline-signed tx is
-            // immediately includable when broadcast).
+            // The signer's next queue-aware nonce (on-chain + pending) so the
+            // offline-signed tx is immediately includable AND queues behind any tx
+            // already pending, instead of colliding with its slot.
             let nonce = RpcClient::new(rpc)
                 .with_timeout(Duration::from_secs(8))
-                .nonce(&signer_id)
+                .next_nonce(&signer_id)
                 .map_err(|e| e.to_string())?;
             let tx = Transaction {
                 signer: signer_id,
@@ -3745,7 +3746,7 @@ impl Station {
         if ui
             .checkbox(
                 &mut self.expose_rpc_lan,
-                "Expose node RPC on LAN (for explorer/conformance tools)",
+                "Expose node RPC on LAN (for XUS Miner/explorer/conformance tools)",
             )
             .on_hover_text(
                 "Off (default): the node's RPC is reachable only from this machine (127.0.0.1). \
@@ -8118,7 +8119,10 @@ fn submit_action(
     let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(15));
     let kp = Keypair::hybrid_from_seed(seed);
     let id = AccountId::new(signer).map_err(|e| e.to_string())?;
-    let nonce = client.nonce(&id).map_err(|e| e.to_string())?;
+    // Queue-aware: on-chain nonce + this signer's pending pool count, so an action
+    // issued while an earlier send is still pending gets the next free slot instead
+    // of colliding with it (the "transaction … nonce N is already pooled" reject).
+    let nonce = client.next_nonce(&id).map_err(|e| e.to_string())?;
     let tx = Transaction {
         signer: id,
         public_key: kp.public_key(),
@@ -8725,7 +8729,8 @@ fn deshield_amount(
     // receives the funds and pays the fee.
     let kp = Keypair::hybrid_from_seed(seed);
     let from = AccountId::new(account).map_err(|e| e.to_string())?;
-    let nonce = client.nonce(&from).map_err(|e| e.to_string())?;
+    // Queue-aware next nonce so a send while one is pending queues instead of colliding.
+    let nonce = client.next_nonce(&from).map_err(|e| e.to_string())?;
     let tx = Transaction {
         signer: from,
         public_key: kp.public_key(),
@@ -8847,7 +8852,9 @@ fn shielded_send(
     let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(60));
     let kp = Keypair::hybrid_from_seed(seed);
     let from = AccountId::new(signer).map_err(|e| e.to_string())?;
-    let nonce = client.nonce(&from).map_err(|e| e.to_string())?;
+    // Queue-aware next nonce — the private-send path that produced the observed
+    // "transaction … nonce N is already pooled" when sending while one was pending.
+    let nonce = client.next_nonce(&from).map_err(|e| e.to_string())?;
     let tx = Transaction {
         signer: from,
         public_key: kp.public_key(),
