@@ -40,6 +40,21 @@ export type HashHex = string;
 export type AccountIdStr = string;
 
 /**
+ * The network signing domain a transaction signature binds to under the
+ * miner-signaled `tx-domain` hard fork (mirrors the node's
+ * `sov_primitives::SigningDomain` and the `sov_getSigningDomain` RPC).
+ * While the fork is dormant, clients see no domain (`null`) and sign the
+ * legacy way; once active, the signing preimage is framed as
+ * `"sov:tx:v1" ‖ 0x00 ‖ chain_id ‖ 0x00 ‖ genesis(32) ‖ borsh(Transaction)`.
+ */
+export interface SigningDomain {
+  /** The bound chain id (ASCII network name, e.g. `sov-mainnet`). */
+  chainId: string;
+  /** The bound genesis block hash (32 bytes, hex with or without `0x`). */
+  genesis: HashHex;
+}
+
+/**
  * On-chain account state. Mirrors `state::Account`.
  * `key` is `null` for a keyless (receive-only) account; `code` is `null` for a
  * non-contract account (and a byte array when present).

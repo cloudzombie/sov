@@ -13,6 +13,7 @@ import type {
   GrainString,
   HashHex,
   SignedTransaction,
+  SigningDomain,
 } from "./types.js";
 
 /** A JSON-RPC error response. */
@@ -178,6 +179,28 @@ export class SovClient {
   /** Whether the block with header hash `hash` has reached finality. */
   isFinal(hash: HashHex): Promise<boolean> {
     return this.call<boolean>("sov_isFinal", { hash });
+  }
+
+  /**
+   * The network {@link SigningDomain} a NEW transaction's signature must bind
+   * to (`sov_getSigningDomain`), or `null` while the miner-signaled `tx-domain`
+   * hard fork is dormant — sign the legacy (un-bound) way then, byte-identical
+   * to pre-fork behavior. A node too old to know the method (`-32601`
+   * method-not-found) is by definition pre-fork, so it also maps to `null`.
+   */
+  async getSigningDomain(): Promise<SigningDomain | null> {
+    let r: { active?: boolean; chainId?: string | null; genesis?: string | null };
+    try {
+      r = await this.call<typeof r>("sov_getSigningDomain");
+    } catch (e) {
+      if (e instanceof RpcError && e.code === -32601) return null;
+      throw e;
+    }
+    if (!r || r.active !== true) return null;
+    if (typeof r.chainId !== "string" || typeof r.genesis !== "string") {
+      throw new RpcError(-32000, "active signing domain missing chainId/genesis");
+    }
+    return { chainId: r.chainId, genesis: r.genesis };
   }
 
   // --- write ---------------------------------------------------------------

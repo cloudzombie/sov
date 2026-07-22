@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use sov_crypto::Keypair;
-use sov_primitives::{AccountId, Balance, Hash};
+use sov_primitives::{AccountId, Balance, Hash, SigningDomain};
 use sov_rpc::RpcClient;
 use sov_state::{nft_class_id, token_asset_id};
 use sov_types::{
@@ -319,6 +319,11 @@ struct Ctx {
     /// against `max_spend_grains` before each spend. Behind a mutex because the web
     /// server shares one `Ctx` across the worker thread.
     spent_grains: Mutex<u128>,
+    /// The network signing domain from node A's `sov_getSigningDomain`, captured
+    /// at preflight: `None` while the `tx-domain` fork is dormant (legacy
+    /// signatures, byte-identical to before), `Some` once active (network-bound
+    /// signatures, which the node then requires).
+    domain: Option<SigningDomain>,
 }
 
 impl Ctx {
@@ -350,7 +355,7 @@ impl Ctx {
             nonce,
             action,
         };
-        SignedTransaction::sign(tx, kp).map_err(|e| e.to_string())
+        SignedTransaction::sign_in(tx, kp, self.domain.as_ref()).map_err(|e| e.to_string())
     }
 
     /// Submit to node A, wait for the receipt, and return `(height, receipt_json)`.
@@ -560,6 +565,12 @@ fn prepare(cfg: &Config) -> Result<(Ctx, Value), String> {
     };
     let run_id = a.height().unwrap_or(0);
     let bal = a.balance(&account).unwrap_or(Balance::ZERO);
+    // The signing domain every transaction in this sweep must bind to. `None`
+    // while the `tx-domain` fork is dormant (or on an old node without the
+    // method) — legacy signing, byte-identical to before the fork existed.
+    let domain = a
+        .signing_domain()
+        .map_err(|e| format!("reading signing domain: {e}"))?;
 
     let preflight = json!({
         "chainId": id_a,
@@ -595,6 +606,7 @@ fn prepare(cfg: &Config) -> Result<(Ctx, Value), String> {
         max_spend_grains: cfg.max_spend_grains,
         max_fee_grains: cfg.max_fee_grains,
         spent_grains: Mutex::new(0),
+        domain,
     };
     Ok((ctx, preflight))
 }
@@ -1034,7 +1046,8 @@ fn build_cases() -> Vec<Case> {
                     proof,
                 },
             };
-            let stx = SignedTransaction::sign(tx, &acct_kp).map_err(|e| e.to_string())?;
+            let stx = SignedTransaction::sign_in(tx, &acct_kp, ctx.domain.as_ref())
+                .map_err(|e| e.to_string())?;
             let (h, r) = ctx.submit_mined(&stx)?;
             if !receipt_ok(&r) {
                 return Err(format!("rotate failed: {}", receipt_reason(&r)));
@@ -1064,7 +1077,8 @@ fn build_cases() -> Vec<Case> {
                     threshold: 2,
                 },
             };
-            let set_stx = SignedTransaction::sign(set_tx, &m_kp).map_err(|e| e.to_string())?;
+            let set_stx = SignedTransaction::sign_in(set_tx, &m_kp, ctx.domain.as_ref())
+                .map_err(|e| e.to_string())?;
             let (_sh, sr) = ctx.submit_mined(&set_stx)?;
             if !receipt_ok(&sr) {
                 return Err(format!("set_multisig failed: {}", receipt_reason(&sr)));
@@ -1100,7 +1114,8 @@ fn build_cases() -> Vec<Case> {
                     approvals,
                 },
             };
-            let exec_stx = SignedTransaction::sign(exec_tx, &s1).map_err(|e| e.to_string())?;
+            let exec_stx = SignedTransaction::sign_in(exec_tx, &s1, ctx.domain.as_ref())
+                .map_err(|e| e.to_string())?;
             let (h, r) = ctx.submit_mined(&exec_stx)?;
             if !receipt_ok(&r) {
                 return Err(format!("multisig_exec failed: {}", receipt_reason(&r)));
@@ -1124,7 +1139,8 @@ fn build_cases() -> Vec<Case> {
                     code: COUNTER_WASM.to_vec(),
                 },
             };
-            let dep_stx = SignedTransaction::sign(dep_tx, &c_kp).map_err(|e| e.to_string())?;
+            let dep_stx = SignedTransaction::sign_in(dep_tx, &c_kp, ctx.domain.as_ref())
+                .map_err(|e| e.to_string())?;
             let (_dh, dr) = ctx.submit_mined(&dep_stx)?;
             if !receipt_ok(&dr) {
                 return Err(format!("deploy failed: {}", receipt_reason(&dr)));

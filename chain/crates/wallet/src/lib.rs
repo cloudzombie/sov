@@ -19,7 +19,7 @@ pub use hd::{generate_mnemonic, HdError, HdWallet, SOV_COIN_TYPE};
 use std::collections::HashMap;
 
 use sov_crypto::{Keypair, PublicKey};
-use sov_primitives::{AccountId, Balance};
+use sov_primitives::{AccountId, Balance, SigningDomain};
 use sov_types::{Action, SignedTransaction, Transaction};
 
 /// An in-memory holder of account keypairs and a builder of signed transactions.
@@ -70,12 +70,36 @@ impl Wallet {
 
     /// Build and sign a transfer of `amount` from a managed account `from` to
     /// `to`, with the given `nonce` (the account's current nonce in state).
+    ///
+    /// Signs the legacy (un-bound) way — correct while the `tx-domain` hard fork
+    /// is dormant. Once the fork is active on the target network, use
+    /// [`transfer_in`](Self::transfer_in) with the domain the node reports via
+    /// `sov_getSigningDomain` (`RpcClient::signing_domain`).
     pub fn transfer(
         &self,
         from: &AccountId,
         to: AccountId,
         amount: Balance,
         nonce: u64,
+    ) -> Result<SignedTransaction, WalletError> {
+        self.transfer_in(from, to, amount, nonce, None)
+    }
+
+    /// Build and sign a transfer under an optional network [`SigningDomain`].
+    ///
+    /// `None` produces the legacy signature (byte-identical to
+    /// [`transfer`](Self::transfer)); `Some(domain)` binds the signature to that
+    /// network — required once the miner-signaled `tx-domain` fork is active.
+    /// This wallet is offline (it holds keys, not a node connection), so the
+    /// domain is the caller's to supply: query it from the node you will submit
+    /// to (`sov_getSigningDomain`) and pass it through.
+    pub fn transfer_in(
+        &self,
+        from: &AccountId,
+        to: AccountId,
+        amount: Balance,
+        nonce: u64,
+        domain: Option<&SigningDomain>,
     ) -> Result<SignedTransaction, WalletError> {
         let keypair = self
             .keys
@@ -90,7 +114,7 @@ impl Wallet {
             action: Action::Transfer { to, amount },
         };
         // sign cannot mismatch: we built the tx with this keypair's public key.
-        SignedTransaction::sign(tx, keypair).map_err(|_| WalletError::Signing)
+        SignedTransaction::sign_in(tx, keypair, domain).map_err(|_| WalletError::Signing)
     }
 }
 
@@ -162,6 +186,42 @@ mod tests {
                 account: "ghost.sov".into()
             })
         );
+    }
+
+    #[test]
+    fn domain_bound_transfer_verifies_only_under_that_domain() {
+        use sov_primitives::Hash;
+        let mut wallet = Wallet::new();
+        wallet.generate(id("usa.reserve.sov")).unwrap();
+        let domain = SigningDomain::new("sov-mainnet", Hash::digest(b"test-genesis"));
+        let bound = wallet
+            .transfer_in(
+                &id("usa.reserve.sov"),
+                id("ecb.reserve.sov"),
+                Balance::from_sov(1).unwrap(),
+                0,
+                Some(&domain),
+            )
+            .unwrap();
+        // The bound signature verifies under its domain, NOT as a legacy sig,
+        // and not under a different network's domain (the anti-replay point).
+        assert!(bound.verify_signature_in(Some(&domain)));
+        assert!(!bound.verify_signature());
+        let other = SigningDomain::new("sov-testnet", Hash::digest(b"test-genesis"));
+        assert!(!bound.verify_signature_in(Some(&other)));
+
+        // `transfer` (legacy) stays the un-bound signature: dormant-path unchanged.
+        let legacy = wallet
+            .transfer(
+                &id("usa.reserve.sov"),
+                id("ecb.reserve.sov"),
+                Balance::from_sov(1).unwrap(),
+                0,
+            )
+            .unwrap();
+        assert!(legacy.verify_signature());
+        // The tx id is domain-independent: same body ⇒ same id either way.
+        assert_eq!(bound.id(), legacy.id());
     }
 
     #[test]

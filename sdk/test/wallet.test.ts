@@ -9,6 +9,8 @@ describe("Wallet", () => {
       endpoint: "http://x",
       transport: async (method, params: any) => {
         if (method === "sov_getNonce") return 4;
+        // Dormant tx-domain fork: no signing domain ⇒ legacy signing.
+        if (method === "sov_getSigningDomain") return { active: false, chainId: null, genesis: null };
         if (method === "sov_submitTransaction") {
           seen.submitted = params;
           return { accepted: true, txId: "00" };
@@ -55,6 +57,7 @@ describe("Wallet", () => {
       endpoint: "http://x",
       transport: async (method) => {
         if (method === "sov_getNonce") return 0;
+        if (method === "sov_getSigningDomain") return { active: false, chainId: null, genesis: null };
         if (method === "sov_submitTransaction") return { accepted: false, txId: "" };
         throw new Error(`unexpected ${method}`);
       },

@@ -73,4 +73,28 @@ describe("SovClient", () => {
     });
     await expect(c.getHeight()).rejects.toThrow(RpcError);
   });
+
+  it("getSigningDomain maps a dormant fork to null", async () => {
+    const c = stub(async (method) => {
+      if (method !== "sov_getSigningDomain") throw new Error(`unexpected ${method}`);
+      return { active: false, height: 10, chainId: null, genesis: null };
+    });
+    expect(await c.getSigningDomain()).toBeNull();
+  });
+
+  it("getSigningDomain treats an old node (-32601) as dormant, not an error", async () => {
+    const c = stub(async () => {
+      throw new RpcError(-32601, "method not found: sov_getSigningDomain");
+    });
+    expect(await c.getSigningDomain()).toBeNull();
+  });
+
+  it("getSigningDomain returns the bound domain once the fork is active", async () => {
+    const genesis = "22".repeat(32);
+    const c = stub(async (method) => {
+      if (method !== "sov_getSigningDomain") throw new Error(`unexpected ${method}`);
+      return { active: true, height: 10, chainId: "sov-mainnet", genesis, txTag: "sov:tx:v1" };
+    });
+    expect(await c.getSigningDomain()).toEqual({ chainId: "sov-mainnet", genesis });
+  });
 });

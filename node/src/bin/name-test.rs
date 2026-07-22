@@ -31,13 +31,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("balance : {bal} grains");
 
     let nonce = client.nonce(&account)?;
+    // `None` while the `tx-domain` fork is dormant (legacy signature);
+    // `Some(domain)` once active (network-bound signature the node requires).
+    let domain = client.signing_domain()?;
     let tx = Transaction {
         signer: account.clone(),
         public_key: kp.public_key(),
         nonce,
         action: Action::RegisterName { name: name.clone() },
     };
-    let stx = SignedTransaction::sign(tx, &kp)?;
+    let stx = SignedTransaction::sign_in(tx, &kp, domain.as_ref())?;
     let txid = client.submit_transaction(&stx)?;
     println!("submit  : RegisterName({name}) tx {}", txid.to_hex());
 

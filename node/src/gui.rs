@@ -2026,18 +2026,39 @@ impl Station {
         };
         let seed = w.seed;
         let input = self.ofl_sign_in.trim().to_string();
-        let signed = (|| -> Result<String, String> {
+        let rpc = self
+            .config
+            .lock()
+            .map(|c| c.rpc.clone())
+            .unwrap_or_default();
+        let signed = (|| -> Result<(String, bool), String> {
             let tx: Transaction = serde_json::from_str(&input).map_err(|e| e.to_string())?;
             let kp = Keypair::hybrid_from_seed(seed);
-            // SignedTransaction::sign refuses if the keypair's key isn't the one the
-            // transaction names — exactly the cross-wallet guard we want.
-            let stx = SignedTransaction::sign(tx, &kp).map_err(|e| e.to_string())?;
-            serde_json::to_string_pretty(&stx).map_err(|e| e.to_string())
+            // Best-effort tx-domain query: if a node is reachable and the
+            // `tx-domain` fork is ACTIVE, bind the signature to this network;
+            // on a genuinely air-gapped machine (no node reachable) or while the
+            // fork is dormant, fall back to the legacy (un-bound) signature —
+            // exactly what pre-fork verification expects.
+            let domain = RpcClient::new(rpc)
+                .with_timeout(Duration::from_secs(3))
+                .signing_domain()
+                .ok()
+                .flatten();
+            // SignedTransaction::sign_in refuses if the keypair's key isn't the one
+            // the transaction names — exactly the cross-wallet guard we want.
+            let stx =
+                SignedTransaction::sign_in(tx, &kp, domain.as_ref()).map_err(|e| e.to_string())?;
+            let json = serde_json::to_string_pretty(&stx).map_err(|e| e.to_string())?;
+            Ok((json, domain.is_some()))
         })();
         match signed {
-            Ok(json) => {
+            Ok((json, bound)) => {
                 self.ofl_signed = json;
-                self.ofl_msg = "✓ signed — copy this to an online node and broadcast".into();
+                self.ofl_msg = if bound {
+                    "✓ signed (network-bound) — copy this to an online node and broadcast".into()
+                } else {
+                    "✓ signed — copy this to an online node and broadcast".into()
+                };
             }
             Err(e) => self.ofl_msg = format!("sign failed: {e}"),
         }
@@ -8119,17 +8140,19 @@ fn submit_action(
     let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(15));
     let kp = Keypair::hybrid_from_seed(seed);
     let id = AccountId::new(signer).map_err(|e| e.to_string())?;
-    // Queue-aware: on-chain nonce + this signer's pending pool count, so an action
-    // issued while an earlier send is still pending gets the next free slot instead
-    // of colliding with it (the "transaction … nonce N is already pooled" reject).
+    // Queue-aware nonce (slice 1) + Phase-2 signing domain: an action issued while an
+    // earlier send is still pending gets the next free slot instead of colliding, and
+    // its signature binds to {chain_id, genesis} once the tx-domain fork is active
+    // (`None` = dormant/legacy, byte-identical).
     let nonce = client.next_nonce(&id).map_err(|e| e.to_string())?;
+    let domain = client.signing_domain().map_err(|e| e.to_string())?;
     let tx = Transaction {
         signer: id,
         public_key: kp.public_key(),
         nonce,
         action,
     };
-    let stx = SignedTransaction::sign(tx, &kp).map_err(|e| e.to_string())?;
+    let stx = SignedTransaction::sign_in(tx, &kp, domain.as_ref()).map_err(|e| e.to_string())?;
     let txid = client.submit_transaction(&stx).map_err(|e| e.to_string())?;
     Ok(txid.to_hex())
 }
@@ -8729,8 +8752,11 @@ fn deshield_amount(
     // receives the funds and pays the fee.
     let kp = Keypair::hybrid_from_seed(seed);
     let from = AccountId::new(account).map_err(|e| e.to_string())?;
-    // Queue-aware next nonce so a send while one is pending queues instead of colliding.
+    // Queue-aware next nonce (slice 1) + Phase-2 signing domain: queues behind a
+    // pending send, and binds the signature to {chain_id, genesis} when active
+    // (`None` = dormant/legacy).
     let nonce = client.next_nonce(&from).map_err(|e| e.to_string())?;
+    let domain = client.signing_domain().map_err(|e| e.to_string())?;
     let tx = Transaction {
         signer: from,
         public_key: kp.public_key(),
@@ -8739,7 +8765,7 @@ fn deshield_amount(
             bundle: bundle.to_bytes(),
         },
     };
-    let stx = SignedTransaction::sign(tx, &kp).map_err(|e| e.to_string())?;
+    let stx = SignedTransaction::sign_in(tx, &kp, domain.as_ref()).map_err(|e| e.to_string())?;
     let txid = client.submit_transaction(&stx).map_err(|e| e.to_string())?;
     // Wait for the receipt: only report success once the transaction actually
     // applied on-chain. A rejection (e.g. the drain limit) surfaces its reason
@@ -8852,9 +8878,11 @@ fn shielded_send(
     let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(60));
     let kp = Keypair::hybrid_from_seed(seed);
     let from = AccountId::new(signer).map_err(|e| e.to_string())?;
-    // Queue-aware next nonce — the private-send path that produced the observed
-    // "transaction … nonce N is already pooled" when sending while one was pending.
+    // Queue-aware next nonce (slice 1) on the private-send path + Phase-2 signing
+    // domain: queues behind a pending send, and binds the signature when active
+    // (`None` = dormant/legacy).
     let nonce = client.next_nonce(&from).map_err(|e| e.to_string())?;
+    let domain = client.signing_domain().map_err(|e| e.to_string())?;
     let tx = Transaction {
         signer: from,
         public_key: kp.public_key(),
@@ -8863,7 +8891,7 @@ fn shielded_send(
             bundle: bundle.to_bytes(),
         },
     };
-    let stx = SignedTransaction::sign(tx, &kp).map_err(|e| e.to_string())?;
+    let stx = SignedTransaction::sign_in(tx, &kp, domain.as_ref()).map_err(|e| e.to_string())?;
     let txid = client.submit_transaction(&stx).map_err(|e| e.to_string())?;
     // Confirm the spend actually applied on-chain before reporting success, so a
     // rejected private transfer is never mistaken for a confirmed one.

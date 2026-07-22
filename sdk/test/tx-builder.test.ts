@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { AccountIdError } from "../src/account.js";
-import { transactionId } from "../src/borsh.js";
+import { bytesToHex, encodeTransaction, transactionId } from "../src/borsh.js";
 import { Keypair } from "../src/keys.js";
 import {
   TxBuildError,
@@ -8,6 +8,7 @@ import {
   buildTransaction,
   signTransaction,
   toWireSignedTransaction,
+  transactionSigningBytes,
   verifyBuiltSignature,
 } from "../src/tx-builder.js";
 import type { Action } from "../src/types.js";
@@ -125,5 +126,64 @@ describe("signTransaction (canonical Borsh)", () => {
     const wire = toWireSignedTransaction(signed);
     expect(Object.keys(wire).sort()).toEqual(["signature", "transaction"]);
     expect("id" in wire).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tx-domain fork: network-bound signing (`sov:tx:v1` framing)
+// ---------------------------------------------------------------------------
+
+describe("transactionSigningBytes (tx-domain binding)", () => {
+  // KAT pinned in LOCK-STEP with the Rust side
+  // (chain/crates/rpc/src/client.rs, `bound_signing_preimage_matches_the_sdk_kat`):
+  // same seed, transaction, and domain — both suites assert this exact hex, so a
+  // TS-framed bound signature verifies byte-for-byte on a Rust node.
+  const seed = new Uint8Array(32).fill(7);
+  const katKp = () => Keypair.fromSeed(seed);
+  const katSigner = "ad3981e8399e9d5f30346e336d66f70e1d9df9ae712362f4e3d6fed28967f719";
+  const katDomain = { chainId: "sov-mainnet", genesis: "22".repeat(32) };
+  const katTx = () =>
+    buildTransaction({
+      signer: katSigner,
+      publicKey: katKp().publicKey,
+      nonce: 7,
+      action: { type: "transfer", to: "treasury.sov", amount: "42" },
+    });
+  const KAT_BOUND_PREIMAGE_HEX =
+    "736f763a74783a763100736f762d6d61696e6e6574002222222222222222222222222222222222222222222222222222222222222222400000006164333938316538333939653964356633303334366533333664363666373065316439646639616537313233363266346533643666656432383936376637313900ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c0700000000000000000c00000074726561737572792e736f762a000000000000000000000000000000";
+
+  it("frames the bound preimage byte-for-byte like Rust `signing_bytes_in`", () => {
+    // The key itself must match the Rust `Keypair::from_seed([7; 32])`.
+    expect(katKp().publicKey.toJSON()).toBe(
+      "0xea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+    );
+    expect(bytesToHex(transactionSigningBytes(katTx(), katDomain))).toBe(KAT_BOUND_PREIMAGE_HEX);
+  });
+
+  it("without a domain (dormant fork) the preimage IS the bare Borsh bytes", () => {
+    const tx = katTx();
+    expect(bytesToHex(transactionSigningBytes(tx))).toBe(bytesToHex(encodeTransaction(tx)));
+    expect(bytesToHex(transactionSigningBytes(tx, null))).toBe(bytesToHex(encodeTransaction(tx)));
+  });
+
+  it("a bound signature verifies only under its domain; the tx id never changes", () => {
+    const bound = signTransaction(katTx(), katKp(), katDomain);
+    expect(verifyBuiltSignature(bound, katDomain)).toBe(true);
+    expect(verifyBuiltSignature(bound)).toBe(false); // not a legacy signature
+    expect(
+      verifyBuiltSignature(bound, { chainId: "sov-testnet", genesis: katDomain.genesis }),
+    ).toBe(false); // and never valid on another network
+
+    const legacy = signTransaction(katTx(), katKp());
+    expect(verifyBuiltSignature(legacy)).toBe(true);
+    expect(verifyBuiltSignature(legacy, katDomain)).toBe(false);
+    // The id hashes the UN-framed bytes: identical with or without the domain.
+    expect(bound.id).toBe(legacy.id);
+  });
+
+  it("rejects a malformed domain genesis", () => {
+    expect(() => transactionSigningBytes(katTx(), { chainId: "sov-mainnet", genesis: "2222" })).toThrow(
+      /32 bytes/,
+    );
   });
 });

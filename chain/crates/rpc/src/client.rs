@@ -20,7 +20,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use sov_crypto::Keypair;
 use sov_mining::Difficulty;
-use sov_primitives::{AccountId, Balance, Hash};
+use sov_primitives::{AccountId, Balance, Hash, SigningDomain};
 use sov_shielded::{mint_to_shielded, AnyAddress, Receiver, ShieldedAddress, ShieldedParams};
 use sov_state::Account;
 use sov_types::{Action, Block, SignedTransaction, Transaction};
@@ -169,6 +169,47 @@ impl RpcClient {
         self.call_typed("sov_getMintReward", json!({}))
     }
 
+    /// The network [`SigningDomain`] a NEW transaction's signature must bind to,
+    /// per the node's `sov_getSigningDomain`.
+    ///
+    /// `None` while the miner-signaled `tx-domain` hard fork is dormant — the
+    /// caller signs the legacy way (`sign_in(None)`, byte-identical to before the
+    /// fork existed). `Some(domain)` once the fork is active — the caller MUST
+    /// `sign_in(Some(domain))` or the node rejects the transaction. A node too old
+    /// to know the method (`-32601` method-not-found) is by definition pre-fork,
+    /// so it maps to `None` (legacy signing) rather than an error.
+    pub fn signing_domain(&self) -> Result<Option<SigningDomain>, RpcClientError> {
+        let result = match self.call("sov_getSigningDomain", json!({})) {
+            Ok(v) => v,
+            // Old node without the endpoint ⇒ pre-fork ⇒ legacy signing.
+            Err(RpcClientError::Rpc { code: -32601, .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if !result
+            .get("active")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        let chain_id = result
+            .get("chainId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                RpcClientError::Malformed("active signing domain missing chainId".into())
+            })?;
+        let genesis_hex = result
+            .get("genesis")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                RpcClientError::Malformed("active signing domain missing genesis".into())
+            })?;
+        let genesis = Hash::from_hex(genesis_hex).map_err(|e| {
+            RpcClientError::Malformed(format!("bad genesis in signing domain: {e}"))
+        })?;
+        Ok(Some(SigningDomain::new(chain_id, genesis)))
+    }
+
     /// The full account record, or `None` if it has never been funded.
     pub fn account(&self, account: &AccountId) -> Result<Option<Account>, RpcClientError> {
         self.call_typed("sov_getAccount", json!({ "account": account.as_str() }))
@@ -228,10 +269,12 @@ impl RpcClient {
         to: &AccountId,
         amount: Balance,
     ) -> Result<Hash, RpcClientError> {
-        // Queue-aware: on-chain nonce + this signer's pending pool count, so a
-        // send issued while an earlier one is still pending gets the next free slot
-        // instead of colliding with it (NonceTaken). See client `next_nonce`.
+        // Queue-aware nonce (slice 1) + the network signing domain (Phase-2): a send
+        // issued while an earlier one is still pending gets the next free slot instead
+        // of colliding (NonceTaken), and its signature binds to {chain_id, genesis}
+        // once the tx-domain fork is active (legacy/byte-identical while dormant).
         let nonce = self.next_nonce(from)?;
+        let domain = self.signing_domain()?;
         let tx = Transaction {
             signer: from.clone(),
             public_key: keypair.public_key(),
@@ -241,7 +284,7 @@ impl RpcClient {
                 amount,
             },
         };
-        let stx = SignedTransaction::sign(tx, keypair)
+        let stx = SignedTransaction::sign_in(tx, keypair, domain.as_ref())
             .map_err(|e| RpcClientError::Malformed(format!("signing failed: {e}")))?;
         self.submit_transaction(&stx)
     }
@@ -263,10 +306,12 @@ impl RpcClient {
             .map_err(|_| RpcClientError::Malformed("amount exceeds u64 grains".into()))?;
         let bundle = mint_to_shielded(params, recipient, units)
             .map_err(|e| RpcClientError::Malformed(format!("shield bundle build failed: {e}")))?;
-        // Queue-aware: on-chain nonce + this signer's pending pool count, so a
-        // send issued while an earlier one is still pending gets the next free slot
-        // instead of colliding with it (NonceTaken). See client `next_nonce`.
+        // Queue-aware nonce (slice 1) + the network signing domain (Phase-2): a send
+        // issued while an earlier one is still pending gets the next free slot instead
+        // of colliding (NonceTaken), and its signature binds to {chain_id, genesis}
+        // once the tx-domain fork is active (legacy/byte-identical while dormant).
         let nonce = self.next_nonce(from)?;
+        let domain = self.signing_domain()?;
         let tx = Transaction {
             signer: from.clone(),
             public_key: keypair.public_key(),
@@ -275,7 +320,7 @@ impl RpcClient {
                 bundle: bundle.to_bytes(),
             },
         };
-        let stx = SignedTransaction::sign(tx, keypair)
+        let stx = SignedTransaction::sign_in(tx, keypair, domain.as_ref())
             .map_err(|e| RpcClientError::Malformed(format!("signing failed: {e}")))?;
         self.submit_transaction(&stx)
     }
@@ -315,4 +360,67 @@ impl RpcClient {
     // consensus: block production itself is the mining, and the coinbase pays
     // the producing node's miner account directly. To mine, run a mining node
     // (`sov-rpcd`) — there is no transaction that mints.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sov_types::{Action, Transaction};
+
+    /// Cross-implementation KAT for the `tx-domain` BOUND signing preimage.
+    ///
+    /// The TS SDK pins the SAME transaction, domain, and expected hex
+    /// (`sdk/test/tx-builder.test.ts`, "bound signing preimage matches the Rust
+    /// framing byte-for-byte"), so both suites passing proves a TS-framed bound
+    /// signature verifies on a Rust node byte-for-byte. Also pins the dormant
+    /// identity: `signing_bytes_in(None)` is exactly the legacy Borsh bytes and
+    /// the tx id is domain-independent.
+    #[test]
+    fn bound_signing_preimage_matches_the_sdk_kat() {
+        let kp = sov_crypto::Keypair::from_seed([7u8; 32]);
+        let tx = Transaction {
+            signer: kp.public_key().implicit_account_id(),
+            public_key: kp.public_key(),
+            nonce: 7,
+            action: Action::Transfer {
+                to: AccountId::new("treasury.sov").unwrap(),
+                amount: Balance::from_grains(42),
+            },
+        };
+        let genesis = Hash::from_hex(&"22".repeat(32)).unwrap();
+        let domain = SigningDomain::new("sov-mainnet", genesis);
+
+        // Dormant path: the un-framed preimage IS the legacy Borsh bytes.
+        let legacy = tx.signing_bytes_in(None);
+        assert_eq!(legacy, tx.signing_bytes());
+
+        // Bound path: tag ‖ 0x00 ‖ chain_id ‖ 0x00 ‖ genesis(32) ‖ borsh(tx).
+        let bound = tx.signing_bytes_in(Some(&domain));
+        let expected_prefix_hex = format!(
+            "{}00{}00{}",
+            hex_of(b"sov:tx:v1"),
+            hex_of(b"sov-mainnet"),
+            "22".repeat(32),
+        );
+        assert_eq!(
+            hex_of(&bound),
+            format!("{expected_prefix_hex}{}", hex_of(&legacy))
+        );
+        // The pinned cross-impl vector (mirrored in the TS SDK test).
+        assert_eq!(hex_of(&bound), BOUND_PREIMAGE_KAT_HEX);
+
+        // The tx id never changes: it hashes the UN-framed bytes either way.
+        let unsigned_id = tx.id();
+        let signed = SignedTransaction::sign_in(tx, &kp, Some(&domain)).unwrap();
+        assert_eq!(signed.id(), unsigned_id);
+        assert!(signed.verify_signature_in(Some(&domain)));
+        assert!(!signed.verify_signature(), "bound sig must not pass legacy");
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Pinned in lock-step with `sdk/test/tx-builder.test.ts`.
+    const BOUND_PREIMAGE_KAT_HEX: &str = "736f763a74783a763100736f762d6d61696e6e6574002222222222222222222222222222222222222222222222222222222222222222400000006164333938316538333939653964356633303334366533333664363666373065316439646639616537313233363266346533643666656432383936376637313900ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c0700000000000000000c00000074726561737572792e736f762a000000000000000000000000000000";
 }

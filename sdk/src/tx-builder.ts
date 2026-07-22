@@ -10,11 +10,11 @@
  */
 
 import { assertValidAccountId } from "./account.js";
-import { encodeTransaction, transactionId } from "./borsh.js";
+import { encodeTransaction, hexToBytes, transactionId } from "./borsh.js";
 import { Keypair, PublicKey, Signature } from "./keys.js";
 import { HybridKeypair, HybridPublicKey, HybridSignature } from "./hybrid.js";
 import { assertWithinCap } from "./units.js";
-import type { Action, SignedTransaction, Transaction } from "./types.js";
+import type { Action, SignedTransaction, SigningDomain, Transaction } from "./types.js";
 
 /** Either signing scheme's public key (Ed25519 or hybrid post-quantum). */
 export type AnyPublicKey = PublicKey | HybridPublicKey;
@@ -128,16 +128,71 @@ export function buildTransaction(params: {
 }
 
 /**
- * Sign a transaction body over its canonical Borsh bytes, producing a
+ * Domain tag for transaction signatures under the miner-signaled `tx-domain`
+ * hard fork — mirrors the node's `sov_types::TX_SIGNING_DOMAIN_TAG`.
+ */
+export const TX_SIGNING_DOMAIN_TAG = "sov:tx:v1";
+
+/**
+ * The signing preimage for `tx` under an optional network {@link SigningDomain}
+ * — byte-for-byte the node's `Transaction::signing_bytes_in`.
+ *
+ * No domain (`undefined`/`null`, the dormant-fork case) yields exactly the
+ * canonical Borsh bytes ({@link encodeTransaction}) — unchanged pre-fork
+ * behavior. With a domain, the preimage is framed as
+ * `"sov:tx:v1" ‖ 0x00 ‖ chain_id ‖ 0x00 ‖ genesis(32) ‖ borsh(Transaction)`
+ * (the node's `SigningDomain::frame`), binding the signature to that network.
+ * The transaction id is unaffected either way — it stays the Blake3 of the
+ * un-framed Borsh bytes.
+ */
+export function transactionSigningBytes(
+  tx: Transaction,
+  domain?: SigningDomain | null,
+): Uint8Array {
+  const body = encodeTransaction(tx);
+  if (!domain) return body;
+  const genesis = hexToBytes(domain.genesis);
+  if (genesis.length !== 32) {
+    throw new TxBuildError(`signing-domain genesis must be 32 bytes, got ${genesis.length}`);
+  }
+  const tag = new TextEncoder().encode(TX_SIGNING_DOMAIN_TAG);
+  const chainId = new TextEncoder().encode(domain.chainId);
+  const out = new Uint8Array(tag.length + 1 + chainId.length + 1 + genesis.length + body.length);
+  let at = 0;
+  out.set(tag, at);
+  at += tag.length;
+  out[at++] = 0x00;
+  out.set(chainId, at);
+  at += chainId.length;
+  out[at++] = 0x00;
+  out.set(genesis, at);
+  at += genesis.length;
+  out.set(body, at);
+  return out;
+}
+
+/**
+ * Sign a transaction body over its canonical signing preimage, producing a
  * {@link BuiltSignedTransaction}. Refuses (like the node's
  * `SignedTransaction::sign`) to sign when the keypair's public key does not
  * match the transaction's committed `public_key`.
+ *
+ * `domain` is the network {@link SigningDomain} from the node's
+ * `sov_getSigningDomain` ({@link SovClient.getSigningDomain}): omit it (or pass
+ * `null`) while the `tx-domain` fork is dormant — the signature is then over the
+ * bare Borsh bytes, byte-identical to before the fork existed. Pass the domain
+ * once the fork is active to produce the network-bound signature the node
+ * requires. The transaction id is identical in both cases.
  */
-export function signTransaction(tx: Transaction, keypair: AnyKeypair): BuiltSignedTransaction {
+export function signTransaction(
+  tx: Transaction,
+  keypair: AnyKeypair,
+  domain?: SigningDomain | null,
+): BuiltSignedTransaction {
   if (keypair.publicKey.toJSON() !== tx.public_key) {
     throw new TxBuildError("signing key does not match the transaction's public key");
   }
-  const signature = keypair.sign(encodeTransaction(tx));
+  const signature = keypair.sign(transactionSigningBytes(tx, domain));
   return {
     transaction: tx,
     signature: signature.toJSON(),
@@ -145,12 +200,13 @@ export function signTransaction(tx: Transaction, keypair: AnyKeypair): BuiltSign
   };
 }
 
-/** Convenience: build + sign in one call. */
+/** Convenience: build + sign in one call (see {@link signTransaction} for `domain`). */
 export function buildAndSign(params: {
   signer: string;
   keypair: AnyKeypair;
   nonce: number;
   action: Action;
+  domain?: SigningDomain | null;
 }): BuiltSignedTransaction {
   const tx = buildTransaction({
     signer: params.signer,
@@ -158,16 +214,21 @@ export function buildAndSign(params: {
     nonce: params.nonce,
     action: params.action,
   });
-  return signTransaction(tx, params.keypair);
+  return signTransaction(tx, params.keypair, params.domain);
 }
 
 /**
  * Verify a {@link BuiltSignedTransaction}'s signature against its committed
- * public key over the canonical Borsh bytes — the same check the node performs.
+ * public key over the canonical signing preimage — the same check the node
+ * performs. Pass `domain` to require a network-bound signature (post-activation
+ * verification); omit it for the legacy (dormant-fork) preimage.
  */
-export function verifyBuiltSignature(signed: BuiltSignedTransaction): boolean {
+export function verifyBuiltSignature(
+  signed: BuiltSignedTransaction,
+  domain?: SigningDomain | null,
+): boolean {
   try {
-    const message = encodeTransaction(signed.transaction);
+    const message = transactionSigningBytes(signed.transaction, domain);
     // Scheme is selected by the committed public key's form (hybrid keys carry
     // the mandatory `hybrid65:` prefix); a hybrid signature is a conjunction.
     if (signed.transaction.public_key.startsWith("hybrid65:")) {

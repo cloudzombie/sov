@@ -72,10 +72,21 @@ export class Wallet {
   /**
    * Build, sign, and submit `action` from this wallet at its current nonce.
    * Throws if the node rejects the transaction.
+   *
+   * Signs under the node's reported signing domain (`sov_getSigningDomain`):
+   * legacy (un-bound) while the `tx-domain` fork is dormant — byte-identical to
+   * pre-fork behavior — and network-bound automatically once it activates.
    */
   async send(action: Action): Promise<SubmitOutcome> {
     const nonce = await this.client.getNonce(this.account);
-    const built = buildAndSign({ signer: this.account, keypair: this.keypair, nonce, action });
+    const domain = await this.client.getSigningDomain();
+    const built = buildAndSign({
+      signer: this.account,
+      keypair: this.keypair,
+      nonce,
+      action,
+      domain,
+    });
     const res = await this.client.submitTransaction(toWireSignedTransaction(built));
     if (!res.accepted) throw new Error("node rejected the transaction");
     return { id: built.id, nonce };
