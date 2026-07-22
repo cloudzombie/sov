@@ -302,6 +302,12 @@ impl Node {
         let ledger = self.chain.ledger();
         self.mempool
             .prune(|a| ledger.account(a).nonce, |a| ledger.account(a).balance);
+        // Reorg is the ONLY path that can strand a tx behind a nonce hole, and this
+        // import tick is the only mempool-maintenance a NON-mining node ever runs
+        // (relay seeds and connect-only Stations never call commit_mined), so the
+        // stranded-entry backstop must live here too, not only on the produce path.
+        self.mempool
+            .evict_stranded(|a| ledger.account(a).nonce, sov_mempool::STRANDED_TTL_MS);
         Ok(imported.receipts)
     }
 }

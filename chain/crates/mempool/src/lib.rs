@@ -193,11 +193,12 @@ impl Mempool {
     }
 
     /// The next nonce a NEW transaction from `signer` should carry, given the
-    /// signer's `on_chain_nonce` (its committed ledger nonce). This is the on-chain
-    /// nonce plus the count of transactions already pooled for the signer — the pool
-    /// keeps a sender's pending nonces gap-free and contiguous from the on-chain
-    /// nonce (admission refuses any hole), so the count is exactly the length of that
-    /// run and `on_chain_nonce + count` is the first free, immediately-mineable slot.
+    /// signer's `on_chain_nonce` (its committed ledger nonce): the first FREE slot at
+    /// or above `on_chain_nonce`, i.e. the first nonce not already pooled for the
+    /// signer. Normally the pool keeps a sender's pending nonces gap-free and
+    /// contiguous from the on-chain nonce (admission refuses any hole), so this equals
+    /// `on_chain_nonce + pending_count`; a reorg can transiently strand higher nonces
+    /// above a hole, and then this returns the hole — the slot the wallet must fill.
     ///
     /// This is the fix for "I already have a transaction waiting in the mempool":
     /// a wallet that signs with the bare `sov_getNonce` (on-chain) value reuses a
