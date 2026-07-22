@@ -247,6 +247,15 @@ two forks = double the coordination risk on reserve mainnet.
   last), gas defined, hard-rejected (`ExecutionError::FeatureInactive`) until activation ⇒
   any block carrying it is invalid. **PROVEN genesis-safe: genesis rebuilds to cb0272ff (6/6),
   KAT byte-identical (6/6), runtime 70/70.** Commit `8a0daac`. `NestedTip` error pre-added.
+  - **Fable audit of 2a (2026-07-22): FLAWED → fixing.** Value-safety AIRTIGHT (additive,
+    no funds move, no exec bypass even via MultisigExec-wrapping-Tipped, genesis/KAT identical,
+    hard block-invalidation confirmed). BUT two liveness/DoS findings:
+    1. NET-NEW (FIXED `8b38b31`): `gas_for(Tipped)` recursed unbounded → stack overflow before
+       the reject; now one-level guard like the MultisigExec arm.
+    2. PRE-EXISTING LIVE VULN: recursive `Box<Action>` in `MultisigExec` + `ProposeMultisig`
+       (+ new `Tipped`) overflows Borsh DECODE at ~depth 2000 (~34KB, under 8MiB frame) → SIGABRT
+       node crash. Fix = bounded-depth Action decode — Fable implementing in a worktree.
+       See memory `action-decode-dos.md`. **Consider a standalone security release ahead of v0.1.98.**
 - **Slice 2b — activation gate + tip charging + inner-dispatch** — ⏭️ NEXT (value-moving /
   conservation-critical; built with the I4 conservation test + KAT vectors + Fable audit, NOT
   rushed). Add `BlockContext.fee_auction_active` (thread from a `fee_auction_deployment` on
