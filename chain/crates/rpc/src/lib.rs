@@ -813,6 +813,15 @@ fn call(
             let id = param_account(params)?;
             Ok(json!(node.chain().ledger().account(&id).nonce))
         }
+        "sov_getNextNonce" => {
+            // The nonce a NEW transaction from this account should carry: the
+            // committed on-chain nonce PLUS what the account already has pending in
+            // this node's mempool. A wallet signing back-to-back sends must use this
+            // (not `sov_getNonce`) so a second send queues behind the first instead of
+            // colliding with its slot (`NonceTaken`). Read-only; no consensus change.
+            let id = param_account(params)?;
+            Ok(json!(node.next_nonce(&id)))
+        }
         "sov_getBlockByHeight" => {
             let h = params
                 .get("height")

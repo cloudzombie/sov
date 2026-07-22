@@ -133,9 +133,22 @@ impl RpcClient {
         self.call_typed("sov_getHeight", json!({}))
     }
 
-    /// The next expected nonce for `account`.
+    /// The account's committed on-chain nonce.
     pub fn nonce(&self, account: &AccountId) -> Result<u64, RpcClientError> {
         self.call_typed("sov_getNonce", json!({ "account": account.as_str() }))
+    }
+
+    /// The nonce a NEW transaction should carry: the on-chain nonce plus what the
+    /// account already has pending in the node's mempool. Building a send with this
+    /// (not [`nonce`](Self::nonce)) lets several sends be in flight at once — each
+    /// queues behind the last and they mine in order — instead of the second send
+    /// colliding with the first's slot and being rejected (`NonceTaken`). Falls back
+    /// to the plain on-chain nonce if the node predates `sov_getNextNonce`.
+    pub fn next_nonce(&self, account: &AccountId) -> Result<u64, RpcClientError> {
+        match self.call_typed("sov_getNextNonce", json!({ "account": account.as_str() })) {
+            Ok(n) => Ok(n),
+            Err(_) => self.nonce(account),
+        }
     }
 
     /// The liquid balance of `account`.
@@ -209,7 +222,10 @@ impl RpcClient {
         to: &AccountId,
         amount: Balance,
     ) -> Result<Hash, RpcClientError> {
-        let nonce = self.nonce(from)?;
+        // Queue-aware: on-chain nonce + this signer's pending pool count, so a
+        // send issued while an earlier one is still pending gets the next free slot
+        // instead of colliding with it (NonceTaken). See client `next_nonce`.
+        let nonce = self.next_nonce(from)?;
         let tx = Transaction {
             signer: from.clone(),
             public_key: keypair.public_key(),
@@ -241,7 +257,10 @@ impl RpcClient {
             .map_err(|_| RpcClientError::Malformed("amount exceeds u64 grains".into()))?;
         let bundle = mint_to_shielded(params, recipient, units)
             .map_err(|e| RpcClientError::Malformed(format!("shield bundle build failed: {e}")))?;
-        let nonce = self.nonce(from)?;
+        // Queue-aware: on-chain nonce + this signer's pending pool count, so a
+        // send issued while an earlier one is still pending gets the next free slot
+        // instead of colliding with it (NonceTaken). See client `next_nonce`.
+        let nonce = self.next_nonce(from)?;
         let tx = Transaction {
             signer: from.clone(),
             public_key: keypair.public_key(),

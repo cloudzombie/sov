@@ -89,6 +89,16 @@ impl Node {
         self.mempool.len()
     }
 
+    /// The next nonce a new transaction from `signer` should use: the account's
+    /// committed on-chain nonce plus any transactions it already has pending in the
+    /// pool. A wallet building back-to-back sends must use THIS (not the bare
+    /// on-chain nonce) so a second send queues behind the first instead of colliding
+    /// with its slot. Read-only; no consensus rule changes.
+    pub fn next_nonce(&self, signer: &AccountId) -> u64 {
+        let on_chain = self.chain.ledger().account(signer).nonce;
+        self.mempool.next_nonce(signer, on_chain)
+    }
+
     /// Submit a transaction to the pool, validating it against current state.
     pub fn submit(&mut self, stx: SignedTransaction) -> Result<(), NodeError> {
         // Mirror the runtime's authorization at admission: a validly *signed*

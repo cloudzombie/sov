@@ -185,6 +185,23 @@ impl Mempool {
             .count()
     }
 
+    /// The next nonce a NEW transaction from `signer` should carry, given the
+    /// signer's `on_chain_nonce` (its committed ledger nonce). This is the on-chain
+    /// nonce plus the count of transactions already pooled for the signer — the pool
+    /// keeps a sender's pending nonces gap-free and contiguous from the on-chain
+    /// nonce (admission refuses any hole), so the count is exactly the length of that
+    /// run and `on_chain_nonce + count` is the first free, immediately-mineable slot.
+    ///
+    /// This is the fix for "I already have a transaction waiting in the mempool":
+    /// a wallet that signs with the bare `sov_getNonce` (on-chain) value reuses a
+    /// slot already taken and is rejected with [`MempoolError::NonceTaken`]; signing
+    /// with THIS value instead queues the new transaction behind the pending one, so
+    /// several sends can be in flight at once and mine in order. Pure read; changes
+    /// no consensus rule — the pool already accepts this nonce today.
+    pub fn next_nonce(&self, signer: &AccountId, on_chain_nonce: u64) -> u64 {
+        on_chain_nonce.saturating_add(self.sender_count(signer) as u64)
+    }
+
     /// The signer holding the most pending transactions, with that count.
     fn heaviest_sender(&self) -> Option<(AccountId, usize)> {
         let mut counts: HashMap<&AccountId, usize> = HashMap::new();
@@ -514,6 +531,51 @@ mod tests {
             },
         };
         SignedTransaction::sign(t, &kp).unwrap()
+    }
+
+    #[test]
+    fn next_nonce_is_the_on_chain_nonce_when_pool_is_empty() {
+        let pool = Mempool::new(100);
+        assert_eq!(pool.next_nonce(&id("usa.reserve.sov"), 7), 7);
+    }
+
+    #[test]
+    fn next_nonce_queues_a_second_send_behind_a_pending_one() {
+        // I9 — the fix for "I already have a transaction waiting in the mempool":
+        // with one tx pooled at the on-chain nonce, `next_nonce` advances so a second
+        // send takes the NEXT slot and is ADMITTED (not rejected `NonceTaken`), and
+        // both select in ascending nonce order. Same signer/key, back-to-back sends.
+        let mut pool = Mempool::new(100);
+        let signer = id("usa.reserve.sov");
+        assert_eq!(pool.next_nonce(&signer, 0), 0, "empty pool → on-chain nonce");
+
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        assert_eq!(pool.next_nonce(&signer, 0), 1, "one pending → queue at N+1");
+
+        // The queued send at nonce 1 is accepted; at nonce 0 it would be NonceTaken.
+        pool.insert(tx([1; 32], "usa.reserve.sov", 1), 0, big())
+            .unwrap();
+        assert_eq!(pool.next_nonce(&signer, 0), 2);
+
+        let picked = pool.select(|_| 0, 10);
+        assert_eq!(picked.len(), 2, "both queued sends are mineable");
+        assert_eq!(picked[0].transaction.nonce, 0);
+        assert_eq!(picked[1].transaction.nonce, 1);
+    }
+
+    #[test]
+    fn reusing_the_on_chain_nonce_while_pending_is_still_rejected() {
+        // The bug the fix avoids: signing the SECOND send with the bare on-chain nonce
+        // (0) instead of `next_nonce` collides with the pooled slot → NonceTaken. This
+        // pins the exact failure the wallet must not reproduce.
+        let mut pool = Mempool::new(100);
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        assert!(matches!(
+            pool.insert(tx([2; 32], "usa.reserve.sov", 0), 0, big()),
+            Err(MempoolError::NonceTaken { .. })
+        ));
     }
 
     #[test]
