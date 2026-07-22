@@ -282,6 +282,7 @@ pub enum Action {
     /// `threshold` distinct valid approvals; nesting and `RotateKey` are refused.
     MultisigExec {
         /// The inner action to perform as the multisig account.
+        #[borsh(deserialize_with = "bounded_nested_action")]
         action: Box<Action>,
         /// Approvals from distinct policy signers over `multisig_signing_bytes`.
         approvals: Vec<MultisigApproval>,
@@ -297,6 +298,7 @@ pub enum Action {
         account: AccountId,
         /// The action to perform as `account` once enough members approve. May not be
         /// `MultisigExec`, `RotateKey`, or another multisig-coordination action.
+        #[borsh(deserialize_with = "bounded_nested_action")]
         action: Box<Action>,
     },
     /// A policy member APPROVES a pending proposal on `account`. Signed by the
@@ -362,8 +364,74 @@ pub enum Action {
         /// Priority tip paid to the block's miner, on top of the intrinsic fee.
         tip: Balance,
         /// The action actually performed once the tip is charged.
+        #[borsh(deserialize_with = "bounded_nested_action")]
         inner: Box<Action>,
     },
+}
+
+/// Maximum nesting depth accepted when Borsh-**decoding** an [`Action`].
+///
+/// [`Action`] is recursive through three `Box<Action>` fields
+/// ([`Action::MultisigExec`], [`Action::ProposeMultisig`], [`Action::Tipped`]).
+/// A derived Borsh decoder recurses once per nesting level, so a maliciously
+/// deep payload (~2000 levels, ~34 KB — far under the P2P frame cap) would
+/// overflow the stack and **abort the process**: a remote crash-DoS. Bounding
+/// the *decode* depth turns that payload into a clean decode error instead.
+///
+/// The bound is decode-only and generous: consensus itself refuses *any*
+/// nesting of `MultisigExec`/`Tipped` and restricts `ProposeMultisig`'s inner
+/// action, so every honest transaction has depth ≤ 2. Serialization, the byte
+/// format, JSON, tx-ids, genesis `cb0272ff…`, and every KAT vector are
+/// unchanged — only pathologically deep *inputs* (which no honest node ever
+/// produced, and which previously crashed the decoder) are now rejected, and
+/// identically so on every node.
+pub const MAX_ACTION_DEPTH: u32 = 16;
+
+mod action_depth {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// RAII decode-depth guard. Construction (`enter`) checks and increments the
+    /// thread-local depth; `Drop` **always** decrements — on `?` propagation,
+    /// early return, and unwinding alike — so a rejected over-deep decode can
+    /// never leak depth into a later, unrelated decode (which would make this
+    /// node falsely reject a valid transaction and diverge from its peers).
+    pub(super) struct DepthGuard(());
+
+    impl DepthGuard {
+        pub(super) fn enter() -> Result<Self, borsh::io::Error> {
+            DEPTH.with(|d| {
+                let next = d.get().saturating_add(1);
+                if next > super::MAX_ACTION_DEPTH {
+                    return Err(borsh::io::Error::new(
+                        borsh::io::ErrorKind::InvalidData,
+                        "Action nesting exceeds MAX_ACTION_DEPTH",
+                    ));
+                }
+                d.set(next);
+                Ok(DepthGuard(()))
+            })
+        }
+    }
+
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+}
+
+/// Depth-bounded Borsh decode for the recursive `Box<Action>` fields (wired in
+/// via `#[borsh(deserialize_with)]`). Reads the exact same bytes as the default
+/// `BorshDeserialize::deserialize_reader` — the wire format is untouched — but
+/// rejects inputs nested deeper than [`MAX_ACTION_DEPTH`] with a decode error
+/// instead of recursing to a stack overflow.
+fn bounded_nested_action<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Box<Action>> {
+    let _guard = action_depth::DepthGuard::enter()?;
+    borsh::BorshDeserialize::deserialize_reader(reader)
 }
 
 /// One signer's approval of a [`Action::MultisigExec`]: the signer's index into
@@ -733,5 +801,154 @@ mod tests {
             borsh::from_slice::<SignedTransaction>(&bytes).unwrap(),
             signed
         );
+    }
+
+    // ── Bounded Action decode depth (crash-DoS fix) ─────────────────────────
+
+    fn sample_transfer() -> Action {
+        Action::Transfer {
+            to: AccountId::new("ecb.reserve.sov").unwrap(),
+            amount: Balance::from_sov(5).unwrap(),
+        }
+    }
+
+    /// Split a shallow one-level-nested encoding into the bytes BEFORE and AFTER
+    /// its embedded inner-`Transfer` encoding, so a depth-`n` payload can be
+    /// synthesized as `pre*n ‖ transfer ‖ post*n` WITHOUT ever materializing (or
+    /// recursively dropping) a deep in-memory value.
+    fn split_around_inner(shallow: &[u8], inner: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let pos = shallow
+            .windows(inner.len())
+            .position(|w| w == inner)
+            .expect("inner Transfer encoding must appear in the shallow encoding");
+        (
+            shallow[..pos].to_vec(),
+            shallow[pos + inner.len()..].to_vec(),
+        )
+    }
+
+    /// Synthesized encoded bytes of the given recursive variant nested `depth`
+    /// times around a `Transfer` (depth 1 == the shallow value itself).
+    fn deep_bytes(shallow: &Action, depth: usize) -> Vec<u8> {
+        let inner = borsh::to_vec(&sample_transfer()).unwrap();
+        let shallow_bytes = borsh::to_vec(shallow).unwrap();
+        let (pre, post) = split_around_inner(&shallow_bytes, &inner);
+        let mut out = Vec::with_capacity(depth * (pre.len() + post.len()) + inner.len());
+        for _ in 0..depth {
+            out.extend_from_slice(&pre);
+        }
+        out.extend_from_slice(&inner);
+        for _ in 0..depth {
+            out.extend_from_slice(&post);
+        }
+        out
+    }
+
+    fn recursive_samples() -> Vec<Action> {
+        vec![
+            Action::MultisigExec {
+                action: Box::new(sample_transfer()),
+                approvals: Vec::new(),
+            },
+            Action::ProposeMultisig {
+                account: AccountId::new("usa.reserve.sov").unwrap(),
+                action: Box::new(sample_transfer()),
+            },
+            Action::Tipped {
+                tip: Balance::from_sov(1).unwrap(),
+                inner: Box::new(sample_transfer()),
+            },
+        ]
+    }
+
+    #[test]
+    fn shallow_recursive_actions_roundtrip_byte_identical() {
+        // (a) The fix must not disturb ANY legitimate encoding: serialize →
+        // deserialize → re-serialize is the identity for every recursive variant.
+        for action in recursive_samples() {
+            let bytes = borsh::to_vec(&action).unwrap();
+            let back: Action = borsh::from_slice(&bytes).unwrap();
+            assert_eq!(back, action);
+            assert_eq!(borsh::to_vec(&back).unwrap(), bytes, "re-encode identical");
+            // And the synthesized depth-1 bytes are EXACTLY the real encoding —
+            // proving the deep-payload synthesizer below builds honest bytes.
+            assert_eq!(deep_bytes(&action, 1), bytes);
+        }
+    }
+
+    #[test]
+    fn deeply_nested_payload_is_rejected_not_a_crash() {
+        // (b) ~depth-5000 payloads (which previously stack-overflowed → SIGABRT)
+        // must now come back as a clean decode Err, for ALL THREE recursive fields.
+        for action in recursive_samples() {
+            let bytes = deep_bytes(&action, 5000);
+            let res: Result<Action, _> = borsh::from_slice(&bytes);
+            assert!(res.is_err(), "over-deep payload must be rejected");
+        }
+    }
+
+    #[test]
+    fn depth_bound_is_exact_and_deterministic() {
+        // Every node must draw the SAME line: depth == MAX_ACTION_DEPTH decodes,
+        // depth == MAX_ACTION_DEPTH + 1 is rejected.
+        for action in recursive_samples() {
+            let at_cap = deep_bytes(&action, MAX_ACTION_DEPTH as usize);
+            let decoded: Action = borsh::from_slice(&at_cap).expect("depth at cap must decode");
+            assert_eq!(borsh::to_vec(&decoded).unwrap(), at_cap);
+            let over = deep_bytes(&action, MAX_ACTION_DEPTH as usize + 1);
+            assert!(borsh::from_slice::<Action>(&over).is_err());
+        }
+    }
+
+    #[test]
+    fn rejected_deep_decode_leaks_no_depth() {
+        // (c) The RAII guard must unwind fully on the error path: after MANY
+        // rejected deep decodes on this thread, a normal transaction — including
+        // one at the exact depth cap — must still decode. A leaked counter here
+        // would make this node falsely reject later valid txs (consensus split).
+        for _ in 0..100 {
+            for action in recursive_samples() {
+                let bytes = deep_bytes(&action, 5000);
+                assert!(borsh::from_slice::<Action>(&bytes).is_err());
+            }
+        }
+        // Plain transfer still decodes…
+        let transfer = sample_transfer();
+        let bytes = borsh::to_vec(&transfer).unwrap();
+        assert_eq!(borsh::from_slice::<Action>(&bytes).unwrap(), transfer);
+        // …and so does a value at the FULL depth budget (any leak would shrink it).
+        let ms = &recursive_samples()[0];
+        let at_cap = deep_bytes(ms, MAX_ACTION_DEPTH as usize);
+        assert!(borsh::from_slice::<Action>(&at_cap).is_ok());
+        // A full SignedTransaction round-trip still works too.
+        let (tx, kp) = transfer_tx([4u8; 32], 1);
+        let signed = SignedTransaction::sign(tx, &kp).unwrap();
+        let bytes = borsh::to_vec(&signed).unwrap();
+        assert_eq!(
+            borsh::from_slice::<SignedTransaction>(&bytes).unwrap(),
+            signed
+        );
+    }
+
+    #[test]
+    fn recursive_actions_serde_json_unchanged() {
+        // (d) serde is untouched by the borsh-only fix: shallow values keep their
+        // exact tagged-JSON shape and round-trip.
+        let ms = Action::MultisigExec {
+            action: Box::new(sample_transfer()),
+            approvals: Vec::new(),
+        };
+        let json = serde_json::to_string(&ms).unwrap();
+        assert!(json.contains("\"type\":\"multisig_exec\""));
+        assert!(json.contains("\"type\":\"transfer\""));
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), ms);
+
+        let tipped = Action::Tipped {
+            tip: Balance::from_sov(1).unwrap(),
+            inner: Box::new(sample_transfer()),
+        };
+        let json = serde_json::to_string(&tipped).unwrap();
+        assert!(json.contains("\"type\":\"tipped\""));
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), tipped);
     }
 }
