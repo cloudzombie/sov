@@ -2039,11 +2039,19 @@ impl Station {
             // on a genuinely air-gapped machine (no node reachable) or while the
             // fork is dormant, fall back to the legacy (un-bound) signature —
             // exactly what pre-fork verification expects.
-            let domain = RpcClient::new(rpc)
+            let domain = match RpcClient::new(rpc)
                 .with_timeout(Duration::from_secs(3))
                 .signing_domain()
-                .ok()
-                .flatten();
+            {
+                Ok(d) => d,
+                // A genuinely air-gapped machine (no node reachable) surfaces as a
+                // TRANSPORT error → fall back to the legacy (un-bound) signature. Any
+                // OTHER error (a reachable node returning a malformed/unexpected
+                // domain) is surfaced, not silently downgraded to a legacy signature
+                // that a post-activation node would reject at broadcast.
+                Err(sov_rpc::RpcClientError::Io(_)) => None,
+                Err(e) => return Err(format!("signing domain query failed: {e}")),
+            };
             // SignedTransaction::sign_in refuses if the keypair's key isn't the one
             // the transaction names — exactly the cross-wallet guard we want.
             let stx =

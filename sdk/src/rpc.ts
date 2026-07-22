@@ -136,9 +136,26 @@ export class SovClient {
     return this.call<GrainString>("sov_getBalance", { account });
   }
 
-  /** Next expected nonce for `account`. */
+  /** The account's committed on-chain nonce. */
   getNonce(account: string): Promise<number> {
     return this.call<number>("sov_getNonce", { account });
+  }
+
+  /**
+   * The nonce a NEW transaction should carry: the on-chain nonce plus what the
+   * account already has pending in the node's mempool. Building a send with this
+   * (not {@link getNonce}) lets several sends be in flight at once — each queues
+   * behind the last and they mine in order — instead of the second colliding with
+   * the first's slot (`NonceTaken`). Falls back to `getNonce` only when the node
+   * predates `sov_getNextNonce` (`-32601` method-not-found).
+   */
+  async getNextNonce(account: string): Promise<number> {
+    try {
+      return await this.call<number>("sov_getNextNonce", { account });
+    } catch (e) {
+      if (e instanceof RpcError && e.code === -32601) return this.getNonce(account);
+      throw e;
+    }
   }
 
   /** Block at `height`, or `null` if it does not exist. */

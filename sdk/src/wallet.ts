@@ -78,7 +78,9 @@ export class Wallet {
    * pre-fork behavior — and network-bound automatically once it activates.
    */
   async send(action: Action): Promise<SubmitOutcome> {
-    const nonce = await this.client.getNonce(this.account);
+    // Queue-aware nonce so back-to-back sends line up behind one another instead of
+    // colliding at the same slot (`NonceTaken`); parity with the Rust clients.
+    const nonce = await this.client.getNextNonce(this.account);
     const domain = await this.client.getSigningDomain();
     const built = buildAndSign({
       signer: this.account,
