@@ -252,10 +252,16 @@ two forks = double the coordination risk on reserve mainnet.
     hard block-invalidation confirmed). BUT two liveness/DoS findings:
     1. NET-NEW (FIXED `8b38b31`): `gas_for(Tipped)` recursed unbounded → stack overflow before
        the reject; now one-level guard like the MultisigExec arm.
-    2. PRE-EXISTING LIVE VULN: recursive `Box<Action>` in `MultisigExec` + `ProposeMultisig`
-       (+ new `Tipped`) overflows Borsh DECODE at ~depth 2000 (~34KB, under 8MiB frame) → SIGABRT
-       node crash. Fix = bounded-depth Action decode — Fable implementing in a worktree.
-       See memory `action-decode-dos.md`. **Consider a standalone security release ahead of v0.1.98.**
+    2. PRE-EXISTING LIVE VULN — ✅ FIXED (`7be6741`, Fable rewrite): recursive `Box<Action>` in
+       `MultisigExec` + `ProposeMultisig` (+ new `Tipped`) overflowed Borsh DECODE at ~depth 2000
+       (~34KB, under 8MiB frame) → SIGABRT node crash. Fix = bounded-depth decode via borsh
+       `#[borsh(deserialize_with)]` on the 3 recursive fields (MAX_ACTION_DEPTH=16, RAII depth
+       guard, no thread-local leak). Byte-identical BY CONSTRUCTION (serialize + serde 100%
+       derived/untouched). Independently re-verified on-branch: genesis → cb0272ff, KAT identical,
+       sov-types 28/28 (5 new: deep-rejected-not-crashed, no-leak, shallow-roundtrip-identical).
+       See memory `action-decode-dos.md`. **RECOMMEND: ship this decode-cap as a standalone
+       security release (e.g. v0.1.98-sec or fold into next point release) — it hardens the LIVE
+       chain and is genesis-safe; it should NOT wait on the dormant auction feature.**
 - **Slice 2b — activation gate + tip charging + inner-dispatch** — ⏭️ NEXT (value-moving /
   conservation-critical; built with the I4 conservation test + KAT vectors + Fable audit, NOT
   rushed). Add `BlockContext.fee_auction_active` (thread from a `fee_auction_deployment` on
