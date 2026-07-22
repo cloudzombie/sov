@@ -269,7 +269,33 @@ two forks = double the coordination risk on reserve mainnet.
   MultisigExec unwrap): gate on active, reject nesting (`NestedTip`), check affordability of
   `intrinsic_fee + tip + outflow`, debit `tip` → credit `ctx.miner` via `credit()`, execute
   `inner`. New KAT vectors for a tipped tx.
-- **Slice 3** — mempool feerate ordering + RBF (bid = tip; replace ≥ MIN_RBF_BUMP) + template.
+- **Slice 3 — REAL Bitcoin-style blockspace auction** (owner directive 2026-07-22). The three
+  properties, and the exact SOV rules:
+  1. **Scarcity (exists):** `max_block_txs` (256) + elastic size cap = finite blockspace. The
+     auction only bites under congestion (demand > capacity); empty blocks today ⇒ floor = 0,
+     nothing waits — market emerges under load, exactly like Bitcoin.
+  2. **Template = strictly highest-tip-first.** Replace the current nonce-FAIR `select`
+     (`node.rs:188`) with a greedy highest-effective-feerate fill, RESPECTING per-signer nonce
+     contiguity (a sender's txs are an Ethereum-style package; a later high-tip nonce can't jump
+     its own earlier low-tip nonce — stops nonce-gaming). Across DIFFERENT signers it's a pure
+     independent bid, Bitcoin-like.
+  3. **Rule A — a low/zero-tip tx WAITS, it never errors.** The auction is ORDERING, not
+     rejection. A valid tx sits patiently (hours, like a 0.04¢ BTC tx) until a block has room or
+     the user RBFs a higher tip. No Failed/rejected status for "too cheap."
+  4. **Rule B — "mempool full" must be economically impossible.** Reshape the mempool from the
+     current sender-FAIRNESS eviction (drops the heaviest sender's tx — WRONG for an auction) to
+     **feerate-ordered with a dynamic floor**: at capacity, admit a new tx iff it OUTBIDS the
+     lowest pooled tx, evicting that lowest one (which can rebid). An adequate bid is NEVER turned
+     away for "fullness"; only a bid BELOW the current floor is refused — and the message is "tip
+     higher," not "full." That floor = the emergent min-relay price of blockspace; it rises under
+     congestion, falls when demand fades. Set capacity high so the floor stays 0 until real demand.
+     Overflowing the pool costs real fees (must outbid to displace) ⇒ ungriefable.
+  5. **RBF:** replace a pooled `(signer, nonce)` iff `new_tip ≥ old_tip + MIN_RBF_BUMP` — the
+     unstick/cancel path for a waiting tx.
+  Untipped txs keep today's fair `(signer, nonce)` order at bid 0 (byte-identical when no tips
+  exist / pre-activation). Tests: low-tip waits behind high-tip; outbid evicts lowest not newest;
+  underbid-at-capacity refused with a floor signal (not admitted, not the old Full error on an
+  adequate bid); per-signer nonce package ordering; RBF ≥ bump.
 - **Slice 4** — confirm conservation (I4) end-to-end with tips in real blocks.
 - **Slice 5** — Part A Phase-2 signers (SDK, wallet, Station, conformance, tx-cannon).
 - **Slice 6** — grace window + full release gate + end-to-end Fable audit + external review.
