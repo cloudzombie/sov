@@ -124,8 +124,19 @@ pub fn gas_for(action: &Action) -> u64 {
         | Action::OracleUpdate { .. } => INTRINSIC_GAS + BOOKKEEPING_GAS,
         // A fee-auction envelope: the inner action's own gas plus one bookkeeping unit
         // for charging the tip. The tip itself is a value transfer to the miner, not a
-        // gas cost. (Nesting is rejected in execution, so `inner` is never `Tipped`.)
-        Action::Tipped { inner, .. } => gas_for(inner).saturating_add(BOOKKEEPING_GAS),
+        // gas cost. Recurse at MOST one level — mirroring the `MultisigExec` guard
+        // above — so a maliciously deep-nested `Tipped{Tipped{…}}` can never blow the
+        // stack during gas estimation (which runs before the execution-layer reject).
+        // Nested tips are rejected at execution anyway; here we only need a bounded,
+        // non-crashing price.
+        Action::Tipped { inner, .. } => {
+            let g = if matches!(**inner, Action::Tipped { .. }) {
+                INTRINSIC_GAS
+            } else {
+                gas_for(inner)
+            };
+            g.saturating_add(BOOKKEEPING_GAS)
+        }
     }
 }
 
