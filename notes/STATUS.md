@@ -1,12 +1,14 @@
 # SOV — STATUS (master anchor)
 
-_Last updated: 2026-07-19. Update at the end of every session._
+_Last updated: 2026-07-21. Update at the end of every session._
 
 ## One-line state
 
-Mainnet LIVE (genesis `cb0272ff…e72d`, FROZEN). Current release **v0.1.93** — ships the
-cross-network replay hard fork **DORMANT**. No consensus behavior has changed on the live
-chain. Nothing is armed.
+Mainnet LIVE (genesis `cb0272ff…e72d`, FROZEN). Current release **v0.1.97** — accurate live
+hashrate (30-block window, display-only). v0.1.96 = the DEFINITIVE cold-sync fix (size-capped
+`GetBlocks` batches; fresh nodes stuck at 7168 → fixed; all 3 seeds deployed). **v0.1.95 was
+SKIPPED as a release** — its tx-domain activation plan now folds into **v0.1.98** (see below).
+No consensus behavior has changed on the live chain. Nothing is armed.
 
 ## Golden rules (do not break)
 
@@ -20,7 +22,16 @@ chain. Nothing is armed.
 
 ## OPEN TRACKS (each with its exact NEXT ACTION)
 
-### 1. tx-domain hard fork — cross-network ("ghost chain") replay
+### 1. v0.1.98 ACTIVATION (tx-domain fork + fee-auction mempool) — see [activation-v0198.md](activation-v0198.md)
+**★ v0.1.95 SKIPPED — its tx-domain activation now bundles with the new fee-priority mempool +
+v2 tx envelope into ONE coordinated v0.1.98 activation** (both touch the tx envelope/signing;
+one flag day, not two). Full plan + backtest/verification method in `activation-v0198.md`.
+**Blocker (unchanged): Phase-2 client signing is NOT done** — only `node/src/gui.rs` references it;
+SDK, Rust wallet, conformance, tx-cannon still pending. A tx-domain flag day is impossible until
+all 5 signers query `sov_getSigningDomain` + `sign_in`. **NEXT: land fee-priority mempool
+Layer-1 (policy-only, genesis-safe) + finish the Phase-2 signers.**
+
+#### 1a. tx-domain hard fork — reference (carried into v0.1.98)
 **State:** v0.1.93 shipped DORMANT (commit `25b3b5d`, tag `v0.1.93`). Full machinery present +
 tested; `tx_domain_deployment` defaults `None` → byte-identical, inactive.
 **NEXT ACTION:** **Phase-2 client signing** (v0.1.94, additive/dormant). Foundation DONE: the
