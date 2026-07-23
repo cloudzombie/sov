@@ -1,0 +1,29 @@
+[package]
+name = "sov-shielded-pq"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "PROTOTYPE post-quantum shielded pool core for SOV: hash-based note commitments (Rescue-Prime), a STARK (winterfell) spend proof for Merkle membership + nullifier derivation, ML-KEM-768 note encryption, ML-DSA-65 spend authorization. NOT wired into consensus; NOT in the trust path."
+
+[dependencies]
+# STARK proof system (pure Rust, no elliptic curves). winterfell re-exports
+# winter-math and winter-crypto as `winterfell::math` / `winterfell::crypto`.
+winterfell = "0.13"
+winter-crypto = "0.13"
+winter-math = "0.13"
+winter-utils = "0.13"
+# PQ KEM + signatures — the SAME crates the transparent layer already trusts
+# (sov-network uses fips203, sov-crypto uses fips204).
+fips203 = "0.4.3"
+fips204 = "0.4.6"
+# AEAD already in the workspace dependency graph (sov-network transport).
+chacha20poly1305 = "0.10.1"
+blake3.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

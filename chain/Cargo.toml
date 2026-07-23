@@ -15,6 +15,7 @@ members = [
     "crates/intents",
     "crates/compliance",
     "crates/shielded",
+    "crates/shielded-pq",
     "crates/rpc",
     "crates/governance",
     "crates/reserve",
