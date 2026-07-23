@@ -436,10 +436,12 @@ fn scan_notes(client: &RpcClient, zkey: &ShieldedKey) -> Result<NoteStore, Box<d
         println!("scanning blocks 1..={tip} for shielded notes...");
     }
     for h in 1..=tip {
-        let block = client
-            .block_by_height(h)?
+        let block = retrying(|| client.block_by_height(h))?
             .ok_or_else(|| format!("block {h} unavailable — re-run to rescan"))?;
-        let receipts = client.call("sov_getBlockReceipts", json!({ "height": h }))?;
+        let receipts = retrying(|| client.call("sov_getBlockReceipts", json!({ "height": h })))?;
+        if h % 1000 == 0 {
+            println!("  ...scanned {h}/{tip}");
+        }
         let receipts = receipts.as_array();
         let bundles: Vec<ShieldedBundle> = block
             .transactions
@@ -461,6 +463,29 @@ fn scan_notes(client: &RpcClient, zkey: &ShieldedKey) -> Result<NoteStore, Box<d
         store.ingest_block(zkey, h, *block.hash().as_bytes(), &refs);
     }
     Ok(store)
+}
+
+/// Retry a transient-fallible RPC call with a short backoff, so a long WAN scan
+/// (thousands of sequential round-trips) survives a momentary socket error
+/// (`EAGAIN`, a dropped keep-alive, a brief peer stall) instead of dying at
+/// block N and forcing a full rescan. Non-transient errors still surface after
+/// the retries are exhausted.
+fn retrying<T>(
+    mut call: impl FnMut() -> Result<T, sov_rpc::RpcClientError>,
+) -> Result<T, sov_rpc::RpcClientError> {
+    let mut delay = std::time::Duration::from_millis(200);
+    let mut last = None;
+    for _ in 0..5 {
+        match call() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+        }
+    }
+    Err(last.expect("at least one attempt ran"))
 }
 
 /// The pool's `sov_getShieldedInfo` snapshot, or `None` on an older node that
