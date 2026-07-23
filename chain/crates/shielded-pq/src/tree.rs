@@ -1,4 +1,5 @@
-//! Fixed-depth append-only note-commitment tree over Rescue-Prime.
+//! Fixed-depth append-only note-commitment tree over domain-separated
+//! Rescue-Prime (`RESCUE_DOMAIN_MERKLE_NODE` on every internal node).
 //!
 //! Depth-[`TREE_DEPTH`] binary Merkle tree; empty leaves are the all-zero
 //! digest and empty internal nodes are the usual precomputed
@@ -8,7 +9,8 @@
 //! version this prototype keeps all appended leaves (no pruning); fine for a
 //! prototype, noted in the design doc.
 
-use crate::hash::{merge, PqDigest};
+use crate::domains::RESCUE_DOMAIN_MERKLE_NODE;
+use crate::hash::{merge_domain, PqDigest};
 
 /// Merkle tree depth — up to 2^20 (~1M) notes.
 pub const TREE_DEPTH: usize = 20;
@@ -31,9 +33,9 @@ impl MerklePath {
         for (level, sib) in self.siblings.iter().enumerate() {
             let bit = (self.position >> level) & 1;
             acc = if bit == 0 {
-                merge(acc, *sib)
+                merge_domain(RESCUE_DOMAIN_MERKLE_NODE, acc, *sib)
             } else {
-                merge(*sib, acc)
+                merge_domain(RESCUE_DOMAIN_MERKLE_NODE, *sib, acc)
             };
         }
         acc
@@ -63,7 +65,7 @@ impl CommitmentTree {
     pub fn new() -> Self {
         let mut empty = [PqDigest::ZERO; TREE_DEPTH + 1];
         for l in 1..=TREE_DEPTH {
-            empty[l] = merge(empty[l - 1], empty[l - 1]);
+            empty[l] = merge_domain(RESCUE_DOMAIN_MERKLE_NODE, empty[l - 1], empty[l - 1]);
         }
         CommitmentTree {
             leaves: Vec::new(),
@@ -133,7 +135,7 @@ impl CommitmentTree {
         }
         let left = self.subtree_hash(level - 1, index * 2);
         let right = self.subtree_hash(level - 1, index * 2 + 1);
-        merge(left, right)
+        merge_domain(RESCUE_DOMAIN_MERKLE_NODE, left, right)
     }
 }
 
@@ -147,7 +149,7 @@ mod tests {
         let mut tree = CommitmentTree::new();
         let mut cms = Vec::new();
         for i in 0u64..5 {
-            let cm = digest_from_bytes("sov-shielded-pq:test:v1", &i.to_le_bytes());
+            let cm = digest_from_bytes(crate::domains::B3_TEST, &i.to_le_bytes());
             tree.append(cm).expect("append");
             tree.mark().expect("mark");
             cms.push(cm);
@@ -162,10 +164,10 @@ mod tests {
     #[test]
     fn wrong_leaf_fails_native_check() {
         let mut tree = CommitmentTree::new();
-        let cm = digest_from_bytes("sov-shielded-pq:test:v1", b"leaf");
+        let cm = digest_from_bytes(crate::domains::B3_TEST, b"leaf");
         tree.append(cm).expect("append");
         let (path, anchor) = tree.witness(0).expect("witness");
-        let wrong = digest_from_bytes("sov-shielded-pq:test:v1", b"other");
+        let wrong = digest_from_bytes(crate::domains::B3_TEST, b"other");
         assert_ne!(path.compute_root(wrong), anchor);
     }
 }

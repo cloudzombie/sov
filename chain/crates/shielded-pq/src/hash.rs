@@ -74,14 +74,22 @@ impl PqDigest {
     }
 }
 
-/// The 2-to-1 Rescue-Prime compression: byte-identical to `Rp64_256::merge`.
+/// The DOMAIN-SEPARATED 2-to-1 Rescue-Prime compression.
 ///
-/// Sponge convention (matches `winter-crypto`): capacity = `[8, 0, 0, 0]`
-/// (first capacity element set to the rate width), rate = `left || right`,
-/// one permutation, digest = state elements 4..8.
-pub fn merge(left: PqDigest, right: PqDigest) -> PqDigest {
+/// Sponge convention (matches `winter-crypto` except for the domain slot):
+/// capacity = `[8, domain, 0, 0]` (first capacity element is the rate width,
+/// second carries the domain constant from [`crate::domains`]), rate =
+/// `left || right`, one permutation, digest = state elements 4..8.
+///
+/// `merge_domain(0, l, r)` is byte-identical to `Rp64_256::merge` (pinned by
+/// a test below); domain 0 is reserved and never used by the protocol.
+/// Distinct domains initialize the sponge capacity differently, so outputs
+/// under different domains are computationally independent (a cross-domain
+/// collision would be a collision of the Rescue permutation itself).
+pub fn merge_domain(domain: u64, left: PqDigest, right: PqDigest) -> PqDigest {
     let mut state = [Felt::ZERO; STATE_WIDTH];
     state[0] = Felt::new(8); // RATE_WIDTH, per Rp64_256::merge
+    state[1] = Felt::new(domain);
     state[4..8].copy_from_slice(&left.to_elements());
     state[8..12].copy_from_slice(&right.to_elements());
     Rp64_256::apply_permutation(&mut state);
@@ -113,22 +121,22 @@ mod tests {
     use winter_crypto::{Digest as _, Hasher as _};
 
     #[test]
-    fn merge_matches_rp64_256() {
-        // Pin our sponge convention byte-for-byte to the upstream hasher: if
-        // either drifts, the circuit and the native hash disagree and this
-        // screams.
-        let a = digest_from_bytes("sov-shielded-pq:test:v1", b"left");
-        let b = digest_from_bytes("sov-shielded-pq:test:v1", b"right");
+    fn merge_domain_zero_matches_rp64_256() {
+        // Pin our sponge convention byte-for-byte to the upstream hasher at
+        // the reserved domain 0: if either drifts, the circuit and the
+        // native hash disagree and this screams.
+        let a = digest_from_bytes(crate::domains::B3_TEST, b"left");
+        let b = digest_from_bytes(crate::domains::B3_TEST, b"right");
         type UpstreamDigest = <Rp64_256 as winter_crypto::Hasher>::Digest;
         let ua = UpstreamDigest::new(a.to_elements());
         let ub = UpstreamDigest::new(b.to_elements());
         let upstream = Rp64_256::merge(&[ua, ub]);
-        assert_eq!(merge(a, b).to_bytes(), upstream.as_bytes());
+        assert_eq!(merge_domain(0, a, b).to_bytes(), upstream.as_bytes());
     }
 
     #[test]
     fn digest_bytes_roundtrip_and_canonical() {
-        let d = digest_from_bytes("sov-shielded-pq:test:v1", b"roundtrip");
+        let d = digest_from_bytes(crate::domains::B3_TEST, b"roundtrip");
         assert_eq!(PqDigest::from_bytes(&d.to_bytes()), Some(d));
         // A limb >= p must be rejected.
         let mut bad = [0u8; 32];

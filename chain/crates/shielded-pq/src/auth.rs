@@ -7,6 +7,7 @@
 //! work (see the design doc). Uses the same `fips204` crate `sov-crypto`
 //! already trusts for the transparent layer's hybrid signatures.
 
+use crate::domains::{AUTH_SIGN_CTX, B3_AUTH_KEYGEN, B3_AUTH_SIGN};
 use fips204::ml_dsa_65;
 use fips204::traits::{KeyGen, SerDes, Signer, Verifier};
 
@@ -14,8 +15,6 @@ use fips204::traits::{KeyGen, SerDes, Signer, Verifier};
 pub const AUTH_PK_LEN: usize = ml_dsa_65::PK_LEN;
 /// ML-DSA-65 signature length (3309 bytes).
 pub const AUTH_SIG_LEN: usize = ml_dsa_65::SIG_LEN;
-
-const SIGN_CTX: &[u8] = b"sov-shielded-pq:auth:v1";
 
 /// Errors from spend authorization.
 #[derive(Debug, thiserror::Error)]
@@ -37,11 +36,11 @@ impl AuthKeypair {
     /// (domain-separated, FIPS 204 seeded keygen — same pattern as
     /// `sov-crypto`'s hybrid keys).
     pub fn from_seed(seed: &[u8; 32]) -> Self {
-        let xi = *blake3::Hasher::new_derive_key("sov-shielded-pq:auth-keygen:v1")
+        let xi = *blake3::Hasher::new_derive_key(B3_AUTH_KEYGEN)
             .update(seed)
             .finalize()
             .as_bytes();
-        let sign_seed = *blake3::Hasher::new_derive_key("sov-shielded-pq:auth-sign:v1")
+        let sign_seed = *blake3::Hasher::new_derive_key(B3_AUTH_SIGN)
             .update(seed)
             .finalize()
             .as_bytes();
@@ -61,7 +60,7 @@ impl AuthKeypair {
     /// Sign a bundle digest (deterministic, seeded FIPS 204 mode).
     pub fn sign(&self, digest: &[u8; 32]) -> Result<[u8; AUTH_SIG_LEN], AuthError> {
         self.sk
-            .try_sign_with_seed(&self.sign_seed, digest, SIGN_CTX)
+            .try_sign_with_seed(&self.sign_seed, digest, AUTH_SIGN_CTX)
             .map_err(|_| AuthError::MlDsa("sign"))
     }
 }
@@ -69,7 +68,7 @@ impl AuthKeypair {
 /// Verify an ML-DSA-65 spend-authorization signature over a bundle digest.
 pub fn verify_auth(pk: &[u8; AUTH_PK_LEN], digest: &[u8; 32], sig: &[u8; AUTH_SIG_LEN]) -> bool {
     match ml_dsa_65::PublicKey::try_from_bytes(*pk) {
-        Ok(vk) => vk.verify(digest, sig, SIGN_CTX),
+        Ok(vk) => vk.verify(digest, sig, AUTH_SIGN_CTX),
         Err(_) => false,
     }
 }
