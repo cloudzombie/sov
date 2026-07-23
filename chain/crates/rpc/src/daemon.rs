@@ -2091,7 +2091,7 @@ mod tests {
             vesting: vec![],
         };
 
-        let mut mainnet = genesis_chain_with_baked_preset(&genesis_for("sov-mainnet"))
+        let mainnet = genesis_chain_with_baked_preset(&genesis_for("sov-mainnet"))
             .expect("mainnet chain builds");
         let block = mainnet.produce_block(vec![], 2_000).unwrap();
         assert_eq!(
@@ -2100,7 +2100,7 @@ mod tests {
              is installed at construction, before any replay could run"
         );
 
-        let mut test =
+        let test =
             genesis_chain_with_baked_preset(&genesis_for("sov-test")).expect("test chain builds");
         let block = test.produce_block(vec![], 2_000).unwrap();
         assert_eq!(
