@@ -882,7 +882,7 @@ struct BakedDeployments {
 /// (dev/test/testnet get NOTHING — genesis, KATs, and all test behavior untouched);
 /// for mainnet, the two deployments plus grace + signal mask. Both deployments are
 /// DORMANT machinery until miner signaling reaches the 9/10 threshold over a full
-/// 288-block window at/after height 10656 — pre-activation validation and execution
+/// 288-block window at/after height 10944 — pre-activation validation and execution
 /// are byte-identical. What DOES change immediately: a mainnet v0.1.99 node stamps
 /// `version_bits = 0b11` in headers it mines (the intended, non-breaking signaling —
 /// old nodes record the bits but do not enforce them).
@@ -891,28 +891,28 @@ fn baked_deployments(chain_id: &str) -> Option<BakedDeployments> {
         return None;
     }
     // 90% of a 288-block (~12h) window; all heights are exact window boundaries
-    // (10656 = 37 * 288, 11520 = 40 * 288, 10944 = 38 * 288).
+    // (10944 = 38 * 288, 11808 = 41 * 288, 11232 = 39 * 288).
     let threshold =
         sov_governance::Threshold::new(9, 10).expect("baked mainnet threshold is valid");
     let tx_domain = sov_governance::Deployment::new(
         "tx-domain",
         0,
-        BlockHeight::new(10_656),
-        BlockHeight::new(11_520),
+        BlockHeight::new(10_944),
+        BlockHeight::new(11_808),
         288,
         threshold,
-        BlockHeight::new(10_944),
+        BlockHeight::new(11_232),
         false,
     )
     .expect("baked mainnet deployment is valid");
     let fee_auction = sov_governance::Deployment::new(
         "fee-auction",
         1,
-        BlockHeight::new(10_656),
-        BlockHeight::new(11_520),
+        BlockHeight::new(10_944),
+        BlockHeight::new(11_808),
         288,
         threshold,
-        BlockHeight::new(10_944),
+        BlockHeight::new(11_232),
         false,
     )
     .expect("baked mainnet deployment is valid");
@@ -2031,20 +2031,20 @@ mod tests {
         let tx = &baked.tx_domain;
         assert_eq!(tx.name, "tx-domain");
         assert_eq!(tx.bit, 0);
-        assert_eq!(tx.start_height.get(), 10_656);
-        assert_eq!(tx.timeout_height.get(), 11_520);
+        assert_eq!(tx.start_height.get(), 10_944);
+        assert_eq!(tx.timeout_height.get(), 11_808);
         assert_eq!(tx.period, 288);
         assert_eq!(tx.threshold, sov_governance::Threshold::new(9, 10).unwrap());
-        assert_eq!(tx.min_activation_height.get(), 10_944);
+        assert_eq!(tx.min_activation_height.get(), 11_232);
         assert!(!tx.lockinontimeout);
         let fa = &baked.fee_auction;
         assert_eq!(fa.name, "fee-auction");
         assert_eq!(fa.bit, 1);
-        assert_eq!(fa.start_height.get(), 10_656);
-        assert_eq!(fa.timeout_height.get(), 11_520);
+        assert_eq!(fa.start_height.get(), 10_944);
+        assert_eq!(fa.timeout_height.get(), 11_808);
         assert_eq!(fa.period, 288);
         assert_eq!(fa.threshold, sov_governance::Threshold::new(9, 10).unwrap());
-        assert_eq!(fa.min_activation_height.get(), 10_944);
+        assert_eq!(fa.min_activation_height.get(), 11_232);
         assert!(!fa.lockinontimeout);
         assert_eq!(baked.grace_blocks, 576);
         assert_eq!(baked.signal_mask, 0b11, "signals bits 0 AND 1");
