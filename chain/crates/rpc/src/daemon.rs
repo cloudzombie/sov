@@ -924,6 +924,31 @@ fn baked_deployments(chain_id: &str) -> Option<BakedDeployments> {
     })
 }
 
+/// A fresh [`Blockchain`] from `genesis` with the network's baked governance
+/// activation preset (mainnet only, [`baked_deployments`]) installed: the
+/// tx-domain + fee-auction deployments, the tx-domain grace window, and the
+/// signal mask this node's mined blocks commit. Dormant until miner signaling
+/// meets the threshold; non-mainnet chains get nothing (`None`) — byte-identical
+/// behavior there.
+///
+/// Every boot-time chain construction MUST go through this helper — including
+/// the ones that immediately replay the persisted block log. The preset has to
+/// be live BEFORE replay, not installed after it: once the fee-auction
+/// activates, the log contains `Action::Tipped` transactions (and, post-grace,
+/// Bound-only signatures), and replaying those blocks on a bare chain resolves
+/// `fee_auction_active = false` / `Legacy` — `FeatureInactive` on tier-2/3 and
+/// a daemon that can never boot from its own log.
+fn genesis_chain_with_baked_preset(genesis: &GenesisConfig) -> Result<Blockchain, ChainError> {
+    let mut chain = Blockchain::new(genesis)?;
+    if let Some(baked) = baked_deployments(&genesis.chain_id) {
+        chain.set_tx_domain_deployment(baked.tx_domain);
+        chain.set_fee_auction_deployment(baked.fee_auction);
+        chain.set_tx_domain_grace_blocks(baked.grace_blocks);
+        chain.set_signal_mask(baked.signal_mask);
+    }
+    Ok(chain)
+}
+
 /// Serialize the pending pool and durably write it (atomic temp+rename), under a brief
 /// node lock. Cheap (the pool is bounded), so it is written on the periodic snapshot tick
 /// and once more on clean shutdown.
@@ -1303,7 +1328,12 @@ impl Daemon {
         //      per-block clone / root recompute / PoW re-verify). Seconds.
         //   3. Full VERIFIED import — re-validate every block from genesis. Minutes;
         //      the last-resort source of truth if both caches are unusable.
-        let mut chain = Blockchain::new(genesis)?;
+        // Every tier starts from `genesis_chain_with_baked_preset` — the baked
+        // activation preset must be live BEFORE replay so post-activation blocks
+        // (Tipped txs, Bound-only signatures) re-execute exactly as they were
+        // first imported; a bare chain would reject them as FeatureInactive and
+        // the daemon could never boot from its own log.
+        let mut chain = genesis_chain_with_baked_preset(genesis)?;
         let resumed_fast = match load_snapshot(&snap_path) {
             Some((ledger, receipts, head, height)) => chain
                 .resume_from_snapshot(ledger, receipts, head, height, &persisted)
@@ -1311,7 +1341,7 @@ impl Daemon {
             None => false,
         };
         if !resumed_fast {
-            chain = Blockchain::new(genesis)?;
+            chain = genesis_chain_with_baked_preset(genesis)?;
             if !chain
                 .replay_log_trusted(&persisted, on_progress)
                 .unwrap_or(false)
@@ -1320,7 +1350,7 @@ impl Daemon {
                 // validation, but along the heaviest chain IN ORDER (O(N)). Importing
                 // the raw `persisted` log here instead would re-run every historical
                 // reorg from genesis (O(reorgs×N)) — the multi-minute / "hung" boot.
-                chain = Blockchain::new(genesis)?;
+                chain = genesis_chain_with_baked_preset(genesis)?;
                 chain.replay_log_verified(&persisted, on_progress)?;
             }
             // We replayed a non-empty chain rather than resuming a snapshot (none
@@ -1333,18 +1363,6 @@ impl Daemon {
             }
         }
         let block_log = Arc::new(BlockLog::open(&blocks_path(&data_dir))?);
-
-        // Install the network's baked governance activation preset (mainnet only, the
-        // sibling of the baked checkpoints below): the tx-domain + fee-auction
-        // deployments, the tx-domain grace window, and the signal mask this node's
-        // mined blocks commit. Dormant until miner signaling meets the threshold;
-        // non-mainnet chains get nothing (`None`) — byte-identical behavior there.
-        if let Some(baked) = baked_deployments(&genesis.chain_id) {
-            chain.set_tx_domain_deployment(baked.tx_domain);
-            chain.set_fee_auction_deployment(baked.fee_auction);
-            chain.set_tx_domain_grace_blocks(baked.grace_blocks);
-            chain.set_signal_mask(baked.signal_mask);
-        }
 
         let mut node = Node::new(chain, mempool_capacity, max_block_txs);
         // The first key is this node's miner identity: blocks it mines credit
@@ -2048,6 +2066,47 @@ mod tests {
         assert!(!fa.lockinontimeout);
         assert_eq!(baked.grace_blocks, 576);
         assert_eq!(baked.signal_mask, 0b11, "signals bits 0 AND 1");
+    }
+
+    #[test]
+    fn genesis_chain_with_baked_preset_installs_the_preset_before_any_replay() {
+        // Audit blocker regression (boot ordering): every boot-time chain — including
+        // the ones handed straight to `replay_log_trusted` / `replay_log_verified` /
+        // `resume_from_snapshot` — must come out of `genesis_chain_with_baked_preset`
+        // with the mainnet activation preset ALREADY live. (The behavioral proof that
+        // a preset-less chain cannot replay a post-activation Tipped log is
+        // `sov-chain`'s `post_activation_tipped_log_cold_replays_only_with_the_
+        // deployment_installed`.) Observable here without mining to height 10944:
+        // the installed signal mask stamps `version_bits = 0b11` on the very first
+        // produced block, and a non-mainnet chain stays untouched (bits 0).
+        let genesis_for = |chain_id: &str| GenesisConfig {
+            chain_id: chain_id.into(),
+            timestamp_ms: 1_000,
+            accounts: vec![GenesisAccount {
+                account: AccountId::new("val01.node.sov").unwrap(),
+                key: Keypair::from_seed([1; 32]).public_key(),
+                balance: Balance::ZERO,
+            }],
+            mining: MiningPolicy::test(),
+            vesting: vec![],
+        };
+
+        let mut mainnet = genesis_chain_with_baked_preset(&genesis_for("sov-mainnet"))
+            .expect("mainnet chain builds");
+        let block = mainnet.produce_block(vec![], 2_000).unwrap();
+        assert_eq!(
+            block.header.version_bits, 0b11,
+            "the baked signal mask is live on the FIRST produced block — the preset \
+             is installed at construction, before any replay could run"
+        );
+
+        let mut test =
+            genesis_chain_with_baked_preset(&genesis_for("sov-test")).expect("test chain builds");
+        let block = test.produce_block(vec![], 2_000).unwrap();
+        assert_eq!(
+            block.header.version_bits, 0,
+            "non-mainnet chains get NO preset — behavior byte-identical"
+        );
     }
 
     /// The committed, FROZEN testnet-1 chain-spec, embedded at compile time. This

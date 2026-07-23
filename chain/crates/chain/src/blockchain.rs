@@ -3482,6 +3482,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn post_activation_tipped_log_cold_replays_only_with_the_deployment_installed() {
+        // Audit blocker regression (daemon boot ordering): once the fee-auction
+        // activates and an `Action::Tipped` tx is COMMITTED to the chain, a node
+        // that cold-boots from its persisted block log must re-execute that block
+        // with the deployment ALREADY installed — v0.1.99's daemon originally
+        // installed the baked preset only AFTER the three replay tiers, so the
+        // replayed Tipped tx resolved `fee_auction_active = false`, tier-2 fell
+        // through, tier-3 errored (FeatureInactive), and the daemon could never
+        // boot again. Both directions are proven here: a preset-first chain
+        // replays the log on BOTH tiers to the exact committed head, and a bare
+        // chain (the old ordering) FAILS on both.
+        use sov_governance::{Deployment, Threshold};
+
+        // Same window math as the activation test above: signaling opens at 4,
+        // window 4, 3-of-4 threshold -> LockedIn at 8 -> Active at 12.
+        fn preset_chain() -> Blockchain {
+            let mut chain = fresh_chain();
+            chain.set_fee_auction_deployment(
+                Deployment::new(
+                    "fee-auction",
+                    2,
+                    BlockHeight::new(4),
+                    BlockHeight::new(400),
+                    4,
+                    Threshold::new(3, 4).unwrap(),
+                    BlockHeight::new(0),
+                    false,
+                )
+                .unwrap(),
+            );
+            chain.set_signal_mask(1 << 2);
+            chain
+        }
+
+        // Drive a signaling chain to activation, then commit a block CARRYING a
+        // Tipped tx and keep the whole block log — the exact on-disk history a
+        // restarted node replays.
+        let mut chain = preset_chain();
+        let mut log = Vec::new();
+        let mut ts = 2_000u64;
+        for _ in 1..=11 {
+            let block = chain.produce_block(vec![], ts).unwrap();
+            chain.import_block(block.clone()).unwrap();
+            log.push(block);
+            ts += 1_000;
+        }
+        assert!(chain.fee_auction_active(12), "active for the block at 12");
+        let tipped = usa_tipped_transfer(3, "ecb.reserve.sov", 10, 0);
+        let block = chain.produce_block(vec![tipped], ts).unwrap();
+        assert_eq!(block.transactions.len(), 1, "the Tipped tx is committed");
+        chain.import_block(block.clone()).unwrap();
+        log.push(block);
+        let head = chain.head().hash();
+        let state_root = chain.ledger().state_root();
+
+        // THE FIX: a fresh chain with the deployment installed BEFORE replay
+        // reproduces the committed head on tier-2 (trusted) AND tier-3 (verified).
+        let mut trusted = preset_chain();
+        assert!(
+            trusted.replay_log_trusted(&log, &mut |_, _| {}).unwrap(),
+            "trusted replay must verify against the committed head state"
+        );
+        assert_eq!(trusted.head().hash(), head);
+        assert_eq!(trusted.ledger().state_root(), state_root);
+
+        let mut verified = preset_chain();
+        verified
+            .replay_log_verified(&log, &mut |_, _| {})
+            .expect("verified replay must import the post-activation Tipped block");
+        assert_eq!(verified.head().hash(), head);
+        assert_eq!(verified.ledger().state_root(), state_root);
+
+        // THE BUG (old daemon ordering — preset installed only after replay): a
+        // bare chain re-executes the Tipped tx with the feature dormant. Tier-2
+        // errors (the daemon fell through to tier-3), and tier-3's error is the
+        // one that escaped `Daemon::new` — the restart-triggered boot failure.
+        let mut bare = fresh_chain();
+        assert!(
+            bare.replay_log_trusted(&log, &mut |_, _| {}).is_err(),
+            "a preset-less chain must fail trusted replay of a Tipped log"
+        );
+        let mut bare = fresh_chain();
+        assert!(
+            bare.replay_log_verified(&log, &mut |_, _| {}).is_err(),
+            "a preset-less chain must fail verified replay of a Tipped log — \
+             the exact error that bricked the daemon under the old ordering"
+        );
+    }
+
     /// A chain like [`fresh_chain`] but with transaction fees switched on.
     fn chain_with_fees(gas_price_grains: u128) -> Blockchain {
         let mut mining = MiningPolicy::test();
