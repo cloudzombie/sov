@@ -14,6 +14,7 @@ sov-types = { path = "../types" }
 sov-state = { path = "../state" }
 sov-intents = { path = "../intents" }
 sov-chain = { path = "../chain" }
+sov-governance = { path = "../governance" }
 sov-node = { path = "../node" }
 sov-network = { path = "../network" }
 sov-mining = { path = "../mining" }

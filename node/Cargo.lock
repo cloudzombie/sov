@@ -4173,6 +4173,7 @@ dependencies = [
  "sha2 0.10.9",
  "sov-chain",
  "sov-crypto",
+ "sov-governance",
  "sov-intents",
  "sov-mining",
  "sov-network",
@@ -4239,7 +4240,7 @@ dependencies = [
 
 [[package]]
 name = "sov-station"
-version = "0.1.98"
+version = "0.1.99"
 dependencies = [
  "chacha20poly1305",
  "eframe",

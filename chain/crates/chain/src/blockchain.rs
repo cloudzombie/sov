@@ -893,6 +893,74 @@ impl Blockchain {
         }
     }
 
+    /// The [`TxDomainMode`] the signature gate must enforce for a candidate
+    /// `block`, resolved over its **parent branch's** committed signal history —
+    /// the identical history [`execute_block_on`](Self::execute_block_on)
+    /// evaluates when the block runs on its branch, so the pre-execution
+    /// signature gate and execution can never disagree about the mode (they
+    /// would otherwise diverge for a side-branch/reorg block whose branch's
+    /// signal history differs from the active chain's across a signaling
+    /// boundary — rejecting a branch-valid block, or passing a branch-invalid
+    /// one to execution).
+    ///
+    /// For a block extending the active head the parent branch *is* the active
+    /// chain, so this resolves over `self.signals` — byte-identical to the
+    /// pre-fix behavior on that (dominant) path. While the fork is dormant
+    /// (no `tx-domain` deployment scheduled) every branch resolves `Legacy`
+    /// with no signal walk at all.
+    fn branch_tx_domain_mode(&self, block: &Block) -> TxDomainMode {
+        let height = block.header.height.get();
+        // Dormant fork: Legacy on every branch — skip the signal reconstruction.
+        if self.tx_domain_deployment.is_none() {
+            return TxDomainMode::Legacy;
+        }
+        // Extends the active head: the parent branch's signal history is exactly
+        // the active chain's.
+        if block.header.prev_hash == self.head {
+            return self.resolved_tx_domain_mode(height);
+        }
+        let signals = self.branch_signals_of(block);
+        self.resolved_tx_domain_mode_with(height, &signals)
+    }
+
+    /// Reconstruct the committed signal history of `block`'s **parent branch**:
+    /// the active chain's signals up to the fork point (the branches share that
+    /// prefix), then the branch's own committed `version_bits` above it. This is
+    /// the same log every branch-execution path evaluates —
+    /// [`rebuild_branch`](Self::rebuild_branch) records exactly the branch's
+    /// blocks from genesis, and the incremental reorg/side-branch paths reach the
+    /// same log via [`disconnect_to`](Self::disconnect_to) (which removes the
+    /// active entries above the fork) plus per-block re-recording — so the gate
+    /// that uses it resolves precisely the mode execution will.
+    fn branch_signals_of(&self, block: &Block) -> sov_governance::SignalLog {
+        // Walk parent links, collecting the branch's own (height, bits) above the
+        // fork point, until we meet a block that is the active block at its own
+        // height — the common ancestor. Mirrors `locate_fork`, headers only.
+        let mut branch_bits: Vec<(BlockHeight, u32)> = Vec::new();
+        let mut hash = block.header.prev_hash;
+        let mut fork_height = 0u64;
+        while let Some(entry) = self.index.get(&hash) {
+            let h = entry.height;
+            if self.blocks.get(h as usize).map(Block::hash) == Some(hash) {
+                fork_height = h;
+                break;
+            }
+            branch_bits.push((entry.block.header.height, entry.block.header.version_bits));
+            hash = entry.block.header.prev_hash;
+        }
+        // The shared prefix: active signals truncated to the fork point (the
+        // active blocks above the fork are NOT on the candidate's branch).
+        let mut signals = self.signals.clone();
+        for h in (fork_height + 1)..=self.height() {
+            signals.remove(BlockHeight::new(h));
+        }
+        // The branch's own committed bits above the fork, oldest first.
+        for (h, bits) in branch_bits.into_iter().rev() {
+            signals.record(h, bits);
+        }
+        signals
+    }
+
     /// Whether the miner-signaled `fee-auction` deployment is `Active` for a block
     /// at `height`, resolved over the active chain's committed miner signals.
     /// `false` before activation, or if no deployment is scheduled — the
@@ -1571,11 +1639,18 @@ impl Blockchain {
         // height; `Grace` — legacy OR chain-bound accepted, per transaction — for
         // the grace window at/after activation; `Bound` afterwards, so a block
         // carrying a cross-network-replayed (or legacy un-bound) signature fails
-        // validation. This block extends the active head, so the active chain's
-        // signals govern its activation state. Execution (`apply_transaction`)
-        // resolves the identical mode for the same height, so the two consensus
-        // verification sites can never disagree.
-        let tx_domain = self.resolved_tx_domain_mode(block.header.height.get());
+        // validation. The mode is resolved over the CANDIDATE'S PARENT BRANCH's
+        // committed signals — not blindly over the active chain's — because this
+        // pre-check runs for blocks on ANY branch (side branches and reorg tips
+        // included), while execution (`execute_block_on`) always evaluates the
+        // branch's own signal history. Resolving the identical history here means
+        // the two consensus verification sites can never disagree: a branch whose
+        // signal history diverges from the active chain's across a signaling
+        // boundary is gated by ITS mode, exactly as it will execute. For a block
+        // extending the active head the parent branch IS the active chain, so the
+        // resolved mode (and behavior) is identical to resolving over
+        // `self.signals` directly.
+        let tx_domain = self.branch_tx_domain_mode(block);
         if !block.all_signatures_valid_mode(&tx_domain) {
             return Err(ChainError::BadSignatures);
         }
@@ -3049,6 +3124,191 @@ mod tests {
         let block16 = chain.produce_block(vec![bound3], ts).unwrap();
         assert_eq!(block16.transactions.len(), 1);
         chain.import_block(block16).unwrap();
+    }
+
+    /// The standard tx-domain deployment for the branch-divergence (F1) tests:
+    /// bit 1, signaling opens at 4, window 4, 3-of-4 threshold, NO lock-in on
+    /// timeout — so a branch that does not signal genuinely never activates,
+    /// while a branch that signals 4/4 in [4,8) is LockedIn at 8 and Active at
+    /// 12. Identical consensus parameters on every node; only each miner's
+    /// signal mask (a per-node choice) differs between branches.
+    fn f1_tx_domain_deployment() -> sov_governance::Deployment {
+        sov_governance::Deployment::new(
+            "tx-domain",
+            1,
+            BlockHeight::new(4),
+            BlockHeight::new(400),
+            4,
+            sov_governance::Threshold::new(3, 4).unwrap(),
+            BlockHeight::new(0),
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn side_branch_signature_gate_resolves_branch_mode_and_accepts_a_branch_valid_block() {
+        // F1 regression (accept direction + partition heal): node1's ACTIVE chain
+        // signaled the tx-domain fork (Active => Bound at height 12, grace 0),
+        // while node2's competing branch never signaled (Legacy at 12 on that
+        // branch). node2's block 12 carries a LEGACY-signed transfer — valid on
+        // its own branch, invalid under the active chain's mode. The pre-fix
+        // gate resolved the ACTIVE mode (Bound) for this side-branch block and
+        // returned BadSignatures — node1 could never index it and the network
+        // partitions at activation. The fixed gate resolves the BRANCH mode
+        // (Legacy — the same mode `execute_block_on` uses), so the block is
+        // stored as a side branch, and when the branch grows heavier node1
+        // reorgs onto it cleanly.
+        let mut node1 = fresh_chain();
+        node1.set_tx_domain_deployment(f1_tx_domain_deployment());
+        node1.set_tx_domain_grace_blocks(0);
+        node1.set_signal_mask(1 << 1); // node1 signals: its chain activates
+        let mut node2 = fresh_chain();
+        node2.set_tx_domain_deployment(f1_tx_domain_deployment());
+        node2.set_tx_domain_grace_blocks(0);
+        // node2 signals nothing: its branch never locks in.
+
+        // node1 mines its own (signaling) chain to height 13 — strictly heavier
+        // than node2's branch below, so importing that branch never reorgs early.
+        let mut ts = 2_000u64;
+        for _ in 1..=13 {
+            let b = node1.produce_block(vec![], ts).unwrap();
+            node1.import_block(b).unwrap();
+            ts += 1_000;
+        }
+        // node2 mines the competing (non-signaling) branch to height 11. The
+        // headers differ from node1's only in version_bits — a genuine fork.
+        let mut ts2 = 2_500u64;
+        for _ in 1..=11 {
+            let b = node2.produce_block(vec![], ts2).unwrap();
+            node2.import_block(b.clone()).unwrap();
+            node1.import_block(b).unwrap(); // stored as a lighter side branch
+            ts2 += 1_000;
+        }
+
+        // The divergence at the heart of F1: at height 12 the ACTIVE chain's
+        // signals resolve Bound — what the OLD gate would have (mis)applied to
+        // the side-branch block — while the branch itself resolves Legacy.
+        let domain = node1
+            .resolved_tx_domain(12)
+            .expect("active chain activated");
+        assert_eq!(
+            node1.resolved_tx_domain_mode(12),
+            TxDomainMode::Bound(domain),
+            "active-chain mode at 12 is Bound (the old gate's verdict)"
+        );
+        assert_eq!(
+            node2.resolved_tx_domain_mode(12),
+            TxDomainMode::Legacy,
+            "the branch's own mode at 12 is Legacy"
+        );
+
+        // node2's block 12 carries a legacy-signed transfer — its branch is
+        // Legacy, so its producer includes it and the block is branch-valid.
+        let b12 = node2
+            .produce_block(vec![usa_transfer("ecb.reserve.sov", 10, 0)], ts2)
+            .unwrap();
+        assert_eq!(b12.transactions.len(), 1, "legacy tx mines on the branch");
+        node2.import_block(b12.clone()).unwrap();
+        ts2 += 1_000;
+
+        // The fixed gate accepts the branch-valid block as a side branch (the
+        // old gate returned BadSignatures here). Side-branch storage commits
+        // nothing to the active chain: no receipts, head unchanged.
+        let receipts = node1
+            .import_block(b12)
+            .expect("a branch-valid block must pass the gate under its BRANCH mode");
+        assert!(
+            receipts.is_empty(),
+            "stored on a side branch, not connected"
+        );
+        assert_eq!(node1.height(), 13, "active head unchanged");
+
+        // Partition heal: the branch outgrows the active chain; node1 must reorg
+        // onto it — re-executing block 12 under the branch's Legacy mode.
+        for _ in 13..=15 {
+            let b = node2.produce_block(vec![], ts2).unwrap();
+            node2.import_block(b.clone()).unwrap();
+            node1.import_block(b).unwrap();
+            ts2 += 1_000;
+        }
+        assert_eq!(node1.height(), 15, "node1 reorged onto the heavier branch");
+        assert_eq!(node1.head().hash(), node2.head().hash());
+        assert_eq!(
+            node1.ledger().state_root(),
+            node2.ledger().state_root(),
+            "post-reorg state matches the branch owner's exactly"
+        );
+    }
+
+    #[test]
+    fn side_branch_signature_gate_rejects_a_branch_invalid_block() {
+        // F1 regression (reject direction): the mirror case. node1's ACTIVE
+        // chain never signaled (Legacy at height 12), while node2's branch
+        // signaled and activated (Bound at 12 on that branch, grace 0). A block
+        // at height 12 on node2's branch smuggling a LEGACY-signed transfer is
+        // INVALID on its own branch. The old gate resolved the ACTIVE mode
+        // (Legacy) and waved the signatures through to execution; the fixed
+        // gate resolves the BRANCH mode (Bound) and rejects the block with
+        // BadSignatures — the same verdict execution would reach, now at the
+        // gate.
+        let mut node1 = fresh_chain();
+        node1.set_tx_domain_deployment(f1_tx_domain_deployment());
+        node1.set_tx_domain_grace_blocks(0);
+        // node1 signals nothing: its active chain stays Legacy.
+        let mut node2 = fresh_chain();
+        node2.set_tx_domain_deployment(f1_tx_domain_deployment());
+        node2.set_tx_domain_grace_blocks(0);
+        node2.set_signal_mask(1 << 1); // node2's branch signals and activates
+
+        let mut ts = 2_000u64;
+        for _ in 1..=13 {
+            let b = node1.produce_block(vec![], ts).unwrap();
+            node1.import_block(b).unwrap();
+            ts += 1_000;
+        }
+        let mut ts2 = 2_500u64;
+        for _ in 1..=11 {
+            let b = node2.produce_block(vec![], ts2).unwrap();
+            node2.import_block(b.clone()).unwrap();
+            node1.import_block(b).unwrap();
+            ts2 += 1_000;
+        }
+        assert_eq!(node1.resolved_tx_domain_mode(12), TxDomainMode::Legacy);
+        let domain = node2.resolved_tx_domain(12).expect("branch activated");
+        assert_eq!(
+            node2.resolved_tx_domain_mode(12),
+            TxDomainMode::Bound(domain),
+            "the branch's own mode at 12 is Bound"
+        );
+
+        // Smuggle a legacy-signed transfer into a block at height 12 on node2's
+        // branch (its honest producer would exclude it). Carry the honest
+        // header's committed difficulty and signal bits, and re-grind a VALID
+        // seal for the smuggled body — so the block fails at exactly one check:
+        // the signature gate.
+        let legacy = usa_transfer("ecb.reserve.sov", 10, 0);
+        let empty = node2.produce_block(vec![legacy.clone()], ts2).unwrap();
+        assert!(empty.transactions.is_empty(), "branch producer excludes it");
+        let mut smuggled = Block::assemble(
+            empty.header.height,
+            empty.header.prev_hash,
+            empty.header.state_root,
+            empty.header.receipts_root,
+            empty.header.timestamp_ms,
+            empty.header.proposer.clone(),
+            vec![legacy],
+        );
+        smuggled.header.version_bits = empty.header.version_bits;
+        smuggled.header.bits = empty.header.bits;
+        let target = Target::from_compact(smuggled.header.bits).expect("committed bits");
+        while !target.is_met_by(&node1.seal(&smuggled.header)) {
+            smuggled.header.nonce = smuggled.header.nonce.wrapping_add(1);
+        }
+        assert!(
+            matches!(node1.import_block(smuggled), Err(ChainError::BadSignatures)),
+            "the gate must reject a branch-invalid signature under the BRANCH mode"
+        );
     }
 
     #[test]

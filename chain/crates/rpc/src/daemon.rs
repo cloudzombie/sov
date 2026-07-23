@@ -29,7 +29,7 @@ use sov_crypto::{Keypair, PublicKey};
 use sov_mining::MiningPolicy;
 use sov_network::{NetMessage, TcpNode};
 use sov_node::{Node, NodeError, Produced};
-use sov_primitives::{AccountId, Balance, Hash};
+use sov_primitives::{AccountId, Balance, BlockHeight, Hash};
 use sov_state::Ledger;
 use sov_types::{Block, Receipt, SignedTransaction};
 
@@ -859,6 +859,71 @@ fn baked_checkpoints(chain_id: &str) -> Vec<(u64, Hash)> {
     }
 }
 
+/// The baked mainnet **activation preset** (the F2 coordination fix): the `tx-domain`
+/// and `fee-auction` BIP-9/8 deployments, the tx-domain grace window, and the
+/// version-bits mask a mainnet node signals in blocks it mines — ONE hardcoded,
+/// release-pinned parameter set, exactly like the baked checkpoints above, so every
+/// v0.1.99 mainnet node runs the identical consensus schedule (two nodes with different
+/// deployment heights, thresholds, or grace G would split at activation / at `H_a+G`).
+struct BakedDeployments {
+    /// The `tx-domain` hard-fork deployment (bit 0): chain-bound tx/intent signatures.
+    tx_domain: sov_governance::Deployment,
+    /// The `fee-auction` deployment (bit 1): the `Action::Tipped` envelope.
+    fee_auction: sov_governance::Deployment,
+    /// The tx-domain grace window `G` in blocks — consensus-critical once armed,
+    /// baked here so no per-node divergence is possible.
+    grace_blocks: u64,
+    /// The version-bits mask this node's mined blocks commit (bits 0 and 1: it
+    /// signals readiness for BOTH deployments).
+    signal_mask: u32,
+}
+
+/// The baked activation preset for a chain: `None` for any non-mainnet chain
+/// (dev/test/testnet get NOTHING — genesis, KATs, and all test behavior untouched);
+/// for mainnet, the two deployments plus grace + signal mask. Both deployments are
+/// DORMANT machinery until miner signaling reaches the 9/10 threshold over a full
+/// 288-block window at/after height 10656 — pre-activation validation and execution
+/// are byte-identical. What DOES change immediately: a mainnet v0.1.99 node stamps
+/// `version_bits = 0b11` in headers it mines (the intended, non-breaking signaling —
+/// old nodes record the bits but do not enforce them).
+fn baked_deployments(chain_id: &str) -> Option<BakedDeployments> {
+    if !chain_id.contains("mainnet") {
+        return None;
+    }
+    // 90% of a 288-block (~12h) window; all heights are exact window boundaries
+    // (10656 = 37 * 288, 11520 = 40 * 288, 10944 = 38 * 288).
+    let threshold =
+        sov_governance::Threshold::new(9, 10).expect("baked mainnet threshold is valid");
+    let tx_domain = sov_governance::Deployment::new(
+        "tx-domain",
+        0,
+        BlockHeight::new(10_656),
+        BlockHeight::new(11_520),
+        288,
+        threshold,
+        BlockHeight::new(10_944),
+        false,
+    )
+    .expect("baked mainnet deployment is valid");
+    let fee_auction = sov_governance::Deployment::new(
+        "fee-auction",
+        1,
+        BlockHeight::new(10_656),
+        BlockHeight::new(11_520),
+        288,
+        threshold,
+        BlockHeight::new(10_944),
+        false,
+    )
+    .expect("baked mainnet deployment is valid");
+    Some(BakedDeployments {
+        tx_domain,
+        fee_auction,
+        grace_blocks: 576,
+        signal_mask: 0b11,
+    })
+}
+
 /// Serialize the pending pool and durably write it (atomic temp+rename), under a brief
 /// node lock. Cheap (the pool is bounded), so it is written on the periodic snapshot tick
 /// and once more on clean shutdown.
@@ -1268,6 +1333,18 @@ impl Daemon {
             }
         }
         let block_log = Arc::new(BlockLog::open(&blocks_path(&data_dir))?);
+
+        // Install the network's baked governance activation preset (mainnet only, the
+        // sibling of the baked checkpoints below): the tx-domain + fee-auction
+        // deployments, the tx-domain grace window, and the signal mask this node's
+        // mined blocks commit. Dormant until miner signaling meets the threshold;
+        // non-mainnet chains get nothing (`None`) — byte-identical behavior there.
+        if let Some(baked) = baked_deployments(&genesis.chain_id) {
+            chain.set_tx_domain_deployment(baked.tx_domain);
+            chain.set_fee_auction_deployment(baked.fee_auction);
+            chain.set_tx_domain_grace_blocks(baked.grace_blocks);
+            chain.set_signal_mask(baked.signal_mask);
+        }
 
         let mut node = Node::new(chain, mempool_capacity, max_block_txs);
         // The first key is this node's miner identity: blocks it mines credit
@@ -1936,6 +2013,41 @@ mod tests {
 
         // Saturating: a u64::MAX parent/MTP cannot overflow the +1.
         assert_eq!(clamp_block_timestamp(0, u64::MAX, 0), u64::MAX);
+    }
+
+    #[test]
+    fn baked_deployments_are_mainnet_only_with_the_pinned_activation_preset() {
+        // Non-mainnet chains get NOTHING: no deployments, no grace override, no
+        // signal mask — dev/test/testnet behavior (and every KAT) is untouched.
+        for chain_id in ["sov-test", "sov-dev", "sov-testnet-1"] {
+            assert!(
+                baked_deployments(chain_id).is_none(),
+                "{chain_id} must have no baked deployments"
+            );
+        }
+        // Mainnet gets the exact release-pinned preset — these values are
+        // consensus-coordinating; any drift is a chain split at activation.
+        let baked = baked_deployments("sov-mainnet").expect("mainnet preset is baked");
+        let tx = &baked.tx_domain;
+        assert_eq!(tx.name, "tx-domain");
+        assert_eq!(tx.bit, 0);
+        assert_eq!(tx.start_height.get(), 10_656);
+        assert_eq!(tx.timeout_height.get(), 11_520);
+        assert_eq!(tx.period, 288);
+        assert_eq!(tx.threshold, sov_governance::Threshold::new(9, 10).unwrap());
+        assert_eq!(tx.min_activation_height.get(), 10_944);
+        assert!(!tx.lockinontimeout);
+        let fa = &baked.fee_auction;
+        assert_eq!(fa.name, "fee-auction");
+        assert_eq!(fa.bit, 1);
+        assert_eq!(fa.start_height.get(), 10_656);
+        assert_eq!(fa.timeout_height.get(), 11_520);
+        assert_eq!(fa.period, 288);
+        assert_eq!(fa.threshold, sov_governance::Threshold::new(9, 10).unwrap());
+        assert_eq!(fa.min_activation_height.get(), 10_944);
+        assert!(!fa.lockinontimeout);
+        assert_eq!(baked.grace_blocks, 576);
+        assert_eq!(baked.signal_mask, 0b11, "signals bits 0 AND 1");
     }
 
     /// The committed, FROZEN testnet-1 chain-spec, embedded at compile time. This
