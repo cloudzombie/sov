@@ -476,6 +476,13 @@ pub fn prove_bundle(
 /// Enforces the NATIVE public bounds the in-circuit no-wrap argument
 /// depends on: `transparent_in`, `transparent_out`, and `fee_grains` must
 /// each be `<= MAX_NOTE_VALUE` (< 2^61). See [`crate::note`].
+///
+/// Also enforces the dummy-slot zero convention (defense-in-depth, audit
+/// S1 follow-up): a dummy slot's anchor/nullifier/commitment publics must
+/// be the zero digest even for a caller that bypasses
+/// [`crate::bundle::verify_bundle`] — which remains the authoritative
+/// convention layer (ciphertext rules, anchor ring, in-bundle nullifier
+/// uniqueness live there).
 pub fn verify_spend(
     proof_bytes: &[u8],
     pub_inputs: &BundlePublicInputs,
@@ -485,6 +492,17 @@ pub fn verify_spend(
     }
     if pub_inputs.fee_grains > MAX_NOTE_VALUE {
         return Err(SpendProofError::PublicInput("fee too large"));
+    }
+    for i in 0..NUM_SLOTS {
+        if pub_inputs.input_dummy[i]
+            && (pub_inputs.anchors[i] != PqDigest::ZERO
+                || pub_inputs.nullifiers[i] != PqDigest::ZERO)
+        {
+            return Err(SpendProofError::PublicInput("nonzero dummy input publics"));
+        }
+        if pub_inputs.output_dummy[i] && pub_inputs.output_commitments[i] != PqDigest::ZERO {
+            return Err(SpendProofError::PublicInput("nonzero dummy output publics"));
+        }
     }
     let proof = Proof::from_bytes(proof_bytes)
         .map_err(|e| SpendProofError::Verification(format!("malformed proof: {e}")))?;

@@ -22,7 +22,8 @@
 //! way [`expect_circuit_reject`] fails the test if the forgery survives.
 
 use sov_shielded_pq::air::{
-    rc_base, BundlePublicInputs, ACTIVE_ROWS, NUM_SLOTS, RC_ACC_COL, RC_BIT_COL, VAL_COL,
+    rc_base, BundlePublicInputs, ACTIVE_ROWS, NSK_COL, NUM_SLOTS, RC_ACC_COL, RC_BIT_COL, RHO_COL,
+    VAL_COL,
 };
 use sov_shielded_pq::auth::AuthKeypair;
 use sov_shielded_pq::bundle::{bundle_digest, verify_bundle, BundleError, SpendBundle};
@@ -600,6 +601,110 @@ fn inconsistent_value_register_rejected() {
     );
 }
 
+// --- Constancy families (audit S1 follow-up: the mint / double-spend guards). --
+// These three transition-constraint families were flagged by the S1 audit as
+// defended-but-untested. Each test isolates its constraint by perturbing a
+// single register cell at the balance row (row 0), where the register is held
+// (not hash-injected), so the constancy constraint is the FIRST — and lowest-
+// indexed — objection winterfell's debug validation raises. Without the
+// constraint, each perturbation would MINT or DOUBLE-SPEND.
+
+#[test]
+fn value_register_non_constant_rejected() {
+    // MINT vector: inflate input 0's value register at the balance row ONLY
+    // and withdraw the surplus through the public unshield leg, so the balance
+    // constraint stays satisfied and the commitment hash (absorbed on a later
+    // row) still commits the honest value. The ONLY objection is value-register
+    // constancy (constraint 20). Absent it, this mints `surplus` grains.
+    let (spends, outputs, _) = kat_bundle_witness();
+    let (mut cols, mut pub_inputs) =
+        build_bundle_columns(&spends, &outputs, 0, KAT_T_OUT, KAT_FEE).expect("build");
+    let surplus = 7u64;
+    cols[VAL_COL][0] += Felt::new(surplus);
+    pub_inputs.transparent_out += surplus;
+    expect_circuit_reject(
+        cols,
+        &pub_inputs,
+        "transition constraint 20",
+        "value-register non-constant (mint)",
+    );
+}
+
+#[test]
+fn nsk_register_non_constant_rejected() {
+    // DOUBLE-SPEND vector: `nsk` must be constant across input 0's segment —
+    // it binds the owner tag (ownership) AND the nullifier to the SAME secret.
+    // Perturbing the nsk register breaks nsk-constancy (constraint 16) before
+    // any hash constraint; without it a prover could derive a SECOND, distinct
+    // nullifier for an already-spent note. REJECT.
+    let (spends, outputs, _) = kat_bundle_witness();
+    let (mut cols, pub_inputs) =
+        build_bundle_columns(&spends, &outputs, 0, KAT_T_OUT, KAT_FEE).expect("build");
+    cols[NSK_COL][0] += Felt::new(1);
+    expect_circuit_reject(
+        cols,
+        &pub_inputs,
+        "transition constraint 16",
+        "nsk-register non-constant (double-spend)",
+    );
+}
+
+#[test]
+fn rho_register_non_constant_rejected() {
+    // The note randomness `rho` must be constant across input 0's segment (it
+    // binds the commitment AND the nullifier). Perturbing the rho register
+    // breaks rho-constancy (constraint 12). REJECT.
+    let (spends, outputs, _) = kat_bundle_witness();
+    let (mut cols, pub_inputs) =
+        build_bundle_columns(&spends, &outputs, 0, KAT_T_OUT, KAT_FEE).expect("build");
+    cols[RHO_COL][0] += Felt::new(1);
+    expect_circuit_reject(
+        cols,
+        &pub_inputs,
+        "transition constraint 12",
+        "rho-register non-constant",
+    );
+}
+
+#[test]
+fn verify_spend_rejects_nonzero_dummy_publics() {
+    // Defense-in-depth (audit S1 #2): even bypassing `verify_bundle`, a dummy
+    // slot presenting nonzero publics is refused by `verify_spend` BEFORE the
+    // proof is checked.
+    let (spends, outputs, _) = kat_bundle_witness();
+    let (proof, pub_inputs) =
+        prove_bundle(&spends, &outputs, 0, KAT_T_OUT, KAT_FEE).expect("prove");
+    verify_spend(&proof, &pub_inputs).expect("honest bundle verifies");
+    let d = (0..NUM_SLOTS)
+        .find(|&i| pub_inputs.input_dummy[i])
+        .expect("a dummy input slot exists in the KAT bundle");
+    let mut forged = pub_inputs.clone();
+    forged.nullifiers[d] = PqDigest::from_elements([Felt::new(1); 4]);
+    assert!(
+        matches!(
+            verify_spend(&proof, &forged),
+            Err(SpendProofError::PublicInput(_))
+        ),
+        "nonzero dummy input publics must be refused pre-proof"
+    );
+}
+
+#[test]
+fn auth_pk_swap_rejected() {
+    // Audit S1 #3: the carrier signature binds the AUTHORIZING KEY. Swapping
+    // the public key (keeping the signature) changes the recomputed digest, so
+    // `verify_bundle` refuses — the signature attests "THIS key authorized THIS
+    // bundle", not mere well-formedness.
+    let (mut bundle, anchors) = kat_carrier_bundle();
+    verify_bundle(&bundle, &anchors).expect("honest carrier bundle verifies");
+    let other = AuthKeypair::from_seed(&[0x99u8; 32]);
+    bundle.auth_pk = other.public_bytes();
+    assert!(matches!(
+        verify_bundle(&bundle, &anchors),
+        Err(BundleError::Auth)
+    ));
+}
+
 // --- Bundle layer (carrier auth + native checks). -----------------------
 
 fn kat_carrier_bundle() -> (SpendBundle, Vec<PqDigest>) {
@@ -614,7 +719,7 @@ fn kat_carrier_bundle() -> (SpendBundle, Vec<PqDigest>) {
         None,
     ];
     let auth = AuthKeypair::from_seed(&KAT_SEED);
-    let digest = bundle_digest(&pub_inputs, &cts);
+    let digest = bundle_digest(&pub_inputs, &cts, &auth.public_bytes());
     let bundle = SpendBundle {
         public_inputs: pub_inputs,
         proof_bytes: proof,
@@ -694,7 +799,7 @@ fn duplicate_nullifier_in_bundle_rejected() {
     let (proof, pub_inputs) = prove_bundle(&spends, &[], 0, 2 * KAT_VALUE_0, 0).expect("prove");
     let cts: [Option<NoteCiphertext>; 4] = [None, None, None, None];
     let auth = AuthKeypair::from_seed(&KAT_SEED);
-    let digest = bundle_digest(&pub_inputs, &cts);
+    let digest = bundle_digest(&pub_inputs, &cts, &auth.public_bytes());
     let bundle = SpendBundle {
         public_inputs: pub_inputs,
         proof_bytes: proof,

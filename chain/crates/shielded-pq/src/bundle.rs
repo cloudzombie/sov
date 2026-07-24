@@ -73,14 +73,17 @@ pub enum BundleError {
 }
 
 /// The digest the authorization signature covers (D4): the FULL public
-/// input set of the STARK proof plus every output ciphertext, so neither
-/// the value balance, the anchors/nullifiers/commitments, the dummy
-/// pattern, nor the encrypted payloads can be reshaped around a signature.
-/// (The consensus layer, W2, will additionally bind the carrier tx signer
-/// and nonce per D4.)
+/// input set of the STARK proof, every output ciphertext, AND the
+/// authorizing public key itself, so neither the value balance, the
+/// anchors/nullifiers/commitments, the dummy pattern, the encrypted
+/// payloads, nor the key the signature speaks for can be reshaped around
+/// a signature — the signature attests "THIS key authorized THIS bundle",
+/// not mere well-formedness. (The consensus layer, W2, will additionally
+/// bind the carrier tx signer and nonce per D4.)
 pub fn bundle_digest(
     public_inputs: &BundlePublicInputs,
     output_ciphertexts: &[Option<NoteCiphertext>; NUM_SLOTS],
+    auth_pk: &[u8; AUTH_PK_LEN],
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(B3_BUNDLE_DIGEST);
     for i in 0..NUM_SLOTS {
@@ -107,6 +110,11 @@ pub fn bundle_digest(
     hasher.update(&public_inputs.transparent_in.to_le_bytes());
     hasher.update(&public_inputs.transparent_out.to_le_bytes());
     hasher.update(&public_inputs.fee_grains.to_le_bytes());
+    // Audit S1 follow-up: fold the authorizing key into the signed
+    // statement (length-prefixed), so the signature binds a KEY to the
+    // bundle. W2 will additionally bind the carrier tx signer + nonce (D4).
+    hasher.update(&(AUTH_PK_LEN as u64).to_le_bytes());
+    hasher.update(auth_pk);
     *hasher.finalize().as_bytes()
 }
 
@@ -162,8 +170,8 @@ pub fn verify_bundle(bundle: &SpendBundle, valid_anchors: &[PqDigest]) -> Result
     }
     // The STARK proof over the full public-input set.
     verify_spend(&bundle.proof_bytes, pi).map_err(BundleError::Proof)?;
-    // Carrier authorization over the same set + ciphertexts.
-    let digest = bundle_digest(pi, &bundle.output_ciphertexts);
+    // Carrier authorization over the same set + ciphertexts + the key.
+    let digest = bundle_digest(pi, &bundle.output_ciphertexts, &bundle.auth_pk);
     if !verify_auth(&bundle.auth_pk, &digest, &bundle.auth_sig) {
         return Err(BundleError::Auth);
     }
