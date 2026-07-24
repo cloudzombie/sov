@@ -29,7 +29,8 @@
 //! `sov_getAccount`, `sov_getBalance`, `sov_getNonce`, `sov_getBlockByHeight`,
 //! `sov_getBlockByHash`, `sov_getBlockDigest`, `sov_getHead`,
 //! `sov_getStateRoot`, `sov_getDifficulty`, `sov_estimateFee`,
-//! `sov_getMempoolSize`, `sov_getPeerInfo` (live P2P/sync state),
+//! `sov_getMempoolSize`, `sov_getMempoolHistogram` (pending txs bucketed by
+//! effective tip + the live auction floors), `sov_getPeerInfo` (live P2P/sync state),
 //! `sov_getConfirmations`, `sov_isFinal`,
 //! `sov_getMiners`, `sov_listTokens` (paged), `sov_getTokenInfo`,
 //! `sov_getTokenBalances`, `sov_getHtlc`. SNS (Sovereign Name Service):
@@ -674,6 +675,25 @@ fn to_value<T: serde::Serialize>(v: T) -> Value {
     serde_json::to_value(v).unwrap_or(Value::Null)
 }
 
+/// Serialize a block as `{header, transactions}` — exactly as before — and ADD the
+/// block's own id as `header.hash` (the blake3 header hash the node already computes:
+/// the same id `sov_submitBlock` replies with and fork choice keys on). The id is
+/// content-derived, not stored in the serialized block, so without this a client
+/// needed a second `sov_getBlockDigest` round-trip just to learn which block it was
+/// looking at. ADDITIVE: every pre-existing field is untouched, and serde ignores
+/// unknown fields, so old typed clients (`RpcClient::block_by_height`) decode
+/// unchanged.
+fn block_with_hash(b: &Block) -> Value {
+    let hash = b.hash();
+    let mut v = to_value(b);
+    if let Some(header) = v.get_mut("header").and_then(Value::as_object_mut) {
+        // Bare hex (`to_hex`), matching the id `sov_submitBlock` replies with and
+        // `sov_getBlockByHash` accepts — the exact string a miner round-trips.
+        header.insert("hash".into(), Value::String(hash.to_hex()));
+    }
+    v
+}
+
 // ---- method dispatch ------------------------------------------------------
 
 fn call(
@@ -830,14 +850,14 @@ fn call(
             Ok(node
                 .chain()
                 .block_by_height(h)
-                .map_or(Value::Null, to_value))
+                .map_or(Value::Null, block_with_hash))
         }
         "sov_getBlockByHash" => {
             let hash = param_hash(params)?;
             Ok(node
                 .chain()
                 .block_by_hash(&hash)
-                .map_or(Value::Null, to_value))
+                .map_or(Value::Null, block_with_hash))
         }
         "sov_getReceipt" => {
             // The recorded outcome of a transaction by its id: success, or the
@@ -1005,15 +1025,88 @@ fn call(
             let gas_used = action_gas + envelope;
             let gas_price = node.chain().mining_policy().gas_price.grains();
             let fee = u128::from(gas_used).saturating_mul(gas_price);
+            // ADDITIVE (v0.1.99 miner parity): the live blockspace-auction floor,
+            // from the same mempool state as `sov_getMempoolHistogram`.
+            // `tipFloorGrains` is the tip needed to make the NEXT block right now
+            // (0 when the next template has room); `floorGrains` = base fee + that
+            // tip — the all-in cost to make the next block. Under an empty (or
+            // uncontested) mempool it equals `feeGrains`; under load it reflects
+            // the real floor. Every pre-existing field is unchanged.
+            let tip_floor = node.next_block_floor_grains();
+            let floor = fee.saturating_add(tip_floor);
             Ok(json!({
                 "kind": kind,
                 "gasUsed": gas_used,
                 "gasPriceGrains": gas_price.to_string(),
                 "feeGrains": fee.to_string(),
+                "tipFloorGrains": tip_floor.to_string(),
+                "floorGrains": floor.to_string(),
             }))
         }
         "sov_getMintReward" => Ok(to_value(node.chain().mint_reward())),
         "sov_getMempoolSize" => Ok(json!(node.mempool_len())),
+        // The pending pool bucketed by EFFECTIVE TIP — the key the v0.1.98
+        // blockspace auction orders by (`sov_mempool::effective_tip`: the grains of
+        // a top-level `Tipped` envelope, else 0) — the mempool.space-style fee
+        // histogram. Buckets are exact tip values, highest first, each with its tx
+        // count and total serialized bytes; past MAX_HISTOGRAM_BUCKETS the low-tip
+        // tail is merged into one final bucket keyed by its lowest tip. Alongside:
+        // `floorGrains` — the tip needed to make the NEXT block right now (0 when
+        // the next template has room), and `poolFloorGrains` — the admission floor
+        // a bid must beat to enter a FULL pool (the auction's `BelowFloor` price;
+        // 0 while the pool has capacity). ADDITIVE + read-only: pure serialization
+        // of existing in-memory pool state; no ordering/admission logic changes.
+        "sov_getMempoolHistogram" => {
+            let pending = node.mempool_snapshot();
+            let tx_count = pending.len();
+            let floor = node.next_block_floor_grains();
+            let pool_floor = node.mempool_entry_floor_grains();
+            let max_block_txs = node.max_block_txs();
+            // Group by exact tip value (u128 grains). BTreeMap gives ascending
+            // keys; serialized in reverse for the high→low contract.
+            let mut groups: std::collections::BTreeMap<u128, (u64, u64)> =
+                std::collections::BTreeMap::new();
+            for stx in &pending {
+                let tip = sov_mempool::effective_tip(stx).grains();
+                let bytes = borsh::to_vec(stx).map(|v| v.len() as u64).unwrap_or(0);
+                let e = groups.entry(tip).or_insert((0, 0));
+                e.0 += 1;
+                e.1 = e.1.saturating_add(bytes);
+            }
+            // Response-size bound: at most this many distinct-tip buckets; the
+            // remaining low-tip tail collapses into one final merged bucket.
+            const MAX_HISTOGRAM_BUCKETS: usize = 128;
+            let mut buckets: Vec<Value> = Vec::new();
+            let mut tail: Option<(u128, u64, u64)> = None; // (lowest tip, count, bytes)
+            for (i, (tip, (count, bytes))) in groups.iter().rev().enumerate() {
+                if i < MAX_HISTOGRAM_BUCKETS - 1 {
+                    buckets.push(json!({
+                        "feeRateGrains": tip.to_string(),
+                        "txCount": count,
+                        "totalBytes": bytes,
+                    }));
+                } else {
+                    let t = tail.get_or_insert((*tip, 0, 0));
+                    t.0 = *tip; // iteration is descending: the last seen is the lowest
+                    t.1 += count;
+                    t.2 = t.2.saturating_add(*bytes);
+                }
+            }
+            if let Some((tip, count, bytes)) = tail {
+                buckets.push(json!({
+                    "feeRateGrains": tip.to_string(),
+                    "txCount": count,
+                    "totalBytes": bytes,
+                }));
+            }
+            Ok(json!({
+                "txCount": tx_count,
+                "floorGrains": floor.to_string(),
+                "poolFloorGrains": pool_floor.to_string(),
+                "maxBlockTxs": max_block_txs,
+                "buckets": buckets,
+            }))
+        }
         // LIVE networking state — so an operator (or `curl`) can see EXACTLY why two
         // nodes do or don't see each other, without reading GUI logs. `chainId` +
         // `genesisHash` are what peers handshake on (a mismatch ⇒ they can NEVER
@@ -1421,6 +1514,18 @@ fn call(
             // can splice a candidate nonce in place without re-encoding the header).
             let preimage = header.pow_preimage();
             let nonce_offset = preimage.len().saturating_sub(8);
+            // ADDITIVE (v0.1.99 miner parity): the ids of the transactions this
+            // template ALREADY selected (the exact set `txRoot` commits to, in
+            // block order — the same ids `sov_getBlockDigest` reports once mined),
+            // so a miner UI can show what it is mining without a second call.
+            // Serialization only: selection, `blob`, `templateId`, `txRoot`, and
+            // all mining semantics are untouched.
+            let tx_ids: Vec<Value> = candidate
+                .block()
+                .transactions
+                .iter()
+                .map(|stx| Value::String(stx.id().to_hex()))
+                .collect();
             let resp = json!({
                 "templateId": template_id.to_hex(),
                 "height": header.height.get(),
@@ -1438,6 +1543,8 @@ fn call(
                 "versionBits": header.version_bits,
                 "blob": hex::encode(&preimage),
                 "nonceOffset": nonce_offset,
+                "txCount": tx_ids.len(),
+                "txIds": tx_ids,
             });
             ctx.templates.insert(template_id, candidate);
             Ok(resp)

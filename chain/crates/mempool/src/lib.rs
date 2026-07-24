@@ -739,6 +739,57 @@ impl Mempool {
         }
         out
     }
+
+    // ── Read-only auction telemetry (v0.1.99 miner-parity RPC) ────────────────
+    // Pure observers over the SAME state the auction already maintains — they call
+    // the existing ordering/eviction logic, never change it, and mutate nothing.
+
+    /// The pool's current ADMISSION floor, in grains: the [`effective_tip`] a NEW
+    /// bid must strictly beat to be admitted when the pool is full. `0` while free
+    /// capacity remains (any bid is admitted — Rule A) — otherwise the lowest tip
+    /// among per-signer TAILS, the safely-evictable set [`insert`](Self::insert)
+    /// prices an incoming bid against (the `floor` a [`MempoolError::BelowFloor`]
+    /// reports). Read-only: serializes what admission already computes; changes no
+    /// ordering or admission rule.
+    pub fn entry_floor_grains(&self) -> u128 {
+        if self.by_id.len() < self.capacity {
+            return 0;
+        }
+        let senders: BTreeSet<&AccountId> = self.by_sender.keys().map(|(s, _)| s).collect();
+        senders
+            .into_iter()
+            .filter_map(|signer| {
+                self.by_sender
+                    .range((signer.clone(), 0)..=(signer.clone(), u64::MAX))
+                    .next_back()
+                    .map(|(_, id)| effective_tip(&self.by_id[id]).grains())
+            })
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// The tip (grains) currently needed to MAKE THE NEXT BLOCK: `0` when the
+    /// next block template has spare room (any tip — including zero — gets in),
+    /// otherwise the lowest [`effective_tip`] among the transactions
+    /// [`select`](Self::select) would put in a `max`-slot block right now — the
+    /// marginal bid a newcomer must beat. Computed by running the UNCHANGED
+    /// selection (`&self`, no mutation) and reading its minimum; purely a
+    /// read-only view of the auction's existing ordering.
+    pub fn next_block_floor_grains<F: Fn(&AccountId) -> u64>(
+        &self,
+        current_nonce: F,
+        max: usize,
+    ) -> u128 {
+        let batch = self.select(current_nonce, max);
+        if batch.len() < max {
+            return 0;
+        }
+        batch
+            .iter()
+            .map(|stx| effective_tip(stx).grains())
+            .min()
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]

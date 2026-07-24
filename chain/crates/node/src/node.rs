@@ -92,6 +92,30 @@ impl Node {
         self.mempool.len()
     }
 
+    /// The most transactions one block may carry — the auction's blockspace bound
+    /// (read-only; the same value `build_candidate` selects with).
+    pub fn max_block_txs(&self) -> usize {
+        self.max_block_txs
+    }
+
+    /// Read-only auction telemetry: the pool's current ADMISSION floor in grains —
+    /// the tip a new bid must strictly beat to enter a FULL pool (`0` while free
+    /// capacity remains). See [`Mempool::entry_floor_grains`].
+    pub fn mempool_entry_floor_grains(&self) -> u128 {
+        self.mempool.entry_floor_grains()
+    }
+
+    /// Read-only auction telemetry: the tip (grains) currently needed to make the
+    /// NEXT block — `0` when the next template has spare room, else the marginal
+    /// selected bid. Runs the unchanged mempool selection against live ledger
+    /// nonces (exactly as `build_candidate` does) and reads its minimum; mutates
+    /// nothing. See [`Mempool::next_block_floor_grains`].
+    pub fn next_block_floor_grains(&self) -> u128 {
+        let ledger = self.chain.ledger();
+        self.mempool
+            .next_block_floor_grains(|a| ledger.account(a).nonce, self.max_block_txs)
+    }
+
     /// The next nonce a new transaction from `signer` should use: the account's
     /// committed on-chain nonce plus any transactions it already has pending in the
     /// pool. A wallet building back-to-back sends must use THIS (not the bare

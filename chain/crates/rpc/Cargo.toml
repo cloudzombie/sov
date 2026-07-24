@@ -16,6 +16,7 @@ sov-intents = { path = "../intents" }
 sov-chain = { path = "../chain" }
 sov-governance = { path = "../governance" }
 sov-node = { path = "../node" }
+sov-mempool = { path = "../mempool" }
 sov-network = { path = "../network" }
 sov-mining = { path = "../mining" }
 sov-pow = { path = "../pow" }

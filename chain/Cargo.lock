@@ -1987,6 +1987,7 @@ dependencies = [
  "sov-crypto",
  "sov-governance",
  "sov-intents",
+ "sov-mempool",
  "sov-mining",
  "sov-network",
  "sov-node",
