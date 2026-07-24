@@ -135,7 +135,7 @@ pub const ACTIVE_ROWS: usize = OUTPUTS_START_ROW + NUM_SLOTS * OUTPUT_SEGMENT_RO
 /// Rows allocated per range-check segment (61 used + 3 slack).
 pub const RC_SEGMENT_ROWS: usize = 64;
 
-/// Sponge capacity seed for a 2-to-1 merge (`Rp64_256` sets capacity[0] to
+/// Sponge capacity seed for a 2-to-1 merge (`Rp64_256` sets `capacity[0]` to
 /// the rate width, 8).
 pub const CAPACITY_SEED: u64 = 8;
 

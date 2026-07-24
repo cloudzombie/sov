@@ -9,7 +9,7 @@
 //!
 //! The digest type [`PqDigest`] is 4 field elements (32 bytes). All composite
 //! structures (note commitments, nullifiers, Merkle nodes) are built from the
-//! single 2-to-1 compression [`merge`], which is byte-identical to
+//! single 2-to-1 compression [`merge_domain`], which is byte-identical to
 //! `Rp64_256::merge` (pinned by a test).
 
 use winter_crypto::hashers::Rp64_256;
