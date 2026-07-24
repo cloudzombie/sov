@@ -1,0 +1,17 @@
+{
+  "_comment": "ssh backend host list: node-K runs on the K-th entry. Every host needs the harness machine's key installed and a writable workdir. RPC/P2P ports come from --base-rpc/--base-p2p; the node configs must carry addresses valid ON the hosts (bring-up step).",
+  "hosts": [
+    {
+      "host": "10.0.0.11",
+      "user": "sov",
+      "key": "~/.ssh/sov_e2e_vm",
+      "workdir": "/home/sov/e2e"
+    },
+    {
+      "host": "10.0.0.12",
+      "user": "sov",
+      "key": "~/.ssh/sov_e2e_vm",
+      "workdir": "/home/sov/e2e"
+    }
+  ]
+}

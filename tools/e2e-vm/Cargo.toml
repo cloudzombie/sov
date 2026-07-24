@@ -1,0 +1,21 @@
+[package]
+name = "sov-e2e-vm"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "S8a Live end-to-end harness: stands up a REAL isolated multi-node SOV network (real sov-rpcd binaries, real P2P, real PoW) and drives it through the W8 lifecycle matrix, asserting every step."
+
+# Standalone tool — intentionally NOT a member of the chain workspace (the
+# `tools/conformance` precedent), so it never affects `chain/` builds, tests, or
+# CI. It deliberately carries NO chain-crate dependencies: every key it uses is
+# derived by the REAL `sov-wallet` binary, every fact it asserts is read live
+# over JSON-RPC from a REAL `sov-rpcd` node — nothing is re-implemented, so the
+# harness can never "agree with itself" instead of with the chain.
+
+[[bin]]
+name = "sov-e2e"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
