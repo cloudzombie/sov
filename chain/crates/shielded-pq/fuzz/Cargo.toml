@@ -1,0 +1,55 @@
+# libFuzzer harness for sov-shielded-pq's TOTAL decoders (S1c/D15).
+#
+# This crate is deliberately its OWN workspace (empty [workspace] below),
+# NOT a member of the chain workspace: fuzzing needs nightly + libfuzzer
+# instrumentation and must never enter normal builds. Run with:
+#
+#   cd chain/crates/shielded-pq/fuzz
+#   cargo +nightly fuzz run fuzz_bundle_decode -- -max_total_time=60
+#   cargo +nightly fuzz run fuzz_proof_decode -- -max_total_time=60
+#   cargo +nightly fuzz run fuzz_note_ciphertext_decode -- -max_total_time=60
+#
+# Each target asserts (a) no panic anywhere in the decoder, (b) the
+# catch_unwind last line of defense never fires (DecodePanic), and (c)
+# accepted encodings re-encode byte-identically (canonical format).
+
+[package]
+name = "sov-shielded-pq-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sov-shielded-pq = { path = ".." }
+
+[[bin]]
+name = "fuzz_bundle_decode"
+path = "fuzz_targets/fuzz_bundle_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_proof_decode"
+path = "fuzz_targets/fuzz_proof_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_note_ciphertext_decode"
+path = "fuzz_targets/fuzz_note_ciphertext_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Keep this crate out of the chain workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1

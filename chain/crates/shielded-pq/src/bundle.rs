@@ -31,6 +31,7 @@ use crate::note::MAX_NOTE_VALUE;
 use crate::prover::{verify_spend, SpendProofError};
 
 /// A full spend bundle.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpendBundle {
     /// The public inputs the STARK proof is verified against. Everything
     /// value-related in here is either a hiding commitment output or one of

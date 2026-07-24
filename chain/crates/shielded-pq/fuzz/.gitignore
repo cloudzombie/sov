@@ -1,0 +1,9 @@
+# Build + crash-repro dirs (crashes must never be silently committed —
+# a finding becomes a regression test in tests/decode_hardening.rs).
+target/
+artifacts/
+# Machine-discovered corpus entries (hash-named) stay local; only the
+# curated .bin seeds written by `generate_fuzz_corpus` are committed.
+corpus/**
+!corpus/*/
+!corpus/**/*.bin

@@ -42,6 +42,16 @@ pub enum SpendProofError {
     /// The winterfell prover failed.
     #[error("prover error: {0}")]
     Prover(String),
+    /// The proof frame failed structural pre-validation (S1c/D15): the
+    /// bytes were rejected BEFORE winterfell saw them.
+    #[error("malformed proof frame: {0}")]
+    Frame(#[from] crate::proof_frame::ProofFrameError),
+    /// The winterfell decoder panicked on input that had passed frame
+    /// pre-validation. Unreachable by construction (the pre-validator
+    /// covers every audited panic path); kept as the typed result of the
+    /// `catch_unwind` last line of defense in [`decode_proof`].
+    #[error("proof decoder panicked on pre-validated input (winterfell bug — report upstream)")]
+    DecodePanic,
     /// Proof deserialization or verification failed.
     #[error("verification failed: {0}")]
     Verification(String),
@@ -487,6 +497,9 @@ pub fn verify_spend(
     proof_bytes: &[u8],
     pub_inputs: &BundlePublicInputs,
 ) -> Result<(), SpendProofError> {
+    // S1c/D15: decoding below goes through `decode_proof`, the single
+    // TOTAL decode entry point (frame pre-validation, then a
+    // catch_unwind-guarded winterfell decode).
     if pub_inputs.transparent_in > MAX_NOTE_VALUE || pub_inputs.transparent_out > MAX_NOTE_VALUE {
         return Err(SpendProofError::PublicInput("transparent leg too large"));
     }
@@ -504,8 +517,7 @@ pub fn verify_spend(
             return Err(SpendProofError::PublicInput("nonzero dummy output publics"));
         }
     }
-    let proof = Proof::from_bytes(proof_bytes)
-        .map_err(|e| SpendProofError::Verification(format!("malformed proof: {e}")))?;
+    let proof = decode_proof(proof_bytes, pub_inputs)?;
     let acceptable = AcceptableOptions::OptionSet(vec![proof_options()]);
     winterfell::verify::<BundleAir, CarrierHash, CarrierCoin, CarrierVc>(
         proof,
@@ -513,4 +525,36 @@ pub fn verify_spend(
         &acceptable,
     )
     .map_err(|e| SpendProofError::Verification(e.to_string()))
+}
+
+/// The single TOTAL decode entry point for serialized bundle proofs
+/// (S1c/D15): for ANY byte string this returns `Ok(Proof)` or a typed
+/// `Err` — it never panics.
+///
+/// Defense in depth, in order:
+///
+/// 1. [`crate::proof_frame::validate_proof_frame`] — the catch-free
+///    pre-validator. It structurally walks the full winterfell proof
+///    layout (context byte-pinned to this circuit's canonical context,
+///    every declared length checked against actual remaining bytes) and
+///    rejects, with a typed error, every input on which
+///    `Proof::from_bytes` could panic, abort, or over-allocate. THIS is
+///    what makes a winterfell panic unreachable.
+/// 2. `catch_unwind` around the winterfell decode — the LAST line of
+///    defense, not the first: if some unaudited winterfell path still
+///    panicked on pre-validated input, the panic is converted to
+///    [`SpendProofError::DecodePanic`] at this boundary instead of
+///    crossing into the caller (in consensus: instead of crashing the
+///    node). The fuzz targets assert this variant is never produced.
+///
+/// `pub_inputs` selects the expected canonical context (the assertion
+/// count depends on the public dummy pattern).
+pub fn decode_proof(
+    proof_bytes: &[u8],
+    pub_inputs: &BundlePublicInputs,
+) -> Result<Proof, SpendProofError> {
+    crate::proof_frame::validate_proof_frame(proof_bytes, pub_inputs)?;
+    let decoded = std::panic::catch_unwind(|| Proof::from_bytes(proof_bytes))
+        .map_err(|_| SpendProofError::DecodePanic)?;
+    decoded.map_err(|e| SpendProofError::Verification(format!("malformed proof: {e}")))
 }

@@ -126,6 +126,50 @@ carry the D7 4-byte detection checksum
 (`blake3_derive_key(detect, shared_secret)[..4]`), checked before any AEAD
 work so wallet trial-decapsulation scanning stays ~µs per foreign note.
 
+### Total deserialization + proof_version gate (S1c) — hardened
+
+The D15 BLOCKER (a malformed proof header could PANIC inside
+`winterfell::Proof::from_bytes` — in consensus, a remote crash DoS from
+any peer) is closed. All bundle/proof deserialization is now TOTAL: every
+malformed input returns a typed `Err`, never panics, never aborts.
+
+- **Audited upstream hazards** (winterfell 0.13.1, documented in
+  `src/proof_frame.rs`): `ProofOptions::new` / `PartitionOptions::new` /
+  `TraceInfo` asserts reachable from `read_from` (a one-byte option-header
+  corruption panics — reproduced by the
+  `raw_winterfell_decode_panics_on_corrupt_option_header` evidence test),
+  a `2^trace_length_byte` overflow, and `Vec::with_capacity(len)` on
+  attacker-declared vint lengths up to `u64::MAX` in the query sections
+  (at best a catchable "capacity overflow" panic, at worst an uncatchable
+  allocation abort).
+- **Catch-free pre-validator** (`proof_frame::validate_proof_frame`):
+  before winterfell sees any bytes, the full proof layout is walked with a
+  total bounds-checked cursor — size cap (128 KiB), the proof context
+  byte-pinned to the canonical context an honest prover emits for this
+  circuit + public dummy pattern (killing every header assert path), every
+  declared section length checked against the bytes actually present
+  (killing the allocation paths), unique-query count bounded, trailing
+  bytes rejected. `prover::decode_proof` is the single decode entry point;
+  it additionally wraps the winterfell decode in `catch_unwind` as a LAST
+  line of defense (typed `DecodePanic`, asserted unreachable by the fuzz
+  targets).
+- **proof_version gate (D6)**: the v1 bundle wire format (`src/wire.rs`)
+  starts with a `proof_version` byte; v0.2.0 = 1; any other version is a
+  clean typed reject (`WireError::UnknownProofVersion`), never a panic,
+  never a silent skip. The codec is total AND canonical (strict flags,
+  canonical digest encodings, exact lengths, no trailing bytes):
+  `encode(decode(b)) == b` for every accepted `b`. New wire KATs pinned
+  (publics header, canonical context bytes, note-ciphertext encoding) —
+  these are NEW pins, not re-pins: the bundle had no wire format before
+  S1c.
+- **Fuzzed** (`fuzz/` sub-crate, libFuzzer via cargo-fuzz on nightly,
+  curated seed corpus committed): 60 s per target on the dev machine,
+  ZERO crashes/panics/leaks — `fuzz_bundle_decode` 2,428,702 execs,
+  `fuzz_proof_decode` 1,024,107 execs, `fuzz_note_ciphertext_decode`
+  8,633,735 execs. A deterministic structured-random hammer
+  (`random_and_mutated_inputs_never_panic`, ~12k inputs) lives
+  permanently in `cargo test` for toolchains without nightly.
+
 ### Explicitly NOT proven (deferred, with owners)
 
 - **Spend authorization is a carrier ML-DSA-65 signature** over the full
@@ -133,9 +177,6 @@ work so wallet trial-decapsulation scanning stays ~µs per foreign note.
   In-circuit spend auth is a future proof_version (pinned trade-off).
 - **Dummy flags are public**: bundle arity (≤ 4 per side) is visible.
   Values, owners, and linkages are not.
-- **Winterfell deserialization robustness** (S1c, pending): a malformed
-  proof header can panic inside `Proof::from_bytes` rather than return an
-  error — BLOCKER-classed (D15), owned by S1c with fuzz targets.
 - **Parameter review to a written 128-bit target** (S1d, pending): current
   FRI parameters are 42 queries × blowup 8 + 16-bit grinding, quadratic
   extension — 127 bits conjectured, less under proven FRI bounds.
@@ -148,7 +189,9 @@ work so wallet trial-decapsulation scanning stays ~µs per foreign note.
 1. ~~Value-hiding conservation in-circuit~~ — **DONE (S1a, proven
    in-circuit with negative tests).**
 2. ~~Output-note integrity in-circuit~~ — **DONE (S1a).**
-3. Proof deserialization hardening + fuzz (S1c) and parameter review (S1d).
+3. ~~Proof deserialization hardening + fuzz~~ — **DONE (S1c: total
+   decoders, proof_version gate, fuzzed with zero crashes).** Parameter
+   review (S1d) remains pending.
 4. In-circuit spend authorization (future proof_version, per D4).
 5. Consensus wiring, keys/addresses, wallet, RPC/CLI/KAT/SDK, Station (W2–W5).
 6. Aggregation (recursive or batched FRI) if throughput demands it.
@@ -197,7 +240,9 @@ Pool v2 does NOT ship to consensus until ALL of:
   proven (not conjectured) soundness bounds, Goldilocks-field security
   margins with the quadratic extension.
 - The winterfell dependency pinned + reviewed (or replaced by an audited
-  prover), and its deserialization panic-hardened.
+  prover). (Its deserialization is panic-hardened as of S1c — total
+  pre-validated decode + fuzz evidence; the audit still owns confirming
+  it.)
 - Proof-size/throughput budget accepted: at ~55 KB per 4-in/4-out bundle,
   a 2 MB blockspace budget carries ~36 bundles (up to 144 spends) per block
   unaggregated; D10 owns the size-cap audit.

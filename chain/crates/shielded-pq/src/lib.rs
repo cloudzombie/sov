@@ -36,10 +36,12 @@
 //!   (pinned trade-off D4; a future proof_version revisits it).
 //! - Dummy-slot flags are public: the bundle's real arity (≤ 4 each side)
 //!   is visible. Values, owners, and note linkages are not.
-//! - Proof deserialization hardening + fuzzing (S1c) and the written
-//!   128-bit parameter review (S1d) are separate, pending slices;
-//!   `winterfell::Proof::from_bytes` panic paths remain a known BLOCKER
-//!   for any consensus exposure (D15).
+//! - The written 128-bit parameter review (S1d) is a separate, still
+//!   pending slice. (Deserialization is HARDENED as of S1c: all bundle
+//!   and proof decoding is total — [`wire`], [`proof_frame`],
+//!   [`prover::decode_proof`] — version-gated per D6 and fuzzed; the
+//!   `winterfell::Proof::from_bytes` panic paths of D15 are unreachable
+//!   behind the frame pre-validator.)
 //! - Proof parameters, the Rescue-Prime instance, and winterfell itself
 //!   have not been externally audited for this use.
 //!
@@ -53,8 +55,10 @@ pub mod domains;
 pub mod encrypt;
 pub mod hash;
 pub mod note;
+pub mod proof_frame;
 pub mod prover;
 pub mod tree;
+pub mod wire;
 
 pub use air::BundlePublicInputs;
 pub use auth::AuthKeypair;
@@ -62,5 +66,7 @@ pub use bundle::{bundle_digest, verify_bundle, BundleError, SpendBundle};
 pub use encrypt::{encrypt_note, EncryptionKeypair, NoteCiphertext};
 pub use hash::PqDigest;
 pub use note::{Note, SpendingKey, MAX_NOTE_VALUE, VALUE_BITS};
-pub use prover::{prove_bundle, verify_spend, BundleSpend};
+pub use proof_frame::{validate_proof_frame, ProofFrameError, MAX_PROOF_LEN};
+pub use prover::{decode_proof, prove_bundle, verify_spend, BundleSpend};
 pub use tree::{CommitmentTree, MerklePath};
+pub use wire::{decode_bundle, encode_bundle, WireError, PROOF_VERSION_V1};
