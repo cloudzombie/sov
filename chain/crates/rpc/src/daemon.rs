@@ -2153,6 +2153,44 @@ mod tests {
     }
 
     #[test]
+    fn shielded_v2_bit_is_defined_but_not_armed() {
+        // v0.2.0 D13 pin: the `shielded-v2` deployment owns signal bit 2 in
+        // the registry (`sov_governance::BIT_SHIELDED_V2`) but v0.2.0 ARMS
+        // NOTHING — the mainnet preset schedules only bits 0 and 1 and its
+        // signal mask must not set bit 2. If this test ever fails, someone
+        // armed the PQ pool without the arming release + external audit the
+        // program mandates. (The registry also guarantees the bit cannot
+        // collide with the armed ones.)
+        assert_eq!(sov_governance::BIT_SHIELDED_V2, 2);
+        assert_eq!(sov_governance::SHIELDED_V2_DEPLOYMENT, "shielded-v2");
+        assert_ne!(
+            sov_governance::BIT_SHIELDED_V2,
+            sov_governance::BIT_TX_DOMAIN
+        );
+        assert_ne!(
+            sov_governance::BIT_SHIELDED_V2,
+            sov_governance::BIT_FEE_AUCTION
+        );
+        let baked = baked_deployments("sov-mainnet").expect("mainnet preset is baked");
+        assert_eq!(baked.tx_domain.bit, sov_governance::BIT_TX_DOMAIN);
+        assert_eq!(
+            baked.fee_auction.as_ref().map(|d| d.bit),
+            Some(sov_governance::BIT_FEE_AUCTION)
+        );
+        assert_eq!(
+            baked.signal_mask & (1 << sov_governance::BIT_SHIELDED_V2),
+            0,
+            "mainnet must NOT signal bit 2 — shielded-v2 is unarmed in v0.2.0"
+        );
+        // The rehearsal preset arms bit 0 only — bit 2 untouched there too.
+        let rehearsal = baked_deployments("sov-e2e-v020-s8a").expect("rehearsal preset");
+        assert_eq!(
+            rehearsal.signal_mask & (1 << sov_governance::BIT_SHIELDED_V2),
+            0
+        );
+    }
+
+    #[test]
     fn e2e_rehearsal_namespace_arms_a_real_bit0_deployment_and_never_shadows_mainnet() {
         // The reserved harness namespace (`tools/e2e-vm`) gets a REAL BIP-9
         // deployment on compressed windows — the same state machine and the same

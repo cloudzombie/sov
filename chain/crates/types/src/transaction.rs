@@ -367,6 +367,69 @@ pub enum Action {
         #[borsh(deserialize_with = "bounded_nested_action")]
         inner: Box<Action>,
     },
+    /// A **post-quantum shielded pool (pool v2)** action carrying a serialized
+    /// STARK spend bundle (see `sov-shielded-pq`'s wire format: a leading
+    /// `proof_version` byte — decision D6, unknown versions are a clean typed
+    /// reject — then the bundle's public inputs, proof, note ciphertexts, and
+    /// ML-DSA-65 carrier authorization). Appended LAST so every existing
+    /// action's Borsh discriminant — and thus genesis `cb0272ff…` and every
+    /// KAT vector — is byte-identical.
+    ///
+    /// **DORMANT** (v0.2.0): the `shielded-v2` deployment (signal bit 2) is
+    /// defined but NOT armed, so execution hard-rejects this variant as
+    /// `FeatureInactive` everywhere — a block carrying one is invalid on
+    /// every node, uniformly, exactly as `Tipped` was before the fee-auction
+    /// activated. Execution semantics (STARK verification, anchors,
+    /// nullifiers, turnstile, value balance) land in slice S2c behind the
+    /// activation gate.
+    ///
+    /// This is a **leaf** action: it never wraps another action (so the
+    /// bounded-depth recursive decode above is untouched), and its payload is
+    /// decode-capped at [`MAX_SHIELDED_V2_BUNDLE_BYTES`] before any
+    /// allocation, so an attacker-declared length can never drive memory use.
+    ShieldedV2 {
+        /// The canonical byte encoding of the v2 spend bundle
+        /// (`sov_shielded_pq::wire`). Opaque at this layer; decode-capped.
+        #[borsh(deserialize_with = "bounded_v2_bundle_bytes")]
+        bundle: Vec<u8>,
+    },
+}
+
+/// Maximum bytes accepted when Borsh-**decoding** an [`Action::ShieldedV2`]
+/// bundle payload — checked BEFORE any allocation, so a hostile declared
+/// length can neither balloon memory nor abort the process.
+///
+/// Sized to admit every wire-valid v1 bundle with margin: the
+/// `sov-shielded-pq` v1 wire layout maxes out at 141,486 bytes
+/// (fixed header/publics 421 + proof ≤ 131,072 bytes — the wire codec's
+/// `MAX_PROOF_LEN` of 128 KiB — + 4 note ciphertexts ≤ 4,732 + ML-DSA-65
+/// pk 1,952 + sig 3,309); a typical
+/// bundle is ~62 KB. 144 KiB ≥ that maximum, so no bundle the wire codec
+/// could ever accept is bricked by this cap, while anything larger is
+/// rejected at decode with a clean error on every node identically. The cap
+/// is decode-layer DoS armor only — semantic size/weight rules are slice
+/// S2d's; the byte format itself (u32 length + bytes) is the standard Borsh
+/// `Vec<u8>` encoding, untouched.
+pub const MAX_SHIELDED_V2_BUNDLE_BYTES: usize = 144 * 1024;
+
+/// Size-capped Borsh decode for the [`Action::ShieldedV2`] payload (wired in
+/// via `#[borsh(deserialize_with)]`). Reads the exact same bytes as the
+/// default `Vec<u8>` decoder — the wire format is untouched — but rejects a
+/// declared length above [`MAX_SHIELDED_V2_BUNDLE_BYTES`] BEFORE allocating,
+/// and only then reads exactly that many bytes.
+fn bounded_v2_bundle_bytes<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Vec<u8>> {
+    let len = u32::deserialize_reader(reader)? as usize;
+    if len > MAX_SHIELDED_V2_BUNDLE_BYTES {
+        return Err(borsh::io::Error::new(
+            borsh::io::ErrorKind::InvalidData,
+            "ShieldedV2 bundle exceeds MAX_SHIELDED_V2_BUNDLE_BYTES",
+        ));
+    }
+    // Bounded above, so this allocation is at most the cap; read_exact then
+    // fails cleanly if the payload is truncated.
+    let mut bundle = vec![0u8; len];
+    reader.read_exact(&mut bundle)?;
+    Ok(bundle)
 }
 
 /// Maximum nesting depth accepted when Borsh-**decoding** an [`Action`].
@@ -939,6 +1002,146 @@ mod tests {
             borsh::from_slice::<SignedTransaction>(&bytes).unwrap(),
             signed
         );
+    }
+
+    // ── Action::ShieldedV2 (v0.2.0 S2b): appended variant, bounded decode ────
+
+    /// The Borsh discriminant of every PRE-v2 action, pinned by (variant,
+    /// index). `ShieldedV2` was APPENDED, so if any of these ever moves — a
+    /// reorder, an insertion, a removal — the wire format of live mainnet
+    /// transactions changes and this fails loudly.
+    #[test]
+    fn existing_action_discriminants_are_frozen_and_shielded_v2_is_appended() {
+        fn discriminant(a: &Action) -> u8 {
+            borsh::to_vec(a).unwrap()[0]
+        }
+        assert_eq!(discriminant(&sample_transfer()), 0);
+        assert_eq!(discriminant(&Action::ClaimVesting), 1);
+        assert_eq!(discriminant(&Action::Deploy { code: vec![] }), 2);
+        assert_eq!(
+            discriminant(&Action::Shielded { bundle: vec![] }),
+            4,
+            "the v1 pool action keeps its discriminant"
+        );
+        assert_eq!(
+            discriminant(&Action::Tipped {
+                tip: Balance::ZERO,
+                inner: Box::new(sample_transfer()),
+            }),
+            30,
+            "Tipped stays the v0.1.98 tail discriminant"
+        );
+        assert_eq!(
+            discriminant(&Action::ShieldedV2 { bundle: vec![] }),
+            31,
+            "ShieldedV2 is APPENDED after Tipped — never renumber"
+        );
+    }
+
+    #[test]
+    fn shielded_v2_roundtrips_byte_identical_and_matches_default_vec_encoding() {
+        // The bounded decoder must read the EXACT default Borsh Vec<u8> wire
+        // format: encode → decode → re-encode is the identity, and the
+        // encoding equals discriminant ‖ u32 len ‖ bytes.
+        let action = Action::ShieldedV2 {
+            bundle: vec![7u8; 1234],
+        };
+        let bytes = borsh::to_vec(&action).unwrap();
+        let mut expected = vec![31u8];
+        expected.extend_from_slice(&1234u32.to_le_bytes());
+        expected.extend_from_slice(&[7u8; 1234]);
+        assert_eq!(bytes, expected, "standard Borsh Vec<u8> layout");
+        let back: Action = borsh::from_slice(&bytes).unwrap();
+        assert_eq!(back, action);
+        assert_eq!(borsh::to_vec(&back).unwrap(), bytes);
+    }
+
+    /// Raw `ShieldedV2` encoding claiming `len` payload bytes, carrying `have`
+    /// actual bytes.
+    fn v2_bytes(len: u32, have: usize) -> Vec<u8> {
+        let mut out = vec![31u8];
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&vec![0xAAu8; have]);
+        out
+    }
+
+    #[test]
+    fn shielded_v2_bundle_size_cap_is_exact_and_pre_allocation() {
+        // AT the cap decodes; ONE byte over is rejected — identically on
+        // every node (a consensus-relevant line, drawn once).
+        let cap = MAX_SHIELDED_V2_BUNDLE_BYTES;
+        let at_cap: Action = borsh::from_slice(&v2_bytes(cap as u32, cap)).expect("cap decodes");
+        assert_eq!(
+            at_cap,
+            Action::ShieldedV2 {
+                bundle: vec![0xAA; cap]
+            }
+        );
+        assert!(borsh::from_slice::<Action>(&v2_bytes(cap as u32 + 1, cap + 1)).is_err());
+        // A hostile header declaring u32::MAX with NO payload behind it must
+        // be rejected by the length check alone — before any allocation
+        // could be attempted (this returns quickly, it does not try to read
+        // or reserve 4 GiB).
+        assert!(borsh::from_slice::<Action>(&v2_bytes(u32::MAX, 0)).is_err());
+        // A truncated payload (honest length, missing bytes) fails cleanly.
+        assert!(borsh::from_slice::<Action>(&v2_bytes(100, 50)).is_err());
+        // The cap admits every wire-valid v1 bundle (max 141,486 bytes).
+        assert!(cap >= 141_486, "no valid bundle may ever be bricked");
+    }
+
+    #[test]
+    fn shielded_v2_is_a_leaf_and_the_recursive_depth_bound_is_untouched() {
+        // ShieldedV2 wraps nothing, so it can only appear as the INNERMOST
+        // action of the recursive envelopes; the depth-bounded decoder must
+        // treat it exactly like any other leaf (decodes at the cap, rejected
+        // one level deeper).
+        let leaf = Action::ShieldedV2 {
+            bundle: vec![1, 2, 3],
+        };
+        let leaf_bytes = borsh::to_vec(&leaf).unwrap();
+        let shallow = Action::Tipped {
+            tip: Balance::from_sov(1).unwrap(),
+            inner: Box::new(leaf.clone()),
+        };
+        let shallow_bytes = borsh::to_vec(&shallow).unwrap();
+        assert_eq!(
+            borsh::from_slice::<Action>(&shallow_bytes).unwrap(),
+            shallow,
+            "Tipped{{ShieldedV2}} round-trips (legality is execution's call)"
+        );
+        // Synthesize deep nesting around the ShieldedV2 leaf via the same
+        // splice used by the depth tests above.
+        let pos = shallow_bytes
+            .windows(leaf_bytes.len())
+            .position(|w| w == leaf_bytes)
+            .expect("leaf encoding embedded");
+        let (pre, post) = (
+            &shallow_bytes[..pos],
+            &shallow_bytes[pos + leaf_bytes.len()..],
+        );
+        let deep = |depth: usize| {
+            let mut out = Vec::new();
+            for _ in 0..depth {
+                out.extend_from_slice(pre);
+            }
+            out.extend_from_slice(&leaf_bytes);
+            for _ in 0..depth {
+                out.extend_from_slice(post);
+            }
+            out
+        };
+        assert!(borsh::from_slice::<Action>(&deep(MAX_ACTION_DEPTH as usize)).is_ok());
+        assert!(borsh::from_slice::<Action>(&deep(MAX_ACTION_DEPTH as usize + 1)).is_err());
+    }
+
+    #[test]
+    fn shielded_v2_serde_json_shape_and_roundtrip() {
+        let action = Action::ShieldedV2 {
+            bundle: vec![1, 2, 3],
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        assert!(json.contains("\"type\":\"shielded_v2\""));
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), action);
     }
 
     #[test]

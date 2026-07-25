@@ -1,9 +1,14 @@
 //! # sov-shielded-pq — post-quantum shielded pool core (pool v2, pre-audit)
 //!
-//! **This crate is NOT wired into consensus, carries no `Action` variant,
-//! and nothing here enters the trust path until it has an external audit
-//! and parameter review** (the v0.2.0 program ships it DORMANT behind a
-//! BIP-9 deployment; see `notes/v0.2.0-program.md`).
+//! **Everything here is DORMANT: the `shielded-v2` deployment (signal
+//! bit 2) is defined but NOT armed, so no chain executes any of this code
+//! in consensus today, and nothing here enters the trust path until it has
+//! an external audit and parameter review** (see `notes/v0.2.0-program.md`).
+//! As of v0.2.0 slices S2a/S2b the pool's *consensus state shape* exists
+//! ([`state`], folded into the ledger root only once non-empty) and the
+//! `Action::ShieldedV2` carrier variant exists (appended, size-capped,
+//! hard-rejected `FeatureInactive` at execution) — both inert until an
+//! explicit, separately-audited arming release schedules bit 2.
 //!
 //! ## What it is
 //!
@@ -57,6 +62,7 @@ pub mod hash;
 pub mod note;
 pub mod proof_frame;
 pub mod prover;
+pub mod state;
 pub mod tree;
 pub mod wire;
 
@@ -68,5 +74,6 @@ pub use hash::PqDigest;
 pub use note::{Note, SpendingKey, MAX_NOTE_VALUE, VALUE_BITS};
 pub use proof_frame::{validate_proof_frame, ProofFrameError, MAX_PROOF_LEN};
 pub use prover::{decode_proof, prove_bundle, verify_spend, BundleSpend};
+pub use state::{ShieldedV2State, ShieldedV2StateError, ANCHOR_RING_LEN, MAX_V2_NOTES};
 pub use tree::{CommitmentTree, MerklePath};
 pub use wire::{decode_bundle, encode_bundle, WireError, PROOF_VERSION_V1};

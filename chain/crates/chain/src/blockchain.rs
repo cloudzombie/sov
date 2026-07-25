@@ -3341,6 +3341,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shielded_v2_is_dormant_everywhere() {
+        // v0.2.0 S2b: the `shielded-v2` deployment (bit 2) is DEFINED but NOT
+        // armed — there is no schedule on any chain, so `Action::ShieldedV2`
+        // is inert at every height: the producer excludes it, and a block
+        // smuggling one in is rejected on import. Pre-v2 behavior,
+        // byte-identical (the same dormant contract `Tipped` honored before
+        // the fee-auction activated). The chain state proves it too: the head
+        // state root of a chain that SAW a v2 tx offered equals one that
+        // never did.
+        let mut chain = fresh_chain();
+        let kp = Keypair::from_seed([2; 32]);
+        let tx = Transaction {
+            signer: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce: 0,
+            action: Action::ShieldedV2 {
+                bundle: vec![0xB0u8; 128],
+            },
+        };
+        let v2 = SignedTransaction::sign(tx, &kp).unwrap();
+
+        let empty = chain.produce_block(vec![v2.clone()], 2_000).unwrap();
+        assert!(
+            empty.transactions.is_empty(),
+            "producer must exclude a ShieldedV2 tx while dormant"
+        );
+        let smuggled = Block::assemble(
+            empty.header.height,
+            empty.header.prev_hash,
+            empty.header.state_root,
+            empty.header.receipts_root,
+            empty.header.timestamp_ms,
+            empty.header.proposer.clone(),
+            vec![v2],
+        );
+        assert!(
+            chain.import_block(smuggled).is_err(),
+            "a dormant ShieldedV2 tx must invalidate any block carrying it"
+        );
+        // The honest empty block imports, and the resulting state is exactly
+        // what a chain that never saw the v2 tx computes — including an
+        // untouched (empty, uncommitted) v2 pool.
+        let mut control = fresh_chain();
+        let control_block = control.produce_block(vec![], 2_000).unwrap();
+        chain.import_block(empty).unwrap();
+        control.import_block(control_block).unwrap();
+        assert_eq!(
+            chain.head().header.state_root,
+            control.head().header.state_root,
+            "state roots agree with a chain that never saw the v2 tx"
+        );
+        assert!(chain.ledger().shielded_v2().is_empty());
+        assert_eq!(chain.ledger().shielded_v2_value(), Balance::ZERO);
+    }
+
     /// A signed `Tipped{tip, Transfer{to, amount}}` from `usa.reserve.sov`.
     fn usa_tipped_transfer(tip_sov: u128, to: &str, sov: u128, nonce: u64) -> SignedTransaction {
         let kp = Keypair::from_seed([2; 32]);

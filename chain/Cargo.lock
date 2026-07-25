@@ -2066,6 +2066,7 @@ dependencies = [
  "sov-crypto",
  "sov-primitives",
  "sov-shielded",
+ "sov-shielded-pq",
  "thiserror 2.0.18",
 ]
 

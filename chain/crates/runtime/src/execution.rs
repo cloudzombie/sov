@@ -432,6 +432,24 @@ pub fn apply_transaction(
                     }
                 });
             }
+            // Post-quantum shielded pool v2 — DORMANT (v0.2.0 slices S2a/S2b).
+            // The `shielded-v2` deployment (signal bit 2) is DEFINED but NOT
+            // armed, so there is no height on any chain at which this variant
+            // is legal: it is an unconditional HARD error, which propagates to
+            // BlockExecutionError::InvalidTransaction and invalidates any
+            // block carrying it, uniformly on every node — the same dormant
+            // gate `Action::Tipped` used before the fee-auction activated.
+            // The S2c executor replaces this arm with the real activation-
+            // gated path (STARK verify, anchor ring, nullifiers, turnstile,
+            // value balance); until then genesis and every KAT vector stay
+            // byte-identical. It is reached both for a direct `ShieldedV2` tx
+            // and for one wrapped in an (active) `Tipped` envelope or a
+            // `MultisigExec` — all rejected alike while dormant.
+            Action::ShieldedV2 { .. } => {
+                return Err(ExecutionError::FeatureInactive {
+                    feature: "shielded-v2",
+                });
+            }
             Action::Transfer { to, amount } => {
                 do_transfer(ledger, &tx.signer, &mut signer, to, *amount)?
             }
@@ -2280,6 +2298,86 @@ mod tests {
             apply_transactions(&mut ledger, std::slice::from_ref(&stx), &ctx(&p)),
             Err(BlockExecutionError::InvalidTransaction { index: 0, .. })
         ));
+    }
+
+    // ---- Pool v2 (v0.2.0 slice S2b): the ShieldedV2 action while DORMANT ----
+
+    /// A signed `ShieldedV2 { bundle }` from `usa.reserve.sov`.
+    fn shielded_v2_tx(bundle: Vec<u8>, nonce: u64) -> SignedTransaction {
+        let kp = Keypair::from_seed([1; 32]);
+        let tx = Transaction {
+            signer: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce,
+            action: Action::ShieldedV2 { bundle },
+        };
+        SignedTransaction::sign(tx, &kp).unwrap()
+    }
+
+    #[test]
+    fn dormant_shielded_v2_is_rejected_as_feature_inactive() {
+        // v0.2.0 S2b dormant gate: `Action::ShieldedV2` is a HARD execution
+        // error while the `shielded-v2` deployment (bit 2, defined but NOT
+        // armed) is inactive — the exact `Tipped` pattern. The batch layer
+        // maps it to InvalidTransaction, so any block smuggling one is
+        // rejected uniformly on every node, and the ledger is untouched.
+        let mut ledger = ledger_with_usa(100);
+        let root0 = ledger.state_root();
+        let p = policy();
+        let stx = shielded_v2_tx(vec![1u8; 64], 0);
+        assert!(matches!(
+            apply_transaction(&mut ledger, &stx, &ctx(&p)),
+            Err(ExecutionError::FeatureInactive {
+                feature: "shielded-v2"
+            })
+        ));
+        assert!(matches!(
+            apply_transactions(&mut ledger, std::slice::from_ref(&stx), &ctx(&p)),
+            Err(BlockExecutionError::InvalidTransaction { index: 0, .. })
+        ));
+        assert_eq!(
+            ledger.state_root(),
+            root0,
+            "a rejected dormant v2 tx commits nothing (nonce included)"
+        );
+        assert!(ledger.shielded_v2().is_empty());
+    }
+
+    #[test]
+    fn dormant_shielded_v2_inside_an_active_tipped_envelope_is_still_rejected() {
+        // The fee auction IS active on mainnet today (bit 1, h11520) — so the
+        // live-relevant smuggling path is `Tipped{ tip, ShieldedV2 }`: the
+        // active envelope unwraps, then the inner v2 action must still hit the
+        // dormant hard-reject, with NO partial effect (no tip charged, no
+        // nonce burned). Once bit 2 activates, D10 makes this pairing legal —
+        // that flip is S2c's, behind the real gate.
+        let mut ledger = ledger_with_usa(100);
+        let root0 = ledger.state_root();
+        let p = policy();
+        let kp = Keypair::from_seed([1; 32]);
+        let tx = Transaction {
+            signer: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce: 0,
+            action: Action::Tipped {
+                tip: Balance::from_sov(1).unwrap(),
+                inner: Box::new(Action::ShieldedV2 {
+                    bundle: vec![2u8; 64],
+                }),
+            },
+        };
+        let stx = SignedTransaction::sign(tx, &kp).unwrap();
+        assert!(matches!(
+            apply_transaction(&mut ledger, &stx, &auction_ctx(&p, 3)),
+            Err(ExecutionError::FeatureInactive {
+                feature: "shielded-v2"
+            })
+        ));
+        assert_eq!(
+            ledger.state_root(),
+            root0,
+            "no tip, fee, or nonce committed"
+        );
     }
 
     // ---- Fee auction (v0.1.98 slice 2b): the Tipped envelope when Active ----

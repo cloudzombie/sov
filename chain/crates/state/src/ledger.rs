@@ -18,6 +18,7 @@ use sov_compliance::{CompliancePolicy, SpendWindow};
 use sov_crypto::PublicKey;
 use sov_primitives::{AccountId, Balance, Hash};
 use sov_shielded::{ShieldedBundle, ShieldedError, ShieldedState};
+use sov_shielded_pq::{PqDigest, ShieldedV2State, ShieldedV2StateError};
 
 use crate::account::Account;
 use crate::smt::{MerkleProof, SparseMerkleTree};
@@ -252,6 +253,12 @@ enum UndoOp {
     ShieldedValue(Balance),
     HtlcLocked(Balance),
     DeshieldWindow(u64, Balance),
+    /// The whole pool-v2 sub-state, captured before a v2 batch was applied.
+    ShieldedV2(Box<ShieldedV2State>),
+    /// The net pool-v2 value counter (turnstile), captured before a movement.
+    ShieldedV2Value(Balance),
+    /// The pool-v2 rolling de-shield window, captured before an update.
+    DeshieldV2Window(u64, Balance),
     /// A CDP vault write (`owner`, pre-image — `None` = it was absent, so undo removes it).
     Vault(AccountId, Option<crate::vault::Vault>),
     /// The total-collateral-locked counter, captured before a vault movement.
@@ -310,6 +317,22 @@ pub struct Ledger {
     /// Its digest folds into the state root, but only once non-empty — a chain
     /// with no shielded activity has exactly the state root it would without it.
     shielded: ShieldedState,
+    /// Net value (grains) held in the **post-quantum pool v2** — the v2
+    /// turnstile counter, exactly parallel to [`shielded_value`](field@Ledger::shielded_value)
+    /// (decision D11: pool v2 has its OWN turnstile). Zero ⇒ its slot is
+    /// removed, so the pre-v2 state root is untouched. DORMANT until the
+    /// `shielded-v2` deployment (bit 2, unarmed in v0.2.0) activates.
+    shielded_v2_value: Balance,
+    /// Pool v2's consensus state (v2 note-commitment tree frontier, 128-anchor
+    /// ring, v2 nullifier set — see [`ShieldedV2State`]). Its digest folds
+    /// into the state root **only once non-empty**, so every chain with no v2
+    /// activity — including all of mainnet history — keeps the exact state
+    /// root it had before this field existed (S2a non-retroactivity).
+    shielded_v2: ShieldedV2State,
+    /// Pool v2's rolling de-shield window: (window start height, grains
+    /// de-shielded within it). Its OWN limiter with the same parameters as
+    /// v1's (decision D11); committed to the state root only once non-default.
+    deshield_v2_window: (u64, Balance),
     /// Open hash-time-locked contracts (atomic-swap escrows), keyed by id.
     htlcs: BTreeMap<Hash, Htlc>,
     /// Total value (grains) escrowed across all open HTLCs. Counted in
@@ -408,6 +431,12 @@ impl Ledger {
     const HTLC_LOCKED_SLOT: &'static [u8] = b"sov:htlc_locked";
     /// Reserved Merkle slot name for the rolling de-shield window.
     const DESHIELD_WINDOW_SLOT: &'static [u8] = b"sov:deshield_window";
+    /// Reserved Merkle slot name for the pool-v2 commitment digest.
+    const SHIELDED_V2_SLOT: &'static [u8] = b"sov:shielded_v2";
+    /// Reserved Merkle slot name for the net pool-v2 value counter.
+    const SHIELDED_V2_VALUE_SLOT: &'static [u8] = b"sov:shielded_v2_value";
+    /// Reserved Merkle slot name for the pool-v2 rolling de-shield window.
+    const DESHIELD_V2_WINDOW_SLOT: &'static [u8] = b"sov:deshield_v2_window";
     /// Reserved Merkle slot name for the NFT-collections digest.
     const NFT_CLASSES_SLOT: &'static [u8] = b"sov:nft_classes";
     /// Reserved Merkle slot name for the NFT-items digest (includes SNS names).
@@ -508,6 +537,21 @@ impl Ledger {
         } else {
             self.commitment
                 .insert(slot, self.shielded.commitment().to_vec());
+        }
+    }
+
+    /// Re-commit pool v2's digest to its reserved slot. An empty pool
+    /// contributes nothing (the slot is removed), so a chain with no v2
+    /// activity keeps the exact state root it would have without the pool —
+    /// the state commitment changes only when the first v2 action ever
+    /// executes, never retroactively.
+    fn recommit_shielded_v2(&mut self) {
+        let slot = Self::reserved_slot(Self::SHIELDED_V2_SLOT);
+        if self.shielded_v2.is_empty() {
+            self.commitment.remove(&slot);
+        } else {
+            self.commitment
+                .insert(slot, self.shielded_v2.commitment().to_vec());
         }
     }
 
@@ -887,6 +931,25 @@ impl Ledger {
                     self.commitment.insert(slot, encoded);
                 }
             }
+            UndoOp::ShieldedV2(prev) => {
+                self.shielded_v2 = *prev;
+                self.recommit_shielded_v2();
+            }
+            UndoOp::ShieldedV2Value(prev) => {
+                self.shielded_v2_value = prev;
+                self.commit_counter(Self::SHIELDED_V2_VALUE_SLOT, prev);
+            }
+            UndoOp::DeshieldV2Window(start, spent) => {
+                self.deshield_v2_window = (start, spent);
+                let slot = Self::reserved_slot(Self::DESHIELD_V2_WINDOW_SLOT);
+                if start == 0 && spent == Balance::ZERO {
+                    self.commitment.remove(&slot);
+                } else {
+                    let encoded = borsh::to_vec(&self.deshield_v2_window)
+                        .expect("window serialization is infallible");
+                    self.commitment.insert(slot, encoded);
+                }
+            }
         }
     }
 
@@ -974,11 +1037,15 @@ impl Ledger {
         for account in self.accounts.values() {
             sum = sum.checked_add(account.total()?)?;
         }
-        // Value parked in the shielded pool, escrowed in an HTLC, or locked as CDP
-        // vault collateral is still supply — it just lives outside account
-        // balances. Counting it makes every hold/release/refund supply-neutral, so
-        // depositing XUS into a vault (or freeing it) conserves total supply.
+        // Value parked in the shielded pools (v1 Orchard or the dormant v2 PQ
+        // pool), escrowed in an HTLC, or locked as CDP vault collateral is still
+        // supply — it just lives outside account balances. Counting it makes
+        // every hold/release/refund supply-neutral, so depositing XUS into a
+        // vault (or freeing it) conserves total supply. `shielded_v2_value` is
+        // exactly zero on every chain until the (unarmed) `shielded-v2`
+        // deployment activates, so pre-activation sums are byte-identical.
         sum.checked_add(self.shielded_value)?
+            .checked_add(self.shielded_v2_value)?
             .checked_add(self.htlc_locked)?
             .checked_add(self.vault_collateral)
     }
@@ -1028,6 +1095,96 @@ impl Ledger {
         self.shielded_value = next;
         self.commit_counter(Self::SHIELDED_VALUE_SLOT, self.shielded_value);
         Some(())
+    }
+
+    // ── Pool v2 (post-quantum shielded pool) — DORMANT until bit 2 activates ──
+    //
+    // These mirror the v1 pool API one-for-one: their slots are absent-when-
+    // empty, so a ledger that never executes a v2 action (every chain today —
+    // the deployment is defined but NOT armed) keeps a byte-identical state
+    // root. No production code path calls any of these mutators until the S2c
+    // executor lands behind the activation gate; they exist so the state
+    // shape, its commitment folding, and its undo discipline are proven now.
+
+    /// Pool v2's consensus state (read-only): tree frontier, anchor ring, and
+    /// nullifier set.
+    pub fn shielded_v2(&self) -> &ShieldedV2State {
+        &self.shielded_v2
+    }
+
+    /// Net value currently held in pool v2 (grains) — the v2 turnstile counter.
+    pub fn shielded_v2_value(&self) -> Balance {
+        self.shielded_v2_value
+    }
+
+    /// Apply an authorized v2 batch to the pool: insert its nullifiers
+    /// (rejecting double-spends) and append its output commitments (advancing
+    /// the tree and the 128-anchor ring), then re-commit the pool digest into
+    /// the state root. Atomic: a rejected batch changes nothing. The caller
+    /// (the S2c executor) must already have verified the bundle's STARK proof,
+    /// checked its anchors against the ring, and filtered dummy (zero) slots.
+    pub fn apply_shielded_v2(
+        &mut self,
+        nullifiers: &[PqDigest],
+        commitments: &[PqDigest],
+    ) -> Result<(), ShieldedV2StateError> {
+        // Snapshot the pool ONLY if recording, and record it ONLY after the
+        // apply succeeds — a rejected batch must not leave a spurious undo
+        // entry (the same discipline as the v1 pool).
+        let prev = self.undo.is_some().then(|| self.shielded_v2.clone());
+        self.shielded_v2.apply(nullifiers, commitments)?;
+        if let Some(p) = prev {
+            self.record(UndoOp::ShieldedV2(Box::new(p)));
+        }
+        self.recommit_shielded_v2();
+        Ok(())
+    }
+
+    /// Increase the net pool-v2 value (a v2 shield moves transparent value in).
+    /// `None` on overflow. Commits the counter to the state root.
+    pub fn add_shielded_v2_value(&mut self, amount: Balance) -> Option<()> {
+        let next = self.shielded_v2_value.checked_add(amount)?;
+        self.record(UndoOp::ShieldedV2Value(self.shielded_v2_value));
+        self.shielded_v2_value = next;
+        self.commit_counter(Self::SHIELDED_V2_VALUE_SLOT, self.shielded_v2_value);
+        Some(())
+    }
+
+    /// Decrease the net pool-v2 value (a v2 de-shield moves value back out).
+    /// `None` if the pool holds less than `amount` — the consensus-enforced
+    /// turnstile: pool-v2 value can never go negative (checked subtraction,
+    /// exactly like v1's).
+    pub fn sub_shielded_v2_value(&mut self, amount: Balance) -> Option<()> {
+        let next = self.shielded_v2_value.checked_sub(amount)?;
+        self.record(UndoOp::ShieldedV2Value(self.shielded_v2_value));
+        self.shielded_v2_value = next;
+        self.commit_counter(Self::SHIELDED_V2_VALUE_SLOT, self.shielded_v2_value);
+        Some(())
+    }
+
+    /// Pool v2's rolling de-shield window: `(window_start_height, spent)`.
+    /// A fresh chain reads `(0, 0)`.
+    pub fn deshield_v2_window(&self) -> (u64, Balance) {
+        self.deshield_v2_window
+    }
+
+    /// Write pool v2's rolling de-shield window, committing it to the state
+    /// root. The default `(0, 0)` window is removed, keeping the root
+    /// canonical (and pre-v2 roots untouched).
+    pub fn set_deshield_v2_window(&mut self, window_start: u64, spent: Balance) {
+        if self.undo.is_some() {
+            let (s, sp) = self.deshield_v2_window;
+            self.record(UndoOp::DeshieldV2Window(s, sp));
+        }
+        self.deshield_v2_window = (window_start, spent);
+        let slot = Self::reserved_slot(Self::DESHIELD_V2_WINDOW_SLOT);
+        if window_start == 0 && spent == Balance::ZERO {
+            self.commitment.remove(&slot);
+        } else {
+            let encoded = borsh::to_vec(&self.deshield_v2_window)
+                .expect("window serialization is infallible");
+            self.commitment.insert(slot, encoded);
+        }
     }
 
     /// An open hash-time-locked contract by id, if present.
@@ -1641,7 +1798,25 @@ impl Ledger {
     /// [`save`](Ledger::save) writes, exposed so a caller can bundle it into a larger
     /// atomic snapshot file. The Merkle commitment is omitted (rebuilt on load), so
     /// the blob alone deterministically reproduces the `state_root`.
+    ///
+    /// ⚠️ **Pool-v2 state is NOT yet in this blob** (v0.2.0 slice boundary):
+    /// persistence of `shielded_v2` / `shielded_v2_value` / `deshield_v2_window`
+    /// belongs to slice S2e together with the data-dir `schema_version` bump
+    /// (law F4), because appending fields here changes the blob encoding.
+    /// This is SAFE today because no production path can make v2 state
+    /// non-empty — the S2c executor does not exist and the `shielded-v2`
+    /// deployment is unarmed — and it is enforced below: this function
+    /// REFUSES (panics in debug via `debug_assert!`, and is guarded by the
+    /// `snapshot_refuses_nonempty_v2_state_until_s2e` test) rather than
+    /// silently dropping committed state. S2e MUST land before S2c.
     pub fn to_snapshot_bytes(&self) -> Vec<u8> {
+        debug_assert!(
+            self.shielded_v2.is_empty()
+                && self.shielded_v2_value == Balance::ZERO
+                && self.deshield_v2_window == (0, Balance::ZERO),
+            "ledger snapshot does not yet persist pool-v2 state (slice S2e); \
+             snapshotting a ledger with live v2 state would silently drop it"
+        );
         let accounts: Vec<AccountEntry> = self
             .accounts
             .iter()
@@ -1874,6 +2049,137 @@ mod tests {
             restored.vault(&id("alice.sov")).debt,
             Balance::from_sov(100).unwrap()
         );
+    }
+
+    // ── Pool v2 (S2a): absent-when-empty folding, turnstile, undo ─────────────
+
+    /// A distinct canonical nonzero PqDigest per index (small limbs are always
+    /// `< p`, and never all-zero for `n > 0`).
+    fn pq(n: u64) -> PqDigest {
+        PqDigest([n, 0, 0, 1])
+    }
+
+    #[test]
+    fn pool_v2_folds_only_once_nonempty_and_undo_restores_the_exact_root() {
+        // The S2a linchpin, exercised end-to-end at the ledger: a ledger with
+        // real (v1-era) state keeps its EXACT root while pool v2 is empty; the
+        // root changes only when v2 state first exists; and a reorg (undo)
+        // restores the pre-v2 root bit-for-bit — all three v2 slots included.
+        let mut l = Ledger::new();
+        l.set_account(
+            &id("alice.sov"),
+            Account::with_balance(Balance::from_sov(100).unwrap()),
+        );
+        l.add_mined_emitted(Balance::from_sov(1000).unwrap())
+            .unwrap();
+        let root0 = l.state_root();
+        let supply0 = l.total_supply().unwrap();
+        assert!(l.shielded_v2().is_empty());
+        assert_eq!(l.shielded_v2_value(), Balance::ZERO);
+        assert_eq!(l.deshield_v2_window(), (0, Balance::ZERO));
+
+        // A full v2 "block": pool mutation + turnstile credit/debit + window.
+        l.begin_undo();
+        l.apply_shielded_v2(&[pq(1)], &[pq(2), pq(3)])
+            .expect("v2 apply");
+        let root_pool = l.state_root();
+        assert_ne!(root_pool, root0, "non-empty v2 pool folds into the root");
+        l.add_shielded_v2_value(Balance::from_sov(40).unwrap())
+            .unwrap();
+        l.sub_shielded_v2_value(Balance::from_sov(15).unwrap())
+            .unwrap();
+        l.set_deshield_v2_window(7, Balance::from_sov(15).unwrap());
+        let undo = l.take_undo();
+
+        assert_eq!(l.shielded_v2().note_count(), 2);
+        assert!(l.shielded_v2().nullifier_seen(&pq(1)));
+        assert_eq!(l.shielded_v2_value(), Balance::from_sov(25).unwrap());
+        assert_eq!(
+            l.total_supply().unwrap(),
+            supply0.checked_add(Balance::from_sov(25).unwrap()).unwrap(),
+            "pool-v2 value counts toward supply (supply-neutral shielding)"
+        );
+
+        // Disconnect the block: every v2 slot (pool digest, value counter,
+        // window) must restore to ABSENT, reproducing root0 exactly.
+        l.apply_undo(undo);
+        assert_eq!(l.state_root(), root0, "undo restores the pre-v2 root");
+        assert!(l.shielded_v2().is_empty());
+        assert_eq!(l.shielded_v2_value(), Balance::ZERO);
+        assert_eq!(l.deshield_v2_window(), (0, Balance::ZERO));
+        assert_eq!(l.total_supply().unwrap(), supply0);
+    }
+
+    #[test]
+    fn pool_v2_turnstile_never_goes_negative() {
+        // D11: the v2 pool-value turnstile is consensus-enforced exactly like
+        // v1's — a de-shield exceeding the pool's value is refused, and the
+        // refusal changes nothing.
+        let mut l = Ledger::new();
+        let root0 = l.state_root();
+        assert!(
+            l.sub_shielded_v2_value(Balance::from_grains(1)).is_none(),
+            "an empty pool cannot be drained"
+        );
+        assert_eq!(l.state_root(), root0);
+
+        l.add_shielded_v2_value(Balance::from_sov(10).unwrap())
+            .unwrap();
+        assert!(
+            l.sub_shielded_v2_value(
+                Balance::from_sov(10)
+                    .unwrap()
+                    .checked_add(Balance::from_grains(1))
+                    .unwrap()
+            )
+            .is_none(),
+            "one grain over the pool value is refused"
+        );
+        assert_eq!(l.shielded_v2_value(), Balance::from_sov(10).unwrap());
+        // Draining to exactly zero is fine, and restores the empty-slot root.
+        l.sub_shielded_v2_value(Balance::from_sov(10).unwrap())
+            .unwrap();
+        assert_eq!(l.state_root(), root0, "zero counter ⇒ slot removed");
+    }
+
+    #[test]
+    fn pool_v2_rejected_apply_leaves_no_undo_entry_and_no_root_change() {
+        let mut l = Ledger::new();
+        l.apply_shielded_v2(&[pq(1)], &[pq(2)]).unwrap();
+        let root = l.state_root();
+        l.begin_undo();
+        assert_eq!(
+            l.apply_shielded_v2(&[pq(1)], &[pq(3)]),
+            Err(ShieldedV2StateError::DoubleSpend)
+        );
+        let undo = l.take_undo();
+        assert!(undo.is_empty(), "a rejected v2 apply journals nothing");
+        assert_eq!(l.state_root(), root);
+    }
+
+    #[test]
+    fn deshield_v2_window_slot_is_absent_when_default() {
+        let mut l = Ledger::new();
+        let root0 = l.state_root();
+        l.set_deshield_v2_window(3, Balance::from_sov(1).unwrap());
+        assert_ne!(l.state_root(), root0);
+        l.set_deshield_v2_window(0, Balance::ZERO);
+        assert_eq!(l.state_root(), root0, "default window ⇒ slot removed");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "does not yet persist pool-v2 state")]
+    fn snapshot_refuses_nonempty_v2_state_until_s2e() {
+        // Slice-boundary guard: ledger snapshots do not carry pool-v2 state
+        // until S2e bumps the data schema. Until then a snapshot of a ledger
+        // with live v2 state must REFUSE rather than silently drop committed
+        // state. (No production path can reach this while the deployment is
+        // unarmed — S2e must land before the S2c executor.)
+        let mut l = Ledger::new();
+        l.add_shielded_v2_value(Balance::from_sov(1).unwrap())
+            .unwrap();
+        let _ = l.to_snapshot_bytes();
     }
 
     #[test]

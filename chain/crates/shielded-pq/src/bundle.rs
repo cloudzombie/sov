@@ -79,8 +79,22 @@ pub enum BundleError {
 /// anchors/nullifiers/commitments, the dummy pattern, the encrypted
 /// payloads, nor the key the signature speaks for can be reshaped around
 /// a signature — the signature attests "THIS key authorized THIS bundle",
-/// not mere well-formedness. (The consensus layer, W2, will additionally
-/// bind the carrier tx signer and nonce per D4.)
+/// not mere well-formedness.
+///
+/// **OPEN SEAM (D4, deliberately unpinned):** the execution slice (S2c)
+/// must additionally bind this authorization to its *carrier context* so a
+/// bundle cannot be lifted out of one transaction and replayed in another.
+/// The binding SCHEME is an open design decision — candidates include the
+/// carrier `{signer, nonce}` (account-model-coupled; a nonce-free UTXO
+/// path would have no nonce) and the carrier transaction id
+/// (model-agnostic, **but circular as the id is defined today**: the tx id
+/// hashes the full Borsh transaction, whose action embeds these very
+/// bundle bytes *including `auth_sig`*, so the signature would have to
+/// sign a hash of itself). Whichever is chosen, the seam is additive: wrap
+/// this digest in a second domain-separated digest over
+/// `(bundle_digest, carrier_context)` at S2c — this function, its bytes,
+/// and its KATs stay frozen. Nothing in S2a/S2b (state shape, action
+/// variant) depends on the choice.
 pub fn bundle_digest(
     public_inputs: &BundlePublicInputs,
     output_ciphertexts: &[Option<NoteCiphertext>; NUM_SLOTS],
@@ -113,7 +127,9 @@ pub fn bundle_digest(
     hasher.update(&public_inputs.fee_grains.to_le_bytes());
     // Audit S1 follow-up: fold the authorizing key into the signed
     // statement (length-prefixed), so the signature binds a KEY to the
-    // bundle. W2 will additionally bind the carrier tx signer + nonce (D4).
+    // bundle. The carrier-context binding (D4) is an OPEN seam owned by
+    // S2c — see the doc comment above; it must wrap this digest, not
+    // change it.
     hasher.update(&(AUTH_PK_LEN as u64).to_le_bytes());
     hasher.update(auth_pk);
     *hasher.finalize().as_bytes()
