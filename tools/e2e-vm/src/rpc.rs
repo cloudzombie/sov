@@ -99,8 +99,24 @@ impl Rpc {
         Ok(if v.is_null() { None } else { Some(v) })
     }
 
+    /// The FULL block at `height` (header + transactions), or `None` above the
+    /// node's tip. Used to recount BIP-9 miner signaling from the raw committed
+    /// `version_bits` of real headers — an assertion independent of the node's
+    /// own state machine.
+    pub fn block(&self, height: u64) -> Result<Option<Value>, String> {
+        let v = self.call("sov_getBlockByHeight", json!({ "height": height }))?;
+        Ok(if v.is_null() { None } else { Some(v) })
+    }
+
     pub fn peer_info(&self) -> Result<Value, String> {
         self.call("sov_getPeerInfo", json!({}))
+    }
+
+    /// The signing domain a client must bind a NEW signature to: `active:false`
+    /// while the `tx-domain` fork is dormant, `active:true` (+ chain id and
+    /// genesis) once it is live.
+    pub fn signing_domain(&self) -> Result<Value, String> {
+        self.call("sov_getSigningDomain", json!({}))
     }
 
     pub fn supply(&self) -> Result<Value, String> {

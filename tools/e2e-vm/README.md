@@ -45,11 +45,35 @@ nodes — the deployed bits are the tested bits.
 | 1 | genesis determinism across nodes, ≠ mainnet/testnet pins, == harness pin | live |
 | 2 | P2P mesh (authed peers) + convergence + late-join sync to tip | live |
 | 3 | mining: +10 blocks, ≥3 distinct coinbase producers, tip agreement | live |
-| 4 | shielded v1 lifecycle via the real `sov-wallet` CLI: shield 5 → z-balance → unshield 2 → z-send 1; pool/balance deltas EXACT (fees computed from on-chain receipts) | live |
-| 5 | restart/replay survival: SIGKILL node-4, delete `chainstate.snapshot`, cold boot must reproduce head hash + state root from `blocks.log`, then reconverge | live |
-| 6 | cross-node conformance: identical block hash + state root at sampled heights; identical supply at an aligned tip; total == mined; shielded == pool | live |
-| 7 | BIP-9 activation rehearsal | **SKIP** — needs a config-driven (non-mainnet) deployment install; `baked_deployments()` (daemon.rs) is mainnet-gated and neither ChainSpec nor NodeConfig can arm a test deployment. Waits on W2 + a test-deployment config hook. |
-| 8–10 | shield-v2 / z-send-v2 / unshield-v2 / v1→v2 migration / reorg-with-v2 | **SKIP** — waits on W2 (`Action::ShieldedV2` consensus wiring); no v2 action exists in current binaries. |
+| 4 | **shielded-v1 NEVER STRANDED** (law F8): shield 4 XUS into pool v1 *below* the signaling start height → drive `tx-domain` Defined→Started→LockedIn→Active on real miner signaling → SIGKILL node-4 + delete its snapshot + cold boot → then de-shield the pre-activation note under the post-activation `Bound` regime | live |
+| 5 | BIP-9 activation rehearsal: recounts the signaling from raw committed `version_bits` and checks it against the 9/10 threshold and the exact activation boundary | live |
+| 6 | shielded v1 lifecycle via the real `sov-wallet` CLI: shield 5 → z-balance → unshield 2 → z-send 1; pool/balance deltas EXACT (fees computed from on-chain receipts) | live |
+| 7 | restart/replay survival: SIGKILL node-4, delete `chainstate.snapshot`, cold boot must reproduce head hash + state root from `blocks.log`, then reconverge | live |
+| 8 | cross-node conformance: identical block hash + state root at sampled heights; identical supply at an aligned tip; total == mined; shielded == pool | live |
+| 9 | never-stranded across pool **v2** | **SKIP** — waits on W2 (`Action::ShieldedV2`, pool-v2 state, the bit-2 deployment row): there is no v2 pool to introduce yet. |
+| 10–14 | shield-v2 / z-send-v2 / unshield-v2 / v1→v2 migration / reorg-with-v2 | **SKIP** — waits on W2 (`Action::ShieldedV2` consensus wiring); no v2 action exists in current binaries. |
+
+### The activation the harness drives
+
+`baked_deployments()` in `chain/crates/rpc/src/daemon.rs` now has a second arm
+next to the frozen mainnet preset: a chain id in the **reserved `sov-e2e-`
+namespace** (this harness's own) gets a *rehearsal* preset — `tx-domain` on bit 0,
+period 32, start 128, threshold 9/10, LOT off, grace `G = 0`, signal mask `0b1`.
+Same state machine, same threshold arithmetic, same code path as mainnet; only
+the heights are compressed so a real Defined→Started→LockedIn→Active runs inside
+one bounded harness run. `Started` at 128, `LockedIn` at 160, `Active` at 192.
+
+The mainnet arm is evaluated **first and unconditionally**, so the frozen mainnet
+preset can never be displaced; `sov-mainnet`, `sov-testnet-1`, `sov-test` and
+`sov-dev` are all unaffected (asserted by
+`e2e_rehearsal_namespace_arms_a_real_bit0_deployment_and_never_shadows_mainnet`
+in `daemon.rs`). Being a *baked* preset keyed on the chain id, it is identical on
+every node by construction — no per-node divergence is expressible.
+
+`G = 0` is deliberate: from the activation height, transactions are `Bound`-only
+(chain-bound signatures, legacy rejected). The pre-activation note is therefore
+spent under the strictest possible post-fork regime, which is exactly the claim
+law F8 makes.
 
 A hard FAIL aborts the dependent steps that follow (recorded as skips naming
 the failed dependency) and the run exits non-zero after full teardown.

@@ -869,7 +869,9 @@ struct BakedDeployments {
     /// The `tx-domain` hard-fork deployment (bit 0): chain-bound tx/intent signatures.
     tx_domain: sov_governance::Deployment,
     /// The `fee-auction` deployment (bit 1): the `Action::Tipped` envelope.
-    fee_auction: sov_governance::Deployment,
+    /// `None` for a preset that schedules no fee-auction fork (the E2E
+    /// rehearsal net arms bit 0 only).
+    fee_auction: Option<sov_governance::Deployment>,
     /// The tx-domain grace window `G` in blocks — consensus-critical once armed,
     /// baked here so no per-node divergence is possible.
     grace_blocks: u64,
@@ -878,18 +880,70 @@ struct BakedDeployments {
     signal_mask: u32,
 }
 
-/// The baked activation preset for a chain: `None` for any non-mainnet chain
-/// (dev/test/testnet get NOTHING — genesis, KATs, and all test behavior untouched);
-/// for mainnet, the two deployments plus grace + signal mask. Both deployments are
-/// DORMANT machinery until miner signaling reaches the 9/10 threshold over a full
-/// 288-block window at/after height 10944 — pre-activation validation and execution
-/// are byte-identical. What DOES change immediately: a mainnet v0.1.99 node stamps
-/// `version_bits = 0b11` in headers it mines (the intended, non-breaking signaling —
-/// old nodes record the bits but do not enforce them).
+/// The chain-id prefix RESERVED for the in-repo live-VM E2E harness
+/// (`tools/e2e-vm`, v0.2.0 program W8). A chain whose id starts with this string
+/// is a throwaway, loopback-only rehearsal network the harness generates itself,
+/// with its own genesis (asserted `!=` mainnet and `!=` testnet-1 by the very
+/// first matrix step). No canonical network can ever match it: mainnet is
+/// `sov-mainnet`, testnet-1 is `sov-testnet-1`, and the mainnet arm of
+/// [`baked_deployments`] is tested FIRST regardless, so mainnet's release-pinned
+/// preset can never be displaced by this one.
+const E2E_REHEARSAL_CHAIN_PREFIX: &str = "sov-e2e-";
+
+/// The E2E rehearsal net's `tx-domain` window length, in blocks. Small enough
+/// that `Defined → Started → LockedIn → Active` completes inside one bounded
+/// harness run (three window boundaries), large enough that the 9/10 threshold
+/// is a real count over a real window (29 of 32 signaling blocks) rather than a
+/// degenerate one-block vote.
+const E2E_REHEARSAL_PERIOD: u64 = 32;
+/// The E2E rehearsal net's signaling start height (a `E2E_REHEARSAL_PERIOD`
+/// boundary): `Started` at 384, `LockedIn` at 416, `Active` at 448. Chosen so the
+/// harness's pre-activation shield — a real Halo2 proof, which takes tens of
+/// seconds while the chain keeps mining — lands with hundreds of blocks of margin
+/// below the activation height, on a net whose early (trivial-difficulty) blocks
+/// come faster than the 2 s LWMA target.
+const E2E_REHEARSAL_START_HEIGHT: u64 = 384;
+/// The E2E rehearsal net's timeout height — far above the expected lock-in, so a
+/// green run never depends on the timeout path (a run that somehow fails to
+/// signal must FAIL loudly on the activation assertion, not quietly `Failed`).
+const E2E_REHEARSAL_TIMEOUT_HEIGHT: u64 = 4_096;
+
+/// The baked activation preset for a chain: the release-pinned MAINNET preset for
+/// mainnet; a small `tx-domain`-only REHEARSAL preset for the reserved
+/// [`E2E_REHEARSAL_CHAIN_PREFIX`] harness namespace; `None` for everything else
+/// (dev/test/testnet-1 get NOTHING — genesis, KATs, and all test behavior
+/// untouched).
+///
+/// Mainnet: both deployments are DORMANT machinery until miner signaling reaches
+/// the 9/10 threshold over a full 288-block window at/after height 10944 —
+/// pre-activation validation and execution are byte-identical. What DOES change
+/// immediately: a mainnet v0.1.99 node stamps `version_bits = 0b11` in headers it
+/// mines (the intended, non-breaking signaling — old nodes record the bits but do
+/// not enforce them).
+///
+/// E2E rehearsal namespace: bit 0 only, period 32, start 384, threshold 9/10,
+/// LOT off, grace `G = 0`. Same code path, same state machine, same threshold
+/// arithmetic as mainnet — only the heights are compressed, so the harness can
+/// drive a REAL activation (not a simulated one) on its own isolated chain and
+/// then prove that a shielded note accepted BEFORE activation is still spendable
+/// AFTER it. `G = 0` is deliberate: post-activation transactions are immediately
+/// `Bound`-only, the strictest regime, so the proof is not weakened by a grace
+/// window that would still accept legacy signatures.
 fn baked_deployments(chain_id: &str) -> Option<BakedDeployments> {
-    if !chain_id.contains("mainnet") {
-        return None;
+    // MAINNET FIRST, unconditionally: nothing below can shadow the frozen preset.
+    if chain_id.contains("mainnet") {
+        return Some(mainnet_deployments());
     }
+    if chain_id.starts_with(E2E_REHEARSAL_CHAIN_PREFIX) {
+        return Some(e2e_rehearsal_deployments());
+    }
+    None
+}
+
+/// The release-pinned mainnet activation preset (bits 0 and 1). These values are
+/// consensus-coordinating: two nodes with different heights, thresholds, or grace
+/// `G` would split at activation / at `H_a + G`.
+fn mainnet_deployments() -> BakedDeployments {
     // 90% of a 288-block (~12h) window; all heights are exact window boundaries
     // (10944 = 38 * 288, 11808 = 41 * 288, 11232 = 39 * 288).
     let threshold =
@@ -916,20 +970,47 @@ fn baked_deployments(chain_id: &str) -> Option<BakedDeployments> {
         false,
     )
     .expect("baked mainnet deployment is valid");
-    Some(BakedDeployments {
+    BakedDeployments {
         tx_domain,
-        fee_auction,
+        fee_auction: Some(fee_auction),
         grace_blocks: 576,
         signal_mask: 0b11,
-    })
+    }
+}
+
+/// The E2E harness rehearsal preset: `tx-domain` (bit 0) only, on compressed
+/// windows. Reachable ONLY from a chain id in the reserved
+/// [`E2E_REHEARSAL_CHAIN_PREFIX`] namespace.
+fn e2e_rehearsal_deployments() -> BakedDeployments {
+    let threshold =
+        sov_governance::Threshold::new(9, 10).expect("rehearsal threshold 9/10 is valid");
+    let tx_domain = sov_governance::Deployment::new(
+        "tx-domain",
+        0,
+        BlockHeight::new(E2E_REHEARSAL_START_HEIGHT),
+        BlockHeight::new(E2E_REHEARSAL_TIMEOUT_HEIGHT),
+        E2E_REHEARSAL_PERIOD,
+        threshold,
+        // No extra activation guard: lock-in is followed by activation at the
+        // next window boundary, the plain BIP-9 rule.
+        BlockHeight::new(0),
+        false,
+    )
+    .expect("rehearsal deployment is valid");
+    BakedDeployments {
+        tx_domain,
+        fee_auction: None,
+        grace_blocks: 0,
+        signal_mask: 0b1,
+    }
 }
 
 /// A fresh [`Blockchain`] from `genesis` with the network's baked governance
-/// activation preset (mainnet only, [`baked_deployments`]) installed: the
-/// tx-domain + fee-auction deployments, the tx-domain grace window, and the
-/// signal mask this node's mined blocks commit. Dormant until miner signaling
-/// meets the threshold; non-mainnet chains get nothing (`None`) — byte-identical
-/// behavior there.
+/// activation preset ([`baked_deployments`]) installed: the tx-domain (+
+/// fee-auction, where the preset defines one) deployments, the tx-domain grace
+/// window, and the signal mask this node's mined blocks commit. Dormant until
+/// miner signaling meets the threshold; chains outside the mainnet and E2E-harness
+/// namespaces get nothing (`None`) — byte-identical behavior there.
 ///
 /// Every boot-time chain construction MUST go through this helper — including
 /// the ones that immediately replay the persisted block log. The preset has to
@@ -942,7 +1023,9 @@ fn genesis_chain_with_baked_preset(genesis: &GenesisConfig) -> Result<Blockchain
     let mut chain = Blockchain::new(genesis)?;
     if let Some(baked) = baked_deployments(&genesis.chain_id) {
         chain.set_tx_domain_deployment(baked.tx_domain);
-        chain.set_fee_auction_deployment(baked.fee_auction);
+        if let Some(fee_auction) = baked.fee_auction {
+            chain.set_fee_auction_deployment(fee_auction);
+        }
         chain.set_tx_domain_grace_blocks(baked.grace_blocks);
         chain.set_signal_mask(baked.signal_mask);
     }
@@ -2035,8 +2118,9 @@ mod tests {
 
     #[test]
     fn baked_deployments_are_mainnet_only_with_the_pinned_activation_preset() {
-        // Non-mainnet chains get NOTHING: no deployments, no grace override, no
-        // signal mask — dev/test/testnet behavior (and every KAT) is untouched.
+        // Chains outside the mainnet and E2E-harness namespaces get NOTHING: no
+        // deployments, no grace override, no signal mask — dev/test/testnet
+        // behavior (and every KAT) is untouched.
         for chain_id in ["sov-test", "sov-dev", "sov-testnet-1"] {
             assert!(
                 baked_deployments(chain_id).is_none(),
@@ -2055,7 +2139,7 @@ mod tests {
         assert_eq!(tx.threshold, sov_governance::Threshold::new(9, 10).unwrap());
         assert_eq!(tx.min_activation_height.get(), 11_232);
         assert!(!tx.lockinontimeout);
-        let fa = &baked.fee_auction;
+        let fa = baked.fee_auction.as_ref().expect("mainnet arms bit 1 too");
         assert_eq!(fa.name, "fee-auction");
         assert_eq!(fa.bit, 1);
         assert_eq!(fa.start_height.get(), 10_944);
@@ -2066,6 +2150,68 @@ mod tests {
         assert!(!fa.lockinontimeout);
         assert_eq!(baked.grace_blocks, 576);
         assert_eq!(baked.signal_mask, 0b11, "signals bits 0 AND 1");
+    }
+
+    #[test]
+    fn e2e_rehearsal_namespace_arms_a_real_bit0_deployment_and_never_shadows_mainnet() {
+        // The reserved harness namespace (`tools/e2e-vm`) gets a REAL BIP-9
+        // deployment on compressed windows — the same state machine and the same
+        // 9/10 threshold arithmetic mainnet uses, so the live-VM harness can drive
+        // Defined→Started→LockedIn→Active for real instead of simulating it.
+        let baked = baked_deployments("sov-e2e-v020-s8a").expect("rehearsal preset is baked");
+        let tx = &baked.tx_domain;
+        assert_eq!(tx.name, "tx-domain");
+        assert_eq!(tx.bit, 0);
+        assert_eq!(tx.start_height.get(), E2E_REHEARSAL_START_HEIGHT);
+        assert_eq!(tx.timeout_height.get(), E2E_REHEARSAL_TIMEOUT_HEIGHT);
+        assert_eq!(tx.period, E2E_REHEARSAL_PERIOD);
+        assert_eq!(tx.threshold, sov_governance::Threshold::new(9, 10).unwrap());
+        assert_eq!(tx.min_activation_height.get(), 0);
+        assert!(!tx.lockinontimeout);
+        assert!(
+            baked.fee_auction.is_none(),
+            "the rehearsal net arms bit 0 ONLY"
+        );
+        assert_eq!(
+            baked.grace_blocks, 0,
+            "no grace: post-activation txs are Bound-only immediately"
+        );
+        assert_eq!(baked.signal_mask, 0b1, "signals bit 0 only");
+
+        // With every block signaling bit 0 (the mask above), the compressed
+        // schedule is exact and asserted here, not assumed by the harness:
+        // Defined below 384, Started at 384, LockedIn at 416, Active at 448.
+        struct AllSignal;
+        impl sov_governance::MinerSignals for AllSignal {
+            fn signals(&self, _height: BlockHeight, bit: u8) -> bool {
+                bit == 0
+            }
+        }
+        use sov_governance::ThresholdState as S;
+        for (height, want) in [
+            (0u64, S::Defined),
+            (383, S::Defined),
+            (384, S::Started),
+            (415, S::Started),
+            (416, S::LockedIn),
+            (447, S::LockedIn),
+            (448, S::Active),
+            (1_000, S::Active),
+        ] {
+            assert_eq!(
+                sov_governance::state_at(tx, BlockHeight::new(height), &AllSignal),
+                want,
+                "rehearsal state at height {height}"
+            );
+        }
+
+        // MAINNET IS NEVER SHADOWED: even a chain id that lies in both namespaces
+        // resolves to the frozen mainnet preset (the mainnet arm is tested first).
+        let both = baked_deployments("sov-e2e-mainnet").expect("mainnet arm wins");
+        assert_eq!(both.tx_domain.period, 288);
+        assert_eq!(both.signal_mask, 0b11);
+        // And the canonical ids are untouched by the new namespace.
+        assert!(baked_deployments("sov-testnet-1").is_none());
     }
 
     #[test]
