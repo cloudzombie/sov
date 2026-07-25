@@ -87,17 +87,10 @@ EOF
   printf '%s\n' "$dir"
 }
 
-# PATH with every directory that provides `gh` removed — genuine absence, not a stub.
-path_without_gh() {
-  local out="" d
-  local IFS=:
-  for d in $PATH; do
-    [ -n "$d" ] || continue
-    [ -x "$d/gh" ] && continue
-    out="${out:+$out:}$d"
-  done
-  printf '%s\n' "$out"
-}
+# Simulate "gh is not installed" via the script's own override, rather than by stripping
+# PATH: on CI runners gh sits in /usr/bin alongside git, so removing it would remove git
+# too and the test would pass for the wrong reason.
+NO_GH_ENV="SOV_CONTRACT_GH=gh-not-installed-here"
 
 # A synthetic "binary": the version literals a real build would bake, embedded in
 # binary-ish noise, so the string extraction is exercised the way it is on a real ELF
@@ -148,10 +141,9 @@ expect 1 "a GitHub Release already exists" \
   env PATH="$GH_FOUND:$PATH" bash -c "cd '$BASE2/work' && '$CONTRACT' precut v0.1.99"
 
 CASE="RULE 2: with gh absent the remote-tag check still refuses reuse (loud note)"
-NOGH="$(path_without_gh)"
 ( cd "$BASE2/work" && git tag -a v0.1.99 -m x && git push -q origin v0.1.99 && git tag -d v0.1.99 ) >/dev/null 2>&1
 expect 1 "already exists on origin" \
-  env PATH="$NOGH" bash -c "cd '$BASE2/work' && '$CONTRACT' precut v0.1.99"
+  env "$NO_GH_ENV" bash -c "cd '$BASE2/work' && '$CONTRACT' precut v0.1.99"
 
 CASE="RULE 2 (CI): refuses to build a tag that already has a GitHub Release"
 BASE3="$(make_repo 0.1.99)"; GH_FOUND3="$(stub_gh "$BASE3/bin" found)"
@@ -184,7 +176,7 @@ expect 1 "failing" \
 
 CASE="RULE 2 (CI): --require-gh fails when gh is not installed at all"
 expect 1 "gh CLI is required" \
-  env PATH="$NOGH" bash -c "cd '$BASE4/work' && '$CONTRACT' verify-tag-push v0.1.99 $SHA4 --require-gh"
+  env "$NO_GH_ENV" bash -c "cd '$BASE4/work' && '$CONTRACT' verify-tag-push v0.1.99 $SHA4 --require-gh"
 
 # ══ RULE 3 — releases come only from the CURRENT head of origin/main ════════
 CASE="RULE 3: refuses a cut from a feature branch"

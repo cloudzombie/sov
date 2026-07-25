@@ -40,6 +40,9 @@
 set -euo pipefail
 
 REMOTE="origin"
+# The GitHub CLI, overridable so the guard tests can exercise the "gh is not installed"
+# path without surgery on PATH (on CI runners gh lives in /usr/bin next to git).
+GH_BIN="${SOV_CONTRACT_GH:-gh}"
 MAIN_BRANCH="main"
 REQUIRE_GH=0
 
@@ -101,7 +104,7 @@ check_tag_matches_source() {
 # outage) FAILS CLOSED rather than being read as "no release".
 github_release_exists() {
   local tag="$1" out rc
-  if ! command -v gh >/dev/null 2>&1; then
+  if ! command -v "$GH_BIN" >/dev/null 2>&1; then
     if [ "$REQUIRE_GH" = "1" ]; then
       fail "gh CLI is required here (--require-gh) but is not installed"
     fi
@@ -111,7 +114,7 @@ github_release_exists() {
     return 1
   fi
   set +e
-  out="$(gh release view "$tag" 2>&1)"; rc=$?
+  out="$("$GH_BIN" release view "$tag" 2>&1)"; rc=$?
   set -e
   if [ "$rc" = "0" ]; then
     return 0
