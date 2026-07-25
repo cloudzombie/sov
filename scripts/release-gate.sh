@@ -75,6 +75,17 @@ echo "${DIM}git:  $(git rev-parse --short HEAD 2>/dev/null || echo '?') on $(git
 
 command -v cargo >/dev/null || fail "cargo not found on PATH"
 
+# ── 0a. RELEASE VERSION CONTRACT pre-flight (only when actually cutting) ──────
+# Run the tag/ref rules FIRST, before the ~30-minute verification surface below:
+# there is no point compiling the world for a tag that is illegal (wrong version,
+# already released, or not on current main). The exact same rules are re-checked in
+# CI by release.yml's `gate` job — scripts/version-contract.sh is the one shared
+# implementation, so the two paths cannot drift apart.
+if [ -n "$CUT_TAG" ]; then
+  banner "Release version contract (pre-flight for $CUT_TAG)"
+  scripts/version-contract.sh precut "$CUT_TAG" || fail "release version contract violated"
+fi
+
 # ── 0. clean tree (a release must build from committed source) ───────────────
 # We fail on any uncommitted change to a TRACKED file (staged or not) — that is
 # exactly what would differ from the tag's source. Untracked files never enter a
@@ -240,6 +251,12 @@ if [ -n "$CUT_TAG" ]; then
   # release workflow's gate re-checks it so a bare `git tag` can't sneak past either.
   CARGO_VER="$(grep -m1 '^version' node/Cargo.toml | cut -d'"' -f2)"
   [ "$CUT_TAG" = "v$CARGO_VER" ] || fail "version mismatch: node/Cargo.toml is $CARGO_VER but --cut is $CUT_TAG. Bump node/Cargo.toml to ${CUT_TAG#v} (refresh node/Cargo.lock), commit, then re-cut."
+  # Re-run the full version contract immediately before tagging. The pre-flight above
+  # ran ~30 minutes ago; in that window someone could have pushed to main or published
+  # this very version. Re-checking closes that window — the last thing verified before
+  # the tag object exists is that the tag is still new and still points at main's head.
+  scripts/version-contract.sh precut "$CUT_TAG" \
+    || fail "release version contract violated at cut time (the repository moved while the gate ran)"
   echo
   echo "${BOLD}Cutting release $CUT_TAG …${RST}"
   git tag -a "$CUT_TAG" -m "Release $CUT_TAG (release-gate: genesis frozen, all checks green)"

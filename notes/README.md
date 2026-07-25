@@ -10,7 +10,10 @@ how we do not lose our place.
    If you read one file, read this one.
 2. **`YYYY-MM-DD.md`** — one **daily log** per working day. Append-only. What was done,
    decided, shipped, and what is next. Create a new one each day (`notes/2026-07-19.md`).
-3. **`activation-*.md`** — deep **runbooks** for each big activation track (the
+3. **`release-version-contract.md`** — the RELEASE runbook: the single version source,
+   how a tag is cut, and the rules that make a mis-versioned or re-used release
+   impossible. Read it before touching anything release-related.
+4. **`activation-*.md`** — deep **runbooks** for each big activation track (the
    pool-mining / stratum rollout, the tx-domain hard fork). These hold the step-by-step
    detail that STATUS only summarizes.
 
@@ -29,6 +32,7 @@ how we do not lose our place.
 ## Index
 
 - [STATUS.md](STATUS.md) — master state + next actions **(read first)**
+- [release-version-contract.md](release-version-contract.md) — how releases are versioned, cut, and proven
 - [activation-tx-domain.md](activation-tx-domain.md) — cross-network replay hard fork runbook
 - [activation-pool-mining.md](activation-pool-mining.md) — stratum + `getBlockTemplate` pool rollout runbook
 - Daily logs: `2026-07-19.md`, …
