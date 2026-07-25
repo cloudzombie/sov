@@ -153,6 +153,50 @@ pub enum ExecutionError {
     TipInnerNotAllowed,
 }
 
+/// The miner-signaled feature a SINGLE action node depends on, when that
+/// feature is not yet `Active` at this block's height — i.e. the node is
+/// DORMANT and may never execute or be mined.
+///
+/// **This is the one table.** A future dormant variant added here is gated
+/// automatically wherever [`find_inactive_feature`] walks — at the top level
+/// and inside every carrier — so correctness never depends on remembering to
+/// re-check each carrier's pre-checks. Only the node itself is classified;
+/// recursion is [`find_inactive_feature`]'s job.
+fn dormant_feature(action: &Action, ctx: &BlockContext) -> Option<&'static str> {
+    match action {
+        // `fee-auction` (signal bit 1). Resolved per block height, so blocks
+        // below its activation height re-validate as dormant exactly as they
+        // did when they were mined.
+        Action::Tipped { .. } if !ctx.fee_auction_active => Some("fee-auction"),
+        // `shielded-v2` (signal bit 2) — DEFINED but NOT armed on any chain
+        // (v0.2.0 slices S2a/S2b): there is no height at which it may execute,
+        // so it is dormant unconditionally.
+        Action::ShieldedV2 { .. } => Some("shielded-v2"),
+        _ => None,
+    }
+}
+
+/// The first dormant feature anywhere in `action`'s carrier chain, or `None`.
+///
+/// [`Action`] is recursive through exactly three `Box<Action>` carriers
+/// (`MultisigExec.action`, `ProposeMultisig.action`, `Tipped.inner`), each with
+/// at most one action child — so the walk is a simple loop rather than
+/// recursion, and cannot grow the stack regardless of how deeply an in-memory
+/// action was constructed.
+fn find_inactive_feature(action: &Action, ctx: &BlockContext) -> Option<&'static str> {
+    let mut node = action;
+    loop {
+        if let Some(feature) = dormant_feature(node, ctx) {
+            return Some(feature);
+        }
+        node = match node {
+            Action::MultisigExec { action, .. } | Action::ProposeMultisig { action, .. } => action,
+            Action::Tipped { inner, .. } => inner,
+            _ => return None,
+        };
+    }
+}
+
 /// Apply one signed transaction to `ledger` in `ctx`, returning its [`Receipt`].
 ///
 /// Returns `Err` only if the transaction is *rejected* (bad signature, wrong
@@ -259,6 +303,24 @@ pub fn apply_transaction(
                 });
             }
         }
+    }
+
+    // ── Dormant-variant hard gate (PR#8 audit finding F1) ────────────────────
+    // A miner-signaled action variant that is not yet Active must be a HARD,
+    // block-invalidating reject NO MATTER WHERE it sits in the action tree —
+    // top-level, or smuggled inside ANY carrier (`MultisigExec`,
+    // `ProposeMultisig`, `Tipped`). This must run BEFORE the carrier
+    // resolution below: a carrier whose own pre-checks fail first (no multisig
+    // policy, too few approvals, a non-proposable inner) would otherwise
+    // short-circuit to a MINEABLE `Failed` receipt whose serialized bytes
+    // embed a discriminant pre-upgrade nodes cannot Borsh-decode — the
+    // upgraded node mines a block the rest of the network rejects: a chain
+    // split during any rolling upgrade. The walk is generic over the whole
+    // (decode-depth-bounded) tree, so a FUTURE dormant variant added to
+    // `dormant_feature`'s one table is automatically gated in every carrier —
+    // present and future — rather than relying on per-carrier vigilance.
+    if let Some(feature) = find_inactive_feature(&tx.action, ctx) {
+        return Err(ExecutionError::FeatureInactive { feature });
     }
 
     // BIP-110: cap the arbitrary data a transaction may carry (contract code on
@@ -2312,6 +2374,142 @@ mod tests {
             action: Action::ShieldedV2 { bundle },
         };
         SignedTransaction::sign(tx, &kp).unwrap()
+    }
+
+    /// Wrap `inner` in a carrier, signed by a PLAIN (non-multisig) account —
+    /// the cheapest possible attack: no policy, no approvals, any funded key.
+    fn carrier_tx(inner: Action, nonce: u64) -> SignedTransaction {
+        let kp = Keypair::from_seed([1; 32]);
+        let tx = Transaction {
+            signer: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce,
+            action: inner,
+        };
+        SignedTransaction::sign(tx, &kp).unwrap()
+    }
+
+    #[test]
+    fn dormant_variants_are_unmineable_through_every_carrier() {
+        // PR#8 audit finding F1 (HIGH). A carrier whose OWN pre-checks fail
+        // first — no multisig policy, too few approvals, a non-proposable
+        // inner — used to short-circuit to a `Failed` receipt BEFORE the
+        // dormant dispatch arm was ever reached. `Failed` is `Ok(_)`, so the
+        // producer MINED it, and the block's bytes embedded a discriminant
+        // that pre-upgrade nodes cannot Borsh-decode: the upgraded node
+        // accepts a block the rest of the network rejects — a chain split
+        // during any rolling upgrade, from any funded account.
+        //
+        // The gate now runs over the whole carrier chain before carrier
+        // resolution, so every one of these is a HARD, block-invalidating
+        // reject. `Tipped` (bit 1, dormant below its activation height) is
+        // covered by the same table — it carried this identical latent gap
+        // from v0.1.98 and was never exercised only because nobody crafted
+        // the transaction.
+        let p = policy();
+        let dormant_v2 = || Action::ShieldedV2 {
+            bundle: vec![1u8; 64],
+        };
+        let dormant_tip = || Action::Tipped {
+            tip: Balance::from_grains(1),
+            inner: Box::new(Action::Transfer {
+                to: id("usa.reserve.sov"),
+                amount: Balance::from_grains(1),
+            }),
+        };
+
+        for (label, action, feature) in [
+            (
+                "MultisigExec{ShieldedV2} from a plain account",
+                Action::MultisigExec {
+                    action: Box::new(dormant_v2()),
+                    approvals: vec![],
+                },
+                "shielded-v2",
+            ),
+            (
+                "ProposeMultisig{ShieldedV2}",
+                Action::ProposeMultisig {
+                    account: id("usa.reserve.sov"),
+                    action: Box::new(dormant_v2()),
+                },
+                "shielded-v2",
+            ),
+            (
+                "MultisigExec{Tipped} while the auction is dormant",
+                Action::MultisigExec {
+                    action: Box::new(dormant_tip()),
+                    approvals: vec![],
+                },
+                "fee-auction",
+            ),
+            (
+                "ProposeMultisig{Tipped} while the auction is dormant",
+                Action::ProposeMultisig {
+                    account: id("usa.reserve.sov"),
+                    action: Box::new(dormant_tip()),
+                },
+                "fee-auction",
+            ),
+        ] {
+            let mut ledger = ledger_with_usa(100);
+            let root0 = ledger.state_root();
+            let stx = carrier_tx(action, 0);
+
+            // A HARD reject — never an `Ok(Failed)` receipt, which is what
+            // made it mineable.
+            match apply_transaction(&mut ledger, &stx, &ctx(&p)) {
+                Err(ExecutionError::FeatureInactive { feature: f }) => assert_eq!(
+                    f, feature,
+                    "{label}: rejected for the wrong dormant feature"
+                ),
+                other => panic!("{label}: expected a hard FeatureInactive, got {other:?}"),
+            }
+
+            // The block layer rejects it, so a smuggled block is invalid on
+            // every node rather than accepted by upgraded ones only.
+            assert!(
+                matches!(
+                    apply_transactions(&mut ledger, std::slice::from_ref(&stx), &ctx(&p)),
+                    Err(BlockExecutionError::InvalidTransaction { index: 0, .. })
+                ),
+                "{label}: a block carrying it must be invalid"
+            );
+            assert_eq!(
+                ledger.state_root(),
+                root0,
+                "{label}: a rejected dormant tx commits nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn an_active_tipped_carrier_still_executes_normally() {
+        // The gate must not over-reject: with the auction ACTIVE, a `Tipped`
+        // envelope is NOT dormant, so the walk passes through it and only a
+        // genuinely dormant inner (here, none) would stop it. This pins that
+        // the F1 fix did not break the live mainnet fee-auction path.
+        let p = policy();
+        let mut ledger = ledger_with_usa(100);
+        let stx = carrier_tx(
+            Action::Tipped {
+                tip: Balance::from_grains(1),
+                inner: Box::new(Action::Transfer {
+                    to: miner_id(),
+                    amount: Balance::from_grains(1),
+                }),
+            },
+            0,
+        );
+        let mut active = ctx(&p);
+        active.fee_auction_active = true;
+        let receipt = apply_transaction(&mut ledger, &stx, &active)
+            .expect("an active tipped transfer is not dormant and must execute");
+        assert!(
+            matches!(receipt.status, ExecutionStatus::Success { .. }),
+            "active fee-auction path must still succeed, got {:?}",
+            receipt.status
+        );
     }
 
     #[test]

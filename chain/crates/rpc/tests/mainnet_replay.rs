@@ -115,5 +115,55 @@ fn replay_real_mainnet_block_log_if_provided() {
         assert_eq!(c.ledger().state_root().to_hex(), root, "…and state root");
     }
     println!("MAINNET REPLAY tier1: height/head/state_root identical on snapshot resume");
+    drop(daemon2);
+
+    // Boot 3 (optional) — a REAL chainstate snapshot written by a PRE-v0.2.0
+    // binary (the LEGACY ledger-blob format, no pool-v2 element), if the
+    // operator provides a copy: the daemon must tier-1 resume from it through
+    // the legacy-decode fallback, trusted-replay the post-snapshot gap from
+    // the log, and land on the identical head triple. This is the real-data
+    // proof that upgrading in place keeps existing snapshots loadable.
+    if let Ok(snap) = std::env::var("SOV_MAINNET_SNAPSHOT") {
+        let dir_b = dir.with_file_name(format!(
+            "{}-legacy-snap",
+            dir.file_name().expect("dir name").to_string_lossy()
+        ));
+        let _ = std::fs::remove_dir_all(&dir_b);
+        std::fs::create_dir_all(&dir_b).expect("legacy-snapshot scratch dir");
+        for (src, dst) in [
+            (log.as_str(), "blocks.log"),
+            (snap.as_str(), "chainstate.snapshot"),
+        ] {
+            std::fs::copy(src, dir_b.join(dst)).expect("copy into scratch dir");
+            let mut p = std::fs::metadata(dir_b.join(dst))
+                .expect("metadata")
+                .permissions();
+            #[allow(clippy::permissions_set_readonly_false)] // scratch copy, test-only
+            p.set_readonly(false);
+            std::fs::set_permissions(dir_b.join(dst), p).expect("writable scratch copy");
+        }
+        std::fs::write(dir_b.join("schema_version"), b"1").expect("schema tag");
+        let daemon3 = Daemon::new(&genesis, &dir_b, 16, 16, vec![]).expect("legacy resume");
+        assert!(
+            daemon3.resumed_from_snapshot(),
+            "the pre-v0.2.0 snapshot must be ACCEPTED (tier-1), not discarded — \
+             the legacy ledger-blob fallback is what this proves"
+        );
+        {
+            let node = daemon3.node();
+            let n = node.lock().expect("node lock");
+            let c = n.chain();
+            assert_eq!(c.height(), height, "legacy-snapshot boot agrees on height");
+            assert_eq!(c.head().hash().to_hex(), head, "…and head hash");
+            assert_eq!(c.ledger().state_root().to_hex(), root, "…and state root");
+        }
+        println!(
+            "MAINNET REPLAY legacy-snapshot: tier-1 resume from a real pre-v0.2.0 \
+             snapshot reproduces the identical head/state_root"
+        );
+        let _ = std::fs::remove_dir_all(&dir_b);
+    } else {
+        eprintln!("SOV_MAINNET_SNAPSHOT not set — legacy-snapshot leg skipped");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
