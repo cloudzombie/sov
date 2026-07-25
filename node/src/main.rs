@@ -42,7 +42,21 @@ enum Command {
         accounts: Vec<String>,
         interval_ms: u64,
     },
+    /// Print the app version and exit — the machine-checkable version surface the
+    /// release workflow asserts against the tag (see `scripts/verify-artifact-version.sh`).
+    Version,
     Help,
+}
+
+/// The single line `--version` prints: `sov-station <CARGO_PKG_VERSION>`.
+///
+/// `CARGO_PKG_VERSION` comes from `node/Cargo.toml` — the SAME value the GUI shows in
+/// its status bar ("SOV Station v…"), and the value the release gate requires to equal
+/// the tag. Every release build is executed with `--version` on its own build runner and
+/// the output must equal the tag exactly, so a published artifact can never merely
+/// *claim* a version: it proves it. Keep the format stable — the check parses it.
+fn version_line() -> String {
+    format!("sov-station {}", env!("CARGO_PKG_VERSION"))
 }
 
 fn main() {
@@ -64,6 +78,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
             accounts,
             interval_ms,
         } => watch(&rpc, &client(&rpc), &accounts, interval_ms),
+        Command::Version => {
+            println!("{}", version_line());
+            Ok(())
+        }
         Command::Help => {
             print_usage();
             Ok(())
@@ -85,6 +103,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     let command = args[0].as_str();
     if matches!(command, "-h" | "--help" | "help") {
         return Ok(Command::Help);
+    }
+    if matches!(command, "-V" | "--version" | "version") {
+        return Ok(Command::Version);
     }
 
     match command {
@@ -163,6 +184,7 @@ fn print_usage() {
     println!("  sov-station mining [rpc_addr]");
     println!("  sov-station wallet [rpc_addr] <account>...");
     println!("  sov-station watch [rpc_addr] [account]... [--interval-ms 3000]");
+    println!("  sov-station --version             print the app version and exit");
     println!();
     println!("Default RPC: {DEFAULT_RPC}");
 }
@@ -473,6 +495,35 @@ mod tests {
                 accounts: vec!["alice.sov".to_string()],
                 interval_ms: 750
             }
+        );
+    }
+
+    #[test]
+    fn version_flag_is_recognised_in_every_spelling() {
+        for spelling in ["--version", "-V", "version"] {
+            assert_eq!(
+                parse_args(&args(&[spelling])).unwrap(),
+                Command::Version,
+                "`{spelling}` must select the version command"
+            );
+        }
+    }
+
+    #[test]
+    fn version_line_is_exactly_what_the_release_check_expects() {
+        // The release workflow runs the BUILT binary with `--version` and requires the
+        // output to equal `sov-station <tag-without-v>` exactly. Pin both the format and
+        // the source of the number (node/Cargo.toml) so neither can drift silently.
+        let line = version_line();
+        assert_eq!(line, format!("sov-station {}", env!("CARGO_PKG_VERSION")));
+        assert!(!line.contains('\n'), "version output must be a single line");
+        let number = line.strip_prefix("sov-station ").expect("fixed prefix");
+        assert!(
+            number.split('.').count() == 3
+                && number
+                    .split('.')
+                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+            "version must be a bare X.Y.Z (no `v`, no git-describe suffix), got {number:?}"
         );
     }
 

@@ -17,6 +17,10 @@ No consensus behavior has changed on the live chain. Nothing is armed.
   **separate, coordinated, explicitly-approved** step — never a countdown wired in casually.
 - Every phase gate re-proves the `sov-verify` KAT byte-for-byte + genesis pins before shipping.
 - This is mainnet post-quantum reserve cash. Conservative pace, honest disclosure, prove-don't-claim.
+- **Releases follow the version contract** — ONE version source (`node/Cargo.toml`), tags only via
+  `scripts/release-gate.sh --cut vX.Y.Z`, versions NEVER re-used, tags NEVER moved, releases only
+  from the current head of `origin/main`, and every artifact proves its own version before it is
+  published. See [release-version-contract.md](release-version-contract.md).
 
 ---
 
@@ -71,6 +75,10 @@ external audit. Tracked in `~/.claude/.../memory/` (see `v0186-program.md`).
 ---
 
 ## Recently shipped
+- **release version contract** (2026-07-25, branch `feat/release-version-contract`, PR open) —
+  reused/moved tags refused, release-from-current-main enforced in both the gate and CI, and every
+  published artifact asserted to self-report the tag; 35 guard tests in CI. See
+  [release-version-contract.md](release-version-contract.md) + [2026-07-25.md](2026-07-25.md).
 - **v0.1.93** (2026-07-19) — dormant cross-network replay hard fork; also hardened a macOS-flaky
   p2p sync test. All CI-equivalent gates green locally before push.
 - **v0.1.92** (2026-07-19) — pool-mining groundwork (Phases 1–2).

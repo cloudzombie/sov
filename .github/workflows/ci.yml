@@ -25,6 +25,24 @@ jobs:
             exit 1
           fi
 
+  # The RELEASE VERSION CONTRACT guards (scripts/version-contract.sh and
+  # scripts/verify-artifact-version.sh) are the last thing standing between a typo and a
+  # mis-versioned mainnet release — so they are tested like consensus code, on every
+  # push, not merely trusted. The suite drives every REFUSAL path (reused version, moved
+  # tag, release off a stale main, a binary whose self-reported version != the tag)
+  # against throwaway git repos with real file:// remotes and synthetic binaries: no
+  # network, no cargo, seconds to run. (shellcheck over the same scripts lives in the
+  # `hygiene` job, per the mandatory local gate in notes/v0.2.0-program.md.)
+  release-contract:
+    name: release version contract (guards)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Guard tests (every failure path must fire)
+        run: scripts/tests/release-contract.test.sh
+
   # Platform-agnostic checks: run once on Linux.
   lint:
     name: fmt · clippy
@@ -216,8 +234,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: ShellCheck (release + build scripts)
-        run: shellcheck scripts/*.sh
+      - name: ShellCheck (release + build scripts, incl. their tests)
+        run: shellcheck scripts/*.sh scripts/tests/*.sh
       - name: Spelling (typos)
         uses: crate-ci/typos@685eb3d55be2f85191e8c84acb9f44d7756f84ab # v1.29.4
       - uses: dtolnay/rust-toolchain@1.97.0

@@ -36,7 +36,20 @@ jobs:
     name: release gate (genesis double-lock + full verification)
     runs-on: ubuntu-latest
     steps:
+      # Full history: the version contract diagnoses a rejected ref precisely (is this
+      # commit an ANCESTOR of main, or not on main at all?), which needs the graph.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      # REF DISCIPLINE (1/2) — a release is only ever a TAG. `workflow_dispatch` on a
+      # branch would otherwise publish "SOV Station main". Tags are created only by the
+      # documented path (scripts/release-gate.sh --cut vX.Y.Z).
+      - name: Ref discipline (the release ref must be a tag)
+        run: |
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            echo "::error::This workflow publishes releases and may only run on a TAG ref (got ${{ github.ref_type }} '${GITHUB_REF_NAME}'). Cut a release with scripts/release-gate.sh --cut vX.Y.Z."
+            exit 1
+          fi
       # VERSION GUARD — the release tag MUST equal node/Cargo.toml's version, because
       # SOV Station displays CARGO_PKG_VERSION (from node/Cargo.toml). A tag cut while
       # that version is stale ships an app whose in-app version lies (e.g. a v0.1.93
@@ -53,6 +66,22 @@ jobs:
             exit 1
           fi
           echo "OK — SOV Station will display $CARGO_VER, matching tag $TAG"
+      # REF DISCIPLINE (2/2) + NO VERSION REUSE — the authoritative check, here in CI
+      # because only CI sees the real remote:
+      #   · the tag must NOT already have a GitHub Release (a published version is spent);
+      #   · the tag on the remote must still point at THIS commit (it never moves);
+      #   · that commit must be the CURRENT head of origin/main — an ancestor is refused
+      #     too, since publishing it would omit commits main already has.
+      # Same script the developer path runs (scripts/release-gate.sh --cut), so the two
+      # cannot drift; `--require-gh` makes an unanswerable GitHub API fail CLOSED.
+      - name: Release version contract (no reuse · tag never moves · from current main)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/version-contract.sh verify-tag-push "${GITHUB_REF_NAME}" "${GITHUB_SHA}" --require-gh
+      # The guards themselves are tested — every failure path is exercised locally and
+      # in CI (ci.yml → release-contract). A guard nobody has watched fail is not a guard.
+      - name: Release-contract guard tests
+        run: scripts/tests/release-contract.test.sh
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: wasm32-unknown-unknown
@@ -84,6 +113,17 @@ jobs:
       - name: Build GUI (release)
         shell: bash
         run: cargo build --release --manifest-path node/Cargo.toml
+      # ARTIFACT SELF-REPORT — run the binary we are about to publish and require it to
+      # state this exact tag. `station` executes `sov-station --version` (the same
+      # CARGO_PKG_VERSION the app's status bar shows); `embedded` proves the in-process
+      # daemon's baked SOV_VERSION is the tag and not a `git describe` fallback (the
+      # v0.1.93-ships-sov/v0.1.89 bug). Runs BEFORE staging: a mis-versioned binary is
+      # never even packaged.
+      - name: Artifact self-report (built binary must state the tag)
+        shell: bash
+        run: |
+          scripts/verify-artifact-version.sh station  node/target/release/sov-station.exe "${GITHUB_REF_NAME}"
+          scripts/verify-artifact-version.sh embedded node/target/release/sov-station.exe "${GITHUB_REF_NAME}"
       - name: Stage bundle
         shell: bash
         run: |
@@ -110,10 +150,21 @@ jobs:
           cache-on-failure: true
       - name: Build GUI (release)
         run: cargo build --release --manifest-path node/Cargo.toml
+      # ARTIFACT SELF-REPORT — see the Windows job. The .app's CFBundleShortVersionString
+      # is written from the tag below; this proves the executable INSIDE it agrees.
+      - name: Artifact self-report (built binary must state the tag)
+        shell: bash
+        run: |
+          scripts/verify-artifact-version.sh station  node/target/release/sov-station "${GITHUB_REF_NAME}"
+          scripts/verify-artifact-version.sh embedded node/target/release/sov-station "${GITHUB_REF_NAME}"
       - name: Bundle .app + .dmg
         shell: bash
         run: |
           VER="${GITHUB_REF_NAME:-0.0.0}"
+          # Apple's version keys are numeric (X.Y.Z, no leading `v`). CFBundleVersion was
+          # hardcoded `0.1.0` — every release claimed the same build version in Finder.
+          # Both keys now come from the tag, and are verified below.
+          VER_NUM="${VER#v}"
           STAGE="dist/stage"; APP="$STAGE/SOV Station.app"; MAC="$APP/Contents/MacOS"
           mkdir -p "$MAC" "$APP/Contents/Resources" dist
           cp node/target/release/sov-station "$MAC/sov-station"
@@ -125,14 +176,17 @@ jobs:
             <key>CFBundleName</key><string>SOV Station</string>
             <key>CFBundleDisplayName</key><string>SOV Station</string>
             <key>CFBundleIdentifier</key><string>sov.station</string>
-            <key>CFBundleVersion</key><string>0.1.0</string>
-            <key>CFBundleShortVersionString</key><string>${VER}</string>
+            <key>CFBundleVersion</key><string>${VER_NUM}</string>
+            <key>CFBundleShortVersionString</key><string>${VER_NUM}</string>
             <key>CFBundleExecutable</key><string>sov-station</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>LSMinimumSystemVersion</key><string>11.0</string>
             <key>NSHighResolutionCapable</key><true/>
           </dict></plist>
           PLIST
+          # The bundle's own version keys are a version surface too — Finder and the
+          # "About" panel read them, not the executable. Assert them before signing.
+          scripts/verify-artifact-version.sh plist "$APP/Contents/Info.plist" "$VER"
           cp .github/STATION-README.txt "$STAGE/READ ME.txt" || true
           # Ad-hoc sign the binary first, then the bundle (Apple Silicon requires a
           # valid signature to run at all). --deep is deprecated and can corrupt the
@@ -160,6 +214,16 @@ jobs:
       - name: Build headless node daemon + operator helper (release)
         run: |
           cargo build --release --manifest-path chain/Cargo.toml --bin sov-rpcd --bin sov-testnet
+      # ARTIFACT SELF-REPORT — the strongest form for the daemon: BOOT the freshly built
+      # sov-rpcd on an isolated port and ask it `sov_version` over JSON-RPC. The answer
+      # is the literal string every peer sees as `sov/<version>`; it must equal the tag.
+      # `embedded` additionally proves no `git describe` fallback leaked into either
+      # published binary. Runs BEFORE staging: nothing mis-versioned gets packaged.
+      - name: Artifact self-report (daemon reports the tag, live over RPC)
+        run: |
+          scripts/verify-artifact-version.sh embedded chain/target/release/sov-rpcd   "${GITHUB_REF_NAME}"
+          scripts/verify-artifact-version.sh no-describe chain/target/release/sov-testnet "${GITHUB_REF_NAME}"
+          scripts/verify-artifact-version.sh daemon   chain/target/release            "${GITHUB_REF_NAME}"
       - name: Stage Linux node bundle (for VPS / server deployment)
         shell: bash
         run: |
