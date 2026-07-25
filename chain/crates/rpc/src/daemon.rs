@@ -2906,6 +2906,36 @@ mod tests {
             "decimal-string grains, the codebase convention"
         );
         assert_eq!(buckets[0].get("txCount"), Some(&serde_json::json!(1)));
+        // The SIZE dimension: real summed Borsh bytes of the bucket's txs, and the
+        // block's byte budget alongside its transaction budget — so a client packs
+        // projected blocks against whichever limit binds first.
+        let bucket_bytes = buckets[0]
+            .get("totalBytes")
+            .and_then(serde_json::Value::as_u64)
+            .expect("every bucket reports its summed serialized bytes");
+        assert!(bucket_bytes > 0, "a pooled tx has a real, nonzero size");
+        let max_block_bytes = hist
+            .get("maxBlockBytes")
+            .and_then(serde_json::Value::as_u64)
+            .expect("the elastic block-size cap is disclosed");
+        assert!(
+            max_block_bytes >= 1024 * 1024,
+            "the elastic cap never drops below its 1 MiB floor: {max_block_bytes}"
+        );
+        // Both prices: the forming block's marginal tip and the pool's admission
+        // floor. Free room in both here, so both are an honest zero.
+        assert_eq!(hist.get("floorGrains"), Some(&serde_json::json!("0")));
+        assert_eq!(hist.get("poolFloorGrains"), Some(&serde_json::json!("0")));
+        // The client contract: bucket counts sum EXACTLY to the headline txCount.
+        let bucket_total: u64 = buckets
+            .iter()
+            .map(|b| b.get("txCount").and_then(serde_json::Value::as_u64).unwrap())
+            .sum();
+        assert_eq!(
+            bucket_total,
+            hist.get("txCount").unwrap().as_u64().unwrap(),
+            "buckets account for every ready transaction, exactly once"
+        );
 
         // Operator info: both regions visible, ages present for occupied regions.
         let info = client

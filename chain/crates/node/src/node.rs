@@ -104,10 +104,25 @@ impl Node {
         self.max_block_txs
     }
 
+    /// The byte budget of the next block — the consensus elastic block-size cap
+    /// for a block extending the current head. Together with
+    /// [`max_block_txs`](Self::max_block_txs) it is the pair of limits a
+    /// projected block is packed against.
+    pub fn max_block_bytes(&self) -> usize {
+        self.chain.next_block_size_limit()
+    }
+
     /// Effective-tip histogram of the ready mempool, highest bucket first,
     /// bounded at `max_buckets`. See [`Mempool::tip_histogram`].
-    pub fn mempool_tip_histogram(&self, max_buckets: usize) -> Vec<(u128, u64)> {
+    pub fn mempool_tip_histogram(&self, max_buckets: usize) -> Vec<sov_mempool::TipBucket> {
         self.mempool.tip_histogram(max_buckets)
+    }
+
+    /// The mempool ADMISSION floor in grains — what a new transaction must beat
+    /// to displace a slot in a full pool, `0` while the pool has room. See
+    /// [`Mempool::pool_floor_grains`].
+    pub fn mempool_pool_floor_grains(&self) -> u128 {
+        self.mempool.pool_floor_grains()
     }
 
     /// Ages (ms) of the oldest ready and oldest queued mempool entries —

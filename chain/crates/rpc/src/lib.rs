@@ -44,7 +44,8 @@
 //! state: `sov_getShieldedInfo`.
 //! Write: `sov_submitTransaction`. Mining work-distribution (out-of-process /
 //! Stratum): `sov_getBlockTemplate` (build + cache a candidate, return the header
-//! preimage to grind) and `sov_submitBlock` (verify a submitted nonce's seal and
+//! preimage to grind — additionally disclosing the candidate's `txCount` and a
+//! bounded `txIds`) and `sov_submitBlock` (verify a submitted nonce's seal and
 //! import through the validated path).
 
 #![forbid(unsafe_code)]
@@ -163,6 +164,18 @@ const MAX_TOKEN_PAGE: usize = 200;
 /// any affordable tip (≤ total supply), so in practice every bucket is exact —
 /// and the XUS Miner client is written against exactly this cap.
 pub const HISTOGRAM_MAX_BUCKETS: usize = 128;
+
+/// Hard cap on how many transaction ids `sov_getBlockTemplate` will enumerate in
+/// its `txIds` array. Equal to the default `max_block_txs`, so under the default
+/// policy the list is always COMPLETE; a node configured with a larger per-block
+/// capacity that actually builds a bigger template omits `txIds` entirely (and
+/// says so with `txIdsOmitted: true`) rather than serving a truncated list.
+///
+/// Omit-rather-than-truncate is a correctness requirement, not a preference: the
+/// consuming client treats a present `txIds` array as AUTHORITATIVE for the
+/// block's transaction count, so a silently truncated array would make an honest
+/// client display a wrong count. `txCount` is always exact either way.
+pub const MAX_TEMPLATE_TX_IDS: usize = 4_096;
 
 /// How long a mining template cached by `sov_getBlockTemplate` remains submittable.
 /// Generous relative to the 2.5-minute target block time, but short enough that a
@@ -1038,24 +1051,38 @@ fn call(
             // most HISTOGRAM_MAX_BUCKETS buckets whatever the pool holds (the
             // cheapest tail merges into the last bucket). Deterministic: content
             // depends only on pooled tips; no wall clock in the shape. Rates are
-            // decimal-string grains (the codebase's large-integer convention),
-            // flat per TRANSACTION because this node's block capacity and auction
-            // ordering (`select`) are per-transaction — a per-byte rate would
-            // mispredict the node's real packing (revisit when block limits
-            // become weight-based).
-            let buckets: Vec<Value> = node
-                .mempool_tip_histogram(HISTOGRAM_MAX_BUCKETS)
-                .into_iter()
-                .map(|(min_tip, count)| {
-                    json!({
-                        "feeRateGrains": min_tip.to_string(),
-                        "txCount": count,
-                    })
-                })
-                .collect();
+            // decimal-string grains (the codebase's large-integer convention).
+            //
+            // FEE-RATE DENOMINATOR: `feeRateGrains` is the ABSOLUTE per-transaction
+            // effective tip, because that is this node's actual auction key —
+            // `Mempool::select` orders by `effective_tip` and the next-block floor
+            // is the marginal `effective_tip`. Bucketing by tip-per-byte would sort
+            // the backlog in an order the node does not use and would therefore
+            // mispredict inclusion. Size is NOT ignored: a block is bounded by the
+            // consensus elastic block-size cap as well as by `maxBlockTxs`, and
+            // transaction sizes vary by orders of magnitude here (a shielded spend
+            // dwarfs a transfer) — so every bucket also reports `totalBytes`, and
+            // the response reports `maxBlockBytes`. A client packs projected blocks
+            // against WHICHEVER limit binds first. (If `select` ever becomes
+            // byte-aware, this key must move with it.)
+            let hist = node.mempool_tip_histogram(HISTOGRAM_MAX_BUCKETS);
+            let mut buckets: Vec<Value> = Vec::new();
+            for bucket in &hist {
+                buckets.push(json!({
+                    "feeRateGrains": bucket.min_tip_grains.to_string(),
+                    "txCount": bucket.tx_count,
+                    "totalBytes": bucket.total_bytes,
+                }));
+            }
             Ok(json!({
                 "txCount": node.mempool_len(),
                 "maxBlockTxs": node.max_block_txs(),
+                "maxBlockBytes": node.max_block_bytes(),
+                // The forming block's marginal price (what a tx must beat to take
+                // a slot in the NEXT block) and the pool's admission price (what it
+                // must beat to be pooled at all when the pool is full).
+                "floorGrains": node.next_block_floor_grains().to_string(),
+                "poolFloorGrains": node.mempool_pool_floor_grains().to_string(),
                 "buckets": buckets,
             }))
         }
@@ -1077,7 +1104,9 @@ fn call(
                 "queuedCapacity": queued_capacity,
                 "maxQueuedPerSender": max_queued_per_sender,
                 "maxBlockTxs": node.max_block_txs(),
+                "maxBlockBytes": node.max_block_bytes(),
                 "nextBlockFloorGrains": node.next_block_floor_grains().to_string(),
+                "poolFloorGrains": node.mempool_pool_floor_grains().to_string(),
                 "oldestPendingAgeMs": oldest_pending,
                 "oldestQueuedAgeMs": oldest_queued,
             }))
@@ -1497,7 +1526,30 @@ fn call(
             // can splice a candidate nonce in place without re-encoding the header).
             let preimage = header.pow_preimage();
             let nonce_offset = preimage.len().saturating_sub(8);
-            let resp = json!({
+            // ADDITIVE (law F5) — the candidate's transaction payload, DISCLOSED:
+            // `txCount` is the exact number of transactions this template commits
+            // to (a JSON integer), and `txIds` enumerates them in execution order.
+            // Neither exists on older nodes, so a client that reads them must
+            // tolerate their absence; no existing field changes name, meaning, or
+            // presence, and in particular `blob` and `nonceOffset` are byte-for-byte
+            // what they were — a miner hashes the same preimage and mutates the same
+            // trailing nonce. `txIds` is BOUNDED by MAX_TEMPLATE_TX_IDS and is
+            // omitted whole (with `txIdsOmitted: true`) rather than truncated when a
+            // template exceeds it, so a present list is always the complete one.
+            let txs = &candidate.block().transactions;
+            let tx_count = txs.len();
+            let tx_ids: Option<Vec<String>> = if tx_count <= MAX_TEMPLATE_TX_IDS {
+                // Sized from the CANDIDATE's own length (this node built it), never
+                // from request input.
+                let mut ids = Vec::with_capacity(tx_count);
+                for stx in txs {
+                    ids.push(stx.id().to_hex());
+                }
+                Some(ids)
+            } else {
+                None
+            };
+            let mut resp = json!({
                 "templateId": template_id.to_hex(),
                 "height": header.height.get(),
                 "prevHash": header.prev_hash.to_hex(),
@@ -1514,7 +1566,18 @@ fn call(
                 "versionBits": header.version_bits,
                 "blob": hex::encode(&preimage),
                 "nonceOffset": nonce_offset,
+                "txCount": tx_count,
             });
+            // `resp` is built by `json!` above, so it is always an object.
+            let map = resp.as_object_mut().expect("template response is an object");
+            match tx_ids {
+                Some(ids) => {
+                    map.insert("txIds".into(), json!(ids));
+                }
+                None => {
+                    map.insert("txIdsOmitted".into(), json!(true));
+                }
+            }
             ctx.templates.insert(template_id, candidate);
             Ok(resp)
         }

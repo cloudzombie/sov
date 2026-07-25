@@ -605,6 +605,17 @@ impl Blockchain {
         &self.ledger
     }
 
+    /// The ELASTIC block-size cap (bytes) that applies to the next block built on
+    /// the current head — the byte budget `build_candidate` fills against and
+    /// `import_block` enforces. Pure read of already-derived consensus data (it
+    /// calls the same `block_size_limit` the producer and importer use), exposed
+    /// so `sov_getMempoolHistogram` clients can project backlog depth against the
+    /// SIZE bound as well as the transaction-count bound. Changes no rule.
+    pub fn next_block_size_limit(&self) -> usize {
+        let head = self.index.get(&self.head).expect("head is always indexed");
+        self.block_size_limit(head)
+    }
+
     /// Current SHA-256d mining difficulty (retargeted each epoch).
     pub fn sha256d_difficulty(&self) -> Difficulty {
         self.sha256d_difficulty

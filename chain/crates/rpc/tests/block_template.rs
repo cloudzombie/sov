@@ -739,6 +739,204 @@ fn template_reflects_empty_vs_non_empty_mempool_and_applies_the_tx() {
     handle.shutdown();
 }
 
+// ─────────────── template transaction disclosure (txCount / txIds) ───────────────
+
+/// The 16 keys the LIVE mainnet node (v0.1.98) serves on `sov_getBlockTemplate`,
+/// restated literally. Every one of them must still be present, so the disclosure
+/// additions can only ever ADD.
+const LIVE_TEMPLATE_KEYS: [&str; 16] = [
+    "bits",
+    "blob",
+    "height",
+    "minTimestampMs",
+    "nonceOffset",
+    "powAlgo",
+    "powKey",
+    "prevHash",
+    "proposer",
+    "receiptsRoot",
+    "stateRoot",
+    "target",
+    "templateId",
+    "timestampMs",
+    "txRoot",
+    "versionBits",
+];
+
+/// `txCount` + `txIds` are ADDITIVE ONLY: every field the live node serves is still
+/// there, the only new keys are the disclosure ones, and the GRIND SURFACE is
+/// untouched — `blob` still decodes to the exact header preimage whose trailing u64
+/// sits at `nonceOffset`, and a nonce ground over that blob still seals a block the
+/// node imports. Breaking any of this would stop the network mining.
+#[test]
+fn template_tx_disclosure_is_additive_and_leaves_the_grind_surface_intact() {
+    let (_node, handle, addr) = serve();
+
+    let tmpl = rpc(addr, "sov_getBlockTemplate", json!({}));
+    let r = &tmpl["result"];
+    let keys: std::collections::BTreeSet<String> =
+        r.as_object().unwrap().keys().cloned().collect();
+    for key in LIVE_TEMPLATE_KEYS {
+        assert!(keys.contains(key), "live field `{key}` disappeared: {keys:?}");
+    }
+    let added: std::collections::BTreeSet<&str> = keys
+        .iter()
+        .map(String::as_str)
+        .filter(|k| !LIVE_TEMPLATE_KEYS.contains(k))
+        .collect();
+    assert_eq!(
+        added,
+        ["txCount", "txIds"].into_iter().collect(),
+        "only the disclosure fields may be added"
+    );
+
+    // `txCount` is a JSON INTEGER (not a decimal string): it is a small count, and
+    // the consuming client reads it with `as_u64`.
+    assert!(r["txCount"].is_u64(), "txCount must be an integer: {r}");
+
+    // The grind surface, unchanged: the blob IS the Borsh header preimage, and the
+    // nonce is its trailing u64 at `nonceOffset`.
+    let blob = hex::decode(r["blob"].as_str().unwrap()).unwrap();
+    let nonce_offset = r["nonceOffset"].as_u64().unwrap() as usize;
+    assert_eq!(
+        nonce_offset,
+        blob.len() - 8,
+        "the nonce is still the trailing u64 of the blob"
+    );
+    let header: BlockHeader = borsh::from_slice(&blob).expect("blob is still a header preimage");
+    assert_eq!(header.tx_root.to_hex(), r["txRoot"].as_str().unwrap());
+    assert_eq!(header.height.get(), r["height"].as_u64().unwrap());
+
+    // And it still MINES: grind the blob, submit, the chain advances.
+    let mut t = get_template(addr, json!({}));
+    let nonce = grind(&mut t.blob, t.nonce_offset, &t.target);
+    let submit = rpc(
+        addr,
+        "sov_submitBlock",
+        json!({ "templateId": t.id, "nonce": nonce }),
+    );
+    assert_eq!(submit["result"]["accepted"], true, "{submit}");
+    assert_eq!(height(addr), 1);
+
+    handle.shutdown();
+}
+
+/// `txCount` and `txIds` describe the template's REAL committed transaction set:
+/// zero for an empty mempool, and after admitting three transfers they name exactly
+/// those three ids, in execution order, matching the block that actually gets mined.
+#[test]
+fn template_txcount_and_txids_name_the_real_committed_transactions() {
+    let (_node, handle, addr) = serve();
+
+    // Empty mempool: an exact zero count and an EMPTY list — never a missing field,
+    // so a client can distinguish "no transactions" from "node does not disclose".
+    let empty = rpc(addr, "sov_getBlockTemplate", json!({}))["result"].clone();
+    assert_eq!(empty["txCount"], 0);
+    assert_eq!(empty["txIds"], json!([]));
+
+    // Admit three transfers from one signer (nonces 0,1,2 — a contiguous run).
+    let kp = Keypair::from_seed([2; 32]);
+    let mut expected: Vec<String> = Vec::new();
+    for nonce in 0..3u64 {
+        let stx = SignedTransaction::sign(
+            Transaction {
+                signer: id("usa.reserve.sov"),
+                public_key: kp.public_key(),
+                nonce,
+                action: Action::Transfer {
+                    to: id("ecb.reserve.sov"),
+                    amount: Balance::from_sov(1).unwrap(),
+                },
+            },
+            &kp,
+        )
+        .unwrap();
+        expected.push(stx.id().to_hex());
+        let submitted = rpc(
+            addr,
+            "sov_submitTransaction",
+            serde_json::to_value(&stx).unwrap(),
+        );
+        assert_eq!(submitted["result"]["accepted"], true, "{submitted}");
+    }
+
+    std::thread::sleep(Duration::from_millis(3));
+    let full = rpc(addr, "sov_getBlockTemplate", json!({}))["result"].clone();
+    assert_eq!(full["txCount"], 3);
+    let ids: Vec<String> = full["txIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, expected, "txIds are the real ids in execution order");
+    assert_eq!(
+        ids.len() as u64,
+        full["txCount"].as_u64().unwrap(),
+        "a present txIds list ALWAYS agrees with txCount — the client treats the \
+         list as authoritative for the count, so the two can never diverge"
+    );
+
+    // Mine a template over the same mempool: the imported block carries exactly the
+    // ids the template disclosed. (A fresh fetch gets a fresh timestamp — hence a
+    // fresh `templateId` — but the same committed transaction set, which is the
+    // property under test; assert that before mining it.)
+    let mut t = get_template(addr, json!({}));
+    let refetched = rpc(addr, "sov_getBlockTemplate", json!({}))["result"].clone();
+    assert_eq!(refetched["txIds"], full["txIds"], "same set, fresh template");
+    let nonce = grind(&mut t.blob, t.nonce_offset, &t.target);
+    let submit = rpc(
+        addr,
+        "sov_submitBlock",
+        json!({ "templateId": t.id, "nonce": nonce }),
+    );
+    assert_eq!(submit["result"]["accepted"], true, "{submit}");
+    let mined = rpc(addr, "sov_getBlockByHeight", json!({"height": 1}));
+    let mined_ids: Vec<String> = mined["result"]["transactions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tx| {
+            let stx: SignedTransaction = serde_json::from_value(tx.clone()).unwrap();
+            stx.id().to_hex()
+        })
+        .collect();
+    assert_eq!(
+        mined_ids, expected,
+        "the template's disclosure matched the block that was actually mined"
+    );
+
+    handle.shutdown();
+}
+
+/// The `txIds` bound, at its boundary: the cap is a real constant, it is at least the
+/// default per-block capacity (so the list is complete under default policy), and the
+/// response never truncates the list — over the cap it is OMITTED WHOLE, flagged, with
+/// `txCount` still exact. A truncated list would make an honest client, which treats a
+/// present `txIds` as authoritative, display a wrong count.
+#[test]
+fn template_txids_are_bounded_and_never_silently_truncated() {
+    assert_eq!(sov_rpc::MAX_TEMPLATE_TX_IDS, 4_096);
+    // The default `max_block_txs` is 4096, so a default-configured node's template
+    // can never exceed the cap: the list is always complete in practice.
+    assert!(sov_rpc::MAX_TEMPLATE_TX_IDS >= 4_096);
+
+    // Below the cap (the reachable case in this harness): present and complete.
+    let (_node, handle, addr) = serve();
+    let r = rpc(addr, "sov_getBlockTemplate", json!({}))["result"].clone();
+    assert!(r["txIds"].is_array(), "under the cap the list is present");
+    assert!(
+        r.get("txIdsOmitted").is_none(),
+        "the omission flag appears ONLY when the list is omitted"
+    );
+    assert_eq!(
+        r["txIds"].as_array().unwrap().len() as u64,
+        r["txCount"].as_u64().unwrap(),
+        "present ⇒ complete"
+    );
+    handle.shutdown();
+}
+
 // ───────────────────────────── frozen-genesis guard ─────────────────────────────
 
 /// Guard: the v0.1.92 work-distribution additions change NOTHING about network

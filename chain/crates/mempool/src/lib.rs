@@ -240,11 +240,34 @@ pub fn effective_tip(stx: &SignedTransaction) -> Balance {
 /// incremental-relay-fee bump.
 pub const MIN_RBF_BUMP_GRAINS: u128 = 1_000;
 
-/// One sender may occupy at most this fraction of the pool (1/64), floored at 16,
-/// so a single account cannot crowd everyone else out — the anti-DoS fairness
-/// bound that complements the blockspace auction: tips decide WHO WINS contested
-/// slots ([`effective_tip`]), this cap bounds how many slots one account may
-/// contest at all.
+/// One sender may occupy at most this fraction of the READY pool (1/64), floored
+/// at 16, so a single account cannot crowd everyone else out — the anti-DoS
+/// fairness bound that complements the blockspace auction: tips decide WHO WINS
+/// contested slots ([`effective_tip`]), this cap bounds how many slots one account
+/// may contest at all.
+///
+/// REVIEWED against the queued region (which did not exist when this shape was
+/// chosen) and DELIBERATELY KEPT as `capacity/64`:
+/// - The two caps bound different, non-substitutable things. Ready entries are
+///   *mineable* — one sender's ready run is work the producer will actually try to
+///   pack — so its bound is a share of the pool (256 of 16,384 by default, 1.56%).
+///   Queued entries are *not mineable at all* and exist only to absorb
+///   out-of-order arrival races, so theirs is a small absolute number
+///   ([`MAX_QUEUED_PER_SENDER`] = 16), not a share. Scaling the queued cap with
+///   capacity would let a big pool buy an account a large non-mineable footprint,
+///   which is exactly what the queued region must not become.
+/// - The queued region does not consume ready capacity, so one sender's TOTAL
+///   footprint is now `max_per_sender + max_queued_per_sender` = 272 by default —
+///   still 1.66% of the pool, i.e. the fairness property the 1/64 shape was chosen
+///   for is preserved, not diluted. Sixty-four senders still cannot be crowded out
+///   by one.
+/// - Lowering it would newly penalise the legitimate bulk sender the queued region
+///   is explicitly NOT for (a sender wanting depth submits contiguously and belongs
+///   in the ready region); raising it would weaken the only bound that stops one
+///   account monopolising mineable slots. Neither is justified by the queued
+///   region's arrival.
+///
+/// Pinned by `per_sender_cap_shape_survives_the_queued_region`.
 fn default_per_sender(capacity: usize) -> usize {
     (capacity / 64).max(16)
 }
@@ -270,6 +293,26 @@ struct EvictionVictim {
     /// How many transactions the victim's sender holds (legacy-fairness tie-break;
     /// a zero-tip tie only displaces a sender holding more than one).
     sender_count: usize,
+}
+
+/// One effective-tip bucket of [`Mempool::tip_histogram`] — the unit
+/// `sov_getMempoolHistogram` serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TipBucket {
+    /// The LOWEST actual effective tip (grains) of any transaction in the
+    /// bucket, so a client packing projected blocks never overstates what a
+    /// slot pays.
+    pub min_tip_grains: u128,
+    /// How many ready transactions fall in the bucket.
+    pub tx_count: u64,
+    /// Their summed canonical (Borsh) serialized size in bytes — the SIZE
+    /// dimension of the backlog. A block is bounded by BOTH a transaction count
+    /// (`max_block_txs`, node policy) and the consensus elastic block-size cap,
+    /// and transaction sizes here vary by orders of magnitude (a shielded spend
+    /// dwarfs a transfer), so a client projecting depth beyond the next block
+    /// needs bytes as well as counts. Saturating, so it is bounded regardless of
+    /// pool contents.
+    pub total_bytes: u64,
 }
 
 /// A queued (future-nonce) entry: the transaction plus when it was parked, for
@@ -1088,17 +1131,27 @@ impl Mempool {
     /// bucket keyed by its two leading binary digits — exact integer math, no
     /// floats: `index = 2·⌊log₂(tip)⌋ + second-most-significant-bit`, i.e. the
     /// bucket bounds are 2^p and 1.5·2^p. Zero tips (the legacy/no-demand case)
-    /// get their own bucket. Each returned pair is
-    /// `(lowest actual tip in the bucket, transaction count)` — the reported
-    /// rate is the bucket's true minimum, so a client packing blocks never
-    /// overstates what a slot pays.
+    /// get their own bucket. Each bucket reports the LOWEST actual tip it holds
+    /// — the bucket's true minimum, so a client packing blocks never overstates
+    /// what a slot pays — plus the count and the summed serialized bytes.
+    ///
+    /// FEE-RATE DENOMINATOR — the bucket key is the ABSOLUTE per-transaction
+    /// effective tip, NOT tip-per-byte, because that is literally this node's
+    /// auction key: [`select`](Self::select) orders by [`effective_tip`] and
+    /// [`nth_highest_tip`](Self::nth_highest_tip) prices the marginal slot the
+    /// same way. Bucketing by a per-byte rate would sort the backlog in an order
+    /// the node does not actually use, i.e. it would predict inclusion wrongly.
+    /// The size dimension is not dropped, it is DISCLOSED separately as
+    /// [`TipBucket::total_bytes`], because a block is capped in bytes as well as
+    /// in transactions — so a client projects depth with both. (Revisit the key
+    /// if `select` ever becomes byte-aware; then the two must move together.)
     ///
     /// Output is BOUNDED regardless of pool contents: tips are ≤ total supply
     /// (~2^51 grains, enforced by the affordability gate), giving ~104 possible
     /// buckets; any excess beyond `max_buckets` merges the cheapest tail into
-    /// the final bucket (counts summed, minimum kept). Deterministic: bucket
-    /// membership and order depend only on pooled tips.
-    pub fn tip_histogram(&self, max_buckets: usize) -> Vec<(u128, u64)> {
+    /// the final bucket (counts and bytes summed, minimum tip kept).
+    /// Deterministic: bucket membership and order depend only on pooled tips.
+    pub fn tip_histogram(&self, max_buckets: usize) -> Vec<TipBucket> {
         // Half-octave bucket index for a tip: 0 for zero, else
         // 1 + 2·msb + next-bit — at most 1 + 2·127 + 1 = 256 distinct indices.
         fn bucket_index(tip: u128) -> u16 {
@@ -1113,31 +1166,72 @@ impl Mempool {
             };
             1 + 2 * p + sub
         }
-        // index → (lowest tip seen, count); BTreeMap gives ascending index order.
-        let mut buckets: BTreeMap<u16, (u128, u64)> = BTreeMap::new();
+        // index → bucket; BTreeMap gives ascending index order.
+        let mut buckets: BTreeMap<u16, TipBucket> = BTreeMap::new();
         for stx in self.by_id.values() {
             let tip = effective_tip(stx).grains();
-            let entry = buckets.entry(bucket_index(tip)).or_insert((tip, 0));
-            entry.0 = entry.0.min(tip);
-            entry.1 += 1;
+            let entry = buckets.entry(bucket_index(tip)).or_insert(TipBucket {
+                min_tip_grains: tip,
+                tx_count: 0,
+                total_bytes: 0,
+            });
+            entry.min_tip_grains = entry.min_tip_grains.min(tip);
+            entry.tx_count = entry.tx_count.saturating_add(1);
+            entry.total_bytes = entry
+                .total_bytes
+                .saturating_add(stx.serialized_size() as u64);
         }
         if max_buckets == 0 {
             return Vec::new();
         }
         // Highest bucket first; merge any overflow beyond `max_buckets` into the
-        // last (cheapest) kept bucket: counts sum, the minimum tip is kept, so
-        // the tail is honestly represented as "at least this rate".
-        let mut out: Vec<(u128, u64)> = Vec::new();
-        for (_, (min_tip, count)) in buckets.into_iter().rev() {
+        // last (cheapest) kept bucket: counts and bytes sum, the minimum tip is
+        // kept, so the tail is honestly represented as "at least this rate".
+        // NOTE: no `Vec::with_capacity` from a caller-supplied `max_buckets` —
+        // the vector grows only as real buckets are pushed, so an absurd cap
+        // allocates nothing.
+        let mut out: Vec<TipBucket> = Vec::new();
+        for (_, bucket) in buckets.into_iter().rev() {
             if out.len() < max_buckets {
-                out.push((min_tip, count));
+                out.push(bucket);
             } else {
                 let last = out.last_mut().expect("max_buckets > 0");
-                last.0 = last.0.min(min_tip);
-                last.1 += count;
+                last.min_tip_grains = last.min_tip_grains.min(bucket.min_tip_grains);
+                last.tx_count = last.tx_count.saturating_add(bucket.tx_count);
+                last.total_bytes = last.total_bytes.saturating_add(bucket.total_bytes);
             }
         }
         out
+    }
+
+    /// The POOL floor in grains: the effective tip a new transaction must beat
+    /// to displace the pool's cheapest evictable slot when the pool is FULL, or
+    /// `0` while the pool still has free capacity (any bid gets in). This is the
+    /// admission price — distinct from the next-block floor
+    /// ([`nth_highest_tip`](Self::nth_highest_tip) at `max_block_txs`), which is
+    /// the price of the *forming block*.
+    ///
+    /// Reported globally (no excluded signer), so it is the floor a stranger
+    /// faces; the submitting signer's own tail is skipped at real admission,
+    /// which can only make the price it faces HIGHER, never lower — so this is
+    /// never an over-promise.
+    pub fn pool_floor_grains(&self) -> u128 {
+        if self.by_id.len() < self.capacity {
+            return 0;
+        }
+        // Only per-signer TAILS are evictable (the no-stranding rule); the floor
+        // is the cheapest of them. Bounded: one pass over the ready index.
+        let senders: BTreeSet<&AccountId> = self.by_sender.keys().map(|(s, _)| s).collect();
+        senders
+            .into_iter()
+            .filter_map(|signer| {
+                self.by_sender
+                    .range((signer.clone(), 0)..=(signer.clone(), u64::MAX))
+                    .next_back()
+                    .map(|(_, id)| effective_tip(&self.by_id[id]).grains())
+            })
+            .min()
+            .unwrap_or(0)
     }
 
     /// Select an executable batch of up to `max` transactions by the blockspace
@@ -1234,6 +1328,14 @@ mod tests {
     /// A balance large enough that the affordability gate never trips in these tests.
     fn big() -> Balance {
         Balance::from_grains(u128::MAX)
+    }
+
+    /// `(min tip, count)` pairs of a histogram — the shape most assertions care
+    /// about, without restating byte totals.
+    fn rates(hist: &[TipBucket]) -> Vec<(u128, u64)> {
+        hist.iter()
+            .map(|b| (b.min_tip_grains, b.tx_count))
+            .collect()
     }
 
     /// A transfer of `amount_sov` XUS from `from` at `nonce`.
@@ -2573,20 +2675,36 @@ mod tests {
 
         let hist = pool.tip_histogram(128);
         // Descending by bucket, total count conserved, zero bucket last.
-        let total: u64 = hist.iter().map(|(_, c)| c).sum();
+        let total: u64 = hist.iter().map(|b| b.tx_count).sum();
         assert_eq!(total, 6, "every ready tx is counted exactly once");
         assert!(
-            hist.windows(2).all(|w| w[0].0 > w[1].0),
+            hist.windows(2)
+                .all(|w| w[0].min_tip_grains > w[1].min_tip_grains),
             "strictly descending representative tips: {hist:?}"
         );
-        assert_eq!(hist.first().unwrap().0, 5_000_000, "highest bucket first");
-        assert_eq!(*hist.last().unwrap(), (0, 2), "zero-tip bucket last");
+        assert_eq!(
+            hist.first().unwrap().min_tip_grains,
+            5_000_000,
+            "highest bucket first"
+        );
+        let pairs = rates(&hist);
+        assert_eq!(*pairs.last().unwrap(), (0, 2), "zero-tip bucket last");
         // 1000 (binary 1111101000, p=9, next bit 1 → bucket [768,1024)) and 1100
         // (p=10, next bit 0 → bucket [1024,1536)) land in ADJACENT half-octave
         // buckets — each reports its true minimum.
-        assert!(hist.contains(&(1000, 1)));
-        assert!(hist.contains(&(1100, 1)));
-        assert!(hist.contains(&(3, 1)));
+        assert!(pairs.contains(&(1000, 1)));
+        assert!(pairs.contains(&(1100, 1)));
+        assert!(pairs.contains(&(3, 1)));
+        // Bytes are REAL summed Borsh sizes, never zero and never invented: the
+        // total across buckets equals the pool's own summed serialized size.
+        let hist_bytes: u64 = hist.iter().map(|b| b.total_bytes).sum();
+        let pool_bytes: u64 = pool
+            .snapshot()
+            .iter()
+            .map(|s| s.serialized_size() as u64)
+            .sum();
+        assert_eq!(hist_bytes, pool_bytes, "bucket bytes conserve pool bytes");
+        assert!(hist.iter().all(|b| b.total_bytes > 0));
     }
 
     #[test]
@@ -2605,11 +2723,19 @@ mod tests {
         assert_eq!(pool.tip_histogram(128).len(), 8, "8 exact buckets uncapped");
         let capped = pool.tip_histogram(4);
         assert_eq!(capped.len(), 4, "hard cap holds");
-        assert_eq!(capped[0], (1 << 28, 1));
-        assert_eq!(capped[1], (1 << 24, 1));
-        assert_eq!(capped[2], (1 << 20, 1));
-        assert_eq!(capped[3], (1, 5), "tail merged: min tip 1, count 5");
+        assert_eq!(
+            rates(&capped),
+            vec![(1 << 28, 1), (1 << 24, 1), (1 << 20, 1), (1, 5)],
+            "3 exact buckets then the merged tail: min tip 1, count 5"
+        );
+        // The merge conserves BYTES too — nothing is dropped, only summed.
+        let uncapped_bytes: u64 = pool.tip_histogram(128).iter().map(|b| b.total_bytes).sum();
+        let capped_bytes: u64 = capped.iter().map(|b| b.total_bytes).sum();
+        assert_eq!(capped_bytes, uncapped_bytes);
         assert!(pool.tip_histogram(0).is_empty(), "zero buckets → empty");
+        // An absurd cap is harmless: bounded by the REAL bucket count, and no
+        // allocation is sized from it.
+        assert_eq!(pool.tip_histogram(usize::MAX).len(), 8);
     }
 
     #[test]
@@ -2622,7 +2748,63 @@ mod tests {
         pool.insert(tipped([1; 32], "usa.reserve.sov", 5, 900), 0, big())
             .unwrap(); // queued
         assert_eq!((pool.len(), pool.queued_len()), (1, 1));
-        assert_eq!(pool.tip_histogram(128), vec![(9, 1)]);
+        assert_eq!(rates(&pool.tip_histogram(128)), vec![(9, 1)]);
+    }
+
+    #[test]
+    fn per_sender_cap_shape_survives_the_queued_region() {
+        // The reviewed bounds, pinned as NUMBERS at the operator default (16,384):
+        // ready 1/64 = 256, queued a small ABSOLUTE 16 — so one sender's total
+        // footprint across BOTH regions is 272, still under 2% of the pool. The
+        // queued cap must not scale with capacity, or a large pool would buy one
+        // account a large non-mineable footprint.
+        let pool = Mempool::new(16_384);
+        assert_eq!(pool.capacity(), 16_384);
+        assert_eq!(pool.max_per_sender(), 256, "ready cap is capacity/64");
+        assert_eq!(pool.max_queued_per_sender(), MAX_QUEUED_PER_SENDER);
+        assert_eq!(pool.max_queued_per_sender(), 16, "absolute, not a share");
+        assert_eq!(pool.queued_capacity(), 1_024, "global queued = capacity/16");
+        let total_footprint = pool.max_per_sender() + pool.max_queued_per_sender();
+        assert_eq!(total_footprint, 272);
+        assert!(
+            total_footprint * 50 < pool.capacity(),
+            "one sender still holds under 2% of the pool across both regions"
+        );
+
+        // The floors hold at tiny capacities (the shape is a floor, not a ratio,
+        // below 1,024), and the queued cap never scales with capacity.
+        let small = Mempool::new(64);
+        assert_eq!(small.max_per_sender(), 16, "ready floor");
+        assert_eq!(small.queued_capacity(), 64, "queued global floor");
+        assert_eq!(small.max_queued_per_sender(), 16);
+        let huge = Mempool::new(1_048_576);
+        assert_eq!(huge.max_per_sender(), 16_384);
+        assert_eq!(
+            huge.max_queued_per_sender(),
+            16,
+            "queued per-sender cap is capacity-INDEPENDENT by design"
+        );
+    }
+
+    #[test]
+    fn pool_floor_is_zero_with_room_and_the_cheapest_tail_when_full() {
+        // The ADMISSION price (distinct from the next-block floor): free
+        // capacity means any bid gets in (0); at capacity the price is the
+        // cheapest evictable tail's tip.
+        let mut pool = Mempool::new(3);
+        assert_eq!(pool.pool_floor_grains(), 0, "empty pool has no price");
+        pool.insert(tipped([1; 32], "usa.reserve.sov", 0, 500), 0, big())
+            .unwrap();
+        pool.insert(tipped([2; 32], "ecb.reserve.sov", 0, 70), 0, big())
+            .unwrap();
+        assert_eq!(pool.pool_floor_grains(), 0, "still room → still free");
+        pool.insert(tipped([3; 32], "boj.reserve.sov", 0, 900), 0, big())
+            .unwrap();
+        assert_eq!(
+            pool.pool_floor_grains(),
+            70,
+            "full: the cheapest evictable tail sets the price"
+        );
     }
 
     #[test]
