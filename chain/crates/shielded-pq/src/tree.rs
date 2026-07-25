@@ -12,8 +12,31 @@
 use crate::domains::RESCUE_DOMAIN_MERKLE_NODE;
 use crate::hash::{merge_domain, PqDigest};
 
-/// Merkle tree depth — up to 2^20 (~1M) notes.
+/// Merkle tree depth — a 2^20-slot (~1M) leaf space.
 pub const TREE_DEPTH: usize = 20;
+
+/// **Usable** leaf capacity of the depth-[`TREE_DEPTH`] tree: `2^TREE_DEPTH - 1`,
+/// one slot short of the leaf space.
+///
+/// The last slot is deliberately unusable. Consensus maintains this tree as an
+/// O(depth) *frontier* ([`ShieldedV2State`](crate::ShieldedV2State)), whose
+/// entire representation is "one ommer per set bit of `size`". A depth-`D`
+/// frontier can therefore represent every size in `0..2^D` and **cannot**
+/// represent `2^D`: at exactly `2^D` all `D` low bits are zero, so the
+/// representation is indistinguishable from the empty tree and the completed
+/// root has nowhere to live. Refusing the final leaf keeps the frontier a
+/// total, injective encoding of tree contents at every reachable size, which
+/// is the invariant the anchor ring and the STARK's membership proofs stand
+/// on. The alternative (a 21st ommer slot holding the completed root, special
+/// -cased in `root()`) buys one note out of 1,048,576 and pays for it with a
+/// state field that is only ever meaningful in one unreachable-in-practice
+/// configuration; capping is strictly simpler to reason about and strictly
+/// safer for the executor that consumes this next.
+///
+/// This reference tree enforces the same bound as the frontier so that a
+/// wallet-side tree can never build a witness against a tree state consensus
+/// is unable to hold.
+pub const MAX_TREE_LEAVES: u64 = (1u64 << TREE_DEPTH) - 1;
 
 /// A Merkle membership witness: the leaf position and one sibling per level
 /// (level 0 = leaf level).
@@ -85,9 +108,10 @@ impl CommitmentTree {
     }
 
     /// Append a note commitment in chain order, returning its leaf position.
-    /// `None` if the tree is full.
+    /// `None` if the tree is full ([`MAX_TREE_LEAVES`] — the final leaf slot is
+    /// not usable; see that constant).
     pub fn append(&mut self, cm: PqDigest) -> Option<u64> {
-        if self.leaves.len() >= 1usize << TREE_DEPTH {
+        if self.leaves.len() as u64 >= MAX_TREE_LEAVES {
             return None;
         }
         self.leaves.push(cm);
