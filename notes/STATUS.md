@@ -10,6 +10,19 @@ hashrate (30-block window, display-only). v0.1.96 = the DEFINITIVE cold-sync fix
 SKIPPED as a release** — its tx-domain activation plan now folds into **v0.1.98** (see below).
 No consensus behavior has changed on the live chain. Nothing is armed.
 
+## Sibling repositories (NOT in this tree)
+
+Two operator tools have been extracted to standalone repositories and are guarded by the
+`repository-boundaries` CI job here — re-adding either path fails CI:
+
+- **XUS Miner** — https://github.com/cloudzombie/xus-miner (no SOV source dependency at all;
+  compatibility via the documented RPC/Stratum contract).
+- **SOV TX Cannon** — https://github.com/cloudzombie/sov-tx-cannon (was `tools/tx-cannon`). It
+  signs REAL transactions, so it still uses the real chain crates — `sov-rpc`, `sov-crypto`,
+  `sov-types`, `sov-primitives` — as **git dependencies pinned to a release TAG**, not copies.
+  A chain change reaches it only when that pin is deliberately bumped there; changes on this
+  branch cannot break its build, and it never modifies this repository.
+
 ## Golden rules (do not break)
 
 - Genesis `cb0272ff88e64c18cde0257f7fae1c8236b02651f10cc7a02456fd682ee2e72d` NEVER changes.
@@ -31,7 +44,7 @@ No consensus behavior has changed on the live chain. Nothing is armed.
 v2 tx envelope into ONE coordinated v0.1.98 activation** (both touch the tx envelope/signing;
 one flag day, not two). Full plan + backtest/verification method in `activation-v0198.md`.
 **Blocker (unchanged): Phase-2 client signing is NOT done** — only `node/src/gui.rs` references it;
-SDK, Rust wallet, conformance, tx-cannon still pending. A tx-domain flag day is impossible until
+SDK, Rust wallet, conformance, TX Cannon (external repo) still pending. A tx-domain flag day is impossible until
 all 5 signers query `sov_getSigningDomain` + `sign_in`. **NEXT: land fee-priority mempool
 Layer-1 (policy-only, genesis-safe) + finish the Phase-2 signers.**
 
@@ -41,7 +54,8 @@ tested; `tx_domain_deployment` defaults `None` → byte-identical, inactive.
 **NEXT ACTION:** **Phase-2 client signing** (v0.1.94, additive/dormant). Foundation DONE: the
 read-only `sov_getSigningDomain` RPC (returns `active:false`/null while dormant) — landed +
 tested. **Remaining: the 5 client signers query it and call `sign_in(domain)`** — TS SDK, Rust
-wallet, SOV Station, conformance, tx-cannon. See [activation-tx-domain.md](activation-tx-domain.md).
+wallet, SOV Station, conformance, TX Cannon (external repo).
+See [activation-tx-domain.md](activation-tx-domain.md).
 **★ FIRM TARGET — v0.1.95 = THE tx-domain ACTIVATION RELEASE. Do NOT defer / leave for later
 (user directive 2026-07-19).** v0.1.95 must SET the activation height and ship the whole safe
 activation, in this order (all IN the v0.1.95 line):
