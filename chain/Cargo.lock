@@ -2014,6 +2014,7 @@ dependencies = [
  "sov-pow",
  "sov-primitives",
  "sov-shielded",
+ "sov-shielded-pq",
  "sov-state",
  "sov-types",
  "sov-verify",

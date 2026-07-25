@@ -56,6 +56,7 @@
 pub mod air;
 pub mod auth;
 pub mod bundle;
+pub mod carrier;
 pub mod domains;
 pub mod encrypt;
 pub mod hash;
@@ -68,7 +69,8 @@ pub mod wire;
 
 pub use air::BundlePublicInputs;
 pub use auth::AuthKeypair;
-pub use bundle::{bundle_digest, verify_bundle, BundleError, SpendBundle};
+pub use bundle::{bundle_digest, check_structure, verify_bundle, BundleError, SpendBundle};
+pub use carrier::{carrier_sighash, verify_carrier_auth, CarrierContext, SCHEME_SIGNER_NONCE};
 pub use encrypt::{encrypt_note, EncryptionKeypair, NoteCiphertext};
 pub use hash::PqDigest;
 pub use note::{Note, SpendingKey, MAX_NOTE_VALUE, VALUE_BITS};

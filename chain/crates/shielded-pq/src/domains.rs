@@ -55,6 +55,11 @@ pub const B3_NOTE_AEAD: &str = "sov-shielded-pq:note-aead:v2";
 pub const B3_DETECTION_TAG: &str = "sov-shielded-pq:detect:v2";
 /// blake3 domain: the carrier bundle digest the ML-DSA-65 signature covers.
 pub const B3_BUNDLE_DIGEST: &str = "sov-shielded-pq:bundle:v2";
+/// blake3 domain: the CARRIER-BOUND authorization sighash (S2c) — the
+/// second, wrapping digest over `(bundle_digest, carrier context)` that the
+/// ML-DSA-65 signature actually covers, so an authorization cannot be lifted
+/// out of its transaction. See [`crate::carrier`].
+pub const B3_CARRIER_BINDING: &str = "sov-shielded-pq:carrier-binding:v2";
 /// blake3 domain: test fixtures only. Never used by protocol code.
 pub const B3_TEST: &str = "sov-shielded-pq:test:v2";
 
@@ -69,7 +74,7 @@ pub const ALL_RESCUE_DOMAINS: [u64; 6] = [
 ];
 
 /// All blake3 derive-key domains.
-pub const ALL_B3_DOMAINS: [&str; 8] = [
+pub const ALL_B3_DOMAINS: [&str; 9] = [
     B3_NSK,
     B3_RHO,
     B3_AUTH_KEYGEN,
@@ -77,6 +82,7 @@ pub const ALL_B3_DOMAINS: [&str; 8] = [
     B3_NOTE_AEAD,
     B3_DETECTION_TAG,
     B3_BUNDLE_DIGEST,
+    B3_CARRIER_BINDING,
     B3_TEST,
 ];
 

@@ -71,6 +71,21 @@ pub struct BlockContext<'a> {
     /// Resolved per block height, so historical (pre-activation) blocks always
     /// validate under `false`.
     pub fee_auction_active: bool,
+    /// Whether the miner-signaled `shielded-v2` deployment (signal bit 2, the
+    /// post-quantum shielded pool) is `Active` at this block's height.
+    ///
+    /// **`false` on every chain that exists today** — bit 2 is DEFINED but NOT
+    /// ARMED (D13), so no chain schedules it and no height resolves to `true`.
+    /// While `false`, [`Action::ShieldedV2`] is a HARD, block-invalidating
+    /// [`ExecutionError::FeatureInactive`] wherever it appears (top level or
+    /// inside any carrier) — byte-identical dormant behavior.
+    ///
+    /// When `true`, the full pool-v2 path runs: decode + `proof_version` gate,
+    /// carrier-bound ML-DSA-65 authorization, STARK verification, anchor ring,
+    /// nullifier double-spend, turnstile, value balance, and the v2 drain
+    /// limiter ([`crate::shielded_v2`]). Resolved per block height, so
+    /// historical (pre-activation) blocks always validate under `false`.
+    pub shielded_v2_active: bool,
 }
 
 /// Reasons a transaction is *rejected* — not admitted to a block at all. These
@@ -151,6 +166,12 @@ pub enum ExecutionError {
     /// invalid, so an illegal envelope can never be mined.
     #[error("fee-auction envelope: inner action may not be MultisigExec or RotateKey")]
     TipInnerNotAllowed,
+    /// A pool-v2 ([`Action::ShieldedV2`]) bundle was refused. **Every** v2
+    /// failure lands here as a hard, block-invalidating reject — the pool-v2
+    /// surface has no mineable failure mode by design (see
+    /// [`crate::shielded_v2`]).
+    #[error("shielded-v2: {0}")]
+    ShieldedV2(#[from] crate::shielded_v2::ShieldedV2Error),
 }
 
 /// The miner-signaled feature a SINGLE action node depends on, when that
@@ -168,10 +189,12 @@ fn dormant_feature(action: &Action, ctx: &BlockContext) -> Option<&'static str> 
         // below its activation height re-validate as dormant exactly as they
         // did when they were mined.
         Action::Tipped { .. } if !ctx.fee_auction_active => Some("fee-auction"),
-        // `shielded-v2` (signal bit 2) — DEFINED but NOT armed on any chain
-        // (v0.2.0 slices S2a/S2b): there is no height at which it may execute,
-        // so it is dormant unconditionally.
-        Action::ShieldedV2 { .. } => Some("shielded-v2"),
+        // `shielded-v2` (signal bit 2). DEFINED but NOT armed on any chain
+        // (D13), so `ctx.shielded_v2_active` is false everywhere today and
+        // this is dormant at every height — resolved per block height exactly
+        // like `fee-auction`, so once a schedule IS baked, blocks below the
+        // activation height keep re-validating as dormant.
+        Action::ShieldedV2 { .. } if !ctx.shielded_v2_active => Some("shielded-v2"),
         _ => None,
     }
 }
@@ -494,23 +517,76 @@ pub fn apply_transaction(
                     }
                 });
             }
-            // Post-quantum shielded pool v2 — DORMANT (v0.2.0 slices S2a/S2b).
-            // The `shielded-v2` deployment (signal bit 2) is DEFINED but NOT
-            // armed, so there is no height on any chain at which this variant
-            // is legal: it is an unconditional HARD error, which propagates to
-            // BlockExecutionError::InvalidTransaction and invalidates any
-            // block carrying it, uniformly on every node — the same dormant
-            // gate `Action::Tipped` used before the fee-auction activated.
-            // The S2c executor replaces this arm with the real activation-
-            // gated path (STARK verify, anchor ring, nullifiers, turnstile,
-            // value balance); until then genesis and every KAT vector stay
-            // byte-identical. It is reached both for a direct `ShieldedV2` tx
-            // and for one wrapped in an (active) `Tipped` envelope or a
-            // `MultisigExec` — all rejected alike while dormant.
-            Action::ShieldedV2 { .. } => {
-                return Err(ExecutionError::FeatureInactive {
-                    feature: "shielded-v2",
-                });
+            // ── Post-quantum shielded pool v2 (v0.2.0 slice S2c) ─────────────
+            //
+            // DORMANT TODAY: `ctx.shielded_v2_active` is false on every chain
+            // (bit 2 is defined but unarmed, D13), and the dormant-variant gate
+            // above has already hard-rejected this transaction before reaching
+            // here — so on any chain that exists today this arm is unreachable
+            // and the `!active` branch below is defense in depth, not the live
+            // path. Genesis and every KAT vector stay byte-identical.
+            //
+            // When the deployment IS active, this is the whole pool-v2 path.
+            // Two properties are load-bearing:
+            //
+            // 1. **Validate-then-apply.** `verify_bundle_for_carrier` touches
+            //    no state; every ledger write below happens after ALL checks
+            //    pass, so a rejected bundle leaves nothing behind (even before
+            //    the block-level undo rollback).
+            // 2. **No mineable failure.** Every rejection is a hard
+            //    `ExecutionError` — never an `ExecutionStatus::Failed` receipt.
+            //    A `Failed` receipt is a MINED outcome, and a mined outcome
+            //    that different builds could compute differently (an unknown
+            //    `proof_version`, a proof a future circuit accepts) is a chain
+            //    split. Pool v1 answers these with `Failed` receipts; v1's
+            //    behavior is frozen history and cannot change, but v2 starts
+            //    strict.
+            Action::ShieldedV2 { bundle } => {
+                if !ctx.shielded_v2_active {
+                    return Err(ExecutionError::FeatureInactive {
+                        feature: "shielded-v2",
+                    });
+                }
+                let effects = crate::shielded_v2::verify_bundle_for_carrier(
+                    bundle,
+                    ledger,
+                    ctx.mining,
+                    ctx.height,
+                    &tx.signer,
+                    tx_nonce,
+                    signer.balance,
+                )?;
+                // Everything below is pre-validated; each `?` is an
+                // impossible-by-construction guard, not a live branch.
+                ledger
+                    .apply_shielded_v2(&effects.nullifiers, &effects.commitments)
+                    .map_err(|e| {
+                        ExecutionError::ShieldedV2(
+                            crate::shielded_v2::ShieldedV2Error::MalformedStructure(e.to_string()),
+                        )
+                    })?;
+                if effects.shield_in != Balance::ZERO {
+                    signer.balance = signer
+                        .balance
+                        .checked_sub(effects.shield_in)
+                        .ok_or(ExecutionError::Overflow)?;
+                    ledger
+                        .add_shielded_v2_value(effects.shield_in)
+                        .ok_or(ExecutionError::Overflow)?;
+                }
+                if effects.deshield_out != Balance::ZERO {
+                    ledger
+                        .sub_shielded_v2_value(effects.deshield_out)
+                        .ok_or(ExecutionError::Overflow)?;
+                    signer.balance = signer
+                        .balance
+                        .checked_add(effects.deshield_out)
+                        .ok_or(ExecutionError::Overflow)?;
+                    if let Some((start, spent)) = effects.window_update {
+                        ledger.set_deshield_v2_window(start, spent);
+                    }
+                }
+                ExecutionStatus::Success
             }
             Action::Transfer { to, amount } => {
                 do_transfer(ledger, &tx.signer, &mut signer, to, *amount)?
@@ -2205,6 +2281,7 @@ mod tests {
             pq: None,
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
+            shielded_v2_active: false,
         }
     }
     /// A context at a specific height (for staking/vesting tests).
@@ -2218,6 +2295,7 @@ mod tests {
             pq: None,
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
+            shielded_v2_active: false,
         }
     }
 
@@ -2260,6 +2338,7 @@ mod tests {
             pq: None,
             tx_domain: mode,
             fee_auction_active: false,
+            shielded_v2_active: false,
         }
     }
 
@@ -2592,6 +2671,7 @@ mod tests {
             pq: None,
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: true,
+            shielded_v2_active: false,
         }
     }
 
@@ -3476,6 +3556,7 @@ mod tests {
             pq: None,
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
+            shielded_v2_active: false,
         };
 
         // Heights 1 & 2 mint 50 each (epoch 0); height 3 halves to 25
@@ -3602,6 +3683,7 @@ mod tests {
             pq: None,
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
+            shielded_v2_active: false,
         };
 
         // Deploy from dev.sov.
@@ -3665,6 +3747,7 @@ mod tests {
             pq: None,
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
+            shielded_v2_active: false,
         };
         let mut ledger = ledger_with_usa(1_000);
         let stx = transfer([1; 32], "usa.reserve.sov", "ecb.reserve.sov", 1, 0);
@@ -4340,6 +4423,7 @@ mod tests {
             pq: None,
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
+            shielded_v2_active: false,
         };
         let mut ledger = ledger_with_usa(100);
         let sov_before = ledger.account(&id("usa.reserve.sov")).balance;
@@ -5637,6 +5721,7 @@ mod tests {
             }),
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
+            shielded_v2_active: false,
         }
     }
 
@@ -5858,6 +5943,7 @@ mod tests {
             pq: None,
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
+            shielded_v2_active: false,
         };
 
         // A V1 transfer pays exactly the intrinsic gas — no envelope charge.
