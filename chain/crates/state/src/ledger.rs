@@ -47,6 +47,39 @@ type MultisigEntry = (AccountId, Multisig);
 type ProposalEntry = (Hash, MultisigProposal);
 type VaultEntry = (AccountId, crate::vault::Vault);
 
+/// The **legacy** (pre-pool-v2) ledger snapshot tuple — the exact blob shape
+/// every node before v0.2.0 wrote. Kept decodable FOREVER (see
+/// [`Ledger::from_snapshot_bytes`]): a data dir written by an older binary
+/// must restore losslessly on the current one.
+type LegacySnapshotTuple = (
+    Vec<AccountEntry>,
+    Vec<ContractEntry>,
+    Balance,       // mined_emitted
+    Balance,       // shielded_value
+    Vec<[u8; 32]>, // shielded (v1) commitments, append order
+    Vec<[u8; 32]>, // shielded (v1) nullifiers, sorted
+    Balance,       // htlc_locked
+    Vec<HtlcEntry>,
+    Vec<TokenEntry>,
+    Vec<TokenBalanceEntry>,
+    Vec<TokenPolicyEntry>,
+    Vec<TokenWindowEntry>,
+    Vec<Hash>,      // consumed intents
+    (u64, Balance), // deshield window
+    Vec<NftClassEntry>,
+    Vec<NftEntry>,
+    Vec<MultisigEntry>,
+    Vec<ProposalEntry>,
+    (Vec<VaultEntry>, Balance, Option<u128>), // vaults, collateral, oracle
+);
+
+/// Pool-v2 sub-state as persisted (appended to the snapshot in v0.2.0 S2a so
+/// committed v2 state can NEVER be dropped by a snapshot): note commitments in
+/// append order, nullifiers sorted, the turnstile value, and the v2 de-shield
+/// window. All-empty/zero on every chain while the `shielded-v2` deployment is
+/// dormant.
+type V2SnapshotEntry = (Vec<[u8; 32]>, Vec<[u8; 32]>, Balance, (u64, Balance));
+
 /// Domain tag for native-asset id derivation. Versioned so any future change to
 /// the derivation is a *new* domain rather than a silent redefinition.
 const ASSET_ID_DOMAIN: &[u8] = b"sov:asset:v1";
@@ -1799,24 +1832,31 @@ impl Ledger {
     /// atomic snapshot file. The Merkle commitment is omitted (rebuilt on load), so
     /// the blob alone deterministically reproduces the `state_root`.
     ///
-    /// ⚠️ **Pool-v2 state is NOT yet in this blob** (v0.2.0 slice boundary):
-    /// persistence of `shielded_v2` / `shielded_v2_value` / `deshield_v2_window`
-    /// belongs to slice S2e together with the data-dir `schema_version` bump
-    /// (law F4), because appending fields here changes the blob encoding.
-    /// This is SAFE today because no production path can make v2 state
-    /// non-empty — the S2c executor does not exist and the `shielded-v2`
-    /// deployment is unarmed — and it is enforced below: this function
-    /// REFUSES (panics in debug via `debug_assert!`, and is guarded by the
-    /// `snapshot_refuses_nonempty_v2_state_until_s2e` test) rather than
-    /// silently dropping committed state. S2e MUST land before S2c.
+    /// **Pool-v2 state is carried in this blob** (appended as the final
+    /// element in v0.2.0 S2a): committed v2 state can never be dropped by a
+    /// snapshot — there is no configuration in which the ledger holds state
+    /// the snapshot omits. Legacy (pre-v2) blobs remain loadable; see
+    /// [`from_snapshot_bytes`](Ledger::from_snapshot_bytes) for the exact
+    /// two-format story.
     pub fn to_snapshot_bytes(&self) -> Vec<u8> {
-        debug_assert!(
-            self.shielded_v2.is_empty()
-                && self.shielded_v2_value == Balance::ZERO
-                && self.deshield_v2_window == (0, Balance::ZERO),
-            "ledger snapshot does not yet persist pool-v2 state (slice S2e); \
-             snapshotting a ledger with live v2 state would silently drop it"
+        let (v2_commitments, v2_nullifiers) = self.shielded_v2.snapshot();
+        let v2: V2SnapshotEntry = (
+            v2_commitments,
+            v2_nullifiers,
+            self.shielded_v2_value,
+            self.deshield_v2_window,
         );
+        // Borsh tuples encode as the plain concatenation of their elements, so
+        // `(legacy, v2)` is byte-for-byte `encode(legacy) ‖ encode(v2)` — the
+        // legacy blob plus an appended v2 element.
+        borsh::to_vec(&(self.legacy_snapshot_tuple(), v2))
+            .expect("ledger snapshot serialization is infallible")
+    }
+
+    /// The legacy (pre-pool-v2) portion of the snapshot, exactly as every
+    /// pre-v0.2.0 binary encoded it. Factored so the writer, the reader, and
+    /// the legacy-compatibility test all share one definition.
+    fn legacy_snapshot_tuple(&self) -> LegacySnapshotTuple {
         let accounts: Vec<AccountEntry> = self
             .accounts
             .iter()
@@ -1875,7 +1915,7 @@ impl Ledger {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        borsh::to_vec(&(
+        (
             accounts,
             storage,
             self.mined_emitted,
@@ -1895,8 +1935,7 @@ impl Ledger {
             multisig,
             proposals,
             (vaults, self.vault_collateral, self.oracle_price),
-        ))
-        .expect("ledger snapshot serialization is infallible")
+        )
     }
 
     /// Load a ledger previously written by [`save`](Ledger::save), rebuilding the
@@ -1908,8 +1947,31 @@ impl Ledger {
     /// Rebuild a ledger from a [`to_snapshot_bytes`](Ledger::to_snapshot_bytes) blob,
     /// reconstructing the Merkle commitment so the loaded ledger reproduces the exact
     /// `state_root` the snapshot was taken at.
+    ///
+    /// **Two formats, mutually exclusive by construction.** The CURRENT format
+    /// is `(legacy tuple, pool-v2 entry)`; the LEGACY format (every pre-v0.2.0
+    /// binary) is the bare tuple. Borsh is prefix-deterministic and
+    /// `borsh::from_slice` refuses trailing bytes, so:
+    /// - a legacy blob can never mis-parse as current — its bytes are fully
+    ///   consumed by the identical legacy-prefix parse, leaving nothing for
+    ///   the v2 element (clean EOF error) → the legacy path loads it with an
+    ///   empty v2 pool, exactly the state it was saved with;
+    /// - a current blob can never mis-parse as legacy — the appended v2 entry
+    ///   is trailing bytes to the legacy decoder (clean error).
+    /// There is no configuration in which committed pool-v2 state is silently
+    /// dropped: the current writer always persists it, and only genuinely-old
+    /// blobs (which by definition hold none) take the empty-v2 path.
     pub fn from_snapshot_bytes(bytes: &[u8]) -> std::io::Result<Ledger> {
-        #[allow(clippy::type_complexity)]
+        let (legacy, v2): (LegacySnapshotTuple, V2SnapshotEntry) =
+            match borsh::from_slice::<(LegacySnapshotTuple, V2SnapshotEntry)>(bytes) {
+                Ok(current) => current,
+                Err(_) => {
+                    let legacy: LegacySnapshotTuple = borsh::from_slice(bytes)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                    let empty_v2 = (Vec::new(), Vec::new(), Balance::ZERO, (0, Balance::ZERO));
+                    (legacy, empty_v2)
+                }
+            };
         let (
             accounts,
             storage,
@@ -1930,28 +1992,7 @@ impl Ledger {
             multisig,
             proposals,
             vault_state,
-        ): (
-            Vec<AccountEntry>,
-            Vec<ContractEntry>,
-            Balance,
-            Balance,
-            Vec<[u8; 32]>,
-            Vec<[u8; 32]>,
-            Balance,
-            Vec<HtlcEntry>,
-            Vec<TokenEntry>,
-            Vec<TokenBalanceEntry>,
-            Vec<TokenPolicyEntry>,
-            Vec<TokenWindowEntry>,
-            Vec<Hash>,
-            (u64, Balance),
-            Vec<NftClassEntry>,
-            Vec<NftEntry>,
-            Vec<MultisigEntry>,
-            Vec<ProposalEntry>,
-            (Vec<VaultEntry>, Balance, Option<u128>),
-        ) = borsh::from_slice(bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        ) = legacy;
         let mut ledger = Ledger::new();
         for (id, account) in accounts {
             ledger.set_account(&id, account);
@@ -2004,6 +2045,18 @@ impl Ledger {
         ledger.commit_counter(Self::VAULT_COLLATERAL_SLOT, vault_collateral);
         ledger.oracle_price = oracle_price;
         ledger.recommit_oracle();
+        // Pool v2 (v0.2.0 S2a): restore + recommit so a snapshot taken with
+        // live v2 state (post-activation, once S2c exists) reproduces the
+        // exact state root. Empty on every legacy blob and on every dormant
+        // chain — in which case recommit removes the slots and the root is
+        // byte-identical to a pre-v2 ledger.
+        let (v2_commitments, v2_nullifiers, v2_value, v2_window) = v2;
+        ledger.shielded_v2 = ShieldedV2State::restore(&v2_commitments, &v2_nullifiers)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        ledger.recommit_shielded_v2();
+        ledger.shielded_v2_value = v2_value;
+        ledger.commit_counter(Self::SHIELDED_V2_VALUE_SLOT, v2_value);
+        ledger.set_deshield_v2_window(v2_window.0, v2_window.1);
         Ok(ledger)
     }
 }
@@ -2167,19 +2220,105 @@ mod tests {
         assert_eq!(l.state_root(), root0, "default window ⇒ slot removed");
     }
 
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "does not yet persist pool-v2 state")]
-    fn snapshot_refuses_nonempty_v2_state_until_s2e() {
-        // Slice-boundary guard: ledger snapshots do not carry pool-v2 state
-        // until S2e bumps the data schema. Until then a snapshot of a ledger
-        // with live v2 state must REFUSE rather than silently drop committed
-        // state. (No production path can reach this while the deployment is
-        // unarmed — S2e must land before the S2c executor.)
+    /// A ledger holding REAL state in every family that interacts with the
+    /// snapshot, plus live pool-v2 state.
+    fn ledger_with_v2_state() -> Ledger {
         let mut l = Ledger::new();
-        l.add_shielded_v2_value(Balance::from_sov(1).unwrap())
+        l.set_account(
+            &id("alice.sov"),
+            Account::with_balance(Balance::from_sov(100).unwrap()),
+        );
+        l.add_mined_emitted(Balance::from_sov(1000).unwrap())
             .unwrap();
-        let _ = l.to_snapshot_bytes();
+        l.set_vault(
+            &id("alice.sov"),
+            crate::vault::Vault {
+                collateral: Balance::from_sov(30).unwrap(),
+                debt: Balance::from_sov(10).unwrap(),
+            },
+        );
+        l.apply_shielded_v2(&[pq(1), pq(2)], &[pq(3), pq(4), pq(5)])
+            .expect("v2 apply");
+        l.add_shielded_v2_value(Balance::from_sov(40).unwrap())
+            .unwrap();
+        l.set_deshield_v2_window(9, Balance::from_sov(4).unwrap());
+        l
+    }
+
+    #[test]
+    fn snapshot_round_trips_pool_v2_state_bit_for_bit() {
+        // The structural fix for the owner's follow-up on PR #8: pool-v2 state
+        // is IN the snapshot from S2a on, so there is no configuration in
+        // which committed v2 state can be dropped by a snapshot. This test is
+        // profile-independent — run it under `--release` too (the old
+        // `debug_assert!` guard compiled out there; this cannot).
+        let l = ledger_with_v2_state();
+        let root0 = l.state_root();
+        let restored = Ledger::from_snapshot_bytes(&l.to_snapshot_bytes()).unwrap();
+        assert_eq!(
+            restored.state_root(),
+            root0,
+            "pool-v2 state must survive a snapshot round-trip to the exact root"
+        );
+        assert_eq!(restored.shielded_v2(), l.shielded_v2());
+        assert_eq!(restored.shielded_v2().note_count(), 3);
+        assert!(restored.shielded_v2().nullifier_seen(&pq(1)));
+        assert_eq!(restored.shielded_v2_value(), Balance::from_sov(40).unwrap());
+        assert_eq!(
+            restored.deshield_v2_window(),
+            (9, Balance::from_sov(4).unwrap())
+        );
+    }
+
+    #[test]
+    fn legacy_pre_v2_snapshot_still_loads_and_reproduces_its_root() {
+        // Backward compatibility: the exact blob a pre-v0.2.0 binary wrote
+        // (the bare legacy tuple, no v2 element) must restore losslessly with
+        // an empty v2 pool — a node upgrading in place keeps its snapshot.
+        let mut l = Ledger::new();
+        l.set_account(
+            &id("alice.sov"),
+            Account::with_balance(Balance::from_sov(100).unwrap()),
+        );
+        l.add_mined_emitted(Balance::from_sov(1000).unwrap())
+            .unwrap();
+        l.set_oracle_price(100_000_000);
+        let root0 = l.state_root();
+
+        let legacy_blob = borsh::to_vec(&l.legacy_snapshot_tuple()).unwrap();
+        let restored = Ledger::from_snapshot_bytes(&legacy_blob).unwrap();
+        assert_eq!(restored.state_root(), root0, "legacy blob restores exactly");
+        assert!(restored.shielded_v2().is_empty());
+        assert_eq!(restored.shielded_v2_value(), Balance::ZERO);
+        assert_eq!(restored.deshield_v2_window(), (0, Balance::ZERO));
+
+        // And with v2 EMPTY, the current blob is exactly the legacy blob plus
+        // the empty v2 element appended — the legacy bytes are a strict prefix.
+        let current_blob = l.to_snapshot_bytes();
+        assert!(current_blob.starts_with(&legacy_blob));
+    }
+
+    #[test]
+    fn snapshot_formats_are_mutually_exclusive() {
+        // The dual-format decode discriminates DETERMINISTICALLY: a legacy
+        // blob fails the current-format parse (EOF before the v2 element) and
+        // a current blob fails the legacy parse (trailing bytes) — neither can
+        // ever mis-parse as the other, so v2 state is never silently invented
+        // or discarded.
+        let l = ledger_with_v2_state();
+        let current_blob = l.to_snapshot_bytes();
+        assert!(
+            borsh::from_slice::<LegacySnapshotTuple>(&current_blob).is_err(),
+            "a current blob must not decode as legacy (trailing v2 bytes)"
+        );
+        let legacy_blob = borsh::to_vec(&l.legacy_snapshot_tuple()).unwrap();
+        assert!(
+            borsh::from_slice::<(LegacySnapshotTuple, V2SnapshotEntry)>(&legacy_blob).is_err(),
+            "a legacy blob must not decode as current (EOF at the v2 element)"
+        );
+        // The v2-carrying blob still restores in full through the public API.
+        let restored = Ledger::from_snapshot_bytes(&current_blob).unwrap();
+        assert_eq!(restored.state_root(), l.state_root());
     }
 
     #[test]
