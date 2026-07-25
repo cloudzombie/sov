@@ -9,12 +9,17 @@
 //!   before anything else);
 //! - rejects transactions already past an account's current nonce (stale) or
 //!   already pooled (duplicates);
-//! - admits only *gap-free* nonces — a sender's tx must be contiguous with its
-//!   on-chain nonce plus what it already has pooled, so a hole that would strand
-//!   later nonces can never open in the pool (a client learns immediately via
-//!   `NonceGap` and resubmits the missing nonce);
+//! - keeps the READY region *gap-free* — a sender's mineable run is contiguous
+//!   with its on-chain nonce, so a hole that would strand later nonces can never
+//!   open among mineable transactions;
+//! - parks a future-nonce transaction (one beyond the sender's contiguous run)
+//!   in a bounded, non-mineable QUEUED region instead of rejecting it
+//!   (Ethereum-style), and PROMOTES it into the ready region automatically the
+//!   moment the gap fills — so one missing transaction no longer head-of-line
+//!   blocks an account and forces resubmission;
 //! - time-evicts any entry stranded behind a pre-existing/edge-case gap after a
-//!   TTL, so such a gap self-clears instead of occupying the pool forever;
+//!   TTL — and any queued entry whose gap never fills — so such a gap
+//!   self-clears instead of occupying the pool forever;
 //! - bounds its own size — and at capacity runs a blockspace AUCTION: a new tx
 //!   that outbids (tips more than) the pool's cheapest safely-evictable tx
 //!   displaces it, so "mempool full" is economically impossible for an adequate
@@ -45,8 +50,40 @@ use sov_types::{Action, SignedTransaction};
 /// possible via reorg re-admission — gap-free admission prevents fresh holes) that
 /// has been stuck this long is dropped so the account self-heals. 30 minutes is far
 /// longer than any honest confirmation wait, so a live, soon-mineable tx is never
-/// evicted, while a genuinely stranded one clears.
+/// evicted, while a genuinely stranded one clears. The same TTL reaps QUEUED
+/// (future-nonce) entries whose gap never fills: one knob, one maintenance tick,
+/// and a sender that never submits the missing nonce self-heals on the same
+/// schedule as a reorg-stranded one.
 pub const STRANDED_TTL_MS: u64 = 30 * 60 * 1000;
+
+/// Hard cap on how many FUTURE-nonce (queued, non-mineable) transactions one
+/// sender may park at once. Deliberately much smaller than the ready-region
+/// per-sender cap: the queued region's job is to absorb out-of-order arrival
+/// races (a wallet firing nonces N and N+1 where N is briefly delayed), not to
+/// buffer bulk work — a sender wanting depth submits contiguously and gets the
+/// far larger ready allowance. 16 bounds one account's queued footprint to a
+/// hair of the pool while covering any honest in-flight window.
+pub const MAX_QUEUED_PER_SENDER: usize = 16;
+
+/// Global bound on the queued (future-nonce) region: `capacity / 16`, floored at
+/// 64 — 1,024 entries at the default 16,384 capacity. The queued region is a
+/// side-table that does NOT consume ready capacity, so this bound is the entire
+/// memory story for future-nonce admission: at most `capacity/16` extra
+/// transactions, whatever anyone submits.
+fn default_queued_capacity(capacity: usize) -> usize {
+    (capacity / 16).max(64)
+}
+
+/// How a transaction was admitted by [`Mempool::insert`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admitted {
+    /// Admitted to the READY region: contiguous with the sender's on-chain
+    /// nonce, eligible for block templates now.
+    Ready,
+    /// Parked in the QUEUED region: its nonce is beyond the sender's contiguous
+    /// run, so it waits (never proposed) until the gap fills and it is promoted.
+    Queued,
+}
 
 /// Reasons a transaction is not admitted to the pool.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -103,10 +140,11 @@ pub enum MempoolError {
         required: Balance,
     },
     /// The transaction's nonce is beyond the sender's contiguous pending run
-    /// (`current_nonce + pending_count`), so admitting it would leave a hole that
-    /// strands it — and every later nonce — until the missing one lands. Refusing
-    /// it here means a gap can never form in the pool; the client should submit
-    /// `expected` (the next mineable nonce) first, then resubmit.
+    /// (`current_nonce + pending_count`). RETAINED FOR API COMPATIBILITY: since
+    /// the queued future-nonce region landed, such a transaction is PARKED
+    /// (admitted as [`Admitted::Queued`]) rather than rejected, so this variant
+    /// is no longer produced by [`Mempool::insert`]; queued-region refusals are
+    /// [`MempoolError::QueuedSenderLimit`] / [`MempoolError::QueuedFull`].
     #[error("nonce gap: next mineable nonce is {expected}, transaction used {got}")]
     NonceGap {
         /// The next contiguous nonce the pool will accept.
@@ -129,6 +167,26 @@ pub enum MempoolError {
         /// The over-limit signer.
         signer: AccountId,
         /// The per-sender cap.
+        limit: usize,
+    },
+    /// The signer already parks its full allowance of FUTURE-nonce (queued)
+    /// transactions, and this one is further from mineable than any of them, so
+    /// admitting it would displace a strictly better entry. The sender should
+    /// fill the nonce gap (making room by promotion) or wait for the TTL.
+    #[error("sender {signer} has reached its queued (future-nonce) limit of {limit}")]
+    QueuedSenderLimit {
+        /// The over-limit signer.
+        signer: AccountId,
+        /// The per-sender queued cap.
+        limit: usize,
+    },
+    /// The queued (future-nonce) region is at its global capacity and this
+    /// transaction's tip does not strictly outbid the cheapest queued entry.
+    /// Fill the nonce gap so the transaction is READY at submission (the ready
+    /// region has far more room), raise the tip, or resubmit later.
+    #[error("queued (future-nonce) region is full ({limit} transactions)")]
+    QueuedFull {
+        /// The configured global queued capacity.
         limit: usize,
     },
     /// The signer cannot afford this transaction on top of its already-pooled ones:
@@ -214,6 +272,13 @@ struct EvictionVictim {
     sender_count: usize,
 }
 
+/// A queued (future-nonce) entry: the transaction plus when it was parked, for
+/// TTL eviction of entries whose gap never fills.
+struct QueuedTx {
+    stx: SignedTransaction,
+    queued_at_ms: u64,
+}
+
 /// A bounded pool of pending, validated transactions.
 pub struct Mempool {
     by_id: HashMap<Hash, SignedTransaction>,
@@ -227,6 +292,16 @@ pub struct Mempool {
     capacity: usize,
     /// Max transactions one sender may hold at once (anti-DoS fairness bound).
     max_per_sender: usize,
+    /// The QUEUED region: future-nonce transactions parked (never proposed)
+    /// until their sender's nonce gap fills and they are promoted into the
+    /// ready region. Keyed by `(signer, nonce)`; the value carries the
+    /// admission timestamp (Unix millis) for TTL eviction. Entries here are
+    /// NOT in `by_id`/`by_sender` and never consume ready capacity.
+    queued: BTreeMap<(AccountId, u64), QueuedTx>,
+    /// Global bound on `queued` (side-table memory cap).
+    queued_capacity: usize,
+    /// Per-sender bound on `queued`.
+    max_queued_per_sender: usize,
     /// The `tx-domain` verification regime admission checks signatures under
     /// (set by the node via [`set_mode`](Self::set_mode) on every tip advance,
     /// to the mode resolved at the next height). `Legacy` — the default, and
@@ -245,7 +320,8 @@ impl Mempool {
         Self::with_limits(capacity, default_per_sender(capacity))
     }
 
-    /// Create a pool with an explicit per-sender cap.
+    /// Create a pool with an explicit per-sender cap (queued-region bounds stay
+    /// at their defaults: `capacity/16` global, [`MAX_QUEUED_PER_SENDER`] each).
     pub fn with_limits(capacity: usize, max_per_sender: usize) -> Self {
         Mempool {
             by_id: HashMap::new(),
@@ -253,8 +329,19 @@ impl Mempool {
             inserted_at: HashMap::new(),
             capacity,
             max_per_sender: max_per_sender.max(1),
+            queued: BTreeMap::new(),
+            queued_capacity: default_queued_capacity(capacity),
+            max_queued_per_sender: MAX_QUEUED_PER_SENDER,
             mode: TxDomainMode::Legacy,
         }
+    }
+
+    /// Override the queued (future-nonce) region's bounds — used by tests to
+    /// exercise the bounds at small sizes; operators get the defaults.
+    pub fn with_queue_limits(mut self, queued_capacity: usize, max_queued_per_sender: usize) -> Self {
+        self.queued_capacity = queued_capacity.max(1);
+        self.max_queued_per_sender = max_queued_per_sender.max(1);
+        self
     }
 
     /// Set the `tx-domain` verification mode used to verify admitted signatures.
@@ -385,28 +472,57 @@ impl Mempool {
             .fold(0u128, |acc, out| acc.saturating_add(out))
     }
 
-    /// Number of pooled transactions.
+    /// Number of READY (mineable) transactions. Queued (future-nonce) entries
+    /// are counted by [`queued_len`](Self::queued_len) — keeping this method's
+    /// meaning identical to before the queued region existed, so "is there work
+    /// to mine?" checks stay correct (a queued-only pool has nothing mineable).
     pub fn len(&self) -> usize {
         self.by_id.len()
     }
 
-    /// Whether the pool is empty.
+    /// Whether the READY region is empty (see [`len`](Self::len)).
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
     }
 
-    /// Whether a transaction with this id is pooled.
+    /// Whether a transaction with this id is in the READY region. (A queued
+    /// duplicate is still refused at `insert` via its `(signer, nonce)` slot —
+    /// identical id ⇒ identical slot.)
     pub fn contains(&self, id: &Hash) -> bool {
         self.by_id.contains_key(id)
     }
 
-    /// Try to admit `stx`, given the signer's `current_nonce` and `balance` (from state).
+    /// Try to admit `stx`, given the signer's `current_nonce` and `balance` (from
+    /// state). A transaction contiguous with the sender's pending run is admitted
+    /// READY (mineable now); one whose nonce is beyond the run is parked QUEUED
+    /// (never proposed) and promoted automatically when the gap fills. A ready
+    /// admission immediately attempts promotion of the sender's queued entries,
+    /// since it may be exactly the gap-filler they were waiting for.
     pub fn insert(
         &mut self,
         stx: SignedTransaction,
         current_nonce: u64,
         balance: Balance,
-    ) -> Result<(), MempoolError> {
+    ) -> Result<Admitted, MempoolError> {
+        let signer = stx.transaction.signer.clone();
+        let admitted = self.insert_inner(stx, current_nonce, balance)?;
+        if admitted == Admitted::Ready {
+            self.promote(&signer, current_nonce, balance);
+        }
+        Ok(admitted)
+    }
+
+    /// The admission state machine, WITHOUT the post-admission promotion sweep
+    /// (so promotion, which re-enters this for each promoted entry, can never
+    /// recurse). Check order: signature → stale → duplicate → same-slot RBF →
+    /// future-nonce (queued path) → affordability → per-sender cap → capacity
+    /// auction.
+    fn insert_inner(
+        &mut self,
+        stx: SignedTransaction,
+        current_nonce: u64,
+        balance: Balance,
+    ) -> Result<Admitted, MempoolError> {
         if !stx.verify_signature_mode(&self.mode) {
             return Err(MempoolError::InvalidSignature);
         }
@@ -414,22 +530,6 @@ impl Mempool {
         if nonce < current_nonce {
             return Err(MempoolError::Stale {
                 current: current_nonce,
-                got: nonce,
-            });
-        }
-        // Gap-free admission: a tx may extend the sender's pending run by at most
-        // one — its nonce must be contiguous with the account's on-chain nonce plus
-        // what is already pooled (`current_nonce ..= current_nonce + pending_len`).
-        // A higher nonce would sit behind a hole and could never be mined until the
-        // hole fills, stranding it (and every later nonce). Refusing it here means a
-        // gap can never form in the pool in the first place; the client learns
-        // immediately and resubmits the missing nonce. (Slots at or below `expected`
-        // that are already taken are caught by the `NonceTaken`/`Duplicate` checks.)
-        let expected =
-            current_nonce.saturating_add(self.sender_count(&stx.transaction.signer) as u64);
-        if nonce > expected {
-            return Err(MempoolError::NonceGap {
-                expected,
                 got: nonce,
             });
         }
@@ -485,7 +585,19 @@ impl Mempool {
             self.by_sender.insert(slot, id);
             self.by_id.insert(id, stx);
             self.inserted_at.insert(id, now_millis());
-            return Ok(());
+            return Ok(Admitted::Ready);
+        }
+        // Future nonce: beyond the sender's contiguous pending run
+        // (`current_nonce ..= current_nonce + pending_len`), it would sit behind a
+        // hole and could never be mined until the hole fills. Instead of rejecting
+        // it (the pre-queued `NonceGap` behavior, which head-of-line blocked the
+        // account and forced a resubmit), PARK it in the bounded queued region; it
+        // is promoted the moment the gap fills, and TTL-evicted if it never does.
+        // The ready region stays gap-free — `select` never sees a queued entry.
+        let expected =
+            current_nonce.saturating_add(self.sender_count(&stx.transaction.signer) as u64);
+        if nonce > expected {
+            return self.insert_queued(stx, balance);
         }
         // Affordability: the signer's pooled transfers, plus this one, may not move more
         // base XUS than the signer holds. An over-balance transfer can never be mined
@@ -554,7 +666,208 @@ impl Mempool {
         self.by_sender.insert(slot, id);
         self.by_id.insert(id, stx);
         self.inserted_at.insert(id, now_millis());
-        Ok(())
+        Ok(Admitted::Ready)
+    }
+
+    /// Park a future-nonce transaction in the queued region, DoS-bounded:
+    /// - affordability counts the signer's READY + QUEUED outflow, so the queued
+    ///   region never holds an obvious overspend;
+    /// - a per-sender bound ([`MAX_QUEUED_PER_SENDER`]): at the bound, a newcomer
+    ///   CLOSER to mineable (lower nonce) displaces the sender's furthest-future
+    ///   entry (strictly better for the sender), while a further-future one is
+    ///   refused — one account can never grow its queued footprint past the bound;
+    /// - a global bound (`queued_capacity`): at capacity, a newcomer must
+    ///   strictly outbid the cheapest queued entry (lowest [`effective_tip`],
+    ///   ties broken by the LAST `(signer, nonce)` in key order — deterministic)
+    ///   to displace it, else it is refused.
+    ///
+    /// The same-slot path mirrors ready RBF: an identical id is a `Duplicate`; a
+    /// replacement must raise the tip by [`MIN_RBF_BUMP_GRAINS`]. A slot already
+    /// occupied in the READY region (possible only around reorg strandings) is
+    /// refused `NonceTaken` — the ready entry wins and TTL rules arbitrate.
+    fn insert_queued(
+        &mut self,
+        stx: SignedTransaction,
+        balance: Balance,
+    ) -> Result<Admitted, MempoolError> {
+        let signer = stx.transaction.signer.clone();
+        let nonce = stx.transaction.nonce;
+        let slot = (signer.clone(), nonce);
+        // A reorg-stranded READY entry can occupy this exact slot even though it
+        // is beyond the contiguous run; the incumbent wins (see doc above).
+        if self.by_sender.contains_key(&slot) {
+            return Err(MempoolError::NonceTaken { signer, nonce });
+        }
+        // Same queued slot: duplicate or RBF (same rules as the ready region).
+        if let Some(old) = self.queued.get(&slot) {
+            if old.stx.id() == stx.id() {
+                return Err(MempoolError::Duplicate);
+            }
+            let old_tip = effective_tip(&old.stx).grains();
+            let new_tip = effective_tip(&stx).grains();
+            if new_tip <= old_tip {
+                return Err(MempoolError::NonceTaken { signer, nonce });
+            }
+            let required = old_tip.saturating_add(MIN_RBF_BUMP_GRAINS);
+            if new_tip < required {
+                return Err(MempoolError::RbfUnderpriced {
+                    required: Balance::from_grains(required),
+                });
+            }
+            // Affordability of the post-replacement pool (release old, reserve new).
+            let old_outflow = base_outflow(&old.stx.transaction.action);
+            let committed = self
+                .pending_outflow(&signer)
+                .saturating_add(self.queued_outflow(&signer))
+                .saturating_sub(old_outflow)
+                .saturating_add(base_outflow(&stx.transaction.action));
+            if committed > balance.grains() {
+                return Err(MempoolError::Insufficient {
+                    available: balance.grains(),
+                    committed,
+                });
+            }
+            self.queued.insert(
+                slot,
+                QueuedTx {
+                    stx,
+                    queued_at_ms: now_millis(),
+                },
+            );
+            return Ok(Admitted::Queued);
+        }
+        // Affordability across BOTH regions: a queued tx that could never execute
+        // alongside what the signer already pooled is refused at the door.
+        let committed = self
+            .pending_outflow(&signer)
+            .saturating_add(self.queued_outflow(&signer))
+            .saturating_add(base_outflow(&stx.transaction.action));
+        if committed > balance.grains() {
+            return Err(MempoolError::Insufficient {
+                available: balance.grains(),
+                committed,
+            });
+        }
+        // Per-sender bound: displace the sender's own furthest-future entry only
+        // for a strictly closer-to-mineable newcomer.
+        if self.queued_count(&signer) >= self.max_queued_per_sender {
+            let furthest = self
+                .queued
+                .range((signer.clone(), 0)..=(signer.clone(), u64::MAX))
+                .next_back()
+                .map(|((_, n), _)| *n)
+                .expect("queued_count > 0 implies a queued entry exists");
+            if nonce >= furthest {
+                return Err(MempoolError::QueuedSenderLimit {
+                    signer,
+                    limit: self.max_queued_per_sender,
+                });
+            }
+            self.queued.remove(&(signer.clone(), furthest));
+        }
+        // Global bound: strictly outbid the cheapest queued entry or be refused.
+        if self.queued.len() >= self.queued_capacity {
+            let new_tip = effective_tip(&stx).grains();
+            let victim = self
+                .queued
+                .iter()
+                .map(|(slot, q)| (effective_tip(&q.stx).grains(), slot.clone()))
+                .fold(None::<(u128, (AccountId, u64))>, |best, cand| match best {
+                    // `<=` keeps the LAST minimal key in iteration order — the
+                    // greatest (signer, nonce) among the cheapest — deterministic.
+                    Some(b) if cand.0 > b.0 => Some(b),
+                    _ => Some(cand),
+                })
+                .expect("queued is non-empty at capacity");
+            if new_tip <= victim.0 {
+                return Err(MempoolError::QueuedFull {
+                    limit: self.queued_capacity,
+                });
+            }
+            self.queued.remove(&victim.1);
+        }
+        self.queued.insert(
+            slot,
+            QueuedTx {
+                stx,
+                queued_at_ms: now_millis(),
+            },
+        );
+        Ok(Admitted::Queued)
+    }
+
+    /// Promote `signer`'s queued entries into the ready region while they are
+    /// contiguous with its pending run. Each candidate re-runs full ready
+    /// admission (signature under the CURRENT mode, affordability, caps, the
+    /// capacity auction):
+    /// - admitted → keep promoting the next nonce;
+    /// - refused for a transient reason (pool full / below floor / sender cap) →
+    ///   put back untouched (original timestamp) and stop — still promotable on
+    ///   a later tick;
+    /// - refused for a permanent reason (stale, bad signature under the new
+    ///   mode, unaffordable, losing slot collision) → dropped, and promotion
+    ///   stops at the re-opened gap.
+    ///
+    /// Bounded: each iteration consumes one queued entry or breaks, so the loop
+    /// runs at most `max_queued_per_sender` times; `insert_inner` never promotes,
+    /// so there is no recursion.
+    fn promote(&mut self, signer: &AccountId, current_nonce: u64, balance: Balance) {
+        loop {
+            let expected = current_nonce.saturating_add(self.sender_count(signer) as u64);
+            let slot = (signer.clone(), expected);
+            let Some(q) = self.queued.remove(&slot) else {
+                break;
+            };
+            let queued_at_ms = q.queued_at_ms;
+            match self.insert_inner(q.stx.clone(), current_nonce, balance) {
+                Ok(Admitted::Ready) => continue,
+                Ok(Admitted::Queued) => {
+                    // Unreachable (nonce == expected takes the ready path), but if
+                    // it ever happened the entry is back in the queued region.
+                    break;
+                }
+                Err(
+                    MempoolError::Full { .. }
+                    | MempoolError::BelowFloor { .. }
+                    | MempoolError::SenderLimit { .. },
+                ) => {
+                    // Transient: put it back exactly as it was and retry later.
+                    self.queued.insert(
+                        slot,
+                        QueuedTx {
+                            stx: q.stx,
+                            queued_at_ms,
+                        },
+                    );
+                    break;
+                }
+                Err(_) => break, // permanent: dropped; the gap re-opens here
+            }
+        }
+    }
+
+    /// Number of queued (future-nonce) entries from `signer`. Bounded scan:
+    /// a sender holds at most `max_queued_per_sender` queued entries.
+    fn queued_count(&self, signer: &AccountId) -> usize {
+        self.queued
+            .range((signer.clone(), 0)..=(signer.clone(), u64::MAX))
+            .count()
+    }
+
+    /// The total base-XUS `signer`'s QUEUED transactions would move — added to
+    /// the ready region's [`pending_outflow`](Self::pending_outflow) when gating
+    /// queued admission, so both regions together can never over-commit a
+    /// balance at admission time.
+    fn queued_outflow(&self, signer: &AccountId) -> u128 {
+        self.queued
+            .range((signer.clone(), 0)..=(signer.clone(), u64::MAX))
+            .map(|(_, q)| base_outflow(&q.stx.transaction.action))
+            .fold(0u128, |acc, out| acc.saturating_add(out))
+    }
+
+    /// Number of queued (future-nonce, non-mineable) transactions.
+    pub fn queued_len(&self) -> usize {
+        self.queued.len()
     }
 
     /// Remove a transaction by id, returning it if present. Called after a
@@ -580,6 +893,11 @@ impl Mempool {
         for id in stale {
             self.remove(&id);
         }
+        // Queued entries whose nonce the chain has moved past can never be
+        // promoted — the account consumed that nonce (mined it here or elsewhere,
+        // or a reorg replayed past it). Drop them on the same tick.
+        self.queued
+            .retain(|(signer, nonce), _| *nonce >= current_nonce(signer));
     }
 
     /// Prune both stale AND now-unaffordable transactions. Run after every committed
@@ -606,6 +924,17 @@ impl Mempool {
                     break; // nothing left to evict for this sender
                 }
             }
+        }
+        // State moved (this runs after every committed block): a sender's on-chain
+        // nonce may have advanced INTO its queued run — e.g. the gap-filling nonce
+        // was mined from another node's pool — so attempt promotion for every
+        // sender with queued entries. Bounded: one pass per queued sender, each
+        // promoting at most `max_queued_per_sender` entries.
+        let queued_senders: BTreeSet<AccountId> =
+            self.queued.keys().map(|(s, _)| s.clone()).collect();
+        for signer in queued_senders {
+            let (nonce, bal) = (current_nonce(&signer), balance(&signer));
+            self.promote(&signer, nonce, bal);
         }
     }
 
@@ -649,15 +978,26 @@ impl Mempool {
         for id in stranded {
             self.remove(&id);
         }
-        evicted
+        // QUEUED entries are, by construction, behind a gap (anything promotable
+        // was promoted on this same maintenance tick, which runs `prune` first) —
+        // so the identical TTL applies: a queued entry whose gap has not filled
+        // within `ttl_millis` is dropped and its sender self-heals.
+        let before = self.queued.len();
+        self.queued
+            .retain(|_, q| now.saturating_sub(q.queued_at_ms) < ttl_millis);
+        evicted + (before - self.queued.len())
     }
 
-    /// All pooled transactions, in `(signer, nonce)` order — the snapshot persisted to
-    /// disk so the pool survives a restart.
+    /// All pooled transactions — the READY region in `(signer, nonce)` order,
+    /// then the QUEUED region in `(signer, nonce)` order — the snapshot persisted
+    /// to disk so the pool survives a restart. Restoring re-inserts in this
+    /// order, so ready entries land first and queued ones re-park behind their
+    /// gaps (with a fresh TTL clock — the honest choice on a restart).
     pub fn snapshot(&self) -> Vec<SignedTransaction> {
         self.by_sender
             .values()
             .filter_map(|id| self.by_id.get(id).cloned())
+            .chain(self.queued.values().map(|q| q.stx.clone()))
             .collect()
     }
 
@@ -673,6 +1013,131 @@ impl Mempool {
             let signer = &stx.transaction.signer;
             let _ = self.insert(stx.clone(), current_nonce(signer), balance(signer));
         }
+    }
+
+    /// The pool's configured ready-region capacity.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// The per-sender ready-region cap.
+    pub fn max_per_sender(&self) -> usize {
+        self.max_per_sender
+    }
+
+    /// The global queued-region capacity.
+    pub fn queued_capacity(&self) -> usize {
+        self.queued_capacity
+    }
+
+    /// The per-sender queued-region cap.
+    pub fn max_queued_per_sender(&self) -> usize {
+        self.max_queued_per_sender
+    }
+
+    /// Age in milliseconds of the OLDEST ready (mineable) entry, or `None` when
+    /// the ready region is empty — how long work has been waiting to be mined.
+    /// Coarse wall-clock ages (same clock as TTL eviction); saturating, never
+    /// negative under clock jitter.
+    pub fn oldest_pending_age_ms(&self) -> Option<u64> {
+        let now = now_millis();
+        self.inserted_at
+            .values()
+            .map(|t| now.saturating_sub(*t))
+            .max()
+    }
+
+    /// Age in milliseconds of the OLDEST queued (future-nonce) entry, or `None`
+    /// when the queued region is empty.
+    pub fn oldest_queued_age_ms(&self) -> Option<u64> {
+        let now = now_millis();
+        self.queued
+            .values()
+            .map(|q| now.saturating_sub(q.queued_at_ms))
+            .max()
+    }
+
+    /// The `n`-th highest [`effective_tip`] among READY transactions (1-based),
+    /// or `None` when fewer than `n` are ready. With `n = max_block_txs` this is
+    /// the marginal tip of the forming block template — the live "fee to get in":
+    /// `None`/absent means the next block has free room (bid 0 rides along), and
+    /// a value means a new transaction must tip MORE than it to displace the
+    /// template's cheapest slot. Bounded: O(ready · log ready), ready ≤ capacity.
+    pub fn nth_highest_tip(&self, n: usize) -> Option<u128> {
+        if n == 0 || self.by_id.len() < n {
+            return None;
+        }
+        let mut tips: Vec<u128> = self
+            .by_id
+            .values()
+            .map(|stx| effective_tip(stx).grains())
+            .collect();
+        tips.sort_unstable_by(|a, b| b.cmp(a));
+        Some(tips[n - 1])
+    }
+
+    /// Effective-tip histogram of the READY (mineable) region, highest bucket
+    /// first, hard-capped at `max_buckets` entries — the data behind
+    /// `sov_getMempoolHistogram`, from which a client packs projected blocks in
+    /// the node's own auction order.
+    ///
+    /// Bucketing is LOG-SCALE (deliberately): tips span many orders of magnitude
+    /// (zero-tip legacy transfers to whale bids), and what a projection needs is
+    /// "how many transactions sit at roughly this priority", with resolution
+    /// proportional to the price level. Each nonzero tip lands in a half-octave
+    /// bucket keyed by its two leading binary digits — exact integer math, no
+    /// floats: `index = 2·⌊log₂(tip)⌋ + second-most-significant-bit`, i.e. the
+    /// bucket bounds are 2^p and 1.5·2^p. Zero tips (the legacy/no-demand case)
+    /// get their own bucket. Each returned pair is
+    /// `(lowest actual tip in the bucket, transaction count)` — the reported
+    /// rate is the bucket's true minimum, so a client packing blocks never
+    /// overstates what a slot pays.
+    ///
+    /// Output is BOUNDED regardless of pool contents: tips are ≤ total supply
+    /// (~2^51 grains, enforced by the affordability gate), giving ~104 possible
+    /// buckets; any excess beyond `max_buckets` merges the cheapest tail into
+    /// the final bucket (counts summed, minimum kept). Deterministic: bucket
+    /// membership and order depend only on pooled tips.
+    pub fn tip_histogram(&self, max_buckets: usize) -> Vec<(u128, u64)> {
+        // Half-octave bucket index for a tip: 0 for zero, else
+        // 1 + 2·msb + next-bit — at most 1 + 2·127 + 1 = 256 distinct indices.
+        fn bucket_index(tip: u128) -> u16 {
+            if tip == 0 {
+                return 0;
+            }
+            let p = 127 - tip.leading_zeros() as u16; // ⌊log₂(tip)⌋
+            let sub = if p >= 1 {
+                ((tip >> (p - 1)) & 1) as u16
+            } else {
+                0
+            };
+            1 + 2 * p + sub
+        }
+        // index → (lowest tip seen, count); BTreeMap gives ascending index order.
+        let mut buckets: BTreeMap<u16, (u128, u64)> = BTreeMap::new();
+        for stx in self.by_id.values() {
+            let tip = effective_tip(stx).grains();
+            let entry = buckets.entry(bucket_index(tip)).or_insert((tip, 0));
+            entry.0 = entry.0.min(tip);
+            entry.1 += 1;
+        }
+        if max_buckets == 0 {
+            return Vec::new();
+        }
+        // Highest bucket first; merge any overflow beyond `max_buckets` into the
+        // last (cheapest) kept bucket: counts sum, the minimum tip is kept, so
+        // the tail is honestly represented as "at least this rate".
+        let mut out: Vec<(u128, u64)> = Vec::new();
+        for (_, (min_tip, count)) in buckets.into_iter().rev() {
+            if out.len() < max_buckets {
+                out.push((min_tip, count));
+            } else {
+                let last = out.last_mut().expect("max_buckets > 0");
+                last.0 = last.0.min(min_tip);
+                last.1 += count;
+            }
+        }
+        out
     }
 
     /// Select an executable batch of up to `max` transactions by the blockspace
@@ -1157,22 +1622,29 @@ mod tests {
     }
 
     #[test]
-    fn rejects_nonce_gap_at_admission() {
+    fn future_nonce_is_queued_not_rejected() {
         // (a) A tx whose nonce leaps past the sender's contiguous pending run is
-        // refused at the door — a gap can never form in the pool.
+        // PARKED in the queued region (Ethereum-style), not rejected — the READY
+        // region stays gap-free (len unchanged) and nothing behind a gap is ever
+        // mineable.
         let mut pool = Mempool::new(100);
-        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
-            .unwrap();
+        assert_eq!(
+            pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big()),
+            Ok(Admitted::Ready)
+        );
         // Account at nonce 0 with one pooled tx (nonce 0): the next mineable nonce
-        // is 1. Submitting nonce 2 would strand it behind the missing nonce 1.
+        // is 1. Nonce 2 sits behind the missing nonce 1 → queued.
         assert_eq!(
             pool.insert(tx([1; 32], "usa.reserve.sov", 2), 0, big()),
-            Err(MempoolError::NonceGap {
-                expected: 1,
-                got: 2,
-            })
+            Ok(Admitted::Queued)
         );
-        assert_eq!(pool.len(), 1, "the gapped tx must not enter the pool");
+        assert_eq!(pool.len(), 1, "the gapped tx is NOT in the ready region");
+        assert_eq!(pool.queued_len(), 1, "it is parked in the queued region");
+        assert_eq!(
+            pool.select(|_| 0, 10).len(),
+            1,
+            "a queued tx is never proposed"
+        );
     }
 
     #[test]
@@ -1742,5 +2214,445 @@ mod tests {
                 .collect::<Vec<_>>(),
             order[..3].to_vec()
         );
+    }
+
+    // ── Queued future-nonce region (Bitcoin-like waiting, Ethereum-style queue) ──
+
+    #[test]
+    fn queued_promotes_when_the_gap_fills_and_mines_in_order() {
+        // Fire-and-forget out of order: nonces 0, 2, 3 arrive (2 and 3 queue),
+        // then the missing 1 lands — the whole run promotes and selects 0..=3.
+        let mut pool = Mempool::new(100);
+        assert_eq!(
+            pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big()),
+            Ok(Admitted::Ready)
+        );
+        assert_eq!(
+            pool.insert(tx([1; 32], "usa.reserve.sov", 2), 0, big()),
+            Ok(Admitted::Queued)
+        );
+        assert_eq!(
+            pool.insert(tx([1; 32], "usa.reserve.sov", 3), 0, big()),
+            Ok(Admitted::Queued)
+        );
+        assert_eq!((pool.len(), pool.queued_len()), (1, 2));
+
+        // The gap-filler: admitted ready AND both queued entries promote behind it.
+        assert_eq!(
+            pool.insert(tx([1; 32], "usa.reserve.sov", 1), 0, big()),
+            Ok(Admitted::Ready)
+        );
+        assert_eq!((pool.len(), pool.queued_len()), (4, 0));
+        let batch = pool.select(|_| 0, 10);
+        assert_eq!(batch.len(), 4);
+        for (i, stx) in batch.iter().enumerate() {
+            assert_eq!(stx.transaction.nonce, i as u64, "strict nonce order");
+        }
+    }
+
+    #[test]
+    fn queued_promotes_when_the_chain_advances_via_prune() {
+        // The gap fills on-chain (mined from another node's pool): after the
+        // block, `prune` promotes the now-contiguous queued entries.
+        let mut pool = Mempool::new(100);
+        assert_eq!(
+            pool.insert(tx([1; 32], "usa.reserve.sov", 2), 0, big()),
+            Ok(Admitted::Queued)
+        );
+        assert_eq!(pool.select(|_| 0, 10).len(), 0, "nothing mineable yet");
+
+        // Chain advances to nonce 2 (nonces 0 and 1 mined elsewhere).
+        pool.prune(|_| 2, |_| big());
+        assert_eq!((pool.len(), pool.queued_len()), (1, 0), "promoted");
+        assert_eq!(pool.select(|_| 2, 10).len(), 1);
+    }
+
+    #[test]
+    fn queued_stale_is_dropped_when_the_nonce_moves_past_it() {
+        // The chain consumed the queued entry's nonce (its sender mined a
+        // different tx there): it can never apply, so prune drops it.
+        let mut pool = Mempool::new(100);
+        pool.insert(tx([1; 32], "usa.reserve.sov", 5), 0, big())
+            .unwrap();
+        assert_eq!(pool.queued_len(), 1);
+        pool.prune(|_| 6, |_| big());
+        assert_eq!(pool.queued_len(), 0, "nonce 5 was consumed on-chain");
+        assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn queued_entry_is_ttl_evicted_when_the_gap_never_fills() {
+        // A queued entry whose missing nonce never arrives is reaped by the same
+        // TTL tick as reorg-stranded ready entries — boundary: a generous TTL
+        // keeps it, TTL 0 (everything has aged ≥ 0) reaps it and reports the count.
+        let mut pool = Mempool::new(100);
+        pool.insert(tx([1; 32], "usa.reserve.sov", 3), 0, big())
+            .unwrap();
+        assert_eq!(pool.queued_len(), 1);
+        assert_eq!(pool.evict_stranded(|_| 0, u64::MAX), 0, "not yet expired");
+        assert_eq!(pool.queued_len(), 1);
+        assert_eq!(pool.evict_stranded(|_| 0, 0), 1, "expired → evicted");
+        assert_eq!(pool.queued_len(), 0);
+    }
+
+    #[test]
+    fn queued_per_sender_bound_holds_at_its_boundary() {
+        // Bound 3: nonces 10, 20, 30 queue; a FURTHER-future nonce (40) is refused
+        // at the exact boundary; a CLOSER one (5) displaces the furthest (30) —
+        // the sender's own queue always keeps its most-promotable entries.
+        let mut pool = Mempool::new(100).with_queue_limits(100, 3);
+        for n in [10u64, 20, 30] {
+            assert_eq!(
+                pool.insert(tx([1; 32], "usa.reserve.sov", n), 0, big()),
+                Ok(Admitted::Queued)
+            );
+        }
+        assert_eq!(
+            pool.insert(tx([1; 32], "usa.reserve.sov", 40), 0, big()),
+            Err(MempoolError::QueuedSenderLimit {
+                signer: id("usa.reserve.sov"),
+                limit: 3,
+            })
+        );
+        assert_eq!(pool.queued_len(), 3, "the refused tx did not enter");
+        assert_eq!(
+            pool.insert(tx([1; 32], "usa.reserve.sov", 5), 0, big()),
+            Ok(Admitted::Queued)
+        );
+        assert_eq!(pool.queued_len(), 3, "one-in, one-out at the bound");
+        // The furthest-future (30) was the displaced one: filling 0..=4 and 6..=9
+        // would promote 5, 10, 20 — but verify membership directly via snapshot.
+        let queued_nonces: Vec<u64> = pool
+            .snapshot()
+            .iter()
+            .map(|s| s.transaction.nonce)
+            .collect();
+        assert_eq!(queued_nonces, vec![5, 10, 20], "30 was displaced");
+    }
+
+    #[test]
+    fn queued_global_bound_refuses_or_takes_a_strict_outbid() {
+        // Global queued capacity 2 (per-sender 1 so distinct senders fill it):
+        // a zero-tip newcomer is refused QueuedFull; a strictly-outbidding
+        // newcomer displaces the cheapest queued entry deterministically.
+        let mut pool = Mempool::new(100).with_queue_limits(2, 1);
+        assert_eq!(
+            pool.insert(tipped([1; 32], "usa.reserve.sov", 7, 10), 0, big()),
+            Ok(Admitted::Queued)
+        );
+        assert_eq!(
+            pool.insert(tipped([2; 32], "ecb.reserve.sov", 7, 5), 0, big()),
+            Ok(Admitted::Queued)
+        );
+        // At capacity: a non-outbidding (equal-to-cheapest) tip is refused.
+        assert_eq!(
+            pool.insert(tipped([3; 32], "boj.reserve.sov", 7, 5), 0, big()),
+            Err(MempoolError::QueuedFull { limit: 2 })
+        );
+        assert_eq!(pool.queued_len(), 2);
+        // A strict outbid (6 > 5) displaces the cheapest (ecb's tip-5 entry).
+        assert_eq!(
+            pool.insert(tipped([3; 32], "boj.reserve.sov", 7, 6), 0, big()),
+            Ok(Admitted::Queued)
+        );
+        assert_eq!(pool.queued_len(), 2);
+        let survivors: Vec<AccountId> = pool
+            .snapshot()
+            .iter()
+            .map(|s| s.transaction.signer.clone())
+            .collect();
+        assert!(survivors.contains(&id("usa.reserve.sov")));
+        assert!(survivors.contains(&id("boj.reserve.sov")));
+        assert!(!survivors.contains(&id("ecb.reserve.sov")), "cheapest displaced");
+    }
+
+    #[test]
+    fn queued_rbf_follows_the_same_bump_rules_as_ready() {
+        // Same (signer, nonce) in the queued region: identical id → Duplicate;
+        // equal-or-lower tip → NonceTaken; raised-under-bump → RbfUnderpriced;
+        // at the bump → replaced in place (queued count unchanged).
+        let mut pool = Mempool::new(100);
+        let original = tipped([1; 32], "usa.reserve.sov", 4, 100);
+        assert_eq!(
+            pool.insert(original.clone(), 0, big()),
+            Ok(Admitted::Queued)
+        );
+        assert_eq!(
+            pool.insert(original, 0, big()),
+            Err(MempoolError::Duplicate)
+        );
+        assert_eq!(
+            pool.insert(tipped([1; 32], "usa.reserve.sov", 4, 50), 0, big()),
+            Err(MempoolError::NonceTaken {
+                signer: id("usa.reserve.sov"),
+                nonce: 4,
+            })
+        );
+        assert_eq!(
+            pool.insert(
+                tipped([1; 32], "usa.reserve.sov", 4, 100 + MIN_RBF_BUMP_GRAINS - 1),
+                0,
+                big()
+            ),
+            Err(MempoolError::RbfUnderpriced {
+                required: Balance::from_grains(100 + MIN_RBF_BUMP_GRAINS),
+            })
+        );
+        assert_eq!(
+            pool.insert(
+                tipped([1; 32], "usa.reserve.sov", 4, 100 + MIN_RBF_BUMP_GRAINS),
+                0,
+                big()
+            ),
+            Ok(Admitted::Queued)
+        );
+        assert_eq!(pool.queued_len(), 1, "replacement is one-for-one");
+    }
+
+    #[test]
+    fn queued_admission_counts_both_regions_for_affordability() {
+        // Balance 5 XUS: a 3-XUS ready transfer plus a 3-XUS QUEUED transfer
+        // would commit 6 > 5 — the queued one is refused at the door, exactly
+        // like a ready overspend. At 2 XUS it fits (boundary).
+        let mut pool = Mempool::new(100);
+        let bal = Balance::from_sov(5).unwrap();
+        pool.insert(tx_amt([1; 32], "usa.reserve.sov", 0, 3), 0, bal)
+            .unwrap();
+        assert!(matches!(
+            pool.insert(tx_amt([1; 32], "usa.reserve.sov", 2, 3), 0, bal),
+            Err(MempoolError::Insufficient { .. })
+        ));
+        assert_eq!(pool.queued_len(), 0);
+        assert_eq!(
+            pool.insert(tx_amt([1; 32], "usa.reserve.sov", 2, 2), 0, bal),
+            Ok(Admitted::Queued),
+            "exactly-affordable queued tx is admitted"
+        );
+    }
+
+    #[test]
+    fn promotion_failure_for_a_full_pool_keeps_the_entry_queued() {
+        // Transient refusal: the ready pool is FULL of other senders' zero-tip
+        // singles (nothing evictable for a zero-bid), so the queued entry cannot
+        // promote — it must stay queued (not vanish) and promote once room opens.
+        let mut pool = Mempool::with_limits(2, 10);
+        pool.insert(tx([2; 32], "ecb.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(tx([3; 32], "boj.reserve.sov", 0), 0, big())
+            .unwrap();
+        // usa queues nonce 1 (its nonce 0 is missing), then fills the gap — but
+        // the gap-filler itself is refused (pool full, zero bid), so nothing
+        // promotes and the queued entry survives.
+        assert_eq!(
+            pool.insert(tx([1; 32], "usa.reserve.sov", 1), 0, big()),
+            Ok(Admitted::Queued)
+        );
+        assert!(matches!(
+            pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big()),
+            Err(MempoolError::Full { .. })
+        ));
+        assert_eq!(pool.queued_len(), 1, "transient failure keeps it queued");
+
+        // Room opens (a block mined ecb+boj): prune promotes usa's entry once
+        // its gap-filler lands.
+        pool.prune(
+            |a| if *a == id("usa.reserve.sov") { 0 } else { 1 },
+            |_| big(),
+        );
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        assert_eq!((pool.len(), pool.queued_len()), (2, 0), "promoted");
+    }
+
+    #[test]
+    fn one_sender_flood_cannot_exceed_its_queued_bound() {
+        // Adversarial: one sender fires 1,000 future nonces. Its queued
+        // footprint is exactly MAX_QUEUED_PER_SENDER — shared capacity is never
+        // consumed beyond the bound, and the ready region is untouched.
+        let mut pool = Mempool::new(16_384);
+        for n in 1..=1_000u64 {
+            let _ = pool.insert(tx([1; 32], "usa.reserve.sov", n), 0, big());
+        }
+        assert_eq!(pool.queued_len(), MAX_QUEUED_PER_SENDER);
+        assert_eq!(pool.len(), 0, "nothing mineable from a gapped flood");
+        // And the entries kept are the CLOSEST to mineable (lowest nonces).
+        let kept: Vec<u64> = pool
+            .snapshot()
+            .iter()
+            .map(|s| s.transaction.nonce)
+            .collect();
+        assert_eq!(kept, (1..=MAX_QUEUED_PER_SENDER as u64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn many_sender_flood_cannot_exceed_the_global_queued_bound() {
+        // Adversarial: many distinct senders each park future nonces. The global
+        // queued bound holds exactly; excess zero-tip submissions are refused.
+        let mut pool = Mempool::new(100).with_queue_limits(8, 4);
+        let mut admitted = 0usize;
+        for seed in 1..=20u8 {
+            let name = format!("s{seed:02}.flood.sov");
+            for n in [5u64, 6] {
+                if pool.insert(tx([seed; 32], &name, n), 0, big()).is_ok() {
+                    admitted += 1;
+                }
+            }
+        }
+        assert_eq!(pool.queued_len(), 8, "global bound holds exactly");
+        assert_eq!(admitted, 8, "every admission beyond the bound was refused");
+    }
+
+    #[test]
+    fn snapshot_restore_round_trips_queued_entries() {
+        // Persistence: a queued entry survives a restart — snapshot carries it,
+        // restore re-parks it (still unmineable), and it promotes normally once
+        // the gap fills after the restart.
+        let mut pool = Mempool::new(100);
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 2), 0, big())
+            .unwrap();
+        let snap = pool.snapshot();
+        assert_eq!(snap.len(), 2, "ready + queued are both persisted");
+
+        let mut fresh = Mempool::new(100);
+        fresh.restore(snap, |_| 0, |_| big());
+        assert_eq!((fresh.len(), fresh.queued_len()), (1, 1));
+        fresh
+            .insert(tx([1; 32], "usa.reserve.sov", 1), 0, big())
+            .unwrap();
+        assert_eq!((fresh.len(), fresh.queued_len()), (3, 0), "promoted");
+    }
+
+    #[test]
+    fn reorg_rollback_makes_queued_entries_promotable_again() {
+        // A reorg can move an account's on-chain nonce BACKWARD. Entries parked
+        // as future under the old tip become contiguous under the new one; the
+        // next maintenance tick promotes them — no wedge, no resubmit.
+        let mut pool = Mempool::new(100);
+        // Under the pre-reorg tip the account is at nonce 3; nonce 4 with a
+        // pending 3 is ready, nonce 6 is future → queued.
+        pool.insert(tx([1; 32], "usa.reserve.sov", 3), 3, big())
+            .unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 4), 3, big())
+            .unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 6), 3, big())
+            .unwrap();
+        assert_eq!((pool.len(), pool.queued_len()), (2, 1));
+        // Reorg: the account's nonce rolls back to 3 (unchanged here) but the
+        // hole at 5 fills from re-admitted reverted txs.
+        pool.insert(tx([1; 32], "usa.reserve.sov", 5), 3, big())
+            .unwrap();
+        assert_eq!((pool.len(), pool.queued_len()), (4, 0), "6 promoted behind 5");
+        let batch = pool.select(|_| 3, 10);
+        let nonces: Vec<u64> = batch.iter().map(|s| s.transaction.nonce).collect();
+        assert_eq!(nonces, vec![3, 4, 5, 6]);
+    }
+
+    // ── Tip histogram + next-block floor (sov_getMempoolHistogram feed) ────────
+
+    #[test]
+    fn tip_histogram_orders_buckets_highest_first_with_true_minimums() {
+        // Tips 0, 0, 3, 1000, 1100, 5_000_000: zero bucket, half-octave grouping
+        // (1000 and 1100 share [1024? no — 1000 is in [512,768)? compute: both
+        // land in distinct-or-same buckets purely by leading bits), highest first,
+        // each bucket reporting its true minimum tip and exact count.
+        let mut pool = Mempool::new(100);
+        pool.insert(tx([1; 32], "a1.reserve.sov", 0), 0, big())
+            .unwrap(); // tip 0
+        pool.insert(tx([2; 32], "a2.reserve.sov", 0), 0, big())
+            .unwrap(); // tip 0
+        pool.insert(tipped([3; 32], "a3.reserve.sov", 0, 3), 0, big())
+            .unwrap();
+        pool.insert(tipped([4; 32], "a4.reserve.sov", 0, 1000), 0, big())
+            .unwrap();
+        pool.insert(tipped([5; 32], "a5.reserve.sov", 0, 1100), 0, big())
+            .unwrap();
+        pool.insert(tipped([6; 32], "a6.reserve.sov", 0, 5_000_000), 0, big())
+            .unwrap();
+
+        let hist = pool.tip_histogram(128);
+        // Descending by bucket, total count conserved, zero bucket last.
+        let total: u64 = hist.iter().map(|(_, c)| c).sum();
+        assert_eq!(total, 6, "every ready tx is counted exactly once");
+        assert!(
+            hist.windows(2).all(|w| w[0].0 > w[1].0),
+            "strictly descending representative tips: {hist:?}"
+        );
+        assert_eq!(hist.first().unwrap().0, 5_000_000, "highest bucket first");
+        assert_eq!(*hist.last().unwrap(), (0, 2), "zero-tip bucket last");
+        // 1000 (binary 1111101000, p=9, next bit 1 → bucket [768,1024)) and 1100
+        // (p=10, next bit 0 → bucket [1024,1536)) land in ADJACENT half-octave
+        // buckets — each reports its true minimum.
+        assert!(hist.contains(&(1000, 1)));
+        assert!(hist.contains(&(1100, 1)));
+        assert!(hist.contains(&(3, 1)));
+    }
+
+    #[test]
+    fn tip_histogram_is_bounded_and_merges_the_cheap_tail() {
+        // 8 tips a full octave apart = 8 distinct buckets; with max_buckets 4 the
+        // 3 highest stay exact and the cheapest 5 merge into the last bucket
+        // (counts summed, TRUE minimum kept) — the response can never grow past
+        // the cap however diverse the pool.
+        let mut pool = Mempool::new(100);
+        for (i, seed) in (1u8..=8).enumerate() {
+            let name = format!("h{seed:02}.tips.sov");
+            let tip = 1u128 << (4 * i); // 1, 16, 256, ..., 2^28
+            pool.insert(tipped([seed; 32], &name, 0, tip), 0, big())
+                .unwrap();
+        }
+        assert_eq!(pool.tip_histogram(128).len(), 8, "8 exact buckets uncapped");
+        let capped = pool.tip_histogram(4);
+        assert_eq!(capped.len(), 4, "hard cap holds");
+        assert_eq!(capped[0], (1 << 28, 1));
+        assert_eq!(capped[1], (1 << 24, 1));
+        assert_eq!(capped[2], (1 << 20, 1));
+        assert_eq!(capped[3], (1, 5), "tail merged: min tip 1, count 5");
+        assert!(pool.tip_histogram(0).is_empty(), "zero buckets → empty");
+    }
+
+    #[test]
+    fn tip_histogram_counts_only_the_ready_region() {
+        // A queued (future-nonce) tx can never be proposed, so a projection that
+        // counted it would overstate pending blocks — it must be excluded.
+        let mut pool = Mempool::new(100);
+        pool.insert(tipped([1; 32], "usa.reserve.sov", 0, 9), 0, big())
+            .unwrap();
+        pool.insert(tipped([1; 32], "usa.reserve.sov", 5, 900), 0, big())
+            .unwrap(); // queued
+        assert_eq!((pool.len(), pool.queued_len()), (1, 1));
+        assert_eq!(pool.tip_histogram(128), vec![(9, 1)]);
+    }
+
+    #[test]
+    fn nth_highest_tip_marks_the_next_block_floor_at_its_boundary() {
+        // Tips 5, 3, 1 pooled. With block capacity 2 the marginal (2nd-highest)
+        // tip is 3; with capacity 3 it is 1; with capacity 4 the block has free
+        // room → None (floor 0). n = 0 is never a floor.
+        let mut pool = Mempool::new(100);
+        pool.insert(tipped([1; 32], "usa.reserve.sov", 0, 5), 0, big())
+            .unwrap();
+        pool.insert(tipped([2; 32], "ecb.reserve.sov", 0, 3), 0, big())
+            .unwrap();
+        pool.insert(tipped([3; 32], "boj.reserve.sov", 0, 1), 0, big())
+            .unwrap();
+        assert_eq!(pool.nth_highest_tip(2), Some(3));
+        assert_eq!(pool.nth_highest_tip(3), Some(1));
+        assert_eq!(pool.nth_highest_tip(4), None, "free room → no floor");
+        assert_eq!(pool.nth_highest_tip(0), None);
+    }
+
+    #[test]
+    fn oldest_ages_are_none_only_when_a_region_is_empty() {
+        let mut pool = Mempool::new(100);
+        assert_eq!(pool.oldest_pending_age_ms(), None);
+        assert_eq!(pool.oldest_queued_age_ms(), None);
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(tx([1; 32], "usa.reserve.sov", 3), 0, big())
+            .unwrap();
+        assert!(pool.oldest_pending_age_ms().is_some());
+        assert!(pool.oldest_queued_age_ms().is_some());
     }
 }

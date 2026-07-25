@@ -29,7 +29,9 @@
 //! `sov_getAccount`, `sov_getBalance`, `sov_getNonce`, `sov_getBlockByHeight`,
 //! `sov_getBlockByHash`, `sov_getBlockDigest`, `sov_getHead`,
 //! `sov_getStateRoot`, `sov_getDifficulty`, `sov_estimateFee`,
-//! `sov_getMempoolSize`, `sov_getPeerInfo` (live P2P/sync state),
+//! `sov_getMempoolSize`, `sov_getMempoolHistogram` (effective-tip buckets for
+//! multi-block projection), `sov_getMempoolInfo` (ready/queued occupancy, bounds,
+//! next-block floor, entry ages), `sov_getPeerInfo` (live P2P/sync state),
 //! `sov_getConfirmations`, `sov_isFinal`,
 //! `sov_getMiners`, `sov_listTokens` (paged), `sov_getTokenInfo`,
 //! `sov_getTokenBalances`, `sov_getHtlc`. SNS (Sovereign Name Service):
@@ -154,6 +156,13 @@ impl RpcRateLimiter {
 /// Hard cap on `sov_listTokens` page size, so a registry of any size yields a
 /// bounded response (the client pages through with `offset`).
 const MAX_TOKEN_PAGE: usize = 200;
+
+/// Hard cap on `sov_getMempoolHistogram` buckets: the response array is bounded
+/// no matter what the mempool holds (the cheapest tail merges into the final
+/// bucket). 128 comfortably exceeds the ~104 half-octave buckets reachable by
+/// any affordable tip (≤ total supply), so in practice every bucket is exact —
+/// and the XUS Miner client is written against exactly this cap.
+pub const HISTOGRAM_MAX_BUCKETS: usize = 128;
 
 /// How long a mining template cached by `sov_getBlockTemplate` remains submittable.
 /// Generous relative to the 2.5-minute target block time, but short enough that a
@@ -1010,10 +1019,69 @@ fn call(
                 "gasUsed": gas_used,
                 "gasPriceGrains": gas_price.to_string(),
                 "feeGrains": fee.to_string(),
+                // ADDITIVE (law F5): the live next-block auction floor — 0 while the
+                // forming template has free room, else the marginal effective tip a
+                // new transaction must EXCEED to displace the template's cheapest
+                // slot. This is the real "fee to get in the next block"; clients
+                // that prefer it (XUS Miner does) fall back to `feeGrains` on
+                // older nodes that lack it.
+                "floorGrains": node.next_block_floor_grains().to_string(),
             }))
         }
         "sov_getMintReward" => Ok(to_value(node.chain().mint_reward())),
         "sov_getMempoolSize" => Ok(json!(node.mempool_len())),
+        "sov_getMempoolHistogram" => {
+            // NEW (additive, law F5): effective-tip fee-rate buckets of the READY
+            // (mineable) mempool, HIGHEST first, so a client packs them into
+            // successive projected blocks using this node's own `maxBlockTxs`
+            // capacity — the multi-block mempool visualization feed. Bounded: at
+            // most HISTOGRAM_MAX_BUCKETS buckets whatever the pool holds (the
+            // cheapest tail merges into the last bucket). Deterministic: content
+            // depends only on pooled tips; no wall clock in the shape. Rates are
+            // decimal-string grains (the codebase's large-integer convention),
+            // flat per TRANSACTION because this node's block capacity and auction
+            // ordering (`select`) are per-transaction — a per-byte rate would
+            // mispredict the node's real packing (revisit when block limits
+            // become weight-based).
+            let buckets: Vec<Value> = node
+                .mempool_tip_histogram(HISTOGRAM_MAX_BUCKETS)
+                .into_iter()
+                .map(|(min_tip, count)| {
+                    json!({
+                        "feeRateGrains": min_tip.to_string(),
+                        "txCount": count,
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "txCount": node.mempool_len(),
+                "maxBlockTxs": node.max_block_txs(),
+                "buckets": buckets,
+            }))
+        }
+        "sov_getMempoolInfo" => {
+            // NEW (additive, law F5): the operator's waiting-room view — how much
+            // is ready versus queued (future-nonce, not yet mineable), the pool's
+            // configured bounds, the live next-block floor, and how long the
+            // oldest entries have been pooled (relative ages in ms, `null` for an
+            // empty region). Complements `sov_getMempoolSize` (whose meaning —
+            // ready count — is unchanged).
+            let (capacity, max_per_sender, queued_capacity, max_queued_per_sender) =
+                node.mempool_limits();
+            let (oldest_pending, oldest_queued) = node.mempool_oldest_ages_ms();
+            Ok(json!({
+                "txCount": node.mempool_len(),
+                "queuedCount": node.mempool_queued_len(),
+                "capacity": capacity,
+                "maxPerSender": max_per_sender,
+                "queuedCapacity": queued_capacity,
+                "maxQueuedPerSender": max_queued_per_sender,
+                "maxBlockTxs": node.max_block_txs(),
+                "nextBlockFloorGrains": node.next_block_floor_grains().to_string(),
+                "oldestPendingAgeMs": oldest_pending,
+                "oldestQueuedAgeMs": oldest_queued,
+            }))
+        }
         // LIVE networking state — so an operator (or `curl`) can see EXACTLY why two
         // nodes do or don't see each other, without reading GUI logs. `chainId` +
         // `genesisHash` are what peers handshake on (a mismatch ⇒ they can NEVER
@@ -1150,7 +1218,8 @@ fn call(
             let stx: SignedTransaction = serde_json::from_value(params.clone())
                 .map_err(|e| RpcError::invalid_params(format!("invalid SignedTransaction: {e}")))?;
             let tx_id = stx.id();
-            node.submit(stx.clone())
+            let admitted = node
+                .submit(stx.clone())
                 .map_err(|e| RpcError::server(format!("rejected: {e}")))?;
             // GOSSIP the accepted tx to peers so it reaches EVERY node's mempool and any
             // miner can include it — not just the node it was submitted to. Release the
@@ -1160,7 +1229,14 @@ fn call(
             if let Some(g) = &ctx.gossip {
                 g.broadcast(&sov_network::NetMessage::NewTransaction(stx));
             }
-            Ok(json!({"accepted": true, "txId": tx_id.to_hex()}))
+            // ADDITIVE (law F5): `queued` reports a future-nonce admission — the tx
+            // is parked (not yet mineable) until the sender's nonce gap fills and
+            // it is promoted. Older clients that ignore the field lose nothing.
+            Ok(json!({
+                "accepted": true,
+                "txId": tx_id.to_hex(),
+                "queued": matches!(admitted, sov_node::Admitted::Queued),
+            }))
         }
         // A PAGE of the token registry — never the whole set, so the response
         // stays bounded no matter how many assets exist. Params: `offset`
