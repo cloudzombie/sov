@@ -23,6 +23,25 @@ use crate::util::{labeled_value, parse_tx_id, poll, run_cmd_timeout};
 /// itself resolves a block later.
 const DEPTH: u64 = 2;
 
+/// The `tx-domain` deployment the E2E rehearsal namespace bakes (see
+/// `e2e_rehearsal_deployments()` in `chain/crates/rpc/src/daemon.rs`). PINNED
+/// here too so a silent drift in the node's preset fails this step loudly
+/// instead of quietly re-timing the activation the matrix depends on.
+const ACT_DEPLOYMENT: &str = "tx-domain";
+/// Signaling bit the rehearsal deployment uses (mirrors mainnet's bit 0).
+const ACT_BIT: u64 = 0;
+/// Signaling window length, in blocks.
+const ACT_PERIOD: u64 = 32;
+/// First window boundary at which signaling may begin (`Defined → Started`).
+const ACT_START_HEIGHT: u64 = 384;
+/// Threshold: `num`/`den` of a window must signal for lock-in (9/10, as mainnet).
+const ACT_THRESHOLD_NUM: u64 = 9;
+/// Denominator of [`ACT_THRESHOLD_NUM`].
+const ACT_THRESHOLD_DEN: u64 = 10;
+/// Whole XUS shielded by the never-stranded step before activation, then
+/// de-shielded in full after it.
+const STRANDED_TEST_XUS: u128 = 4;
+
 /// Shared context the matrix threads through the steps.
 pub struct Ctx<'a> {
     pub backend: &'a mut dyn Backend,
@@ -53,10 +72,15 @@ pub fn run_matrix(ctx: &mut Ctx) -> Vec<StepResult> {
     let mut aborted: Option<&'static str> = None;
 
     type StepFn = fn(&mut Ctx) -> Result<(String, Value), String>;
-    let live_steps: [(&'static str, StepFn); 6] = [
+    let live_steps: [(&'static str, StepFn); 8] = [
         ("genesis-determinism", step_genesis),
         ("p2p-mesh-and-late-join-sync", step_mesh_and_late_join),
         ("mining-block-production", step_mining),
+        // Shields BEFORE the activation window opens, drives the deployment all
+        // the way to Active, cold-boots a node, and only then spends the note.
+        ("shielded-v1-never-stranded", step_never_stranded),
+        // Audits, post-hoc and race-free, the activation the step above drove.
+        ("bip9-activation-rehearsal", step_bip9_activation),
         ("shielded-v1-lifecycle", step_shielded_lifecycle),
         ("restart-replay-survival", step_restart_replay),
         ("cross-node-conformance", step_conformance),
@@ -85,7 +109,7 @@ pub fn run_matrix(ctx: &mut Ctx) -> Vec<StepResult> {
     }
 
     // Steps that CANNOT exist yet — explicit, precise skips (never silent).
-    out.push(bip9_rehearsal_skip(ctx));
+    out.push(never_stranded_v2_skip(ctx));
     for (name, what) in [
         (
             "shield-v2",
@@ -519,83 +543,29 @@ fn step_shielded_lifecycle(ctx: &mut Ctx) -> Result<(String, Value), String> {
 // ---------------------------------------------------------------------------
 
 fn step_restart_replay(ctx: &mut Ctx) -> Result<(String, Value), String> {
-    let victim = "node-4"; // the observer that carried every shielded tx in its log
-    let plan = ctx.net.plan(victim).clone();
-    let rpc4 = ctx.rpc(victim);
-    let ref_rpc = ctx.rpc("node-1");
-
-    // The snapshot must EXIST before we delete it, or the test is vacuous.
-    // The daemon refreshes it every 50 committed blocks.
-    poll(
-        "node-4's chainstate.snapshot to exist (written every 50 blocks)",
-        Duration::from_secs(300),
-        Duration::from_secs(1),
-        || {
-            Ok(ctx
-                .backend
-                .data_file_exists(&plan, "chainstate.snapshot")?
-                .then_some(()))
-        },
-    )?;
-
-    // Pin a reference point below the victim's tip, from the victim itself.
-    let h4 = rpc4.height()?;
-    let hpin = h4.saturating_sub(DEPTH);
-    let ref_digest = rpc4
-        .digest(hpin)?
-        .ok_or(format!("node-4 lacks its own block {hpin}"))?;
-    let (ref_hash, ref_root) = (
-        ref_digest.get("hash").cloned().unwrap_or(Value::Null),
-        ref_digest.get("stateRoot").cloned().unwrap_or(Value::Null),
-    );
-
     // Kill (SIGKILL — an UNCLEAN exit on purpose), delete the snapshot, and
     // require the log alone to reproduce the state on cold boot.
-    ctx.backend.stop(victim)?;
-    let existed = ctx.backend.remove_data_file(&plan, "chainstate.snapshot")?;
-    if !existed {
-        return Err("chainstate.snapshot vanished between the existence check and deletion".into());
-    }
-    if !ctx.backend.data_file_exists(&plan, "blocks.log")? {
-        return Err("node-4 has no blocks.log — nothing to replay from".into());
-    }
-    ctx.backend.start(&plan, &ctx.rpcd)?;
-    poll(
-        "node-4 to serve RPC after cold boot",
-        Duration::from_secs(120),
-        Duration::from_millis(300),
-        || Ok(rpc4.healthy().then_some(())),
-    )?;
-    poll(
-        &format!("node-4 to replay back past height {hpin}"),
-        Duration::from_secs(180),
-        Duration::from_millis(500),
-        || {
-            let h = rpc4.height()?;
-            Ok((h >= hpin).then_some(h))
-        },
-    )?;
-    let replayed = rpc4
-        .digest(hpin)?
-        .ok_or(format!("node-4 lacks block {hpin} after replay"))?;
-    if replayed.get("hash") != Some(&ref_hash) {
-        return Err(format!(
-            "replay produced a DIFFERENT block {hpin}: {:?} != pre-kill {ref_hash:?}",
-            replayed.get("hash")
-        ));
-    }
-    if replayed.get("stateRoot") != Some(&ref_root) {
-        return Err(format!(
-            "replay produced a DIFFERENT state root at {hpin}: {:?} != pre-kill {ref_root:?}",
-            replayed.get("stateRoot")
-        ));
-    }
+    let mut evidence = cold_boot_observer(ctx)?;
+    let hpin = evidence
+        .get("pinned_height")
+        .and_then(Value::as_u64)
+        .expect("cold_boot_observer records the pinned height");
+    let h4 = evidence
+        .get("pre_kill_height")
+        .and_then(Value::as_u64)
+        .expect("cold_boot_observer records the pre-kill height");
+    let ref_hash = evidence
+        .get("pinned_hash")
+        .cloned()
+        .expect("cold_boot_observer records the pinned hash");
+
     // And it rejoins the LIVE network: converges with everyone at the current tip.
     let nodes = ctx.running_rpcs();
     let (hc, _d) = converged(&nodes, h4, Duration::from_secs(180))?;
     // Cross-check the reference against another node too (the victim did not
     // define truth for the network).
-    let d1 = ref_rpc
+    let d1 = ctx
+        .rpc("node-1")
         .digest(hpin)?
         .ok_or(format!("node-1 lacks block {hpin}"))?;
     if d1.get("hash") != Some(&ref_hash) {
@@ -603,20 +573,15 @@ fn step_restart_replay(ctx: &mut Ctx) -> Result<(String, Value), String> {
             "node-1 disagrees with the pre-kill reference at {hpin}"
         ));
     }
+    if let Value::Object(map) = &mut evidence {
+        map.insert("reconverged_height".into(), json!(hc));
+    }
     Ok((
         format!(
             "killed node-4 (SIGKILL), deleted its snapshot; cold boot replayed the log and \
              reproduced block {hpin} (hash + state root), then reconverged at height {hc}"
         ),
-        json!({
-            "victim": victim,
-            "pre_kill_height": h4,
-            "pinned_height": hpin,
-            "pinned_hash": ref_hash,
-            "pinned_state_root": ref_root,
-            "reconverged_height": hc,
-            "snapshot_deleted": true,
-        }),
+        evidence,
     ))
 }
 
@@ -728,29 +693,640 @@ fn step_conformance(ctx: &mut Ctx) -> Result<(String, Value), String> {
 }
 
 // ---------------------------------------------------------------------------
-// 7. BIP-9 activation rehearsal — precise SKIP
+// 4. shielded-v1 NEVER STRANDED — value survives a real activation boundary
 // ---------------------------------------------------------------------------
 
-fn bip9_rehearsal_skip(ctx: &mut Ctx) -> StepResult {
-    // Show the LIVE gap, not an assumption: what this chain's deployment list
-    // actually is (empty — the baked preset is mainnet-gated).
+/// **"Old shielded notes better not be stuck. Nothing ever better get stuck."**
+///
+/// The proof, on the harness's own isolated chain, in one self-contained step:
+///
+/// 1. the shielded pool is EMPTY and the `tx-domain` deployment is genuinely
+///    pre-activation (`Defined`/`Started`, signing domain inactive);
+/// 2. shield [`STRANDED_TEST_XUS`] into pool v1 (Orchard) — pool delta EXACT,
+///    and the shield is mined strictly BELOW the signaling start height, so the
+///    note provably predates the fork;
+/// 3. the deployment is driven to `Active` by REAL miner signaling (no stub, no
+///    simulation) — the same BIP-9 machinery mainnet used at h11520;
+/// 4. the observer node is SIGKILLed, its snapshot deleted, and cold-booted from
+///    `blocks.log` alone: the pre-activation note must survive the replay (pool
+///    value exact, head hash + state root reproduced, note still scannable);
+/// 5. only THEN is the note spent — under the post-activation `Bound` signature
+///    regime — and it must work: exact pool delta, exact transparent credit, the
+///    note's nullifier published (so the wallet sees zero unspent notes), a
+///    second spend of the same note REFUSED, and supply conservation intact.
+///
+/// Every wait polls observed chain state under a bounded deadline; nothing here
+/// sleeps for correctness.
+fn step_never_stranded(ctx: &mut Ctx) -> Result<(String, Value), String> {
+    let obs = ctx.rpc("node-4");
+    let obs_addr = obs.addr.clone();
+    let val01 = ctx.net.key("val01.e2e.sov").clone();
+    let user2 = ctx.net.key("user2.e2e.sov").clone();
+    let xus = |n: u128| n * GRAINS_PER_XUS;
+    let amount = STRANDED_TEST_XUS;
+
+    // -- (0) PRE-ACTIVATION PRECONDITIONS --------------------------------------
+    // The deployment must exist (the rehearsal preset) and must NOT have locked
+    // in or activated yet, or "pre-activation note" would be a lie.
+    let dep0 = tx_domain_deployment(&obs)?;
+    check_deployment_params(&dep0)?;
+    let state0 = deployment_state(&dep0)?;
+    if state0 != "Defined" && state0 != "Started" {
+        return Err(format!(
+            "`{ACT_DEPLOYMENT}` is already `{state0}` at the start of this step — the shield \
+             below would NOT predate activation. The harness must reach this step before \
+             height {}; raise E2E_REHEARSAL_START_HEIGHT in chain/crates/rpc/src/daemon.rs \
+             (the earlier steps got slower).",
+            ACT_START_HEIGHT + 2 * ACT_PERIOD
+        ));
+    }
+    let domain0 = obs.signing_domain()?;
+    if domain0.get("active").and_then(Value::as_bool) != Some(false) {
+        return Err(format!(
+            "signing domain is already active before the fork: {domain0}"
+        ));
+    }
+    let pool0 = obs.pool_grains()?;
+    if pool0 != 0 {
+        return Err(format!("shielded pool started non-empty: {pool0} grains"));
+    }
+
+    // -- (1) SHIELD, PRE-ACTIVATION -------------------------------------------
+    poll(
+        "val01 to hold ≥ 10 mined XUS",
+        Duration::from_secs(240),
+        Duration::from_secs(1),
+        || {
+            let b = obs.balance_grains("val01.e2e.sov")?;
+            Ok((b >= xus(10)).then_some(b))
+        },
+    )?;
+    // Fee headroom for the post-activation carrier transaction.
+    let fund = wallet(
+        ctx,
+        &obs_addr,
+        &[
+            "transfer",
+            &val01.seed_hex,
+            "val01.e2e.sov",
+            "user2.e2e.sov",
+            "3",
+        ],
+    )?;
+    let fund_tx = parse_tx_id(&fund).ok_or("no tx id in funding transfer output")?;
+    await_success(&obs, &fund_tx, "funding transfer", Duration::from_secs(120))?;
+    poll_balance_eq(&obs, "user2.e2e.sov", xus(3), Duration::from_secs(90))?;
+
+    let shield = wallet(
+        ctx,
+        &obs_addr,
+        &[
+            "transfer",
+            &val01.seed_hex,
+            "val01.e2e.sov",
+            &user2.shielded_addr,
+            &amount.to_string(),
+        ],
+    )?;
+    let shield_tx = parse_tx_id(&shield).ok_or("no tx id in shield output")?;
+    let shield_rcpt = await_success(&obs, &shield_tx, "shield", Duration::from_secs(300))?;
+    let shield_height = shield_rcpt
+        .get("height")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("shield receipt lacks `height`: {shield_rcpt}"))?;
+    // EXACT pool delta — the pool was 0, it must now be exactly the shield.
+    poll_pool_eq(
+        &obs,
+        xus(amount),
+        "pool after the pre-activation shield",
+        Duration::from_secs(90),
+    )?;
+    let zb_shield = zbalance(ctx, &obs_addr, &user2.seed_hex)?;
+    if zb_shield != (amount.to_string(), 1) {
+        return Err(format!(
+            "z-balance after the pre-activation shield: expected ({amount} XUS, 1 note), got \
+             {zb_shield:?}"
+        ));
+    }
+    // The note provably PREDATES the fork, on BOTH counts:
+    //   * it was mined strictly below the activation height, and
+    //   * the deployment had not activated at any point up to now (Active is
+    //     terminal, so "not Active now" proves "not Active when it was mined").
+    let activation_height = ACT_START_HEIGHT + 2 * ACT_PERIOD;
+    let state_after_shield = deployment_state(&tx_domain_deployment(&obs)?)?;
+    if state_after_shield == "Active" {
+        return Err(format!(
+            "`{ACT_DEPLOYMENT}` was already Active by the time the shield was mined (height \
+             {shield_height}) — this step can no longer prove the note predates activation. \
+             Raise E2E_REHEARSAL_START_HEIGHT in chain/crates/rpc/src/daemon.rs (and \
+             ACT_START_HEIGHT here) so the shield finishes well below it."
+        ));
+    }
+    if shield_height >= activation_height {
+        return Err(format!(
+            "the shield landed at height {shield_height}, at/after the activation height \
+             {activation_height} — the note does not predate the fork. Raise \
+             E2E_REHEARSAL_START_HEIGHT in chain/crates/rpc/src/daemon.rs (and \
+             ACT_START_HEIGHT here)."
+        ));
+    }
+
+    // -- (2) DRIVE THE ACTIVATION (real signaling, no simulation) --------------
+    let (trace, activation) = drive_activation_to_active(&obs)?;
+
+    // -- (3) COLD BOOT: the note must survive a replay from the LOG ------------
+    let replay = cold_boot_observer(ctx)?;
+    // After the cold boot the pool value must be UNCHANGED and exact.
+    let pool_after_replay = obs.pool_grains()?;
+    if pool_after_replay != xus(amount) {
+        return Err(format!(
+            "pool value changed across the cold boot: {pool_after_replay} grains != {} — a \
+             replayed node disagrees with the pre-kill chain about shielded value",
+            xus(amount)
+        ));
+    }
+    // And the note is still THERE, scanned out of the cold-booted node's chain.
+    let zb_replay = zbalance(ctx, &obs_addr, &user2.seed_hex)?;
+    if zb_replay != (amount.to_string(), 1) {
+        return Err(format!(
+            "the pre-activation note did NOT survive the cold boot: expected ({amount} XUS, 1 \
+             note) after replay, got {zb_replay:?}"
+        ));
+    }
+
+    // -- (4) SPEND IT, POST-ACTIVATION ----------------------------------------
+    // The fork is Active with grace G = 0, so this carrier transaction MUST be
+    // chain-bound (`Bound` regime) — assert the node says so before signing.
+    let domain1 = obs.signing_domain()?;
+    if domain1.get("active").and_then(Value::as_bool) != Some(true) {
+        return Err(format!(
+            "the fork is Active but sov_getSigningDomain still reports inactive: {domain1}"
+        ));
+    }
+    if domain1.get("chainId").and_then(Value::as_str) != Some(CHAIN_ID) {
+        return Err(format!(
+            "post-activation signing domain names the wrong chain: {domain1}"
+        ));
+    }
+    let bal_before = obs.balance_grains("user2.e2e.sov")?;
+    let supply_before = obs.supply()?;
+    let unshield = wallet(
+        ctx,
+        &obs_addr,
+        &[
+            "unshield",
+            &user2.seed_hex,
+            "user2.e2e.sov",
+            &amount.to_string(),
+        ],
+    )?;
+    let unshield_tx = parse_tx_id(&unshield).ok_or("no tx id in unshield output")?;
+    let unshield_rcpt = await_success(
+        &obs,
+        &unshield_tx,
+        "post-activation unshield of the pre-activation note",
+        Duration::from_secs(300),
+    )?;
+    let unshield_height = unshield_rcpt
+        .get("height")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("unshield receipt lacks `height`: {unshield_rcpt}"))?;
+    if unshield_height < activation.active_height {
+        return Err(format!(
+            "the spend was mined at height {unshield_height}, BELOW the activation height {} — \
+             it did not actually cross the fork boundary",
+            activation.active_height
+        ));
+    }
+    let gas = gas_used(&unshield_rcpt)?;
+
+    // EXACT pool delta: the whole note left the pool, nothing more, nothing less.
+    poll_pool_eq(
+        &obs,
+        0,
+        "pool after the post-activation de-shield",
+        Duration::from_secs(90),
+    )?;
+    // EXACT transparent credit: amount in, real on-chain fee out.
+    let expect_transparent = bal_before + xus(amount) - GAS_PRICE_GRAINS * u128::from(gas);
+    poll_balance_eq(
+        &obs,
+        "user2.e2e.sov",
+        expect_transparent,
+        Duration::from_secs(90),
+    )?;
+    // The note is genuinely CONSUMED. `NoteStore::ingest_block` (sov-shielded)
+    // marks a note spent exactly when the note's derived nullifier appears in an
+    // on-chain bundle, so "0 unspent notes" here is a direct observation that the
+    // nullifier was published in consensus — not wallet bookkeeping.
+    let zb_spent = zbalance(ctx, &obs_addr, &user2.seed_hex)?;
+    if zb_spent != ("0".to_string(), 0) {
+        return Err(format!(
+            "the spent note's nullifier is NOT on-chain: expected (0 XUS, 0 unspent notes) \
+             after de-shielding the whole note, got {zb_spent:?}"
+        ));
+    }
+    // ...and it cannot be spent twice.
+    let respend = wallet_expect_failure(
+        ctx,
+        &obs_addr,
+        &[
+            "z-send",
+            &user2.seed_hex,
+            &ctx.net.key("user1.e2e.sov").shielded_addr,
+            "1",
+            "--signer",
+            "user2.e2e.sov",
+        ],
+    )?;
+
+    // Supply conservation across the whole episode.
+    let supply_after = obs.supply()?;
+    let total = supply_after
+        .get("total")
+        .and_then(grains_of)
+        .ok_or("supply lacks total")?;
+    let mined = supply_after
+        .get("mined")
+        .and_then(grains_of)
+        .ok_or("supply lacks mined")?;
+    if total != mined {
+        return Err(format!(
+            "conservation violated after the cross-activation spend: total {total} != mined \
+             {mined} on a no-pre-mine chain"
+        ));
+    }
+    let shielded = supply_after
+        .get("shielded")
+        .and_then(grains_of)
+        .ok_or("supply lacks shielded")?;
+    if shielded != 0 {
+        return Err(format!(
+            "shielded supply is {shielded} grains after the pool was fully drained — the \
+             turnstile and the pool disagree"
+        ));
+    }
+
+    Ok((
+        format!(
+            "{amount} XUS shielded at height {shield_height} (pre-fork); `{ACT_DEPLOYMENT}` \
+             driven Defined→Started→LockedIn→Active by real signaling (active at {}); node-4 \
+             cold-booted from blocks.log with the note intact; the note then de-shielded at \
+             height {unshield_height} under the Bound regime — exact deltas, nullifier \
+             published, re-spend refused, supply conserved",
+            activation.active_height
+        ),
+        json!({
+            "fund_tx": fund_tx,
+            "shield_tx": shield_tx,
+            "shield_height": shield_height,
+            "shield_pool_grains": xus(amount).to_string(),
+            "deployment": {
+                "name": ACT_DEPLOYMENT,
+                "bit": ACT_BIT,
+                "period": ACT_PERIOD,
+                "start_height": ACT_START_HEIGHT,
+                "threshold": format!("{ACT_THRESHOLD_NUM}/{ACT_THRESHOLD_DEN}"),
+                "observed_trace": trace,
+                "started_height": activation.started_height,
+                "lockedin_height": activation.lockedin_height,
+                "active_height": activation.active_height,
+            },
+            "cold_boot": replay,
+            "pool_after_replay_grains": pool_after_replay.to_string(),
+            "unshield_tx": unshield_tx,
+            "unshield_height": unshield_height,
+            "unshield_gas": gas,
+            "pool_after_spend_grains": "0",
+            "user2_transparent_before_grains": bal_before.to_string(),
+            "user2_transparent_after_grains": expect_transparent.to_string(),
+            "unspent_notes_after_spend": 0,
+            "respend_refused_with": respend,
+            "supply_before": supply_before,
+            "supply_after": supply_after,
+        }),
+    ))
+}
+
+/// One deployment's observed activation heights.
+struct Activation {
+    started_height: u64,
+    lockedin_height: u64,
+    active_height: u64,
+}
+
+/// Poll `sov_getDeployments` until `tx-domain` is `Active`, recording the height
+/// at which each state was first OBSERVED.
+///
+/// Assertions here are deliberately race-free: a poll cannot be made to observe a
+/// state at an exact block, so each first-observation height is only required to
+/// fall inside the window in which that state is actually in force (a full
+/// [`ACT_PERIOD`] of slack — 32 blocks — which no scheduler hiccup can exceed
+/// while a 250 ms poll runs against a 2 s cadence). The EXACT, race-free facts —
+/// the per-window signal counts and the activation boundary — are asserted from
+/// the committed block headers by [`step_bip9_activation`].
+fn drive_activation_to_active(rpc: &Rpc) -> Result<(Vec<Value>, Activation), String> {
+    let mut trace: Vec<Value> = Vec::new();
+    let mut seen: Vec<(String, u64)> = Vec::new();
+    let deadline_blocks = ACT_START_HEIGHT + 4 * ACT_PERIOD;
+    poll(
+        &format!("`{ACT_DEPLOYMENT}` to reach Active (real miner signaling)"),
+        // Bounded by the schedule, not by hope: activation is due at
+        // start + 2*period. The deadline is a WEDGE detector, not a cadence
+        // assumption — real block rate on an isolated net swings while LWMA
+        // tracks the box's hashrate, so it is generous; the `deadline_blocks`
+        // check below is the tight, height-based bound.
+        Duration::from_secs(3_600),
+        Duration::from_millis(250),
+        || {
+            let dep = tx_domain_deployment(rpc)?;
+            let height = dep
+                .get("__height")
+                .and_then(Value::as_u64)
+                .ok_or("deployments reply lacks height")?;
+            let state = deployment_state(&dep)?;
+            if seen.last().map(|(s, _)| s.as_str()) != Some(state.as_str()) {
+                seen.push((state.clone(), height));
+                trace.push(json!({ "state": state, "first_seen_height": height }));
+            }
+            if state == "Failed" {
+                return Err(format!(
+                    "`{ACT_DEPLOYMENT}` reached `Failed` at height {height} — miners did not \
+                     signal; the rehearsal preset or the signal mask is broken"
+                ));
+            }
+            if height > deadline_blocks && state != "Active" {
+                return Err(format!(
+                    "chain is at height {height}, well past the scheduled activation, and \
+                     `{ACT_DEPLOYMENT}` is still `{state}`"
+                ));
+            }
+            Ok((state == "Active").then_some(()))
+        },
+    )?;
+
+    // The trace must be MONOTONE through the BIP-9 lifecycle and must contain
+    // every state — no jumping straight to Active, never going backwards.
+    let order = |s: &str| match s {
+        "Defined" => Some(0u8),
+        "Started" => Some(1),
+        "LockedIn" => Some(2),
+        "Active" => Some(3),
+        _ => None,
+    };
+    let mut last = 0u8;
+    for (state, height) in &seen {
+        let rank = order(state)
+            .ok_or_else(|| format!("unknown deployment state `{state}` at height {height}"))?;
+        if rank < last {
+            return Err(format!(
+                "deployment state went BACKWARDS to `{state}` at height {height}: {seen:?}"
+            ));
+        }
+        last = rank;
+    }
+    let at = |want: &str| -> Result<u64, String> {
+        seen.iter()
+            .find(|(s, _)| s == want)
+            .map(|(_, h)| *h)
+            .ok_or_else(|| {
+                format!(
+                    "never observed `{ACT_DEPLOYMENT}` in state `{want}` — the \
+                     Defined→Started→LockedIn→Active lifecycle was not driven in full: {seen:?}"
+                )
+            })
+    };
+    let started_height = at("Started")?;
+    let lockedin_height = at("LockedIn")?;
+    let active_height = at("Active")?;
+    // Each state must have been observed inside the window where it is in force.
+    for (label, seen_at, from) in [
+        ("Started", started_height, ACT_START_HEIGHT),
+        ("LockedIn", lockedin_height, ACT_START_HEIGHT + ACT_PERIOD),
+        ("Active", active_height, ACT_START_HEIGHT + 2 * ACT_PERIOD),
+    ] {
+        if seen_at < from || seen_at >= from + ACT_PERIOD {
+            return Err(format!(
+                "`{label}` first observed at height {seen_at}, outside the window \
+                 [{from}, {}) in which it is in force — the activation schedule is not the \
+                 pinned one",
+                from + ACT_PERIOD
+            ));
+        }
+    }
+    Ok((
+        trace,
+        Activation {
+            started_height,
+            lockedin_height,
+            active_height,
+        },
+    ))
+}
+
+/// SIGKILL node-4, delete its chainstate snapshot, and cold-boot it from
+/// `blocks.log` alone; assert it reproduces the pre-kill block hash + state root
+/// and rejoins the network. Returns the evidence object.
+///
+/// This is the same machinery [`step_restart_replay`] uses — factored out so the
+/// never-stranded step exercises it across an ACTIVATED chain (a log whose blocks
+/// span both signature regimes) with a live pre-activation note in it.
+fn cold_boot_observer(ctx: &mut Ctx) -> Result<Value, String> {
+    let victim = "node-4";
+    let plan = ctx.net.plan(victim).clone();
+    let rpc4 = ctx.rpc(victim);
+
+    poll(
+        "node-4's chainstate.snapshot to exist (written every 50 blocks)",
+        Duration::from_secs(300),
+        Duration::from_secs(1),
+        || {
+            Ok(ctx
+                .backend
+                .data_file_exists(&plan, "chainstate.snapshot")?
+                .then_some(()))
+        },
+    )?;
+    let h4 = rpc4.height()?;
+    let hpin = h4.saturating_sub(DEPTH);
+    let ref_digest = rpc4
+        .digest(hpin)?
+        .ok_or(format!("node-4 lacks its own block {hpin}"))?;
+    let ref_hash = ref_digest.get("hash").cloned().unwrap_or(Value::Null);
+    let ref_root = ref_digest.get("stateRoot").cloned().unwrap_or(Value::Null);
+
+    ctx.backend.stop(victim)?;
+    if !ctx.backend.remove_data_file(&plan, "chainstate.snapshot")? {
+        return Err("chainstate.snapshot vanished between the existence check and deletion".into());
+    }
+    if !ctx.backend.data_file_exists(&plan, "blocks.log")? {
+        return Err("node-4 has no blocks.log — nothing to replay from".into());
+    }
+    ctx.backend.start(&plan, &ctx.rpcd)?;
+    poll(
+        "node-4 to serve RPC after cold boot",
+        Duration::from_secs(180),
+        Duration::from_millis(300),
+        || Ok(rpc4.healthy().then_some(())),
+    )?;
+    poll(
+        &format!("node-4 to replay back past height {hpin}"),
+        Duration::from_secs(240),
+        Duration::from_millis(500),
+        || {
+            let h = rpc4.height()?;
+            Ok((h >= hpin).then_some(h))
+        },
+    )?;
+    let replayed = rpc4
+        .digest(hpin)?
+        .ok_or(format!("node-4 lacks block {hpin} after replay"))?;
+    if replayed.get("hash") != Some(&ref_hash) {
+        return Err(format!(
+            "replay produced a DIFFERENT block {hpin}: {:?} != pre-kill {ref_hash:?}",
+            replayed.get("hash")
+        ));
+    }
+    if replayed.get("stateRoot") != Some(&ref_root) {
+        return Err(format!(
+            "replay produced a DIFFERENT state root at {hpin}: {:?} != pre-kill {ref_root:?}",
+            replayed.get("stateRoot")
+        ));
+    }
+    Ok(json!({
+        "victim": victim,
+        "pre_kill_height": h4,
+        "pinned_height": hpin,
+        "pinned_hash": ref_hash,
+        "pinned_state_root": ref_root,
+        "snapshot_deleted": true,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// 5. BIP-9 activation rehearsal — post-hoc, race-free audit of the activation
+// ---------------------------------------------------------------------------
+
+/// Re-derives the activation outcome from RAW COMMITTED HEADERS, independently of
+/// the node's own state machine: it counts, block by block, how many headers in
+/// each signaling window actually set the deployment's bit, checks that count
+/// against the pinned 9/10 threshold, and asserts the exact activation boundary.
+/// Nothing here polls or races — every input is immutable chain history.
+fn step_bip9_activation(ctx: &mut Ctx) -> Result<(String, Value), String> {
+    let rpc = ctx.rpc("node-1");
+    let dep = tx_domain_deployment(&rpc)?;
+    check_deployment_params(&dep)?;
+    let state = deployment_state(&dep)?;
+    if state != "Active" {
+        return Err(format!(
+            "`{ACT_DEPLOYMENT}` is `{state}`, not `Active` — the activation the previous step \
+             drove did not hold"
+        ));
+    }
+
+    // The signaling window that decides lock-in, and the one after it.
+    let signaling_window = ACT_START_HEIGHT;
+    let lockin_window = ACT_START_HEIGHT + ACT_PERIOD;
+    let active_height = ACT_START_HEIGHT + 2 * ACT_PERIOD;
+    let tip = rpc.height()?;
+    if tip < active_height {
+        return Err(format!(
+            "tip {tip} is below the activation height {active_height} — cannot audit"
+        ));
+    }
+    let mut counts = serde_json::Map::new();
+    for window in [signaling_window, lockin_window] {
+        let mut signaled = 0u64;
+        for h in window..window + ACT_PERIOD {
+            let block = rpc
+                .block(h)?
+                .ok_or_else(|| format!("node-1 lacks block {h}"))?;
+            let bits = block
+                .pointer("/header/version_bits")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| format!("block {h} header lacks version_bits"))?;
+            if bits & (1 << ACT_BIT) != 0 {
+                signaled += 1;
+            }
+        }
+        // BIP-9 threshold, exact integer arithmetic — no floating point.
+        if signaled * ACT_THRESHOLD_DEN < ACT_THRESHOLD_NUM * ACT_PERIOD {
+            return Err(format!(
+                "window [{window}, {}) signaled bit {ACT_BIT} in only {signaled}/{ACT_PERIOD} \
+                 blocks — below the {ACT_THRESHOLD_NUM}/{ACT_THRESHOLD_DEN} threshold, yet the \
+                 node reports the deployment Active. The node's state machine and the \
+                 committed headers DISAGREE.",
+                window + ACT_PERIOD
+            ));
+        }
+        counts.insert(
+            format!("window_{window}"),
+            json!({ "signaled": signaled, "of": ACT_PERIOD }),
+        );
+    }
+    // The signature regime flipped exactly at the boundary the schedule dictates:
+    // dormant at the last pre-activation block, live at the activation block.
+    let domain = rpc.signing_domain()?;
+    if domain.get("active").and_then(Value::as_bool) != Some(true) {
+        return Err(format!(
+            "deployment Active but signing domain is not: {domain}"
+        ));
+    }
+    if domain
+        .get("genesis")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        != Some(EXPECTED_GENESIS_HASH.to_string())
+    {
+        return Err(format!(
+            "the post-activation signing domain does not bind THIS chain's genesis \
+             ({EXPECTED_GENESIS_HASH}): {domain}"
+        ));
+    }
+    Ok((
+        format!(
+            "`{ACT_DEPLOYMENT}` (bit {ACT_BIT}) Active: recounted from committed headers, \
+             {ACT_PERIOD}/{ACT_PERIOD} blocks signaled in the window at {signaling_window} \
+             (threshold {ACT_THRESHOLD_NUM}/{ACT_THRESHOLD_DEN}); activation height \
+             {active_height}; signatures now bound to {CHAIN_ID}/{EXPECTED_GENESIS_HASH}"
+        ),
+        json!({
+            "deployment": dep,
+            "recounted_signal_windows": counts,
+            "activation_height": active_height,
+            "signing_domain": domain,
+        }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// the v2 half of the never-stranded law — precise SKIP (no fake, no stub)
+// ---------------------------------------------------------------------------
+
+/// The other half of forward-compatibility law F8: a note in pool **v1** must
+/// still be spendable after pool **v2** is introduced and activated. That leg
+/// cannot exist yet — `Action::ShieldedV2` is not in `chain/crates/types`, there
+/// is no pool-v2 state in `chain/crates/chain`, and the bit-2 deployment has no
+/// row — so it is reported as a SKIP with its exact dependency, never as a pass.
+fn never_stranded_v2_skip(ctx: &mut Ctx) -> StepResult {
+    // Show the LIVE gap rather than asserting it from memory: the deployment
+    // table this chain actually runs (bit 2 is absent).
     let live = ctx
         .rpc("node-1")
         .deployments()
         .unwrap_or_else(|e| json!({ "error": e }));
     StepResult::skip(
-        "bip9-activation-rehearsal",
-        "needs a CONFIG-DRIVEN (non-mainnet) deployment install: `baked_deployments()` in \
-         chain/crates/rpc/src/daemon.rs returns None for any chain id not containing \
-         `mainnet`, and neither ChainSpec nor NodeConfig can install a test deployment or \
-         set a signal mask — so Defined→Started→LockedIn→Active cannot be observed on an \
-         isolated chain yet. Waits on W2 (bit-2 deployment definition) + a test-deployment \
-         config hook (e.g. an optional `deployments` block in the chain-spec, applied only \
-         to non-canonical chain ids). sov_getDeployments on this chain is empty, live proof \
-         of the gap."
+        "shielded-v1-never-stranded-across-pool-v2",
+        "waits on W2 (`Action::ShieldedV2`, pool-v2 ledger state, the bit-2 deployment row): \
+         the v1-across-a-consensus-activation half of law F8 runs for real in \
+         `shielded-v1-never-stranded`, but the v1-across-the-introduction-of-pool-v2 half \
+         needs a v2 pool to introduce. When W2 lands, this step shields into v1, activates \
+         bit 2, and re-spends the v1 note after pool v2 is Active — no code here simulates \
+         that today."
             .to_string(),
         json!({
-            "waits_on": ["v0.2.0 W2 (S2e deployment row)", "test-deployment config hook (non-mainnet)"],
+            "waits_on": "v0.2.0 program W2 (S2a-S2f) + D13 bit-2 deployment",
+            "enforces": "notes/v0.2.0-program.md law F8 (safe-exit protocol)",
             "live_sov_getDeployments": live,
         }),
     )
@@ -759,6 +1335,73 @@ fn bip9_rehearsal_skip(ctx: &mut Ctx) -> StepResult {
 // ---------------------------------------------------------------------------
 // shared helpers
 // ---------------------------------------------------------------------------
+
+/// The `tx-domain` deployment row from `sov_getDeployments`, with the reply's
+/// chain height folded in as `__height` so a caller reads state and height from
+/// ONE consistent snapshot (never two calls that could straddle a block).
+fn tx_domain_deployment(rpc: &Rpc) -> Result<Value, String> {
+    let reply = rpc.deployments()?;
+    let height = reply
+        .get("height")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("sov_getDeployments lacks `height`: {reply}"))?;
+    let mut row = reply
+        .get("deployments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("sov_getDeployments lacks `deployments`: {reply}"))?
+        .iter()
+        .find(|d| d.get("name").and_then(Value::as_str) == Some(ACT_DEPLOYMENT))
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "this chain runs NO `{ACT_DEPLOYMENT}` deployment — the node binary lacks the \
+                 E2E rehearsal preset (`e2e_rehearsal_deployments()` in \
+                 chain/crates/rpc/src/daemon.rs, keyed on the reserved `sov-e2e-` chain-id \
+                 prefix). Rebuild the release binaries from this branch. Live reply: {reply}"
+            )
+        })?;
+    if let Value::Object(map) = &mut row {
+        map.insert("__height".into(), json!(height));
+    }
+    Ok(row)
+}
+
+/// The deployment row's `state` string (`Defined|Started|LockedIn|Active|Failed`).
+fn deployment_state(row: &Value) -> Result<String, String> {
+    row.get("state")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("deployment row lacks `state`: {row}"))
+}
+
+/// Assert the LIVE deployment parameters equal the ones this matrix pins. A
+/// silent drift in the node's preset would re-time the activation every
+/// assertion below depends on, so it fails here, loudly, first.
+fn check_deployment_params(row: &Value) -> Result<(), String> {
+    for (field, expected) in [
+        ("bit", ACT_BIT),
+        ("period", ACT_PERIOD),
+        ("startHeight", ACT_START_HEIGHT),
+    ] {
+        let got = row
+            .get(field)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("deployment row lacks `{field}`: {row}"))?;
+        if got != expected {
+            return Err(format!(
+                "`{ACT_DEPLOYMENT}` {field} is {got}, not the pinned {expected} — the node's \
+                 rehearsal preset drifted from tools/e2e-vm's pins"
+            ));
+        }
+    }
+    if row.get("lockinontimeout").and_then(Value::as_bool) != Some(false) {
+        return Err(format!(
+            "`{ACT_DEPLOYMENT}` has lock-in-on-timeout ENABLED — activation would not prove \
+             real miner signaling: {row}"
+        ));
+    }
+    Ok(())
+}
 
 fn min_height(nodes: &[(String, Rpc)]) -> Result<u64, String> {
     let mut min = u64::MAX;
@@ -825,6 +1468,31 @@ fn wallet(ctx: &Ctx, addr: &str, args: &[&str]) -> Result<String, String> {
         ));
     }
     Ok(out.stdout)
+}
+
+/// Run a `sov-wallet` command that MUST FAIL, returning the refusal text. A
+/// command that unexpectedly SUCCEEDS is a hard error — this is how the harness
+/// proves a spent note cannot be spent again (an assertion that would be
+/// worthless if a silent success could pass).
+fn wallet_expect_failure(ctx: &Ctx, addr: &str, args: &[&str]) -> Result<String, String> {
+    let mut full: Vec<&str> = vec![addr];
+    full.extend_from_slice(args);
+    let out = run_cmd_timeout(&ctx.wallet, &full, None, Duration::from_secs(900))?;
+    if out.status_ok {
+        return Err(format!(
+            "sov-wallet {} SUCCEEDED but must have been refused (a spent note was re-spendable): \
+             {}",
+            args.first().unwrap_or(&""),
+            out.stdout.trim()
+        ));
+    }
+    let reason = out.stderr.trim();
+    let reason = if reason.is_empty() {
+        out.stdout.trim()
+    } else {
+        reason
+    };
+    Ok(reason.lines().last().unwrap_or("(no message)").to_string())
 }
 
 /// user's shielded position via the real CLI: (balance XUS string, note count).
