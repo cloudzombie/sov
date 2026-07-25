@@ -41,7 +41,8 @@ generous horizon (days) only, after prerequisites provably met + explicit go.
    - [ ] TS SDK (`sdk/`) — the KAT second client — NOT DONE
    - [ ] Rust wallet (`chain/crates/wallet`) — NOT DONE
    - [ ] `tools/conformance` — NOT DONE
-   - [ ] `tools/tx-cannon` — NOT DONE
+   - [ ] SOV TX Cannon — NOT DONE; external repo
+         https://github.com/cloudzombie/sov-tx-cannon (land it there, then bump its chain tag)
 2. **Grace-window gate** (DORMANT) — for `[H_a, H_a+G)` accept EITHER legacy OR bound;
    `≥ H_a+G` bound-only. Removes the boundary cliff for in-flight legacy txs.
 3. **Confirm the fleet** — every node + wallet + tool on the v0.1.98 binary (roll-call +
@@ -146,7 +147,7 @@ and mined right after the first. This is a **client bug, not a consensus limit.*
 **Fix 1 — Queue (wallet-side, NO consensus change, genesis-safe, may ship early):**
 - Add `sov_getNextNonce{account}` → `on_chain_nonce + pooled_count(signer)` (a thin RPC
   over the mempool's existing `sender_count`).
-- Station / SDK / Rust wallet / tx-cannon build at that nonce instead of `sov_getNonce`.
+- Station / SDK / Rust wallet / TX Cannon build at that nonce instead of `sov_getNonce`.
 - Result: fire N, N+1, N+2 back-to-back; they mine in order. Directly fixes the screenshot.
 - Verification: I9 — after admitting a tx at nonce N, a distinct tx at N+1 from the same
   signer is admitted (not `NonceTaken`), and both select in ascending nonce order.
@@ -221,7 +222,7 @@ two forks = double the coordination risk on reserve mainnet.
 ## Sequencing
 1. **Part B Layer 1** (fee-priority mempool policy) — ship EARLY, own release or folded in;
    zero consensus surface, reversible, gives the template builder the ordering it needs.
-2. **Complete Part A Phase-2 signers** (SDK, wallet, conformance, tx-cannon) — the current
+2. **Complete Part A Phase-2 signers** (SDK, wallet, conformance, TX Cannon) — the current
    blocker; without it a tx-domain flag day rejects every legacy tx.
 3. **Part B Layer 2** (v2 envelope + tip) as an additive DORMANT variant, same release.
 4. **Grace window + fleet roll-call + Fable audit + external econ/crypto review.**
@@ -297,7 +298,7 @@ two forks = double the coordination risk on reserve mainnet.
   underbid-at-capacity refused with a floor signal (not admitted, not the old Full error on an
   adequate bid); per-signer nonce package ordering; RBF ≥ bump.
 - **Slice 4** — confirm conservation (I4) end-to-end with tips in real blocks.
-- **Slice 5** — Part A Phase-2 signers (SDK, wallet, Station, conformance, tx-cannon).
+- **Slice 5** — Part A Phase-2 signers (SDK, wallet, Station, conformance, TX Cannon).
 - **Slice 6** — grace window + full release gate + end-to-end Fable audit + external review.
 
 Everything above is on a BRANCH, dormant/additive, nothing armed, genesis frozen — safe for

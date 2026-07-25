@@ -1,7 +1,7 @@
 # sov-stratum — the SOV RandomX Stratum bridge
 
 A standalone TCP daemon (own crate, **not** a member of the chain workspace — the
-`tools/tx-cannon` / `tools/conformance` pattern) that speaks **Monero-lineage
+`tools/conformance` pattern) that speaks **Monero-lineage
 Stratum** to RandomX miners on one side and `sov_getBlockTemplate` /
 `sov_submitBlock` JSON-RPC to a SOV node on the other. It is Phase 2 of the
 pool-mining stack planned in [`.github/RELEASE-0.1.92.md`](../../.github/RELEASE-0.1.92.md).
