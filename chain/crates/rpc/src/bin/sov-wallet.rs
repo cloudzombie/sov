@@ -323,6 +323,18 @@ fn run() -> Result<(), Box<dyn Error>> {
                             .into(),
                     )
                 }
+                // Pool v2 (post-quantum): the receiver type parses so unified
+                // addresses carrying one round-trip, but signal bit 2 is
+                // defined and NOT armed, so no v2 spend can execute on any
+                // chain. Refuse rather than route somewhere the sender did not
+                // choose.
+                Receiver::ShieldedV2(_) => {
+                    return Err(
+                        "recipient routes to the post-quantum shielded pool (v2), which is \
+                         not active on any chain yet — refusing to send"
+                            .into(),
+                    )
+                }
             };
             // The transparent account that carries (and pays the fee for) the tx;
             // it MUST be controlled by the seed's key. Default: the implicit id.

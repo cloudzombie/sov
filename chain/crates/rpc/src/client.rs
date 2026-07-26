@@ -352,6 +352,24 @@ impl RpcClient {
                 })?;
                 self.transfer_shielded(keypair, from, &recipient, amount, params)
             }
+            // Pool v2 (post-quantum). The receiver TYPE exists so unified
+            // addresses carrying one parse and round-trip, but there is no
+            // height on any chain at which a v2 spend may execute: signal bit 2
+            // is defined and NOT armed, and `Action::ShieldedV2` is a hard
+            // `FeatureInactive` reject everywhere.
+            //
+            // Refuse loudly. Falling back to the address's transparent receiver
+            // would silently pay a DIFFERENT recipient than the one the sender
+            // chose, and downgrade privacy without their consent — the same
+            // rule the shielded arm above enforces, and the reason that arm
+            // demands an explicit prover rather than quietly going transparent.
+            Receiver::ShieldedV2(_) => Err(RpcClientError::Malformed(
+                "recipient routes to the post-quantum shielded pool (v2), which is not \
+                 active on any chain yet — refusing to send. Paying the address's \
+                 transparent receiver instead would pay a different recipient and \
+                 downgrade privacy without your consent."
+                    .into(),
+            )),
         }
     }
 
