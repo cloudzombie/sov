@@ -196,12 +196,9 @@ pub fn tx_weight(stx: &SignedTransaction) -> u64 {
 /// For every block in mainnet history this is exactly `serialized_size()`.
 pub fn block_weight(block: &Block) -> u64 {
     let bytes = block.serialized_size() as u64;
-    block
-        .transactions
-        .iter()
-        .fold(bytes, |acc, stx| {
-            acc.saturating_add(verify_weight(&stx.transaction.action))
-        })
+    block.transactions.iter().fold(bytes, |acc, stx| {
+        acc.saturating_add(verify_weight(&stx.transaction.action))
+    })
 }
 
 /// The **fee rate** of a transaction in the blockspace auction: bid grains per

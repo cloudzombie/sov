@@ -15,15 +15,27 @@
 //!   `NonceGap` and resubmits the missing nonce);
 //! - time-evicts any entry stranded behind a pre-existing/edge-case gap after a
 //!   TTL, so such a gap self-clears instead of occupying the pool forever;
-//! - bounds its own size — and at capacity runs a blockspace AUCTION: a new tx
-//!   that outbids (tips more than) the pool's cheapest safely-evictable tx
-//!   displaces it, so "mempool full" is economically impossible for an adequate
-//!   bid, while an underbid gets the actionable [`MempoolError::BelowFloor`];
+//! - refuses any transaction heavier than [`MAX_TX_WEIGHT`] outright, BEFORE
+//!   verifying its signature — it could never be mined, so relaying it would
+//!   only flood the network, and checking size first means an oversized payload
+//!   never buys an expensive post-quantum verification;
+//! - bounds its own size in BOTH a transaction count and a total WEIGHT
+//!   ([`DEFAULT_MAX_POOL_WEIGHT`]) — a count is not a memory bound once
+//!   transactions differ in size by three orders of magnitude — and at either
+//!   limit runs a blockspace AUCTION: a new tx that outbids the pool's cheapest
+//!   safely-evictable tx displaces it, so "mempool full" is economically
+//!   impossible for an adequate bid, while an underbid gets the actionable
+//!   [`MempoolError::BelowFloor`];
+//! - ranks every bid by FEE RATE — grains per unit of weight
+//!   ([`effective_fee_rate`]) — not by the raw tip, so a 140 KB shielded bundle
+//!   and a 300-byte transfer compete on the block space each actually consumes.
+//!   With all tips zero every rate is zero, so the untipped schedule and the
+//!   untipped eviction order are byte-identical to what they replace;
 //! - supports replace-by-fee: a same-`(signer, nonce)` resubmission that raises
 //!   the tip by [`MIN_RBF_BUMP_GRAINS`] replaces the pooled original — the
 //!   unstick/cancel path; and
 //! - on request, returns a block template batch by the auction: highest
-//!   [`effective_tip`] first across signers, ascending nonce within a signer (a
+//!   [`effective_fee_rate`] first across signers, ascending nonce within a signer (a
 //!   nonce package — a later nonce never jumps its own signer's earlier one),
 //!   never proposing a transaction that would be rejected for a nonce gap. A
 //!   low- or zero-tip tx is never *rejected* for being cheap (the auction is
@@ -39,7 +51,29 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use sov_primitives::{AccountId, Balance, Hash, TxDomainMode};
-use sov_types::{Action, SignedTransaction};
+use sov_types::weight::{fee_rate, tx_weight, FEE_RATE_WEIGHT_SCALE, MAX_BLOCK_WEIGHT};
+use sov_types::{Action, SignedTransaction, MAX_TX_WEIGHT};
+
+/// Default ceiling on the pool's TOTAL weight (see [`sov_types::weight`]) —
+/// the bound the pool's transaction *count* never was.
+///
+/// The pool used to be bounded only by a count (16,384 by default). That is not
+/// a memory bound: at ~300-byte transfers it is ~5 MB, but at the 144 KiB
+/// pool-v2 bundle cap the SAME pool holds **2.3 GB** — a remote memory-
+/// exhaustion DoS from valid, signed, affordable transactions, made worse by
+/// every node re-broadcasting each one. Bounding weight bounds bytes.
+///
+/// # Derivation
+///
+/// `16 × MAX_BLOCK_WEIGHT` = 16 × 4 MiB = **64 MiB**. A pool must be able to
+/// hold a real backlog, and the natural unit of backlog is *blocks*: 16 maximum
+/// blocks is ~40 minutes of queued work at the 2.5-minute target interval,
+/// which comfortably exceeds any honest confirmation wait. It is also a size
+/// every fleet node affords trivially (RandomX already requires ≥ 4 GB).
+///
+/// Whichever of the count and the weight budget binds first applies; neither
+/// alone is sufficient.
+pub const DEFAULT_MAX_POOL_WEIGHT: u64 = 16 * MAX_BLOCK_WEIGHT;
 
 /// TTL for [`Mempool::evict_stranded`]: an entry left behind a nonce hole (only
 /// possible via reorg re-admission — gap-free admission prevents fresh holes) that
@@ -86,12 +120,33 @@ pub enum MempoolError {
     /// the tip above `floor` (or wait for demand to fall) and resubmit. This is the
     /// auction's only refusal; a bid above the floor always finds room (Rule B).
     #[error(
-        "mempool at capacity: tip does not beat the current floor of {floor} — raise the tip and resubmit"
+        "mempool at capacity: this transaction must tip at least {floor} for its size — raise the tip and resubmit"
     )]
     BelowFloor {
-        /// The lowest tip currently protecting a pool slot; a new tx must bid
-        /// strictly more than this to displace it.
+        /// The minimum tip THIS transaction must carry to displace the pool's
+        /// marginal slot — a price to PAY, not merely to exceed, so a client
+        /// that resubmits at exactly this value is guaranteed admission
+        /// (against an unchanged pool).
+        ///
+        /// It is derived from the marginal slot's fee RATE and this
+        /// transaction's own weight, so a large transaction is quoted a
+        /// proportionally larger price: the floor is per unit of block space,
+        /// and a bare rate would be unactionable for a client that does not
+        /// know its own weight. For equal-sized transactions this reduces to
+        /// the incumbent tip plus one grain.
         floor: Balance,
+    },
+    /// The transaction's weight exceeds [`MAX_TX_WEIGHT`] — it is too large to
+    /// be relayed or mined, so admitting it would only flood the network with
+    /// something that can never confirm. Checked FIRST, before signature
+    /// verification, so an oversized payload is discarded before it can buy any
+    /// expensive work (a post-quantum signature check is not cheap).
+    #[error("transaction weight {weight} exceeds the per-transaction limit of {limit}")]
+    TooLarge {
+        /// The transaction's weight (`sov_types::weight::tx_weight`).
+        weight: u64,
+        /// [`MAX_TX_WEIGHT`].
+        limit: u64,
     },
     /// A replace-by-fee attempt raised the tip, but not by the anti-churn minimum
     /// bump: a replacement for a pooled `(signer, nonce)` must tip at least
@@ -174,6 +229,51 @@ pub fn effective_tip(stx: &SignedTransaction) -> Balance {
     }
 }
 
+/// The transaction's bid in the auction **per unit of block space it consumes**:
+/// [`effective_tip`] grains per [`FEE_RATE_WEIGHT_SCALE`] weight units.
+///
+/// This is what makes the auction honest once transactions differ in size by
+/// orders of magnitude. Ranking by the raw tip lets a 144 KiB pool-v2 bundle
+/// outbid a 300-byte transfer by ONE grain while consuming ~480× the block
+/// space — the fat transaction would win every contested slot at a rounding
+/// error's cost. Ranking by rate makes each transaction bid for the space it
+/// actually takes, in both directions: a large transaction that genuinely pays
+/// proportionally more still wins, as it should.
+///
+/// **Untipped traffic is unaffected.** With every tip zero — the pre-auction
+/// case and the no-demand case — every rate is zero, so every comparison ties
+/// and the pool falls through to exactly the same deterministic tie-breaks as
+/// before. The zero-tip schedule and the zero-tip eviction order are therefore
+/// byte-identical to the tip-ranked behaviour they replace.
+pub fn effective_fee_rate(stx: &SignedTransaction) -> u128 {
+    fee_rate(effective_tip(stx).grains(), tx_weight(stx))
+}
+
+/// The smallest tip a transaction of `weight` must carry for its
+/// [`effective_fee_rate`] to STRICTLY exceed `rate` — i.e. the actionable price
+/// quoted back to a rejected bidder in [`MempoolError::BelowFloor`].
+///
+/// [`fee_rate`] truncates, so the inverse must round UP or the quote is short
+/// by up to one whole grain-per-unit and a bidder who pays exactly what they
+/// were told is refused again — the worst possible failure for an "actionable"
+/// error. Solving `floor(tip × SCALE / weight) > rate` exactly:
+///
+/// ```text
+/// floor(tip×S/w) > rate  ⟺  tip×S ≥ (rate+1)×w  ⟺  tip ≥ ceil((rate+1)×w / S)
+/// ```
+///
+/// Saturating throughout: an absurd `rate` yields an absurd (but finite) quote
+/// rather than wrapping into a cheap one. The tests assert tightness — the
+/// quote clears the floor and one grain less does not — at every weight from a
+/// bare transfer to [`MAX_TX_WEIGHT`].
+fn min_tip_to_beat(rate: u128, weight: u64) -> u128 {
+    let scale = FEE_RATE_WEIGHT_SCALE as u128;
+    rate.saturating_add(1)
+        .saturating_mul(weight as u128)
+        .saturating_add(scale - 1)
+        / scale
+}
+
 /// Minimum tip increase (in grains, 10⁻⁸ XUS) a replace-by-fee must add over the
 /// pooled transaction it displaces: `new_tip ≥ old_tip + MIN_RBF_BUMP_GRAINS`.
 /// 1_000 grains = 0.00001 XUS — economically negligible for a genuine repricing, but
@@ -207,10 +307,12 @@ fn now_millis() -> u64 {
 struct EvictionVictim {
     /// The victim's tx id.
     id: Hash,
-    /// The victim's [`effective_tip`], in grains — the pool's current price floor.
-    tip: u128,
+    /// The victim's [`effective_fee_rate`] — the pool's current price floor,
+    /// denominated per unit of block space rather than per transaction, so a
+    /// fat transaction cannot hold a slot with a token tip.
+    rate: u128,
     /// How many transactions the victim's sender holds (legacy-fairness tie-break;
-    /// a zero-tip tie only displaces a sender holding more than one).
+    /// a zero-rate tie only displaces a sender holding more than one).
     sender_count: usize,
 }
 
@@ -227,6 +329,14 @@ pub struct Mempool {
     capacity: usize,
     /// Max transactions one sender may hold at once (anti-DoS fairness bound).
     max_per_sender: usize,
+    /// Ceiling on the pool's TOTAL weight — the byte bound `capacity` never
+    /// was (see [`DEFAULT_MAX_POOL_WEIGHT`]). Whichever of the two binds first
+    /// applies.
+    max_weight: u64,
+    /// Running sum of `tx_weight` over `by_id`. Maintained in lockstep with
+    /// every insertion and removal so it can never drift from the pool's real
+    /// contents; `debug_assert`ed against a full recomputation in the tests.
+    weight_total: u64,
     /// The `tx-domain` verification regime admission checks signatures under
     /// (set by the node via [`set_mode`](Self::set_mode) on every tip advance,
     /// to the mode resolved at the next height). `Legacy` — the default, and
@@ -253,8 +363,30 @@ impl Mempool {
             inserted_at: HashMap::new(),
             capacity,
             max_per_sender: max_per_sender.max(1),
+            max_weight: DEFAULT_MAX_POOL_WEIGHT,
+            weight_total: 0,
             mode: TxDomainMode::Legacy,
         }
+    }
+
+    /// Override the pool's total-weight ceiling (default
+    /// [`DEFAULT_MAX_POOL_WEIGHT`]). Node-local policy, not consensus: a node
+    /// with less memory may lower it, and a relay with more may raise it,
+    /// without any effect on which blocks either accepts.
+    pub fn set_max_weight(&mut self, max_weight: u64) {
+        // A pool that cannot hold one maximum transaction could never admit
+        // anything, so floor the setting rather than brick the node.
+        self.max_weight = max_weight.max(MAX_TX_WEIGHT);
+    }
+
+    /// The pool's current total weight, in the units of [`sov_types::weight`].
+    pub fn weight(&self) -> u64 {
+        self.weight_total
+    }
+
+    /// The pool's total-weight ceiling.
+    pub fn max_weight(&self) -> u64 {
+        self.max_weight
     }
 
     /// Set the `tx-domain` verification mode used to verify admitted signatures.
@@ -343,18 +475,18 @@ impl Mempool {
             else {
                 continue;
             };
-            let tip = effective_tip(&self.by_id[id]).grains();
+            let rate = effective_fee_rate(&self.by_id[id]);
             let count = self.sender_count(signer);
             // Strictly-better comparisons keep the FIRST (lowest-id) sender on full
             // ties, making the choice deterministic.
             let better = match &best {
                 None => true,
-                Some(b) => tip < b.tip || (tip == b.tip && count > b.sender_count),
+                Some(b) => rate < b.rate || (rate == b.rate && count > b.sender_count),
             };
             if better {
                 best = Some(EvictionVictim {
                     id: *id,
-                    tip,
+                    rate,
                     sender_count: count,
                 });
             }
@@ -407,6 +539,20 @@ impl Mempool {
         current_nonce: u64,
         balance: Balance,
     ) -> Result<(), MempoolError> {
+        // Size gate FIRST — before the signature check. A transaction heavier
+        // than MAX_TX_WEIGHT can never be mined (it exceeds what a block may
+        // carry usefully), so admitting it would only make this node flood the
+        // network with something that cannot confirm. Checking it before
+        // `verify_signature_mode` also means an oversized payload never buys an
+        // expensive verification: a hybrid ML-DSA-65 check is orders of
+        // magnitude costlier than a length comparison.
+        let weight = tx_weight(&stx);
+        if weight > MAX_TX_WEIGHT {
+            return Err(MempoolError::TooLarge {
+                weight,
+                limit: MAX_TX_WEIGHT,
+            });
+        }
         if !stx.verify_signature_mode(&self.mode) {
             return Err(MempoolError::InvalidSignature);
         }
@@ -484,6 +630,7 @@ impl Mempool {
             self.remove(&old_id);
             self.by_sender.insert(slot, id);
             self.by_id.insert(id, stx);
+            self.weight_total = self.weight_total.saturating_add(weight);
             self.inserted_at.insert(id, now_millis());
             return Ok(());
         }
@@ -524,8 +671,16 @@ impl Mempool {
         //                       (a zero bid against a fairly-shared zero-tip pool)
         //                       or nothing is evictable at all (every tail is the
         //                       submitting signer's own).
-        if self.by_id.len() >= self.capacity {
-            let new_tip = effective_tip(&stx).grains();
+        //
+        // The same auction ALSO enforces the pool's total-weight budget: a
+        // count cap is not a memory bound (16,384 slots is ~5 MB of transfers
+        // but 2.3 GB of maximum-size pool-v2 bundles), so admission loops until
+        // BOTH the slot count and the weight budget have room. Each iteration
+        // removes exactly one transaction or returns, so it always terminates.
+        let new_rate = fee_rate(effective_tip(&stx).grains(), weight);
+        while self.by_id.len() >= self.capacity
+            || self.weight_total.saturating_add(weight) > self.max_weight
+        {
             match self.eviction_victim(&stx.transaction.signer) {
                 // Displace either by STRICTLY outbidding the cheapest displaceable tail,
                 // OR — only at a ZERO floor — by the legacy heaviest-sender fairness tie
@@ -534,14 +689,18 @@ impl Mempool {
                 // closes an equal-tip sybil displacement: at any NONZERO tip a newcomer
                 // must strictly outbid (new_tip > v.tip), never merely match, to evict.
                 Some(v)
-                    if new_tip > v.tip
-                        || (new_tip == v.tip && v.tip == 0 && v.sender_count > 1) =>
+                    if new_rate > v.rate
+                        || (new_rate == v.rate && v.rate == 0 && v.sender_count > 1) =>
                 {
                     self.remove(&v.id);
                 }
-                Some(v) if v.tip > 0 => {
+                Some(v) if v.rate > 0 => {
+                    // Quote the floor as the minimum TIP THIS transaction must
+                    // carry, not the raw rate: the rate is per unit of weight,
+                    // so a bare rate would be unactionable for a bidder who
+                    // does not know their own weight.
                     return Err(MempoolError::BelowFloor {
-                        floor: Balance::from_grains(v.tip),
+                        floor: Balance::from_grains(min_tip_to_beat(v.rate, weight)),
                     });
                 }
                 _ => {
@@ -553,6 +712,7 @@ impl Mempool {
         }
         self.by_sender.insert(slot, id);
         self.by_id.insert(id, stx);
+        self.weight_total = self.weight_total.saturating_add(weight);
         self.inserted_at.insert(id, now_millis());
         Ok(())
     }
@@ -561,6 +721,10 @@ impl Mempool {
     /// transaction is committed in a block.
     pub fn remove(&mut self, id: &Hash) -> Option<SignedTransaction> {
         let stx = self.by_id.remove(id)?;
+        // Keep the running weight in lockstep with `by_id`: every removal path
+        // in the pool funnels through here, so there is exactly one place that
+        // can get this wrong, and it is covered by the accounting test.
+        self.weight_total = self.weight_total.saturating_sub(tx_weight(&stx));
         self.by_sender
             .remove(&(stx.transaction.signer.clone(), stx.transaction.nonce));
         self.inserted_at.remove(id);
@@ -721,13 +885,15 @@ impl Mempool {
         }
         let mut out = Vec::new();
         while out.len() < max && !queues.is_empty() {
-            // Head-tip greedy: the signer whose NEXT mineable tx bids highest.
+            // Head-RATE greedy: the signer whose NEXT mineable tx bids highest PER
+            // UNIT OF BLOCK SPACE (see `effective_fee_rate`), so a 140 KB shielded
+            // bundle and a 300-byte transfer are ranked on the same terms.
             // Strict `>` keeps the first (lowest-id) signer on ties.
             let mut best: Option<(&AccountId, u128)> = None;
             for (signer, queue) in &queues {
-                let head_tip = effective_tip(queue.front().expect("queues are non-empty")).grains();
-                if best.is_none_or(|(_, t)| head_tip > t) {
-                    best = Some((*signer, head_tip));
+                let head_rate = effective_fee_rate(queue.front().expect("queues are non-empty"));
+                if best.is_none_or(|(_, r)| head_rate > r) {
+                    best = Some((*signer, head_rate));
                 }
             }
             let winner = best.expect("queues is non-empty").0;
@@ -1476,7 +1642,9 @@ mod tests {
     #[test]
     fn capacity_underbid_is_refused_below_floor_not_full() {
         // Rule B's flip side: a bid under the floor is refused with the actionable
-        // BelowFloor (carrying the price to beat) — never the dead-end Full.
+        // BelowFloor (carrying the price to PAY) — never the dead-end Full.
+        // Every tx here is the same size, so the weight-denominated floor
+        // reduces to the incumbent tip plus one grain: pay 6 to displace a 5.
         let mut pool = Mempool::with_limits(2, 10);
         pool.insert(tipped([1; 32], "usa.reserve.sov", 0, 5), 0, big())
             .unwrap();
@@ -1488,11 +1656,14 @@ mod tests {
         assert_eq!(
             pool.insert(underbid, 0, big()),
             Err(MempoolError::BelowFloor {
-                floor: Balance::from_grains(5),
+                floor: Balance::from_grains(6),
             })
         );
         assert!(!pool.contains(&underbid_id), "the underbid is not admitted");
         assert_eq!(pool.len(), 2, "nothing was evicted for an underbid");
+        // And the quote is honest: paying exactly it gets in.
+        pool.insert(tipped([3; 32], "boj.reserve.sov", 0, 6), 0, big())
+            .expect("paying the quoted floor is sufficient");
     }
 
     #[test]
@@ -1511,7 +1682,8 @@ mod tests {
     fn eviction_never_strands_a_package_and_the_floor_is_the_tail_price() {
         // Signer A holds [n0 tip 0, n1 tip 9]: its n0 is NOT evictable (a hole at
         // n0 would strand n1) — only tails are. Signer B holds [n0 tip 3].
-        // Entry price (floor) is therefore min over TAILS = 3, not the global min 0.
+        // Entry price is therefore set by the min over TAILS (tip 3), not the
+        // buried global min 0, and is quoted as the tip to PAY: 4.
         let mut pool = Mempool::with_limits(3, 10);
         pool.insert(tipped([1; 32], "usa.reserve.sov", 0, 0), 0, big())
             .unwrap();
@@ -1524,7 +1696,7 @@ mod tests {
         assert_eq!(
             pool.insert(tipped([3; 32], "boj.reserve.sov", 0, 1), 0, big()),
             Err(MempoolError::BelowFloor {
-                floor: Balance::from_grains(3),
+                floor: Balance::from_grains(4),
             })
         );
         // A tip-5 bid beats the 3-tip tail: B is displaced; A's package is intact.
@@ -1742,5 +1914,349 @@ mod tests {
                 .collect::<Vec<_>>(),
             order[..3].to_vec()
         );
+    }
+
+    // ---------------------------------------------------------------
+    // S2d — weight accounting, fee-rate-by-weight, and v2 interplay
+    // ---------------------------------------------------------------
+
+    /// A transaction carrying a `ShieldedV2` bundle of `bundle_bytes`, with an
+    /// optional fee-auction tip wrapped around it. This exercises the exact
+    /// carrier shape decision D10 pins as LEGAL: `Tipped { inner: ShieldedV2 }`.
+    fn v2(
+        seed: [u8; 32],
+        from: &str,
+        nonce: u64,
+        bundle_bytes: usize,
+        tip_grains: Option<u128>,
+    ) -> SignedTransaction {
+        let kp = Keypair::from_seed(seed);
+        // A realistic bundle body: the leading `proof_version` byte (D6) then
+        // opaque payload. The mempool never interprets it — it only weighs it.
+        let mut bundle = vec![0u8; bundle_bytes];
+        if !bundle.is_empty() {
+            bundle[0] = 1; // PROOF_VERSION_V1
+        }
+        let leaf = Action::ShieldedV2 { bundle };
+        let action = match tip_grains {
+            Some(tip) => Action::Tipped {
+                tip: Balance::from_grains(tip),
+                inner: Box::new(leaf),
+            },
+            None => leaf,
+        };
+        let t = Transaction {
+            signer: id(from),
+            public_key: kp.public_key(),
+            nonce,
+            action,
+        };
+        SignedTransaction::sign(t, &kp).unwrap()
+    }
+
+    /// Recompute the pool's weight from scratch — the independent check that
+    /// the incrementally-maintained running total can never drift.
+    fn recomputed_weight(pool: &Mempool) -> u64 {
+        pool.by_id
+            .values()
+            .map(tx_weight)
+            .fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    #[test]
+    fn a_v2_transaction_is_admitted_through_the_tipped_carrier() {
+        // D10: `Tipped { inner: ShieldedV2 }` is LEGAL and the pool must admit
+        // it. (Whether it EXECUTES is the dormant gate's business, tested in
+        // the execution layer — the pool's job is to carry it correctly.)
+        let mut pool = Mempool::new(16);
+        let tx = v2([9; 32], "usa.reserve.sov", 0, 64 * 1024, Some(50_000));
+        pool.insert(tx.clone(), 0, big()).expect("admitted");
+        assert_eq!(pool.len(), 1);
+        // The tip is read through the carrier, and the weight includes both the
+        // bundle's bytes AND the verification surcharge.
+        assert_eq!(effective_tip(&tx).grains(), 50_000);
+        assert!(tx_weight(&tx) > 64 * 1024);
+        assert_eq!(pool.weight(), tx_weight(&tx));
+        assert_eq!(pool.weight(), recomputed_weight(&pool));
+    }
+
+    #[test]
+    fn a_bare_v2_transaction_is_admitted_and_bids_zero() {
+        // Rule A: an untipped transaction is never REJECTED for being cheap.
+        // A bare `ShieldedV2` (no auction envelope) bids zero and waits.
+        let mut pool = Mempool::new(16);
+        let tx = v2([10; 32], "usa.reserve.sov", 0, 32 * 1024, None);
+        pool.insert(tx.clone(), 0, big()).expect("admitted");
+        assert_eq!(effective_tip(&tx).grains(), 0);
+        assert_eq!(effective_fee_rate(&tx), 0);
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn an_oversized_transaction_is_refused_at_the_boundary() {
+        // One below / at / one above MAX_TX_WEIGHT. The bundle decode cap
+        // (144 KiB) is below MAX_TX_WEIGHT (256 KiB), so a ShieldedV2 can never
+        // trip this on its own — a `Deploy` payload is what reaches the limit,
+        // which is exactly why the cap must not be v2-specific.
+        let mut pool = Mempool::new(64);
+
+        let build = |nonce: u64, code_len: usize| {
+            let kp = Keypair::from_seed([11; 32]);
+            let t = Transaction {
+                signer: id("usa.reserve.sov"),
+                public_key: kp.public_key(),
+                nonce,
+                action: Action::Deploy {
+                    code: vec![7u8; code_len],
+                },
+            };
+            SignedTransaction::sign(t, &kp).unwrap()
+        };
+
+        // Binary-search the code length whose tx weight lands exactly on the
+        // limit, so the boundary is tested AT the limit and not merely near it.
+        let (mut lo, mut hi) = (0usize, MAX_TX_WEIGHT as usize);
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if tx_weight(&build(0, mid)) <= MAX_TX_WEIGHT {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let exact = build(0, lo);
+        assert_eq!(
+            tx_weight(&exact),
+            MAX_TX_WEIGHT,
+            "landed exactly on the cap"
+        );
+
+        // One below: admitted.
+        pool.insert(build(0, lo - 1), 0, big()).expect("one below");
+        // Exactly at the limit: admitted (the check is `>`, not `>=`).
+        pool.insert(build(1, lo), 0, big()).expect("at the limit");
+        // One above: refused, with the real numbers.
+        let over = build(2, lo + 1);
+        assert!(tx_weight(&over) > MAX_TX_WEIGHT);
+        match pool.insert(over, 0, big()) {
+            Err(MempoolError::TooLarge { weight, limit }) => {
+                assert_eq!(limit, MAX_TX_WEIGHT);
+                assert!(weight > MAX_TX_WEIGHT);
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_size_gate_runs_before_signature_verification() {
+        // An oversized payload must not buy an expensive (post-quantum)
+        // signature check. Proven by submitting an oversized tx whose
+        // signature is INVALID: if the size gate ran second we would see
+        // InvalidSignature instead.
+        let mut pool = Mempool::new(16);
+        let kp = Keypair::from_seed([12; 32]);
+        let t = Transaction {
+            signer: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce: 0,
+            action: Action::Deploy {
+                code: vec![7u8; MAX_TX_WEIGHT as usize + 4096],
+            },
+        };
+        let mut stx = SignedTransaction::sign(t, &kp).unwrap();
+        // Corrupt the signature so BOTH checks would fail.
+        stx.transaction.nonce = 1;
+        assert!(!stx.verify_signature());
+        assert!(matches!(
+            pool.insert(stx, 0, big()),
+            Err(MempoolError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn the_auction_ranks_a_fat_transaction_against_a_small_one_honestly() {
+        // The headline requirement: a ~140 KB shielded tx and a ~300-byte
+        // transfer must be ranked on the space they consume, in BOTH
+        // directions.
+        let small = tipped([20; 32], "aaa.reserve.sov", 0, 100_000);
+        let fat_underbid = v2([21; 32], "bbb.reserve.sov", 0, 140 * 1024, Some(100_001));
+
+        // Direction 1: the fat tx tips MORE in absolute terms but must rank
+        // BELOW the small one — it buys ~480x the block space for one extra
+        // grain.
+        assert!(effective_tip(&fat_underbid) > effective_tip(&small));
+        assert!(effective_fee_rate(&fat_underbid) < effective_fee_rate(&small));
+
+        // Direction 2: paying proportionally, the fat tx wins — the rate is
+        // not a blanket penalty on size.
+        let ratio = tx_weight(&fat_underbid) as u128 / tx_weight(&small) as u128;
+        let fat_fairbid = v2(
+            [21; 32],
+            "bbb.reserve.sov",
+            0,
+            140 * 1024,
+            Some(100_000 * ratio * 2),
+        );
+        assert!(effective_fee_rate(&fat_fairbid) > effective_fee_rate(&small));
+
+        // And the SELECTED order follows the rate, not the raw tip.
+        let mut pool = Mempool::new(16);
+        pool.insert(small.clone(), 0, big()).unwrap();
+        pool.insert(fat_underbid.clone(), 0, big()).unwrap();
+        let order = pool.select(|_| 0, 2);
+        assert_eq!(order[0].id(), small.id(), "the small tx wins on rate");
+        assert_eq!(order[1].id(), fat_underbid.id());
+    }
+
+    #[test]
+    fn a_fat_low_rate_transaction_cannot_displace_a_small_high_rate_one() {
+        // Capacity auction, ranked by rate: a full pool of small well-paying
+        // transfers must NOT be evicted by a fat transaction that merely tips
+        // a larger absolute number.
+        let mut pool = Mempool::with_limits(2, 2);
+        pool.insert(tipped([30; 32], "aaa.reserve.sov", 0, 100_000), 0, big())
+            .unwrap();
+        pool.insert(tipped([31; 32], "bbb.reserve.sov", 0, 100_000), 0, big())
+            .unwrap();
+
+        let fat = v2([32; 32], "ccc.reserve.sov", 0, 140 * 1024, Some(1_000_000));
+        assert!(effective_tip(&fat).grains() > 100_000);
+        match pool.insert(fat, 0, big()) {
+            Err(MempoolError::BelowFloor { floor }) => {
+                // The quote is actionable: it is the TIP this transaction
+                // must carry, and paying it must actually get it in.
+                let paid = v2(
+                    [32; 32],
+                    "ccc.reserve.sov",
+                    0,
+                    140 * 1024,
+                    Some(floor.grains()),
+                );
+                pool.insert(paid, 0, big())
+                    .expect("paying the quoted floor is always sufficient");
+                assert_eq!(pool.len(), 2);
+            }
+            other => panic!("expected BelowFloor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_pool_weight_budget_bounds_memory_where_the_count_cap_cannot() {
+        // The real fix: 16,384 slots x 144 KiB = 2.3 GB. A weight budget makes
+        // the pool's memory bounded regardless of transaction mix. Here a
+        // generous COUNT cap is paired with a small weight budget, and the
+        // weight budget is what binds.
+        let mut pool = Mempool::with_limits(1_000, 1_000);
+        pool.set_max_weight(MAX_TX_WEIGHT * 4);
+
+        // Fill with distinct fat senders until the budget refuses one.
+        let mut admitted = 0usize;
+        for i in 0..64u8 {
+            let who = format!("s{i:02}.reserve.sov");
+            let tx = v2([i; 32], &who, 0, 100 * 1024, None);
+            match pool.insert(tx, 0, big()) {
+                Ok(()) => admitted += 1,
+                Err(MempoolError::Full { .. }) | Err(MempoolError::BelowFloor { .. }) => break,
+                Err(e) => panic!("unexpected {e:?}"),
+            }
+        }
+        assert!(admitted > 0, "at least one fat tx must fit");
+        assert!(
+            admitted < 64,
+            "the weight budget must bind long before the 1,000-slot count cap"
+        );
+        assert!(pool.len() < 1_000, "the count cap never bound");
+        assert!(
+            pool.weight() <= pool.max_weight(),
+            "pool weight {} exceeded the budget {}",
+            pool.weight(),
+            pool.max_weight()
+        );
+        assert_eq!(pool.weight(), recomputed_weight(&pool));
+    }
+
+    #[test]
+    fn weight_accounting_survives_every_mutation_path() {
+        // The running total is maintained incrementally, so every path that
+        // adds or drops a transaction must be covered: plain insert, RBF
+        // replacement, explicit remove, and prune.
+        let mut pool = Mempool::with_limits(4, 4);
+        pool.insert(tipped([40; 32], "aaa.reserve.sov", 0, 10), 0, big())
+            .unwrap();
+        pool.insert(
+            v2([41; 32], "bbb.reserve.sov", 0, 8 * 1024, Some(10)),
+            0,
+            big(),
+        )
+        .unwrap();
+        assert_eq!(pool.weight(), recomputed_weight(&pool));
+
+        // RBF: replace the fat one with a SMALLER body at a higher tip; the
+        // running total must shrink, not just grow.
+        let before = pool.weight();
+        pool.insert(
+            v2(
+                [41; 32],
+                "bbb.reserve.sov",
+                0,
+                1024,
+                Some(10 + MIN_RBF_BUMP_GRAINS),
+            ),
+            0,
+            big(),
+        )
+        .expect("rbf");
+        assert!(
+            pool.weight() < before,
+            "a smaller replacement must shrink the total"
+        );
+        assert_eq!(pool.weight(), recomputed_weight(&pool));
+
+        // Explicit remove.
+        let victim = *pool.by_id.keys().next().unwrap();
+        pool.remove(&victim).unwrap();
+        assert_eq!(pool.weight(), recomputed_weight(&pool));
+
+        // Prune-to-empty.
+        pool.prune(|_| 99, |_| big());
+        assert_eq!(pool.len(), 0);
+        assert_eq!(pool.weight(), 0);
+    }
+
+    #[test]
+    fn a_zero_tip_pool_evicts_exactly_as_it_did_before_the_rate_change() {
+        // Byte-identity guard: with every tip zero, every fee RATE is zero, so
+        // the rate-ranked eviction must fall through to the identical legacy
+        // fairness tie-break (displace the sender holding the most).
+        let mut pool = Mempool::with_limits(3, 3);
+        pool.insert(tx([50; 32], "aaa.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(tx([50; 32], "aaa.reserve.sov", 1), 0, big())
+            .unwrap();
+        pool.insert(tx([51; 32], "bbb.reserve.sov", 0), 0, big())
+            .unwrap();
+        // aaa holds 2, bbb holds 1 — the heaviest sender's TAIL goes.
+        let aaa_tail = pool.by_sender[&(id("aaa.reserve.sov"), 1)];
+        pool.insert(tx([52; 32], "ccc.reserve.sov", 0), 0, big())
+            .expect("admitted by the zero-floor fairness tie");
+        assert!(!pool.contains(&aaa_tail), "aaa's tail is the victim");
+        assert_eq!(pool.len(), 3);
+        assert_eq!(pool.weight(), recomputed_weight(&pool));
+    }
+
+    #[test]
+    fn min_tip_to_beat_is_the_exact_inverse_of_the_rate() {
+        // The quote must be TIGHT: paying it clears the floor, paying one
+        // grain less does not. A loose quote would overcharge honest bidders.
+        for &w in &[300u64, 4_096, 140 * 1024, MAX_TX_WEIGHT] {
+            for &rate in &[1u128, 3_333, 1_000_000] {
+                let quote = min_tip_to_beat(rate, w);
+                assert!(fee_rate(quote, w) > rate, "quote {quote} must clear {rate}");
+                assert!(
+                    quote == 1 || fee_rate(quote - 1, w) <= rate,
+                    "quote {quote} for rate {rate} at weight {w} is not tight"
+                );
+            }
+        }
     }
 }
