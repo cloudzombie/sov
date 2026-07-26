@@ -924,7 +924,7 @@ fn template_txids_are_bounded_and_never_silently_truncated() {
     assert_eq!(sov_rpc::MAX_TEMPLATE_TX_IDS, 4_096);
     // The default `max_block_txs` is 4096, so a default-configured node's template
     // can never exceed the cap: the list is always complete in practice.
-    assert!(sov_rpc::MAX_TEMPLATE_TX_IDS >= 4_096);
+    const { assert!(sov_rpc::MAX_TEMPLATE_TX_IDS >= 4_096) };
 
     // Below the cap (the reachable case in this harness): present and complete.
     let (_node, handle, addr) = serve();
