@@ -373,6 +373,18 @@ pub struct BundleProver {
 }
 
 impl BundleProver {
+    /// A prover with EXPLICIT proof options — for parameter research only
+    /// (see `tests/security_level.rs`, which sweeps queries x blowup to find
+    /// the set that reaches a PROVEN security target). Consensus paths must
+    /// use [`BundleProver::new`]: `verify_spend` accepts only proofs produced
+    /// with the standard [`proof_options`].
+    pub fn with_options(pub_inputs: BundlePublicInputs, options: ProofOptions) -> Self {
+        Self {
+            pub_inputs,
+            options,
+        }
+    }
+
     /// A prover with the standard [`proof_options`] for the given publics.
     pub fn new(pub_inputs: BundlePublicInputs) -> Self {
         BundleProver {
@@ -497,26 +509,78 @@ pub fn verify_spend(
     proof_bytes: &[u8],
     pub_inputs: &BundlePublicInputs,
 ) -> Result<(), SpendProofError> {
-    // S1c/D15: decoding below goes through `decode_proof`, the single
-    // TOTAL decode entry point (frame pre-validation, then a
-    // catch_unwind-guarded winterfell decode).
-    if pub_inputs.transparent_in > MAX_NOTE_VALUE || pub_inputs.transparent_out > MAX_NOTE_VALUE {
-        return Err(SpendProofError::PublicInput("transparent leg too large"));
-    }
-    if pub_inputs.fee_grains > MAX_NOTE_VALUE {
-        return Err(SpendProofError::PublicInput("fee too large"));
-    }
-    for i in 0..NUM_SLOTS {
-        if pub_inputs.input_dummy[i]
-            && (pub_inputs.anchors[i] != PqDigest::ZERO
-                || pub_inputs.nullifiers[i] != PqDigest::ZERO)
+    // The bound check is not optional and not remembered: it is the ONLY way
+    // to obtain the `Bounded` token `verify_bounded` demands.
+    let bounded = Bounded::check(pub_inputs)?;
+    verify_bounded(proof_bytes, bounded)
+}
+
+/// Proof that a [`BundlePublicInputs`] has passed the native bound checks the
+/// in-circuit no-wrap argument depends on.
+///
+/// **Why this type exists.** Conservation is enforced in-circuit as field
+/// equality; that only implies INTEGER equality because neither side can wrap
+/// the Goldilocks modulus, and that in turn holds only because the public legs
+/// are bounded — a check that lives in the verifier, NOT in the AIR. A future
+/// call site that verified a proof without it would silently reintroduce field
+/// wraparound and unbounded inflation, and every existing test would still
+/// pass.
+///
+/// So the check is made structural rather than procedural: `Bounded` has a
+/// private field and exactly one constructor ([`Bounded::check`]), and
+/// [`verify_bounded`] accepts nothing else. Verifying without having bounded
+/// the publics is not something a caller can forget to do — it does not
+/// compile.
+#[derive(Clone, Copy)]
+pub struct Bounded<'a>(&'a BundlePublicInputs);
+
+impl<'a> Bounded<'a> {
+    /// Check the public inputs, yielding the token required to verify.
+    ///
+    /// Enforces the NATIVE public bounds (`transparent_in`,
+    /// `transparent_out`, `fee_grains` each `<= MAX_NOTE_VALUE` `< 2^61`; see
+    /// [`crate::note`]) and the dummy-slot zero convention (audit S1
+    /// follow-up): a dummy slot's anchor/nullifier/commitment publics must be
+    /// the zero digest, even for a caller bypassing
+    /// [`crate::bundle::verify_bundle`] — which remains the authoritative
+    /// convention layer (ciphertext rules, anchor ring, in-bundle nullifier
+    /// uniqueness live there).
+    pub fn check(pub_inputs: &'a BundlePublicInputs) -> Result<Self, SpendProofError> {
+        if pub_inputs.transparent_in > MAX_NOTE_VALUE || pub_inputs.transparent_out > MAX_NOTE_VALUE
         {
-            return Err(SpendProofError::PublicInput("nonzero dummy input publics"));
+            return Err(SpendProofError::PublicInput("transparent leg too large"));
         }
-        if pub_inputs.output_dummy[i] && pub_inputs.output_commitments[i] != PqDigest::ZERO {
-            return Err(SpendProofError::PublicInput("nonzero dummy output publics"));
+        if pub_inputs.fee_grains > MAX_NOTE_VALUE {
+            return Err(SpendProofError::PublicInput("fee too large"));
         }
+        for i in 0..NUM_SLOTS {
+            if pub_inputs.input_dummy[i]
+                && (pub_inputs.anchors[i] != PqDigest::ZERO
+                    || pub_inputs.nullifiers[i] != PqDigest::ZERO)
+            {
+                return Err(SpendProofError::PublicInput("nonzero dummy input publics"));
+            }
+            if pub_inputs.output_dummy[i] && pub_inputs.output_commitments[i] != PqDigest::ZERO {
+                return Err(SpendProofError::PublicInput("nonzero dummy output publics"));
+            }
+        }
+        Ok(Bounded(pub_inputs))
     }
+
+    /// The checked public inputs.
+    pub fn get(&self) -> &BundlePublicInputs {
+        self.0
+    }
+}
+
+/// Verify a bundle proof against public inputs that have ALREADY been bounded.
+///
+/// Takes [`Bounded`] rather than raw publics so the no-wrap premise cannot be
+/// skipped at any call site — see [`Bounded`].
+pub fn verify_bounded(proof_bytes: &[u8], bounded: Bounded<'_>) -> Result<(), SpendProofError> {
+    let pub_inputs = bounded.get();
+    // S1c/D15: decoding goes through `decode_proof`, the single TOTAL decode
+    // entry point (frame pre-validation, then a catch_unwind-guarded decode).
     let proof = decode_proof(proof_bytes, pub_inputs)?;
     let acceptable = AcceptableOptions::OptionSet(vec![proof_options()]);
     winterfell::verify::<BundleAir, CarrierHash, CarrierCoin, CarrierVc>(

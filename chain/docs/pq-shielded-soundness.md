@@ -188,11 +188,15 @@ Goldilocks does not have — `p` is below `2^64`, so four 64-bit values can wrap
 The cost is nil in practice: SOV's entire supply is ≈ 2^51 grains, about 2^10
 below the cap.
 
-**This is the single most fragile link in the argument, and it is fragile in a
-specific way:** premise B lives in the verifier, not the AIR. Anyone who later
-adds a second call site that verifies a proof without that bound check
-reintroduces field wraparound and unbounded inflation. It should be made
-structurally impossible to verify without it, rather than remembered.
+**Premise B was the single most fragile link, and is now structural.** It lives
+in the verifier rather than the AIR, so a future call site that verified without
+it would silently reintroduce field wraparound and unbounded inflation — with
+every existing test still passing. That is no longer possible to forget:
+`Bounded` (in `prover.rs`) has a private field and exactly one constructor,
+`Bounded::check`, which performs the bound and dummy-slot checks; and
+`verify_bounded` accepts nothing else. Verifying without having bounded the
+publics does not compile. `verify_spend` remains the convenience entry point and
+simply does `Bounded::check` then `verify_bounded`.
 
 ---
 
@@ -212,10 +216,9 @@ is the one to keep an eye on.
 
 Stated plainly, because a soundness argument that overclaims is worse than none:
 
-1. **Concrete security level.** The proof options are 42 FRI queries, blowup 8,
-   16 bits of grinding, quadratic extension. Our own documentation says **127
-   bits conjectured, and explicitly less under proven FRI bounds** — a figure
-   nobody has derived. Until it is, the bit-security claim is unverified.
+1. ~~**Concrete security level** — underived.~~ **DERIVED, see §10.** The
+   answer is materially worse than the headline number, and it changes the
+   recommended parameters.
 2. **Rescue-Prime and winterfell.** We rely on their published analysis and on
    the correctness of the winterfell implementation, including its FRI verifier.
 3. **Completeness.** That an honest prover always succeeds is evidenced by
@@ -246,3 +249,76 @@ In our own order of concern:
    activates on exactly the intended rows. The masks are constructed
    programmatically; an off-by-one would silently drop a constraint while every
    test still passed.
+
+
+---
+
+## 10. Concrete security level — measured, not conjectured
+
+Winterfell computes both figures from a real proof. `tests/security_level.rs`
+does exactly that, on a realistic 2-in/2-out bundle at the shipped parameters
+(42 FRI queries, blowup 8, 16 bits grinding, quadratic extension):
+
+| measure | bits |
+|---|---|
+| conjectured (capacity) | **127** |
+| proven — Johnson / list-decoding radius | **75** |
+| proven — unique decoding radius | **50** |
+
+The 127 we have been quoting is the *conjectured* figure. Unconditionally, the
+protocol is at **75 bits**, and **50** under the most conservative bound.
+
+That matters more than usual right now: the capacity-soundness conjectures on
+which deployed STARKs set parameters had their strongest up-to-capacity forms
+**disproved over large fields in late 2025**. Quoting a conjectured number is
+therefore not a conservative posture for an asset that intends to hold reserves.
+
+### Adding queries does not fix it
+
+A sweep over queries x blowup (same test) shows proven security **saturates**
+under a quadratic extension:
+
+| extension | blowup | queries | proven | proof size |
+|---|---|---|---|---|
+| quadratic | 8 | 42 | 75 | 53.8 KB |
+| quadratic | 8 | 64 | 86 | 74.1 KB |
+| quadratic | 8 | 200 | **86** | 182.4 KB |
+| quadratic | 16 | 200 | **82** | 209.7 KB |
+| quadratic | 32 | 200 | **79** | 236.6 KB |
+
+Past ~64 queries the number stops moving: 86 bits is a **structural ceiling**,
+not a query-budget problem. Spending 3.4x the proof size buys nothing.
+
+### The cubic extension breaks the ceiling
+
+The binding constraint is the extension field. Goldilocks is a 64-bit base
+field; a quadratic extension gives 128 bits of extension, and the proven bound
+saturates below it. Moving to a **cubic** extension changes the picture
+completely:
+
+| extension | blowup | queries | proven | proof size |
+|---|---|---|---|---|
+| cubic | 8 | 64 | 111 | 85.3 KB |
+| cubic | 8 | 96 | **128** | 115.9 KB |
+| cubic | 16 | 42 | 99 | 67.4 KB |
+| cubic | 16 | 64 | **128** | **94.3 KB** |
+| cubic | 32 | 42 | 120 | 71.9 KB |
+| cubic | 32 | 64 | **128** | 103.4 KB |
+
+**Recommended parameter set: cubic extension, blowup 16, 64 queries.** That is
+**128 bits proven** — not conjectured — at **94.3 KB**, against 53.8 KB today.
+
+The honest trade: **1.75x proof size to go from 75 proven bits to 128.** For a
+pool that is not yet armed, and for a chain whose stated bar is reserve grade,
+that is the right side of the trade. The cost is paid in bandwidth and block
+weight, both of which are already being sized for ~144 KB bundles.
+
+If 128 proven is judged too expensive, `cubic / blowup 32 / 42 queries` gives
+**120 proven bits at 71.9 KB** — still a large improvement over today at a
+smaller size than the 128-bit option.
+
+**This change is cheap to make now and expensive later:** the parameters are
+baked into `proof_options()`, and `verify_spend` accepts only proofs generated
+with them. Changing them after the pool is armed is a consensus change requiring
+its own deployment; changing them while the pool is dormant costs nothing but a
+re-benchmark.
