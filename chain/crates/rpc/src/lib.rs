@@ -29,7 +29,9 @@
 //! `sov_getAccount`, `sov_getBalance`, `sov_getNonce`, `sov_getBlockByHeight`,
 //! `sov_getBlockByHash`, `sov_getBlockDigest`, `sov_getHead`,
 //! `sov_getStateRoot`, `sov_getDifficulty`, `sov_estimateFee`,
-//! `sov_getMempoolSize`, `sov_getPeerInfo` (live P2P/sync state),
+//! `sov_getMempoolSize`, `sov_getMempoolHistogram` (effective-tip buckets for
+//! multi-block projection), `sov_getMempoolInfo` (ready/queued occupancy, bounds,
+//! next-block floor, entry ages), `sov_getPeerInfo` (live P2P/sync state),
 //! `sov_getConfirmations`, `sov_isFinal`,
 //! `sov_getMiners`, `sov_listTokens` (paged), `sov_getTokenInfo`,
 //! `sov_getTokenBalances`, `sov_getHtlc`. SNS (Sovereign Name Service):
@@ -42,7 +44,8 @@
 //! state: `sov_getShieldedInfo`.
 //! Write: `sov_submitTransaction`. Mining work-distribution (out-of-process /
 //! Stratum): `sov_getBlockTemplate` (build + cache a candidate, return the header
-//! preimage to grind) and `sov_submitBlock` (verify a submitted nonce's seal and
+//! preimage to grind — additionally disclosing the candidate's `txCount` and a
+//! bounded `txIds`) and `sov_submitBlock` (verify a submitted nonce's seal and
 //! import through the validated path).
 
 #![forbid(unsafe_code)]
@@ -154,6 +157,25 @@ impl RpcRateLimiter {
 /// Hard cap on `sov_listTokens` page size, so a registry of any size yields a
 /// bounded response (the client pages through with `offset`).
 const MAX_TOKEN_PAGE: usize = 200;
+
+/// Hard cap on `sov_getMempoolHistogram` buckets: the response array is bounded
+/// no matter what the mempool holds (the cheapest tail merges into the final
+/// bucket). 128 comfortably exceeds the ~104 half-octave buckets reachable by
+/// any affordable tip (≤ total supply), so in practice every bucket is exact —
+/// and the XUS Miner client is written against exactly this cap.
+pub const HISTOGRAM_MAX_BUCKETS: usize = 128;
+
+/// Hard cap on how many transaction ids `sov_getBlockTemplate` will enumerate in
+/// its `txIds` array. Equal to the default `max_block_txs`, so under the default
+/// policy the list is always COMPLETE; a node configured with a larger per-block
+/// capacity that actually builds a bigger template omits `txIds` entirely (and
+/// says so with `txIdsOmitted: true`) rather than serving a truncated list.
+///
+/// Omit-rather-than-truncate is a correctness requirement, not a preference: the
+/// consuming client treats a present `txIds` array as AUTHORITATIVE for the
+/// block's transaction count, so a silently truncated array would make an honest
+/// client display a wrong count. `txCount` is always exact either way.
+pub const MAX_TEMPLATE_TX_IDS: usize = 4_096;
 
 /// How long a mining template cached by `sov_getBlockTemplate` remains submittable.
 /// Generous relative to the 2.5-minute target block time, but short enough that a
@@ -674,6 +696,32 @@ fn to_value<T: serde::Serialize>(v: T) -> Value {
     serde_json::to_value(v).unwrap_or(Value::Null)
 }
 
+/// A block serialized for RPC, with the block's own id added as `header.hash`
+/// (the blake3 header hash the node already computes: the same id
+/// `sov_submitBlock` replies with and fork choice keys on).
+///
+/// The id is content-derived and NOT part of the serialized block, so without
+/// this a client needed a second `sov_getBlockDigest` round-trip merely to
+/// learn which block it was looking at — and a client that could not afford
+/// that round-trip had to fall back to matching blocks by HEIGHT, which cannot
+/// distinguish a block it mined from a same-height reorg replacement it did
+/// not. Serving the hash is what lets such a client prove identity instead of
+/// guessing it.
+///
+/// ADDITIVE (forward-compat law F5): every pre-existing field is untouched and
+/// serde ignores unknown fields, so existing typed clients decode unchanged.
+fn block_with_hash(b: &Block) -> Value {
+    let hash = b.hash();
+    let mut v = to_value(b);
+    if let Some(header) = v.get_mut("header").and_then(Value::as_object_mut) {
+        // Bare hex (`to_hex`), matching the id `sov_submitBlock` replies with
+        // and `sov_getBlockByHash` accepts — the exact string a client
+        // round-trips.
+        header.insert("hash".into(), Value::String(hash.to_hex()));
+    }
+    v
+}
+
 // ---- method dispatch ------------------------------------------------------
 
 fn call(
@@ -830,14 +878,14 @@ fn call(
             Ok(node
                 .chain()
                 .block_by_height(h)
-                .map_or(Value::Null, to_value))
+                .map_or(Value::Null, block_with_hash))
         }
         "sov_getBlockByHash" => {
             let hash = param_hash(params)?;
             Ok(node
                 .chain()
                 .block_by_hash(&hash)
-                .map_or(Value::Null, to_value))
+                .map_or(Value::Null, block_with_hash))
         }
         "sov_getReceipt" => {
             // The recorded outcome of a transaction by its id: success, or the
@@ -1010,10 +1058,85 @@ fn call(
                 "gasUsed": gas_used,
                 "gasPriceGrains": gas_price.to_string(),
                 "feeGrains": fee.to_string(),
+                // ADDITIVE (law F5): the live next-block auction floor — 0 while the
+                // forming template has free room, else the marginal effective tip a
+                // new transaction must EXCEED to displace the template's cheapest
+                // slot. This is the real "fee to get in the next block"; clients
+                // that prefer it (XUS Miner does) fall back to `feeGrains` on
+                // older nodes that lack it.
+                "floorGrains": node.next_block_floor_grains().to_string(),
             }))
         }
         "sov_getMintReward" => Ok(to_value(node.chain().mint_reward())),
         "sov_getMempoolSize" => Ok(json!(node.mempool_len())),
+        "sov_getMempoolHistogram" => {
+            // NEW (additive, law F5): effective-tip fee-rate buckets of the READY
+            // (mineable) mempool, HIGHEST first, so a client packs them into
+            // successive projected blocks using this node's own `maxBlockTxs`
+            // capacity — the multi-block mempool visualization feed. Bounded: at
+            // most HISTOGRAM_MAX_BUCKETS buckets whatever the pool holds (the
+            // cheapest tail merges into the last bucket). Deterministic: content
+            // depends only on pooled tips; no wall clock in the shape. Rates are
+            // decimal-string grains (the codebase's large-integer convention).
+            //
+            // FEE-RATE DENOMINATOR: `feeRateGrains` is the ABSOLUTE per-transaction
+            // effective tip, because that is this node's actual auction key —
+            // `Mempool::select` orders by `effective_tip` and the next-block floor
+            // is the marginal `effective_tip`. Bucketing by tip-per-byte would sort
+            // the backlog in an order the node does not use and would therefore
+            // mispredict inclusion. Size is NOT ignored: a block is bounded by the
+            // consensus elastic block-size cap as well as by `maxBlockTxs`, and
+            // transaction sizes vary by orders of magnitude here (a shielded spend
+            // dwarfs a transfer) — so every bucket also reports `totalBytes`, and
+            // the response reports `maxBlockBytes`. A client packs projected blocks
+            // against WHICHEVER limit binds first. (If `select` ever becomes
+            // byte-aware, this key must move with it.)
+            let hist = node.mempool_tip_histogram(HISTOGRAM_MAX_BUCKETS);
+            let mut buckets: Vec<Value> = Vec::new();
+            for bucket in &hist {
+                buckets.push(json!({
+                    "feeRateGrains": bucket.min_tip_grains.to_string(),
+                    "txCount": bucket.tx_count,
+                    "totalBytes": bucket.total_bytes,
+                }));
+            }
+            Ok(json!({
+                "txCount": node.mempool_len(),
+                "maxBlockTxs": node.max_block_txs(),
+                "maxBlockBytes": node.max_block_bytes(),
+                // The forming block's marginal price (what a tx must beat to take
+                // a slot in the NEXT block) and the pool's admission price (what it
+                // must beat to be pooled at all when the pool is full).
+                "floorGrains": node.next_block_floor_grains().to_string(),
+                "poolFloorGrains": node.mempool_pool_floor_grains().to_string(),
+                "buckets": buckets,
+            }))
+        }
+        "sov_getMempoolInfo" => {
+            // NEW (additive, law F5): the operator's waiting-room view — how much
+            // is ready versus queued (future-nonce, not yet mineable), the pool's
+            // configured bounds, the live next-block floor, and how long the
+            // oldest entries have been pooled (relative ages in ms, `null` for an
+            // empty region). Complements `sov_getMempoolSize` (whose meaning —
+            // ready count — is unchanged).
+            let (capacity, max_per_sender, queued_capacity, max_queued_per_sender) =
+                node.mempool_limits();
+            let (oldest_pending, oldest_queued) = node.mempool_oldest_ages_ms();
+            Ok(json!({
+                "txCount": node.mempool_len(),
+                "queuedCount": node.mempool_queued_len(),
+                "capacity": capacity,
+                "maxPerSender": max_per_sender,
+                "queuedCapacity": queued_capacity,
+                "maxQueuedPerSender": max_queued_per_sender,
+                "maxBlockTxs": node.max_block_txs(),
+                "maxBlockBytes": node.max_block_bytes(),
+                "nextBlockFloorGrains": node.next_block_floor_grains().to_string(),
+                "poolFloorGrains": node.mempool_pool_floor_grains().to_string(),
+                "oldestPendingAgeMs": oldest_pending,
+                "oldestQueuedAgeMs": oldest_queued,
+            }))
+        }
         // LIVE networking state — so an operator (or `curl`) can see EXACTLY why two
         // nodes do or don't see each other, without reading GUI logs. `chainId` +
         // `genesisHash` are what peers handshake on (a mismatch ⇒ they can NEVER
@@ -1150,7 +1273,8 @@ fn call(
             let stx: SignedTransaction = serde_json::from_value(params.clone())
                 .map_err(|e| RpcError::invalid_params(format!("invalid SignedTransaction: {e}")))?;
             let tx_id = stx.id();
-            node.submit(stx.clone())
+            let admitted = node
+                .submit(stx.clone())
                 .map_err(|e| RpcError::server(format!("rejected: {e}")))?;
             // GOSSIP the accepted tx to peers so it reaches EVERY node's mempool and any
             // miner can include it — not just the node it was submitted to. Release the
@@ -1160,7 +1284,14 @@ fn call(
             if let Some(g) = &ctx.gossip {
                 g.broadcast(&sov_network::NetMessage::NewTransaction(stx));
             }
-            Ok(json!({"accepted": true, "txId": tx_id.to_hex()}))
+            // ADDITIVE (law F5): `queued` reports a future-nonce admission — the tx
+            // is parked (not yet mineable) until the sender's nonce gap fills and
+            // it is promoted. Older clients that ignore the field lose nothing.
+            Ok(json!({
+                "accepted": true,
+                "txId": tx_id.to_hex(),
+                "queued": matches!(admitted, sov_node::Admitted::Queued),
+            }))
         }
         // A PAGE of the token registry — never the whole set, so the response
         // stays bounded no matter how many assets exist. Params: `offset`
@@ -1421,7 +1552,30 @@ fn call(
             // can splice a candidate nonce in place without re-encoding the header).
             let preimage = header.pow_preimage();
             let nonce_offset = preimage.len().saturating_sub(8);
-            let resp = json!({
+            // ADDITIVE (law F5) — the candidate's transaction payload, DISCLOSED:
+            // `txCount` is the exact number of transactions this template commits
+            // to (a JSON integer), and `txIds` enumerates them in execution order.
+            // Neither exists on older nodes, so a client that reads them must
+            // tolerate their absence; no existing field changes name, meaning, or
+            // presence, and in particular `blob` and `nonceOffset` are byte-for-byte
+            // what they were — a miner hashes the same preimage and mutates the same
+            // trailing nonce. `txIds` is BOUNDED by MAX_TEMPLATE_TX_IDS and is
+            // omitted whole (with `txIdsOmitted: true`) rather than truncated when a
+            // template exceeds it, so a present list is always the complete one.
+            let txs = &candidate.block().transactions;
+            let tx_count = txs.len();
+            let tx_ids: Option<Vec<String>> = if tx_count <= MAX_TEMPLATE_TX_IDS {
+                // Sized from the CANDIDATE's own length (this node built it), never
+                // from request input.
+                let mut ids = Vec::with_capacity(tx_count);
+                for stx in txs {
+                    ids.push(stx.id().to_hex());
+                }
+                Some(ids)
+            } else {
+                None
+            };
+            let mut resp = json!({
                 "templateId": template_id.to_hex(),
                 "height": header.height.get(),
                 "prevHash": header.prev_hash.to_hex(),
@@ -1438,7 +1592,20 @@ fn call(
                 "versionBits": header.version_bits,
                 "blob": hex::encode(&preimage),
                 "nonceOffset": nonce_offset,
+                "txCount": tx_count,
             });
+            // `resp` is built by `json!` above, so it is always an object.
+            let map = resp
+                .as_object_mut()
+                .expect("template response is an object");
+            match tx_ids {
+                Some(ids) => {
+                    map.insert("txIds".into(), json!(ids));
+                }
+                None => {
+                    map.insert("txIdsOmitted".into(), json!(true));
+                }
+            }
             ctx.templates.insert(template_id, candidate);
             Ok(resp)
         }
