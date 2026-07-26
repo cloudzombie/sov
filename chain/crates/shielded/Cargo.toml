@@ -21,6 +21,8 @@ nonempty = "0.11"
 rand = "0.8"
 blake3.workspace = true
 sov-primitives = { path = "../primitives" }
+# The pool-v2 receiver type: the address container carries all three tiers.
+sov-shielded-pq = { path = "../shielded-pq" }
 thiserror.workspace = true
 borsh.workspace = true
 bridgetree = "0.7.0"

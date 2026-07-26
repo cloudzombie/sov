@@ -18,9 +18,11 @@
 //! Display is canonical lowercase; per bech32m, the fully-uppercase forms
 //! (`XUS1…`, `UXUS1…`) are equally valid and decode identically.
 
+use bech32::primitives::checksum::Checksum;
 use bech32::primitives::decode::CheckedHrpstring;
 use bech32::{Bech32m, Hrp};
 use sov_primitives::AccountId;
+use sov_shielded_pq::{PqAddress, PQ_ADDRESS_LEN};
 
 use crate::keys::ShieldedAddress;
 
@@ -28,11 +30,70 @@ use crate::keys::ShieldedAddress;
 const HRP_SHIELDED: &str = "xus";
 /// Human-readable part of a unified address (`uxus1…`).
 const HRP_UNIFIED: &str = "uxus";
+/// Human-readable part of a post-quantum (pool v2) shielded address
+/// (`xusq1…`) — decision D8.
+const HRP_SHIELDED_V2: &str = "xusq";
 
 /// Unified-address TLV typecode: a transparent account id (UTF-8).
 const UA_TYPE_TRANSPARENT: u8 = 0x00;
 /// Unified-address TLV typecode: a 43-byte Orchard shielded receiver.
 const UA_TYPE_SHIELDED: u8 = 0x01;
+/// Unified-address TLV typecode: a [`PQ_ADDRESS_LEN`]-byte post-quantum
+/// (pool v2) receiver, carried as [`UA_V2_CHUNKS`] consecutive records —
+/// see [`UA_V2_CHUNK`] for why.
+const UA_TYPE_SHIELDED_V2: u8 = 0x02;
+
+/// Maximum bytes one unified-address TLV record can carry: the container's
+/// length field is a single byte, and that container is already deployed.
+///
+/// A pool-v2 receiver is [`PQ_ADDRESS_LEN`] (1216) bytes — a 32-byte owner
+/// tag plus a 1184-byte ML-KEM-768 encapsulation key. That does not fit one
+/// record, and widening the length field is **not** an option: an
+/// already-shipped parser reads exactly one length byte, so a wider field
+/// would desync it and break forward-compatibility law F3 (older parsers
+/// must SKIP a receiver they do not understand, not choke on it).
+///
+/// So the v2 receiver is split across consecutive records that all carry
+/// typecode [`UA_TYPE_SHIELDED_V2`]. An older parser sees several unknown
+/// typecodes and skips each one correctly — its duplicate-receiver check
+/// only applies to the typecodes it knows — which is exactly what F3
+/// requires. A v2-aware parser concatenates them in order.
+///
+/// The chunking is canonical: every record but the last is exactly
+/// [`UA_V2_CHUNK`] bytes, the last carries the remainder, and there are
+/// exactly [`UA_V2_CHUNKS`] of them. Any other shape is rejected, so
+/// `encode(decode(s)) == s` for every accepted `s`.
+const UA_V2_CHUNK: usize = 255;
+
+/// Number of TLV records one v2 receiver occupies.
+const UA_V2_CHUNKS: usize = PQ_ADDRESS_LEN.div_ceil(UA_V2_CHUNK);
+
+/// Bech32m with the code-length restriction lifted — the same choice Zcash
+/// makes for unified addresses (ZIP-316).
+///
+/// The `bech32` crate refuses strings longer than 1023 characters, because
+/// beyond the BCH code length the checksum stops *guaranteeing* detection of
+/// up to 4 errors. A pool-v2 address is 1216 bytes of key material, i.e.
+/// ~1950 characters, so that bound cannot be met by any encoding of it: the
+/// size is inherent to a lattice KEM, not a choice.
+///
+/// This type reuses the crate's Bech32m checksum engine verbatim — the same
+/// generator polynomial and target residue, nothing hand-rolled — and only
+/// raises `CODE_LENGTH`. What is kept: a 30-bit checksum, so a corrupted
+/// address is accepted with probability ~2^-30, and the character set,
+/// case-insensitivity and HRP separation are unchanged. What is given up:
+/// the *guaranteed* 4-error detection distance. Tests exercise every
+/// single-character substitution position on a full-length v2 address and
+/// assert every one is rejected.
+struct Bech32mLong;
+
+impl Checksum for Bech32mLong {
+    type MidstateRepr = <Bech32m as Checksum>::MidstateRepr;
+    const CODE_LENGTH: usize = usize::MAX;
+    const CHECKSUM_LENGTH: usize = <Bech32m as Checksum>::CHECKSUM_LENGTH;
+    const GENERATOR_SH: [Self::MidstateRepr; 5] = <Bech32m as Checksum>::GENERATOR_SH;
+    const TARGET_RESIDUE: Self::MidstateRepr = <Bech32m as Checksum>::TARGET_RESIDUE;
+}
 
 /// Why an address string failed to decode. Each variant names the exact
 /// failure so wallet errors are diagnosable, not merely "invalid".
@@ -59,21 +120,59 @@ pub enum AddressError {
     /// A unified address carried the same receiver type twice.
     #[error("unified address duplicates receiver type {0:#04x}")]
     DuplicateReceiver(u8),
+    /// The pool-v2 receiver's chunk sequence was not the canonical one.
+    #[error("non-canonical pool-v2 receiver chunking in a unified address")]
+    V2Chunking,
 }
 
 fn encode(hrp: &str, payload: &[u8]) -> String {
     let hrp = Hrp::parse(hrp).expect("static HRPs are valid");
-    bech32::encode::<Bech32m>(hrp, payload).expect("payloads are within bech32 limits")
+    bech32::encode::<Bech32mLong>(hrp, payload).expect("Bech32mLong imposes no length bound")
 }
 
 /// Strict bech32m decode (the Bech32m checksum specifically; plain bech32 is
 /// rejected), returning the lowercase HRP and payload bytes.
+///
+/// Uses [`Bech32mLong`], which is byte-for-byte the Bech32m checksum with the
+/// 1023-character code-length cap lifted (see that type's docs). Every string
+/// the stock decoder accepts is accepted here identically; the only strings
+/// this additionally admits are ones longer than 1023 characters, which
+/// only a pool-v2 receiver produces.
 fn decode(s: &str) -> Result<(String, Vec<u8>), AddressError> {
-    let checked =
-        CheckedHrpstring::new::<Bech32m>(s).map_err(|e| AddressError::Encoding(e.to_string()))?;
+    let checked = CheckedHrpstring::new::<Bech32mLong>(s)
+        .map_err(|e| AddressError::Encoding(e.to_string()))?;
     let hrp = checked.hrp().to_lowercase();
     let payload = checked.byte_iter().collect();
     Ok((hrp, payload))
+}
+
+/// Append a pool-v2 receiver to a unified-address payload as the canonical
+/// [`UA_V2_CHUNKS`] TLV records.
+fn push_v2_receiver(payload: &mut Vec<u8>, address: &PqAddress) {
+    let bytes = address.to_bytes();
+    debug_assert_eq!(bytes.len(), PQ_ADDRESS_LEN);
+    for chunk in bytes.chunks(UA_V2_CHUNK) {
+        payload.push(UA_TYPE_SHIELDED_V2);
+        payload.push(chunk.len() as u8); // <= UA_V2_CHUNK = 255
+        payload.extend_from_slice(chunk);
+    }
+}
+
+/// Encode a pool-v2 receiver as a standalone `xusq1…` address (D8).
+pub fn encode_shielded_v2(address: &PqAddress) -> String {
+    encode(HRP_SHIELDED_V2, &address.to_bytes())
+}
+
+/// Decode an `xusq1…` post-quantum shielded address.
+pub fn decode_shielded_v2(s: &str) -> Result<PqAddress, AddressError> {
+    let (hrp, payload) = decode(s)?;
+    if hrp != HRP_SHIELDED_V2 {
+        return Err(AddressError::WrongKind {
+            expected: HRP_SHIELDED_V2,
+            got: hrp,
+        });
+    }
+    PqAddress::from_bytes(&payload).ok_or(AddressError::Payload("shielded-v2"))
 }
 
 /// Encode a shielded receiver as `xus1…`.
@@ -105,11 +204,15 @@ pub struct UnifiedAddress {
     pub transparent: Option<AccountId>,
     /// The shielded (Orchard) receiver, if included.
     pub shielded: Option<ShieldedAddress>,
+    /// The post-quantum (pool v2) receiver, if included (D8).
+    pub shielded_v2: Option<PqAddress>,
 }
 
 /// The receiver a sending wallet should use, in privacy order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Receiver {
+    /// Route into the post-quantum shielded pool (pool v2).
+    ShieldedV2(PqAddress),
     /// Route into the shielded pool (the private default).
     Shielded(ShieldedAddress),
     /// Pay the named account transparently.
@@ -117,7 +220,11 @@ pub enum Receiver {
 }
 
 impl UnifiedAddress {
-    /// Build a unified address. At least one receiver must be present.
+    /// Build a unified address with the transparent and pool-v1 receivers.
+    /// At least one receiver must be present.
+    ///
+    /// Kept at two arguments so every existing caller compiles unchanged;
+    /// add a pool-v2 receiver with [`with_shielded_v2`](Self::with_shielded_v2).
     pub fn new(
         transparent: Option<AccountId>,
         shielded: Option<ShieldedAddress>,
@@ -128,10 +235,39 @@ impl UnifiedAddress {
         Ok(UnifiedAddress {
             transparent,
             shielded,
+            shielded_v2: None,
         })
     }
 
+    /// Build a unified address from any combination of the three receivers.
+    /// At least one must be present.
+    pub fn with_receivers(
+        transparent: Option<AccountId>,
+        shielded: Option<ShieldedAddress>,
+        shielded_v2: Option<PqAddress>,
+    ) -> Result<Self, AddressError> {
+        if transparent.is_none() && shielded.is_none() && shielded_v2.is_none() {
+            return Err(AddressError::NoKnownReceiver);
+        }
+        Ok(UnifiedAddress {
+            transparent,
+            shielded,
+            shielded_v2,
+        })
+    }
+
+    /// Attach a pool-v2 receiver, consuming and returning the address.
+    pub fn with_shielded_v2(mut self, address: PqAddress) -> Self {
+        self.shielded_v2 = Some(address);
+        self
+    }
+
     /// Encode as `uxus1…`: a TLV sequence (`[type, len, value]…`) under bech32m.
+    ///
+    /// Receivers are emitted in ascending typecode order — transparent
+    /// (`0x00`), pool v1 (`0x01`), then pool v2 (`0x02`, as
+    /// [`UA_V2_CHUNKS`] consecutive records). The order is fixed so the
+    /// encoding is canonical and `encode(decode(s)) == s`.
     pub fn encode(&self) -> String {
         let mut payload = Vec::new();
         if let Some(account) = &self.transparent {
@@ -144,6 +280,9 @@ impl UnifiedAddress {
             payload.push(UA_TYPE_SHIELDED);
             payload.push(43);
             payload.extend_from_slice(&address.to_bytes());
+        }
+        if let Some(address) = &self.shielded_v2 {
+            push_v2_receiver(&mut payload, address);
         }
         encode(HRP_UNIFIED, &payload)
     }
@@ -162,6 +301,14 @@ impl UnifiedAddress {
         }
         let mut transparent: Option<AccountId> = None;
         let mut shielded: Option<ShieldedAddress> = None;
+        // Accumulated pool-v2 chunks. Bounded to PQ_ADDRESS_LEN: the buffer
+        // is pre-sized to the ONE legal size (a constant, not a length read
+        // from the input), and any chunk that would overflow it is rejected
+        // immediately, so a hostile address cannot drive unbounded work or
+        // memory here.
+        let mut v2_bytes: Vec<u8> = Vec::with_capacity(PQ_ADDRESS_LEN);
+        let mut v2_chunks = 0usize;
+        let mut v2_complete = false;
         let mut i = 0usize;
         while i < payload.len() {
             if i + 2 > payload.len() {
@@ -196,25 +343,72 @@ impl UnifiedAddress {
                             .ok_or(AddressError::Payload("unified"))?,
                     );
                 }
+                UA_TYPE_SHIELDED_V2 => {
+                    // Canonical chunking: exactly UA_V2_CHUNKS records, each
+                    // of the exact expected length, appearing consecutively.
+                    if v2_complete || v2_chunks >= UA_V2_CHUNKS {
+                        return Err(AddressError::V2Chunking);
+                    }
+                    let expected = core::cmp::min(UA_V2_CHUNK, PQ_ADDRESS_LEN - v2_bytes.len());
+                    if len != expected {
+                        return Err(AddressError::V2Chunking);
+                    }
+                    v2_bytes.extend_from_slice(value);
+                    v2_chunks += 1;
+                    v2_complete = v2_bytes.len() == PQ_ADDRESS_LEN;
+                }
                 // Unknown receiver kinds from a future wallet: skip them.
                 _ => {}
             }
         }
-        UnifiedAddress::new(transparent, shielded)
+        // A partial v2 receiver is a malformed address, not a skippable one:
+        // the chunks are ours, so we must not silently drop half of them.
+        if v2_chunks != 0 && !v2_complete {
+            return Err(AddressError::V2Chunking);
+        }
+        let shielded_v2 = if v2_complete {
+            Some(PqAddress::from_bytes(&v2_bytes).ok_or(AddressError::Payload("unified"))?)
+        } else {
+            None
+        };
+        UnifiedAddress::with_receivers(transparent, shielded, shielded_v2)
     }
 
     /// The receiver a sender should pay: **shielded when present** (privacy
     /// by default), transparent otherwise.
+    ///
+    /// This is the pool-v2-**unaware** route, and it is deliberately
+    /// unchanged: pool v2 is dormant (signal bit 2 is defined but not
+    /// armed), so a wallet that routed to it today would build a payment no
+    /// chain can execute. Once the deployment is Active, sending paths use
+    /// [`preferred_pq`](Self::preferred_pq), which implements the D8 order.
     pub fn preferred(&self) -> Receiver {
         if let Some(address) = &self.shielded {
-            Receiver::Shielded(address.clone())
-        } else {
-            Receiver::Transparent(
-                self.transparent
-                    .clone()
-                    .expect("UnifiedAddress::new guarantees at least one receiver"),
-            )
+            return Receiver::Shielded(address.clone());
         }
+        if let Some(account) = &self.transparent {
+            return Receiver::Transparent(account.clone());
+        }
+        // Only a v2 receiver is present: there is nothing else to route to,
+        // so surface it rather than inventing a receiver. The caller must
+        // reject it while the deployment is dormant.
+        Receiver::ShieldedV2(
+            self.shielded_v2
+                .clone()
+                .expect("UnifiedAddress guarantees at least one receiver"),
+        )
+    }
+
+    /// The receiver a **pool-v2-aware** sender should pay, in the D8 privacy
+    /// order: post-quantum shielded, then shielded v1, then transparent.
+    ///
+    /// Only call this once the `shielded-v2` deployment is Active on the
+    /// chain being paid; before then use [`preferred`](Self::preferred).
+    pub fn preferred_pq(&self) -> Receiver {
+        if let Some(address) = &self.shielded_v2 {
+            return Receiver::ShieldedV2(address.clone());
+        }
+        self.preferred()
     }
 }
 
@@ -226,18 +420,25 @@ pub enum AnyAddress {
     Transparent(AccountId),
     /// A `xus1…` shielded receiver.
     Shielded(ShieldedAddress),
+    /// A `xusq1…` post-quantum (pool v2) receiver.
+    ShieldedV2(PqAddress),
     /// A `uxus1…` unified address.
     Unified(UnifiedAddress),
 }
 
 impl AnyAddress {
-    /// Parse a recipient string of any tier. Order: `xus1…`/`uxus1…` prefixes
-    /// are unambiguous (the shielded HRP `xus` is not a prefix of the unified
-    /// HRP `uxus`, and a named account can never start with a digit-bearing
-    /// `…1` HRP separator under bech32m); anything else must be a valid named
-    /// account.
+    /// Parse a recipient string of any tier. The three bech32m prefixes are
+    /// unambiguous — `xusq1…` is tested before `xus1…` (`xus` is a prefix of
+    /// `xusq`, but `xus1` is not a prefix of `xusq1`, and testing the longer
+    /// HRP first makes that independent of the reader's care), `uxus` starts
+    /// with a different letter, and a named account can never contain the
+    /// `…1` HRP separator in those positions. Anything else must be a valid
+    /// named account.
     pub fn parse(s: &str) -> Result<AnyAddress, AddressError> {
         let lower = s.to_lowercase();
+        if lower.starts_with("xusq1") {
+            return decode_shielded_v2(s).map(AnyAddress::ShieldedV2);
+        }
         if lower.starts_with("xus1") {
             return decode_shielded(s).map(AnyAddress::Shielded);
         }
@@ -250,12 +451,24 @@ impl AnyAddress {
     }
 
     /// The receiver a sender should pay, privacy-first: shielded whenever the
-    /// address carries one, the named account otherwise.
+    /// address carries one, the named account otherwise. Pool-v2-unaware —
+    /// see [`UnifiedAddress::preferred`].
     pub fn receiver(&self) -> Receiver {
         match self {
             AnyAddress::Transparent(account) => Receiver::Transparent(account.clone()),
             AnyAddress::Shielded(address) => Receiver::Shielded(address.clone()),
+            AnyAddress::ShieldedV2(address) => Receiver::ShieldedV2(address.clone()),
             AnyAddress::Unified(ua) => ua.preferred(),
+        }
+    }
+
+    /// The receiver a **pool-v2-aware** sender should pay, in the D8 order
+    /// (v2 > v1 > transparent). Only for chains where the `shielded-v2`
+    /// deployment is Active — see [`UnifiedAddress::preferred_pq`].
+    pub fn receiver_pq(&self) -> Receiver {
+        match self {
+            AnyAddress::Unified(ua) => ua.preferred_pq(),
+            other => other.receiver(),
         }
     }
 }

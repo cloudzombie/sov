@@ -23,6 +23,10 @@ chacha20poly1305 = "0.10.1"
 blake3.workspace = true
 hex.workspace = true
 thiserror.workspace = true
+# Wallet-side note storage (scan.rs) uses the same codec the rest of the
+# chain does; secret material is zeroized with the same crate the GUI uses.
+borsh.workspace = true
+zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [lints.rust]
 unsafe_code = "forbid"

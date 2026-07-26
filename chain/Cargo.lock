@@ -2036,6 +2036,7 @@ dependencies = [
  "orchard",
  "rand 0.8.6",
  "sov-primitives",
+ "sov-shielded-pq",
  "thiserror 2.0.18",
  "zcash_note_encryption",
 ]
@@ -2045,6 +2046,7 @@ name = "sov-shielded-pq"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "borsh",
  "chacha20poly1305",
  "fips203",
  "fips204",
@@ -2054,6 +2056,7 @@ dependencies = [
  "winter-math",
  "winter-utils",
  "winterfell",
+ "zeroize",
 ]
 
 [[package]]
