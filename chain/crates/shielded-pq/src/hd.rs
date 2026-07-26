@@ -311,7 +311,10 @@ mod tests {
         assert_eq!(key.encryption_key().decrypt(&ct).expect("decrypt"), note);
         // A wallet restored from the same phrase decrypts it too.
         let restored = PqShieldedKey::from_leaf_seed(&LEAF);
-        assert_eq!(restored.encryption_key().decrypt(&ct).expect("decrypt"), note);
+        assert_eq!(
+            restored.encryption_key().decrypt(&ct).expect("decrypt"),
+            note
+        );
     }
 
     #[test]

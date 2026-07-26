@@ -123,7 +123,7 @@ fn foreign_bundle(recipient: &PqShieldedKey, rho_base: u64) -> SpendBundle {
         fee_grains: 0,
     };
     let mut cts: [Option<NoteCiphertext>; NUM_SLOTS] = [None, None, None, None];
-    for slot in 0..NUM_SLOTS {
+    for (slot, ct) in cts.iter_mut().enumerate() {
         let note = Note::new(
             7_000 + slot as u64,
             address.owner_tag(),
@@ -131,7 +131,7 @@ fn foreign_bundle(recipient: &PqShieldedKey, rho_base: u64) -> SpendBundle {
         )
         .expect("note");
         pi.output_commitments[slot] = note.commitment();
-        cts[slot] = Some(encrypt_note(address.kem_ek(), &note).expect("encrypt"));
+        *ct = Some(encrypt_note(address.kem_ek(), &note).expect("encrypt"));
     }
     SpendBundle {
         public_inputs: pi,

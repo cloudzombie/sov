@@ -53,7 +53,7 @@
 //! for the message to verify and nothing else. See the trade-off write-up in
 //! `notes/v0.2.0-carrier-binding.md`.
 
-use crate::auth::{verify_auth, AuthKeypair, AuthError, AUTH_PK_LEN, AUTH_SIG_LEN};
+use crate::auth::{verify_auth, AuthError, AuthKeypair, AUTH_PK_LEN, AUTH_SIG_LEN};
 use crate::bundle::{bundle_digest, SpendBundle};
 use crate::domains::B3_CARRIER_BINDING;
 

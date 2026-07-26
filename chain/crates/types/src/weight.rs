@@ -349,19 +349,21 @@ mod tests {
         // not just the batch.
         const SYNC_BATCH_MAX_BYTES: u64 = 6 * 1024 * 1024;
         const MAX_FRAME: u64 = 8 * 1024 * 1024;
-        assert!(MAX_BLOCK_WEIGHT <= SYNC_BATCH_MAX_BYTES);
-        assert!(MAX_BLOCK_WEIGHT < MAX_FRAME);
+        const { assert!(MAX_BLOCK_WEIGHT <= SYNC_BATCH_MAX_BYTES) };
+        const { assert!(MAX_BLOCK_WEIGHT < MAX_FRAME) };
         // Two maximum blocks exceed the batch budget, so the size cap is
         // load-bearing (a count-only cap of 256 would be 1 GiB).
-        assert!(2 * MAX_BLOCK_WEIGHT > SYNC_BATCH_MAX_BYTES);
+        const { assert!(2 * MAX_BLOCK_WEIGHT > SYNC_BATCH_MAX_BYTES) };
     }
 
     #[test]
     fn max_tx_weight_boundary() {
+        // The value itself is the contract: a v2 shielded bundle is capped at
+        // 144 KiB, so the per-transaction weight ceiling must leave room for one
+        // plus its envelope, while staying far below the block ceiling.
         assert_eq!(MAX_TX_WEIGHT, 256 * 1024);
-        assert!(MAX_TX_WEIGHT - 1 < MAX_TX_WEIGHT);
-        assert!(MAX_TX_WEIGHT <= MAX_TX_WEIGHT);
-        assert!(MAX_TX_WEIGHT + 1 > MAX_TX_WEIGHT);
+        const { assert!(MAX_TX_WEIGHT > MAX_SHIELDED_V2_BUNDLE_BYTES as u64) };
+        const { assert!(MAX_TX_WEIGHT < MAX_BLOCK_WEIGHT) };
     }
 
     #[test]

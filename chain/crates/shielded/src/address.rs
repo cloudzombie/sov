@@ -212,7 +212,12 @@ pub struct UnifiedAddress {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Receiver {
     /// Route into the post-quantum shielded pool (pool v2).
-    ShieldedV2(PqAddress),
+    ///
+    /// BOXED deliberately: a `PqAddress` carries ML-KEM key material and is
+    /// ~1216 bytes, so holding it inline would make every `Receiver` that
+    /// large — including a transparent one, which is 32 bytes. Boxing keeps
+    /// the common routes cheap.
+    ShieldedV2(Box<PqAddress>),
     /// Route into the shielded pool (the private default).
     Shielded(ShieldedAddress),
     /// Pay the named account transparently.
@@ -392,11 +397,11 @@ impl UnifiedAddress {
         // Only a v2 receiver is present: there is nothing else to route to,
         // so surface it rather than inventing a receiver. The caller must
         // reject it while the deployment is dormant.
-        Receiver::ShieldedV2(
+        Receiver::ShieldedV2(Box::new(
             self.shielded_v2
                 .clone()
                 .expect("UnifiedAddress guarantees at least one receiver"),
-        )
+        ))
     }
 
     /// The receiver a **pool-v2-aware** sender should pay, in the D8 privacy
@@ -406,7 +411,7 @@ impl UnifiedAddress {
     /// chain being paid; before then use [`preferred`](Self::preferred).
     pub fn preferred_pq(&self) -> Receiver {
         if let Some(address) = &self.shielded_v2 {
-            return Receiver::ShieldedV2(address.clone());
+            return Receiver::ShieldedV2(Box::new(address.clone()));
         }
         self.preferred()
     }
@@ -457,7 +462,7 @@ impl AnyAddress {
         match self {
             AnyAddress::Transparent(account) => Receiver::Transparent(account.clone()),
             AnyAddress::Shielded(address) => Receiver::Shielded(address.clone()),
-            AnyAddress::ShieldedV2(address) => Receiver::ShieldedV2(address.clone()),
+            AnyAddress::ShieldedV2(address) => Receiver::ShieldedV2(Box::new(address.clone())),
             AnyAddress::Unified(ua) => ua.preferred(),
         }
     }

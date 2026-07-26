@@ -823,7 +823,10 @@ mod tests {
         assert_eq!(cps.len(), REORG_HORIZON);
         assert_eq!(cps.first().unwrap().0, total - REORG_HORIZON as u64 + 1);
         assert!(store.rollback_to(total - 10));
-        assert!(!store.rollback_to(1), "below the horizon: caller must rescan");
+        assert!(
+            !store.rollback_to(1),
+            "below the horizon: caller must rescan"
+        );
     }
 
     #[test]
@@ -866,7 +869,11 @@ mod tests {
         assert_eq!(store.balance(), 0);
         assert_eq!(store.stats().detection_hits, 1, "it did decrypt");
         assert_eq!(store.stats().rejected_wrong_owner, 1);
-        assert_eq!(store.commitment_count(), 1, "the commitment is still folded");
+        assert_eq!(
+            store.commitment_count(),
+            1,
+            "the commitment is still folded"
+        );
     }
 
     #[test]
@@ -1044,7 +1051,7 @@ mod tests {
         // (all-zero digests are canonical, so this one is about shape, not
         // canonicity: positions must still line up)
         assert!(PqNoteStore::from_bytes(&borsh::to_vec(&data).unwrap()).is_some());
-        assert!(MAX_V2_NOTES > 4);
+        const { assert!(MAX_V2_NOTES > 4) };
     }
 
     #[test]

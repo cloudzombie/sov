@@ -1176,6 +1176,12 @@ enum SendRoute {
     Transparent(String), // a named account (public)
     Shielded,            // xus1… (private)
     Unified,             // uxus1… (routes shielded when possible)
+    // A post-quantum pool-v2 receiver. The address PARSES — it is well-formed,
+    // not garbage — but signal bit 2 is defined and NOT armed, so no v2 spend
+    // can execute on any chain. Kept distinct from `Invalid` on purpose: telling
+    // an operator a valid address is "unrecognized" would send them hunting for
+    // a typo that is not there.
+    ShieldedV2Unsupported,
 }
 
 impl SendRoute {
@@ -1188,11 +1194,19 @@ impl SendRoute {
             Ok(AnyAddress::Transparent(id)) => SendRoute::Transparent(id.to_string()),
             Ok(AnyAddress::Shielded(_)) => SendRoute::Shielded,
             Ok(AnyAddress::Unified(_)) => SendRoute::Unified,
+            Ok(AnyAddress::ShieldedV2(_)) => SendRoute::ShieldedV2Unsupported,
             Err(_) => SendRoute::Invalid,
         }
     }
     fn is_valid(&self) -> bool {
-        !matches!(self, SendRoute::Empty | SendRoute::Invalid)
+        // `ShieldedV2Unsupported` is deliberately NOT valid: the address is
+        // well-formed but unspendable while bit 2 is unarmed, so the Send
+        // control must stay disabled rather than let an operator broadcast a
+        // transaction the chain will hard-reject.
+        !matches!(
+            self,
+            SendRoute::Empty | SendRoute::Invalid | SendRoute::ShieldedV2Unsupported
+        )
     }
     /// True when the route keeps the amount/recipient private.
     fn private(&self) -> bool {
@@ -1210,6 +1224,10 @@ impl SendRoute {
             SendRoute::Unified => (
                 "→ unified (routes shielded — private)".into(),
                 palette::success(),
+            ),
+            SendRoute::ShieldedV2Unsupported => (
+                "✗ post-quantum (v2) address — that pool is not active yet".into(),
+                palette::error(),
             ),
         }
     }
@@ -8841,6 +8859,17 @@ fn shielded_send(
         Receiver::Shielded(addr) => addr,
         Receiver::Transparent(_) => {
             return Err("recipient must be a shielded (xus1…) or unified address".to_string())
+        }
+        // Pool v2 (post-quantum): well-formed but unspendable — bit 2 is defined
+        // and NOT armed, so `Action::ShieldedV2` is a hard reject everywhere.
+        // Refuse rather than fall back to another receiver on the same address,
+        // which would pay someone the sender did not choose.
+        Receiver::ShieldedV2(_) => {
+            return Err(
+                "recipient routes to the post-quantum shielded pool (v2), which is not \
+                 active yet — refusing to send"
+                    .to_string(),
+            )
         }
     };
 
