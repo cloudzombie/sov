@@ -20,10 +20,14 @@
 pub mod block;
 pub mod receipt;
 pub mod transaction;
+pub mod weight;
 
 pub use block::{compute_tx_root, Block, BlockHeader};
 pub use receipt::{receipts_root, Event, ExecutionStatus, Receipt};
 pub use transaction::{
     multisig_signing_bytes, rotation_signing_bytes, Action, MultisigApproval, SignedTransaction,
     Transaction, TxError,
+};
+pub use weight::{
+    block_weight, fee_rate, tx_weight, verify_weight, MAX_BLOCK_WEIGHT, MAX_TX_WEIGHT,
 };
