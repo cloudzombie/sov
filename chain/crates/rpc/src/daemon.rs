@@ -2878,12 +2878,18 @@ mod tests {
 
         // One ready (nonce 0) and one FUTURE (nonce 2 — behind the missing 1).
         let ready = client
-            .call("sov_submitTransaction", serde_json::to_value(self_transfer(0)).unwrap())
+            .call(
+                "sov_submitTransaction",
+                serde_json::to_value(self_transfer(0)).unwrap(),
+            )
             .unwrap();
         assert_eq!(ready.get("accepted"), Some(&serde_json::json!(true)));
         assert_eq!(ready.get("queued"), Some(&serde_json::json!(false)));
         let future = client
-            .call("sov_submitTransaction", serde_json::to_value(self_transfer(2)).unwrap())
+            .call(
+                "sov_submitTransaction",
+                serde_json::to_value(self_transfer(2)).unwrap(),
+            )
             .unwrap();
         assert_eq!(future.get("accepted"), Some(&serde_json::json!(true)));
         assert_eq!(
@@ -2929,7 +2935,11 @@ mod tests {
         // The client contract: bucket counts sum EXACTLY to the headline txCount.
         let bucket_total: u64 = buckets
             .iter()
-            .map(|b| b.get("txCount").and_then(serde_json::Value::as_u64).unwrap())
+            .map(|b| {
+                b.get("txCount")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap()
+            })
             .sum();
         assert_eq!(
             bucket_total,

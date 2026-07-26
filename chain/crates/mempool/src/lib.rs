@@ -381,7 +381,11 @@ impl Mempool {
 
     /// Override the queued (future-nonce) region's bounds — used by tests to
     /// exercise the bounds at small sizes; operators get the defaults.
-    pub fn with_queue_limits(mut self, queued_capacity: usize, max_queued_per_sender: usize) -> Self {
+    pub fn with_queue_limits(
+        mut self,
+        queued_capacity: usize,
+        max_queued_per_sender: usize,
+    ) -> Self {
         self.queued_capacity = queued_capacity.max(1);
         self.max_queued_per_sender = max_queued_per_sender.max(1);
         self
@@ -2465,7 +2469,10 @@ mod tests {
             .collect();
         assert!(survivors.contains(&id("usa.reserve.sov")));
         assert!(survivors.contains(&id("boj.reserve.sov")));
-        assert!(!survivors.contains(&id("ecb.reserve.sov")), "cheapest displaced");
+        assert!(
+            !survivors.contains(&id("ecb.reserve.sov")),
+            "cheapest displaced"
+        );
     }
 
     #[test]
@@ -2645,7 +2652,11 @@ mod tests {
         // hole at 5 fills from re-admitted reverted txs.
         pool.insert(tx([1; 32], "usa.reserve.sov", 5), 3, big())
             .unwrap();
-        assert_eq!((pool.len(), pool.queued_len()), (4, 0), "6 promoted behind 5");
+        assert_eq!(
+            (pool.len(), pool.queued_len()),
+            (4, 0),
+            "6 promoted behind 5"
+        );
         let batch = pool.select(|_| 3, 10);
         let nonces: Vec<u64> = batch.iter().map(|s| s.transaction.nonce).collect();
         assert_eq!(nonces, vec![3, 4, 5, 6]);

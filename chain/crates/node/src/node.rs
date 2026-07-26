@@ -574,7 +574,11 @@ mod tests {
         node.submit(tip_tx([2; 32], "usa.reserve.sov", 7)).unwrap();
         assert_eq!(node.next_block_floor_grains(), 0, "free room → no floor");
         node.submit(tip_tx([3; 32], "ecb.reserve.sov", 4)).unwrap();
-        assert_eq!(node.next_block_floor_grains(), 4, "template full: marginal tip");
+        assert_eq!(
+            node.next_block_floor_grains(),
+            4,
+            "template full: marginal tip"
+        );
         node.submit(tip_tx([4; 32], "boj.reserve.sov", 2)).unwrap();
         assert_eq!(node.next_block_floor_grains(), 4, "2 waits below the floor");
     }

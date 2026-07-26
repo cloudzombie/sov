@@ -774,10 +774,12 @@ fn template_tx_disclosure_is_additive_and_leaves_the_grind_surface_intact() {
 
     let tmpl = rpc(addr, "sov_getBlockTemplate", json!({}));
     let r = &tmpl["result"];
-    let keys: std::collections::BTreeSet<String> =
-        r.as_object().unwrap().keys().cloned().collect();
+    let keys: std::collections::BTreeSet<String> = r.as_object().unwrap().keys().cloned().collect();
     for key in LIVE_TEMPLATE_KEYS {
-        assert!(keys.contains(key), "live field `{key}` disappeared: {keys:?}");
+        assert!(
+            keys.contains(key),
+            "live field `{key}` disappeared: {keys:?}"
+        );
     }
     let added: std::collections::BTreeSet<&str> = keys
         .iter()
@@ -883,7 +885,10 @@ fn template_txcount_and_txids_name_the_real_committed_transactions() {
     // property under test; assert that before mining it.)
     let mut t = get_template(addr, json!({}));
     let refetched = rpc(addr, "sov_getBlockTemplate", json!({}))["result"].clone();
-    assert_eq!(refetched["txIds"], full["txIds"], "same set, fresh template");
+    assert_eq!(
+        refetched["txIds"], full["txIds"],
+        "same set, fresh template"
+    );
     let nonce = grind(&mut t.blob, t.nonce_offset, &t.target);
     let submit = rpc(
         addr,

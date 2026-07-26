@@ -1569,7 +1569,9 @@ fn call(
                 "txCount": tx_count,
             });
             // `resp` is built by `json!` above, so it is always an object.
-            let map = resp.as_object_mut().expect("template response is an object");
+            let map = resp
+                .as_object_mut()
+                .expect("template response is an object");
             match tx_ids {
                 Some(ids) => {
                     map.insert("txIds".into(), json!(ids));
