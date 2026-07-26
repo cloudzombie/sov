@@ -54,6 +54,19 @@ impl PqDigest {
         out
     }
 
+    /// Whether every limb is a canonical field element (`< p`).
+    ///
+    /// [`PqDigest`]'s limbs are a public field, so a digest built by hand —
+    /// rather than by hashing or by [`from_bytes`](Self::from_bytes) — can hold
+    /// non-canonical limbs. Such a digest survives [`to_bytes`](Self::to_bytes)
+    /// but is
+    /// *rejected* by `from_bytes`, so state that accepted one could not be
+    /// reloaded from its own snapshot. Consensus state uses this to refuse them
+    /// at the door.
+    pub fn is_canonical(&self) -> bool {
+        self.0.iter().all(|&limb| limb < Felt::MODULUS)
+    }
+
     /// Parse a canonical 32-byte encoding. `None` if any limb is `>= p`
     /// (non-canonical encodings are rejected, so the byte form is injective).
     pub fn from_bytes(bytes: &[u8; 32]) -> Option<Self> {

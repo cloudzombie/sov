@@ -183,6 +183,15 @@ malformed input returns a typed `Err`, never panics, never aborts.
 - Global nullifier double-spend tracking, the anchor ring, turnstile, and
   drain limiter are consensus state (W2) — the bundle verifier here takes
   the valid-anchor set as an argument and leaves state to the caller.
+- **Usable tree capacity is `2^20 - 1` notes, not `2^20`.** Consensus keeps
+  the depth-20 tree as an O(depth) frontier (one ommer per set bit of the
+  leaf count), which is a total, injective encoding of every size in
+  `0..2^20` and cannot encode `2^20` at all: there every low bit is zero, so
+  the frontier would report the EMPTY-tree root for a FULL pool and the
+  completed root would have no slot to live in. The final leaf slot is
+  therefore refused by both the frontier (`MAX_V2_NOTES`) and the reference
+  tree (`MAX_TREE_LEAVES`), and a compile-time assertion keeps the cap
+  strictly inside the leaf space.
 
 ### Remaining road to a real pool v2
 

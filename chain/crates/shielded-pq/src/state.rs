@@ -31,11 +31,10 @@
 //! pure function of the state.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::OnceLock;
 
 use crate::domains::RESCUE_DOMAIN_MERKLE_NODE;
 use crate::hash::{merge_domain, PqDigest};
-use crate::tree::TREE_DEPTH;
+use crate::tree::{empty_levels, MAX_TREE_LEAVES, TREE_DEPTH};
 
 /// How many recent v2 tree roots (anchors) consensus accepts a spend against
 /// (decision D5 — the same window shape as Orchard's, sized at 128). The ring
@@ -43,9 +42,26 @@ use crate::tree::TREE_DEPTH;
 /// never grow past this bound regardless of input.
 pub const ANCHOR_RING_LEN: usize = 128;
 
-/// Maximum notes the depth-[`TREE_DEPTH`] tree can hold (`2^20`). Appending
-/// beyond this is a typed error, never a wrap or a panic.
-pub const MAX_V2_NOTES: u64 = 1u64 << TREE_DEPTH;
+/// Maximum notes the depth-[`TREE_DEPTH`] pool tree can hold: `2^20 - 1`
+/// ([`MAX_TREE_LEAVES`]). Appending beyond this is a typed error, never a wrap,
+/// a panic, or a silent divergence.
+///
+/// The final leaf slot of the `2^20`-slot leaf space is **deliberately
+/// unusable**: an O(depth) frontier stores one ommer per set bit of `size`, so
+/// a depth-`D` frontier represents `0..2^D` faithfully and cannot represent
+/// `2^D` at all (every low bit is zero there — the encoding collides with the
+/// empty tree, and the completed root has no slot to live in). Capping one
+/// short keeps "the frontier is a total, injective encoding of the tree at
+/// every reachable size" true unconditionally, which is exactly what the
+/// anchor ring and the STARK membership proofs depend on. See
+/// [`MAX_TREE_LEAVES`] for why this beats special-casing the full tree.
+pub const MAX_V2_NOTES: u64 = MAX_TREE_LEAVES;
+
+/// Compile-time guard for the frontier's totality precondition: the usable
+/// capacity must stay strictly inside the depth-`TREE_DEPTH` leaf space, or
+/// `root()` would report the empty-tree root for a full pool. This build fails
+/// if that ever drifts.
+const _: () = assert!(MAX_V2_NOTES < (1u64 << TREE_DEPTH));
 
 /// Typed failures of pool-v2 state transitions. Every reject path is an
 /// explicit variant; nothing here panics.
@@ -63,22 +79,56 @@ pub enum ShieldedV2StateError {
     /// defense in depth.
     #[error("pool-v2 state refuses the zero (dummy) digest")]
     ZeroDigest,
-    /// A persisted snapshot carried a non-canonical digest encoding.
-    #[error("non-canonical digest in pool-v2 snapshot ({0})")]
+    /// A digest carried a non-canonical field encoding (a limb `>= p`) —
+    /// either in a persisted snapshot or handed to a mutator. Such a digest
+    /// cannot survive a snapshot round-trip, so it never enters the state.
+    #[error("non-canonical digest in pool-v2 state ({0})")]
     Decode(&'static str),
 }
 
-/// `empty[l]` = digest of an empty subtree of height `l` (level 0 = leaf).
-/// Deterministic; computed once per process.
-fn empty_levels() -> &'static [PqDigest; TREE_DEPTH + 1] {
-    static EMPTY: OnceLock<[PqDigest; TREE_DEPTH + 1]> = OnceLock::new();
-    EMPTY.get_or_init(|| {
-        let mut empty = [PqDigest::ZERO; TREE_DEPTH + 1];
-        for l in 1..=TREE_DEPTH {
-            empty[l] = merge_domain(RESCUE_DOMAIN_MERKLE_NODE, empty[l - 1], empty[l - 1]);
+/// The root implied by a Merkle frontier of depth `ommers.len()`.
+///
+/// `ommers[l]` is the completed left-sibling subtree at level `l`, meaningful
+/// exactly where bit `l` of `size` is 1; where it is 0 the sibling is the empty
+/// subtree `empty[l]`. `empty` must carry at least `ommers.len() + 1` levels.
+///
+/// **Totality precondition:** `size < 2^ommers.len()`. Bits of `size` at or
+/// above the frontier depth are invisible to this walk, so a caller that let
+/// `size` reach `2^depth` would get the empty-tree root back for a full tree.
+/// Consensus guarantees the precondition by capping usable leaves at
+/// [`MAX_V2_NOTES`], which the compile-time assertion below makes impossible to
+/// drift, and by [`frontier_append`] refusing an index with no free slot.
+fn frontier_root(ommers: &[PqDigest], empty: &[PqDigest], size: u64) -> PqDigest {
+    debug_assert!(empty.len() > ommers.len(), "empty levels cover the depth");
+    let mut acc = empty[0];
+    for (level, &ommer) in ommers.iter().enumerate() {
+        acc = if (size >> level) & 1 == 1 {
+            merge_domain(RESCUE_DOMAIN_MERKLE_NODE, ommer, acc)
+        } else {
+            merge_domain(RESCUE_DOMAIN_MERKLE_NODE, acc, empty[level])
+        };
+    }
+    acc
+}
+
+/// Fold the leaf appended at index `size` into the frontier (O(depth) merges).
+///
+/// Returns `false` — mutating **nothing** — when index `size` has no free ommer
+/// slot, i.e. when its low `depth` bits are all 1 and the append would complete
+/// the whole tree. That is precisely the size the frontier cannot represent, so
+/// the caller must reject rather than store a root that has nowhere to go.
+fn frontier_append(ommers: &mut [PqDigest], size: u64, cm: PqDigest) -> bool {
+    let mut acc = cm;
+    let mut idx = size;
+    for slot in ommers.iter_mut() {
+        if idx & 1 == 0 {
+            *slot = acc;
+            return true;
         }
-        empty
-    })
+        acc = merge_domain(RESCUE_DOMAIN_MERKLE_NODE, *slot, acc);
+        idx >>= 1;
+    }
+    false
 }
 
 /// The post-quantum shielded pool's consensus state (see the module docs).
@@ -124,19 +174,13 @@ impl ShieldedV2State {
     }
 
     /// The current note-commitment tree root (the newest anchor).
+    ///
+    /// `size <= MAX_V2_NOTES < 2^TREE_DEPTH` is an invariant of every mutator
+    /// here, so the frontier walk sees every set bit of `size` and this root
+    /// equals the reference [`CommitmentTree`](crate::CommitmentTree) root at
+    /// every reachable size — including full capacity.
     pub fn root(&self) -> PqDigest {
-        let empty = empty_levels();
-        let mut acc = empty[0];
-        // `ommers` has TREE_DEPTH entries and `empty` TREE_DEPTH + 1, so the
-        // zip walks levels 0..TREE_DEPTH exactly.
-        for (level, (&ommer, &empty_l)) in self.ommers.iter().zip(empty.iter()).enumerate() {
-            acc = if (self.size >> level) & 1 == 1 {
-                merge_domain(RESCUE_DOMAIN_MERKLE_NODE, ommer, acc)
-            } else {
-                merge_domain(RESCUE_DOMAIN_MERKLE_NODE, acc, empty_l)
-            };
-        }
-        acc
+        frontier_root(&self.ommers, empty_levels(), self.size)
     }
 
     /// Whether `anchor` is within the accepted ring of the last
@@ -183,15 +227,13 @@ impl ShieldedV2State {
         if self.size >= MAX_V2_NOTES {
             return Err(ShieldedV2StateError::TreeFull);
         }
-        let mut acc = cm;
-        let mut idx = self.size;
-        for level in 0..TREE_DEPTH {
-            if idx & 1 == 0 {
-                self.ommers[level] = acc;
-                break;
-            }
-            acc = merge_domain(RESCUE_DOMAIN_MERKLE_NODE, self.ommers[level], acc);
-            idx >>= 1;
+        // Unreachable given the bound above (index `MAX_V2_NOTES - 1` always
+        // has a zero bit below the depth), but belt-and-braces: a frontier that
+        // cannot place the new ommer is a full tree, and we reject it as one
+        // rather than dropping the completed root on the floor. Nothing has
+        // been mutated on this path.
+        if !frontier_append(&mut self.ommers, self.size, cm) {
+            return Err(ShieldedV2StateError::TreeFull);
         }
         self.size += 1;
         self.commitments.push(cm.to_bytes());
@@ -229,10 +271,23 @@ impl ShieldedV2State {
         if commitments.contains(&PqDigest::ZERO) {
             return Err(ShieldedV2StateError::ZeroDigest);
         }
+        // Canonicality is a state invariant, not just a decoder rule: a digest
+        // with a limb >= p round-trips through `to_bytes` but is refused by
+        // `from_bytes`, so accepting one would make the state unrestorable from
+        // its own snapshot. Digests reaching here come from decoded wire
+        // bundles (already canonical), so this is defense in depth.
+        for cm in commitments {
+            if !cm.is_canonical() {
+                return Err(ShieldedV2StateError::Decode("commitment"));
+            }
+        }
         let mut batch = BTreeSet::new();
         for nf in nullifiers {
             if *nf == PqDigest::ZERO {
                 return Err(ShieldedV2StateError::ZeroDigest);
+            }
+            if !nf.is_canonical() {
+                return Err(ShieldedV2StateError::Decode("nullifier"));
             }
             let bytes = nf.to_bytes();
             if self.nullifiers.contains(&bytes) || !batch.insert(bytes) {
@@ -332,6 +387,37 @@ mod tests {
         digest_from_bytes(crate::domains::B3_TEST, &n.to_le_bytes())
     }
 
+    /// Empty-subtree digests for an arbitrary depth (level 0 = leaf).
+    fn empty_levels_of(depth: usize) -> Vec<PqDigest> {
+        let mut empty = vec![PqDigest::ZERO; depth + 1];
+        for l in 1..=depth {
+            empty[l] = merge_domain(RESCUE_DOMAIN_MERKLE_NODE, empty[l - 1], empty[l - 1]);
+        }
+        empty
+    }
+
+    /// Depth-parameterized O(n·depth) reference root — the *same* algorithm
+    /// [`CommitmentTree::root`] uses (the tree the STARK's witnesses are built
+    /// against), lifted to an arbitrary depth so the frontier can be pinned
+    /// against it at capacity boundaries that are unreachable in a test at
+    /// depth 20. `reference_root_agrees_with_the_stark_reference_tree` proves
+    /// this really is that algorithm.
+    fn reference_root(leaves: &[PqDigest], depth: usize) -> PqDigest {
+        fn subtree(leaves: &[PqDigest], empty: &[PqDigest], level: usize, index: u64) -> PqDigest {
+            let first = (index as usize) << level;
+            if first >= leaves.len() {
+                return empty[level];
+            }
+            if level == 0 {
+                return leaves[first];
+            }
+            let left = subtree(leaves, empty, level - 1, index * 2);
+            let right = subtree(leaves, empty, level - 1, index * 2 + 1);
+            merge_domain(RESCUE_DOMAIN_MERKLE_NODE, left, right)
+        }
+        subtree(leaves, &empty_levels_of(depth), depth, 0)
+    }
+
     #[test]
     fn empty_root_matches_the_reference_tree_and_is_a_known_anchor() {
         let state = ShieldedV2State::new();
@@ -347,14 +433,243 @@ mod tests {
         // The O(depth) frontier is a REIMPLEMENTATION of the root the O(n)
         // reference tree (tree.rs, which the STARK's witnesses are built
         // against) computes. Pin them to each other leaf-by-leaf across sizes
-        // that cross every carry boundary up to 40.
+        // that cross every carry boundary up to 80 (so the 2^6 carry into a
+        // fresh ommer level is exercised too). The capacity boundary itself
+        // (2^TREE_DEPTH) is out of reach here — it is covered exhaustively at
+        // every small depth by
+        // `frontier_is_exact_below_capacity_and_cannot_represent_a_full_tree`,
+        // and at the real depth by the release-only
+        // `frontier_matches_the_reference_tree_at_full_capacity`.
         let mut state = ShieldedV2State::new();
         let mut reference = CommitmentTree::new();
-        for i in 0..40u64 {
+        for i in 0..80u64 {
             state.apply(&[], &[d(i)]).expect("append");
             reference.append(d(i)).expect("append");
             assert_eq!(state.root(), reference.root(), "size {}", i + 1);
         }
+    }
+
+    #[test]
+    fn reference_root_agrees_with_the_stark_reference_tree() {
+        // The depth-parameterized reference used by the boundary tests below
+        // is the SAME function tree.rs computes — pinned at the real depth so
+        // small-depth conclusions transfer to depth 20.
+        let mut reference = CommitmentTree::new();
+        let mut leaves = Vec::new();
+        assert_eq!(reference_root(&leaves, TREE_DEPTH), reference.root());
+        for i in 0..40u64 {
+            reference.append(d(i)).expect("append");
+            leaves.push(d(i));
+            assert_eq!(
+                reference_root(&leaves, TREE_DEPTH),
+                reference.root(),
+                "size {}",
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn frontier_is_exact_below_capacity_and_cannot_represent_a_full_tree() {
+        // THE BUG THIS FILE ONCE HAD, pinned structurally at every small depth
+        // (the same algorithms production runs at depth 20, driven directly so
+        // the whole leaf space is affordable):
+        //
+        //   * for every size in 0..2^depth the frontier root EQUALS the
+        //     reference root; and
+        //   * at index 2^depth - 1 the append has NO free ommer slot, i.e. a
+        //     depth-`d` frontier provably cannot hold 2^d leaves. Were such an
+        //     append allowed, `size == 2^depth` would have all-zero low bits
+        //     and the frontier would report the EMPTY-TREE root for a full
+        //     tree — a full-pool anchor colliding with the empty anchor.
+        for depth in 1..=6usize {
+            let empty = empty_levels_of(depth);
+            let mut ommers = vec![PqDigest::ZERO; depth];
+            let mut leaves: Vec<PqDigest> = Vec::new();
+            assert_eq!(
+                frontier_root(&ommers, &empty, 0),
+                reference_root(&leaves, depth),
+                "depth {depth} size 0"
+            );
+            let capacity = 1u64 << depth;
+            for size in 0..capacity - 1 {
+                assert!(
+                    frontier_append(&mut ommers, size, d(size)),
+                    "depth {depth}: index {size} must have a free ommer slot"
+                );
+                leaves.push(d(size));
+                assert_eq!(
+                    frontier_root(&ommers, &empty, size + 1),
+                    reference_root(&leaves, depth),
+                    "depth {depth} size {}",
+                    size + 1
+                );
+            }
+            // The final slot: no ommer can hold the completed root.
+            let mut probe = ommers.clone();
+            assert!(
+                !frontier_append(&mut probe, capacity - 1, d(capacity - 1)),
+                "depth {depth}: the 2^{depth}-th leaf has no ommer slot"
+            );
+            assert_eq!(probe, ommers, "a refused append mutates nothing");
+            // And the reason it must be refused: at size 2^depth the frontier
+            // walk sees only zero bits — the empty-tree root.
+            leaves.push(d(capacity - 1));
+            assert_eq!(
+                frontier_root(&ommers, &empty, capacity),
+                frontier_root(&vec![PqDigest::ZERO; depth], &empty, 0),
+                "depth {depth}: size 2^{depth} would collide with the empty root"
+            );
+            assert_ne!(
+                frontier_root(&ommers, &empty, capacity),
+                reference_root(&leaves, depth),
+                "depth {depth}: and would disagree with the reference tree"
+            );
+        }
+    }
+
+    #[test]
+    fn frontier_boundary_holds_at_larger_depths() {
+        // Same boundary, at depths where the leaf space is 1k/4k slots: the
+        // last USABLE size is exact against the reference, and the slot beyond
+        // it is unrepresentable. Guards against the conclusion above being an
+        // artifact of tiny depths.
+        for depth in [10usize, 12] {
+            let empty = empty_levels_of(depth);
+            let mut ommers = vec![PqDigest::ZERO; depth];
+            let mut leaves: Vec<PqDigest> = Vec::new();
+            let capacity = 1u64 << depth;
+            for size in 0..capacity - 1 {
+                assert!(frontier_append(&mut ommers, size, d(size)), "depth {depth}");
+                leaves.push(d(size));
+            }
+            assert_eq!(
+                frontier_root(&ommers, &empty, capacity - 1),
+                reference_root(&leaves, depth),
+                "depth {depth}: exact at the last usable size (all ommers set)"
+            );
+            assert!(
+                !frontier_append(&mut ommers, capacity - 1, d(capacity - 1)),
+                "depth {depth}: the full tree is unrepresentable"
+            );
+        }
+    }
+
+    #[test]
+    fn usable_capacity_is_one_short_of_the_leaf_space() {
+        // The cap that makes the frontier total. If MAX_V2_NOTES ever grew to
+        // the full 2^TREE_DEPTH again, `root()` would return the empty-tree
+        // root for a full pool.
+        assert_eq!(MAX_V2_NOTES, (1u64 << TREE_DEPTH) - 1);
+        const { assert!(MAX_V2_NOTES < (1u64 << TREE_DEPTH)) };
+        assert_eq!(MAX_V2_NOTES, crate::tree::MAX_TREE_LEAVES);
+        // Every reachable append index has a free ommer slot, and every
+        // reachable size is fully visible to the depth-TREE_DEPTH bit walk.
+        assert!(
+            (MAX_V2_NOTES - 1).trailing_ones() < TREE_DEPTH as u32,
+            "the last appendable index must have a zero bit below the depth"
+        );
+        assert_eq!(
+            MAX_V2_NOTES >> TREE_DEPTH,
+            0,
+            "no reachable size has bits above the frontier depth"
+        );
+    }
+
+    #[test]
+    fn capacity_boundary_is_exact_for_real_appends_at_the_real_depth() {
+        // One below / at / one above capacity, for BOTH mutators, with a real
+        // leaf appended at the boundary (the size is faked to make 2^20
+        // affordable; the append, the frontier update and the root are real).
+        for size in [MAX_V2_NOTES - 1, MAX_V2_NOTES] {
+            // append_commitment
+            let mut s = ShieldedV2State::with_claimed_size(size);
+            let r = s.append_commitment(d(7));
+            if size < MAX_V2_NOTES {
+                assert_eq!(r, Ok(()), "the last leaf fits");
+                assert_eq!(s.note_count(), MAX_V2_NOTES);
+                // The root at full capacity is NOT the empty-tree root.
+                assert_ne!(
+                    s.root(),
+                    ShieldedV2State::new().root(),
+                    "a full pool must never share the empty pool's anchor"
+                );
+                assert_eq!(
+                    s.append_commitment(d(8)),
+                    Err(ShieldedV2StateError::TreeFull),
+                    "one past capacity"
+                );
+                assert_eq!(s.note_count(), MAX_V2_NOTES);
+            } else {
+                assert_eq!(r, Err(ShieldedV2StateError::TreeFull), "at capacity");
+                assert_eq!(s.note_count(), MAX_V2_NOTES);
+            }
+            // apply
+            let mut s = ShieldedV2State::with_claimed_size(size);
+            let before = s.commitment();
+            let r = s.apply(&[d(9)], &[d(7)]);
+            if size < MAX_V2_NOTES {
+                assert_eq!(r, Ok(()));
+                assert_eq!(s.note_count(), MAX_V2_NOTES);
+                assert_eq!(
+                    s.apply(&[d(10)], &[d(8)]),
+                    Err(ShieldedV2StateError::TreeFull),
+                    "one past capacity"
+                );
+                assert!(!s.nullifier_seen(&d(10)), "the rejected batch is atomic");
+            } else {
+                assert_eq!(r, Err(ShieldedV2StateError::TreeFull));
+                assert_eq!(s.commitment(), before, "rejected apply mutates nothing");
+            }
+        }
+    }
+
+    #[test]
+    fn a_state_at_full_capacity_never_reports_the_empty_root() {
+        // The exact collision the audit found, in the shape it would have
+        // taken: a frontier whose size is the full leaf space reports the
+        // empty-tree root. Capping capacity is what makes that size
+        // unreachable, and this test fails the moment it becomes reachable.
+        let full = ShieldedV2State::with_claimed_size(1u64 << TREE_DEPTH);
+        assert_eq!(
+            full.root(),
+            ShieldedV2State::new().root(),
+            "documenting WHY 2^TREE_DEPTH must be unreachable"
+        );
+        // ...and it is unreachable: no mutator can take size past
+        // MAX_V2_NOTES, which the build itself now enforces.
+        const { assert!((1u64 << TREE_DEPTH) > MAX_V2_NOTES) };
+    }
+
+    /// Release-only (~2 minutes): fill the REAL depth-20 tree to capacity with
+    /// real appends and pin the frontier root against the reference tree there.
+    /// Run with:
+    /// `cargo test -p sov-shielded-pq --release -- --ignored full_capacity`
+    #[test]
+    #[ignore = "fills the real 2^20 tree; ~2 min in release, far longer in debug"]
+    fn frontier_matches_the_reference_tree_at_full_capacity() {
+        let mut state = ShieldedV2State::new();
+        let mut reference = CommitmentTree::new();
+        for i in 0..MAX_V2_NOTES {
+            state.apply(&[], &[d(i)]).expect("append");
+            reference.append(d(i)).expect("append");
+        }
+        assert_eq!(state.note_count(), MAX_V2_NOTES);
+        assert_eq!(reference.len() as u64, MAX_V2_NOTES);
+        assert_eq!(
+            state.root(),
+            reference.root(),
+            "frontier and reference agree at FULL capacity"
+        );
+        assert_ne!(state.root(), ShieldedV2State::new().root());
+        assert_eq!(
+            state.apply(&[], &[d(0)]),
+            Err(ShieldedV2StateError::TreeFull)
+        );
+        assert!(
+            reference.append(d(0)).is_none(),
+            "reference caps identically"
+        );
     }
 
     #[test]
@@ -459,6 +774,38 @@ mod tests {
             restored.anchors().collect::<Vec<_>>(),
             state.anchors().collect::<Vec<_>>(),
             "the anchor ring (including evictions) is reproduced exactly"
+        );
+    }
+
+    #[test]
+    fn apply_refuses_non_canonical_digests_so_snapshots_always_restore() {
+        // `PqDigest`'s limbs are a public field, so a hand-built digest can
+        // hold a limb >= p. It survives `to_bytes` but `from_bytes` refuses
+        // it — a state that accepted one could not be reloaded from its own
+        // snapshot. Refuse at the door instead, in both roles.
+        let non_canonical = PqDigest([u64::MAX, 0, 0, 0]);
+        assert!(!non_canonical.is_canonical());
+        assert!(PqDigest::from_bytes(&non_canonical.to_bytes()).is_none());
+
+        let mut state = ShieldedV2State::new();
+        let before = state.commitment();
+        assert_eq!(
+            state.apply(&[], &[non_canonical]),
+            Err(ShieldedV2StateError::Decode("commitment"))
+        );
+        assert_eq!(
+            state.apply(&[non_canonical], &[d(1)]),
+            Err(ShieldedV2StateError::Decode("nullifier"))
+        );
+        assert_eq!(state.commitment(), before, "rejected apply mutates nothing");
+        assert!(state.is_empty());
+
+        // Totality: whatever `apply` accepts, `restore` reproduces exactly.
+        state.apply(&[d(1)], &[d(2), d(3)]).expect("apply");
+        let (cms, nfs) = state.snapshot();
+        assert_eq!(
+            ShieldedV2State::restore(&cms, &nfs).expect("restore"),
+            state
         );
     }
 
