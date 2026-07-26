@@ -305,8 +305,19 @@ completely:
 | cubic | 32 | 42 | 120 | 71.9 KB |
 | cubic | 32 | 64 | **128** | 103.4 KB |
 
-**Recommended parameter set: cubic extension, blowup 16, 64 queries.** That is
-**128 bits proven** — not conjectured — at **94.3 KB**, against 53.8 KB today.
+**ADOPTED (this is now `proof_options()`): cubic extension, blowup 16, 64
+queries.** Measured after the change, on the same realistic bundle:
+
+| | previous (42q / 8 / quadratic) | **adopted (64q / 16 / cubic)** |
+|---|---|---|
+| conjectured | 127 | 128 |
+| **proven (Johnson/ldr)** | **75** | **128** |
+| proven (unique decoding) | 50 | **74** |
+| proof bytes | 55,054 | **96,586** |
+| verify (median) | 621 us | **970 us** |
+
+Verification cost rose 621 -> 970 us, which remains far below the block
+interval even for a saturated block, so the liveness budget is unaffected.
 
 The honest trade: **1.75x proof size to go from 75 proven bits to 128.** For a
 pool that is not yet armed, and for a chain whose stated bar is reserve grade,

@@ -57,16 +57,48 @@ pub enum SpendProofError {
     Verification(String),
 }
 
-/// Standard proof options: 42 FRI queries, blowup 8, 16 bits of grinding,
-/// quadratic extension field — ≥ 100 bits conjectured security against a
-/// classical adversary, and no number-theoretic assumptions a quantum
-/// adversary could break (hashes only).
+/// Standard proof options: 64 FRI queries, blowup 16, 16 bits of grinding,
+/// **cubic** extension field.
+///
+/// **128 bits PROVEN, not conjectured** — and that distinction is the whole
+/// reason for these values. Measured by `tests/security_level.rs`, which reads
+/// both figures off a real proof:
+///
+/// | parameters | conjectured | proven | proof |
+/// |---|---|---|---|
+/// | 42q / blowup 8 / quadratic (previous) | 127 | **75** | 53.8 KB |
+/// | 64q / blowup 16 / cubic (these) | 128 | **128** | 94.3 KB |
+///
+/// The previous set quoted 127 bits, but that was the *capacity-conjecture*
+/// figure; unconditionally it was 75 bits (50 under the unique-decoding
+/// bound). Relying on that conjecture became materially less defensible after
+/// the strongest up-to-capacity forms of it were disproved over large fields
+/// in late 2025.
+///
+/// Raising the query count alone does NOT fix it: under a quadratic extension
+/// proven security saturates at 86 bits no matter the budget — 200 queries and
+/// 3.4x the proof size buy nothing, because the ceiling is the extension
+/// field, not the number of queries. Goldilocks is a 64-bit base field, and a
+/// cubic extension is what lifts the ceiling.
+///
+/// The cost is honest and bounded: 1.75x proof size (53.8 KB -> 94.3 KB, a
+/// full bundle ~62 KB -> ~101 KB) for 75 -> 128 proven bits. That stays well
+/// inside `MAX_SHIELDED_V2_BUNDLE_BYTES` (144 KiB), which the weight schedule
+/// is already sized against.
+///
+/// Changing these AFTER the pool is armed would be a consensus change with its
+/// own deployment, since `verify_spend` accepts only proofs generated with
+/// exactly these options. Changing them while the pool is dormant costs
+/// nothing but a re-benchmark — which is why it is done now.
+///
+/// Soundness rests on hashes only: no number-theoretic assumption a quantum
+/// adversary could break.
 pub fn proof_options() -> ProofOptions {
     ProofOptions::new(
-        42,
-        8,
+        64,
         16,
-        FieldExtension::Quadratic,
+        16,
+        FieldExtension::Cubic,
         4,
         31,
         BatchingMethod::Linear,
