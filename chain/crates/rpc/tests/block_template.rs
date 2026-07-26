@@ -976,3 +976,50 @@ fn mainnet_genesis_is_still_frozen() {
     );
     assert_eq!(genesis.header.height.get(), 0);
 }
+
+/// `sov_getBlockByHeight` / `sov_getBlockByHash` disclose the block's own id as
+/// `header.hash`.
+///
+/// This is what lets a client PROVE which block it is looking at. The id is
+/// content-derived and not part of the serialized block, so before this a
+/// client either paid a second `sov_getBlockDigest` round-trip or fell back to
+/// matching by HEIGHT — and a height match cannot tell a block you mined apart
+/// from a same-height reorg replacement you did not. The hash must also
+/// round-trip: the exact string served here is the one `sov_getBlockByHash`
+/// accepts.
+#[test]
+fn block_responses_disclose_the_block_hash_and_it_round_trips() {
+    let (node, handle, addr) = serve();
+
+    let by_height = rpc(addr, "sov_getBlockByHeight", json!({ "height": 0 }))["result"].clone();
+    let served = by_height["header"]["hash"]
+        .as_str()
+        .expect("header.hash is disclosed")
+        .to_owned();
+
+    // It is the node's own id for that block, not an invented value.
+    let expected = node
+        .lock()
+        .unwrap()
+        .chain()
+        .block_by_height(0)
+        .expect("genesis exists")
+        .hash()
+        .to_hex();
+    assert_eq!(served, expected, "header.hash is the node's own block id");
+
+    // The served string is exactly what the by-hash lookup accepts.
+    let by_hash = rpc(addr, "sov_getBlockByHash", json!({ "hash": served }))["result"].clone();
+    assert!(!by_hash.is_null(), "the served hash round-trips");
+    assert_eq!(
+        by_hash["header"]["hash"].as_str(),
+        Some(served.as_str()),
+        "by-hash lookup returns the same disclosed id"
+    );
+
+    // ADDITIVE: pre-existing header fields are untouched.
+    assert_eq!(by_height["header"]["height"], json!(0));
+    assert!(by_height["header"]["timestamp_ms"].is_number());
+
+    handle.shutdown();
+}

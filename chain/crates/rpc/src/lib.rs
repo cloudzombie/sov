@@ -696,6 +696,32 @@ fn to_value<T: serde::Serialize>(v: T) -> Value {
     serde_json::to_value(v).unwrap_or(Value::Null)
 }
 
+/// A block serialized for RPC, with the block's own id added as `header.hash`
+/// (the blake3 header hash the node already computes: the same id
+/// `sov_submitBlock` replies with and fork choice keys on).
+///
+/// The id is content-derived and NOT part of the serialized block, so without
+/// this a client needed a second `sov_getBlockDigest` round-trip merely to
+/// learn which block it was looking at — and a client that could not afford
+/// that round-trip had to fall back to matching blocks by HEIGHT, which cannot
+/// distinguish a block it mined from a same-height reorg replacement it did
+/// not. Serving the hash is what lets such a client prove identity instead of
+/// guessing it.
+///
+/// ADDITIVE (forward-compat law F5): every pre-existing field is untouched and
+/// serde ignores unknown fields, so existing typed clients decode unchanged.
+fn block_with_hash(b: &Block) -> Value {
+    let hash = b.hash();
+    let mut v = to_value(b);
+    if let Some(header) = v.get_mut("header").and_then(Value::as_object_mut) {
+        // Bare hex (`to_hex`), matching the id `sov_submitBlock` replies with
+        // and `sov_getBlockByHash` accepts — the exact string a client
+        // round-trips.
+        header.insert("hash".into(), Value::String(hash.to_hex()));
+    }
+    v
+}
+
 // ---- method dispatch ------------------------------------------------------
 
 fn call(
@@ -852,14 +878,14 @@ fn call(
             Ok(node
                 .chain()
                 .block_by_height(h)
-                .map_or(Value::Null, to_value))
+                .map_or(Value::Null, block_with_hash))
         }
         "sov_getBlockByHash" => {
             let hash = param_hash(params)?;
             Ok(node
                 .chain()
                 .block_by_hash(&hash)
-                .map_or(Value::Null, to_value))
+                .map_or(Value::Null, block_with_hash))
         }
         "sov_getReceipt" => {
             // The recorded outcome of a transaction by its id: success, or the
