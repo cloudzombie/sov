@@ -213,6 +213,73 @@ const MAX_PEERS_REDIAL_ON_LOAD: usize = 32;
 /// every poll), tripped only under a stall or flood.
 const MAX_INBOX: usize = 1_024;
 
+/// Hard ceiling on the TOTAL bytes queued in the inbox, independent of the
+/// message count.
+///
+/// A count-only bound is not a memory bound. [`MAX_INBOX`] alone permits
+/// 1,024 x [`MAX_FRAME`] = 8 GiB of buffered messages if a peer sends large
+/// frames while the single P2P worker is stalled in a slow import or reorg —
+/// precisely the shape of the cold-sync outage that a count-only `GetBlocks`
+/// batch cap once caused (fixed there by `size_capped_batch_len`; the same
+/// lesson applies here).
+///
+/// The pool-v2 shielded pool makes this urgent rather than theoretical: a
+/// transaction message grows from a few hundred bytes to ~104 KB, so 1,024
+/// queued transactions go from under a megabyte to hundreds of megabytes.
+///
+/// 64 MiB is generous for normal operation — the worker drains every poll —
+/// while bounding the worst case to something a node can survive. Eviction is
+/// oldest-first, exactly as for the count bound: a peer whose message is
+/// dropped simply re-requests (sync retries, Status re-announces), so dropping
+/// is always safe.
+const MAX_INBOX_BYTES: usize = 64 * 1024 * 1024;
+
+/// The peer inbox: a FIFO of decoded messages bounded by BOTH message count
+/// ([`MAX_INBOX`]) and total queued bytes ([`MAX_INBOX_BYTES`]).
+///
+/// The byte total is maintained incrementally, so admitting a message is O(1)
+/// amortized. Summing the queue on every push would make the flood case — the
+/// one this bound exists to survive — quadratic, which would be its own denial
+/// of service.
+#[derive(Default)]
+struct Inbox {
+    queue: VecDeque<(SocketAddr, NetMessage, usize)>,
+    bytes: usize,
+}
+
+impl Inbox {
+    /// Queue a message, evicting oldest-first until it fits under both bounds.
+    ///
+    /// Dropping is always safe: a peer whose message is evicted re-requests
+    /// (sync retries, Status re-announces).
+    fn push(&mut self, key: SocketAddr, message: NetMessage, wire_bytes: usize) {
+        let cost = wire_bytes.min(MAX_FRAME);
+        while self.queue.len() >= MAX_INBOX
+            || (!self.queue.is_empty() && self.bytes + cost > MAX_INBOX_BYTES)
+        {
+            match self.queue.pop_front() {
+                Some((_, _, evicted)) => self.bytes = self.bytes.saturating_sub(evicted),
+                None => break,
+            }
+        }
+        self.bytes = self.bytes.saturating_add(cost);
+        self.queue.push_back((key, message, cost));
+    }
+
+    /// Drain every queued message, resetting the byte total.
+    fn drain_all(&mut self) -> Vec<(SocketAddr, NetMessage)> {
+        self.bytes = 0;
+        self.queue
+            .drain(..)
+            .map(|(addr, msg, _bytes)| (addr, msg))
+            .collect()
+    }
+
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
+}
+
 /// LAN auto-discovery (mDNS-style): nodes announce themselves on this
 /// administratively-scoped IPv4 multicast group + port, so peers on the SAME LAN
 /// find and dial each other with **zero configuration**. The group is site-local
@@ -233,7 +300,7 @@ struct Shared {
     /// Active connection writers, keyed by the connection's remote address.
     peers: Mutex<HashMap<SocketAddr, PeerWriter>>,
     /// Received application messages awaiting the caller.
-    inbox: Mutex<VecDeque<(SocketAddr, NetMessage)>>,
+    inbox: Mutex<Inbox>,
     /// Listening addresses we know about (for discovery / dedup of dials).
     known: Mutex<HashSet<SocketAddr>>,
     /// Addresses with an outbound dial currently in flight, so concurrent retries
@@ -361,7 +428,7 @@ impl TcpNode {
         let shared = Arc::new(Shared {
             local_addr,
             peers: Mutex::new(HashMap::new()),
-            inbox: Mutex::new(VecDeque::new()),
+            inbox: Mutex::new(Inbox::default()),
             known: Mutex::new(HashSet::new()),
             dialing: Mutex::new(HashSet::new()),
             inbound: Mutex::new(HashSet::new()),
@@ -675,7 +742,7 @@ impl TcpNode {
 
     /// Drain all received application messages.
     pub fn drain(&self) -> Vec<(SocketAddr, NetMessage)> {
-        self.shared.inbox.lock().unwrap().drain(..).collect()
+        self.shared.inbox.lock().unwrap().drain_all()
     }
 
     /// Number of pending received messages.
@@ -1455,7 +1522,11 @@ fn penalize_inner(shared: &Shared, ip: IpAddr, adjust: impl FnOnce(&mut PeerScor
 // path with no benefit.
 #[allow(clippy::large_enum_variant)]
 enum FrameRead {
-    Message(NetMessage),
+    /// A decoded message and the exact size, in bytes, of the plaintext frame
+    /// it arrived in — the real memory it will occupy while queued. Carried
+    /// rather than re-derived so the inbox can be bounded by BYTES and not
+    /// merely by message count (see [`MAX_INBOX_BYTES`]).
+    Message(NetMessage, usize),
     Closed,
     Malformed,
 }
@@ -1468,7 +1539,7 @@ fn reader_loop(shared: &Arc<Shared>, key: SocketAddr, mut reader: TcpStream, pee
     let ip = key.ip();
     loop {
         match read_frame(&mut reader, &peer) {
-            FrameRead::Message(message) => {
+            FrameRead::Message(message, wire_bytes) => {
                 // Spend a rate token; over the sustained rate this accrues penalty
                 // and, once misbehavior crosses the threshold, bans + drops the peer.
                 if !note_message(shared, ip) {
@@ -1543,13 +1614,9 @@ fn reader_loop(shared: &Arc<Shared>, key: SocketAddr, mut reader: TcpStream, pee
                         let _ = write_frame(&peer, &NetMessage::Peers(addrs));
                     }
                     message => {
-                        let mut inbox = shared.inbox.lock().unwrap();
-                        // Bound memory: drop the oldest if the worker has fallen behind
-                        // (e.g. mid-reorg). The dropped peer re-requests; sync self-heals.
-                        if inbox.len() >= MAX_INBOX {
-                            inbox.pop_front();
-                        }
-                        inbox.push_back((key, message));
+                        // Bounded by BOTH count and bytes; a count-only bound is not a
+                        // memory bound (see MAX_INBOX_BYTES).
+                        shared.inbox.lock().unwrap().push(key, message, wire_bytes);
                     }
                 }
             }
@@ -1611,7 +1678,7 @@ fn read_frame(reader: &mut TcpStream, peer: &Peer) -> FrameRead {
     // Open the inner hybrid layer; any tamper/desync is a malformed frame.
     match peer.pq.lock().unwrap().open(&inner) {
         Some(plaintext) => match NetMessage::decode(&plaintext) {
-            Ok(message) => FrameRead::Message(message),
+            Ok(message) => FrameRead::Message(message, plaintext.len()),
             Err(_) => FrameRead::Malformed,
         },
         None => FrameRead::Malformed,
@@ -2182,7 +2249,7 @@ mod tests {
         let shared = Shared {
             local_addr: "127.0.0.1:1".parse().unwrap(),
             peers: Mutex::new(HashMap::new()),
-            inbox: Mutex::new(VecDeque::new()),
+            inbox: Mutex::new(Inbox::default()),
             known: Mutex::new(HashSet::new()),
             dialing: Mutex::new(HashSet::new()),
             inbound: Mutex::new(HashSet::new()),
@@ -2223,7 +2290,7 @@ mod tests {
         let shared = Shared {
             local_addr: "127.0.0.1:1".parse().unwrap(),
             peers: Mutex::new(HashMap::new()),
-            inbox: Mutex::new(VecDeque::new()),
+            inbox: Mutex::new(Inbox::default()),
             known: Mutex::new(HashSet::new()),
             dialing: Mutex::new(HashSet::new()),
             inbound: Mutex::new(HashSet::new()),
@@ -2265,7 +2332,7 @@ mod tests {
         let shared = Shared {
             local_addr: "127.0.0.1:0".parse().unwrap(),
             peers: Mutex::new(HashMap::new()),
-            inbox: Mutex::new(VecDeque::new()),
+            inbox: Mutex::new(Inbox::default()),
             known: Mutex::new(HashSet::new()),
             dialing: Mutex::new(HashSet::new()),
             inbound: Mutex::new(HashSet::new()),
@@ -2429,7 +2496,7 @@ mod tests {
         let shared = Shared {
             local_addr: "127.0.0.1:1".parse().unwrap(),
             peers: Mutex::new(HashMap::new()),
-            inbox: Mutex::new(VecDeque::new()),
+            inbox: Mutex::new(Inbox::default()),
             known: Mutex::new(HashSet::new()),
             dialing: Mutex::new(HashSet::new()),
             // An inbound from 192.168.1.5 still completing its handshake (ephemeral port).
@@ -2540,5 +2607,86 @@ mod tests {
         assert!(a
             .request_reconnect("definitely not an address !!!")
             .is_err());
+    }
+
+    /// The inbox must be bounded by BYTES, not only by message count.
+    ///
+    /// `MAX_INBOX` alone permits 1,024 x `MAX_FRAME` = 8 GiB of buffering
+    /// while the single P2P worker is stalled — the same "count-only cap where
+    /// a byte cap is needed" shape as the cold-sync outage that
+    /// `size_capped_batch_len` was written to fix. Pool-v2 turns it from
+    /// theoretical into routine: a shielded transaction message is ~104 KB
+    /// rather than a few hundred bytes.
+    #[test]
+    fn inbox_is_bounded_by_bytes_not_just_count() {
+        let addr: SocketAddr = "127.0.0.1:9645".parse().unwrap();
+        let mut inbox = Inbox::default();
+
+        // 1 MiB messages: the BYTE bound must bite long before the count one.
+        const BIG: usize = 1024 * 1024;
+        for _ in 0..MAX_INBOX {
+            inbox.push(addr, NetMessage::GetAddr, BIG);
+        }
+
+        assert!(
+            inbox.bytes <= MAX_INBOX_BYTES,
+            "inbox exceeded its byte ceiling: {} > {}",
+            inbox.bytes,
+            MAX_INBOX_BYTES
+        );
+        assert!(
+            inbox.len() < MAX_INBOX,
+            "the byte bound must evict before the count bound at 1 MiB/message \
+             (kept {} of {})",
+            inbox.len(),
+            MAX_INBOX
+        );
+        // Concretely: a 64 MiB budget holds ~64 one-mebibyte messages, not 1,024.
+        assert!(inbox.len() <= MAX_INBOX_BYTES / BIG + 1);
+    }
+
+    /// The count bound still governs when messages are small, and the running
+    /// byte total stays exact across eviction (it is maintained incrementally,
+    /// so an accounting slip would silently disable the byte bound).
+    #[test]
+    fn inbox_count_bound_and_byte_accounting_stay_exact() {
+        let addr: SocketAddr = "127.0.0.1:9645".parse().unwrap();
+        let mut inbox = Inbox::default();
+
+        const SMALL: usize = 256;
+        for _ in 0..(MAX_INBOX * 2) {
+            inbox.push(addr, NetMessage::GetAddr, SMALL);
+        }
+        assert_eq!(inbox.len(), MAX_INBOX, "count bound governs small messages");
+        assert_eq!(
+            inbox.bytes,
+            MAX_INBOX * SMALL,
+            "running byte total must equal the queue's real cost"
+        );
+
+        // Draining resets the total; a stale total would permanently wedge the
+        // byte bound closed and silently drop every later message.
+        let drained = inbox.drain_all();
+        assert_eq!(drained.len(), MAX_INBOX);
+        assert_eq!(inbox.bytes, 0, "drain must reset the byte total");
+        assert_eq!(inbox.len(), 0);
+    }
+
+    /// A single frame at the transport ceiling must still be accepted — the
+    /// bound is there to cap accumulation, never to make a legal message
+    /// undeliverable.
+    #[test]
+    fn a_single_max_frame_message_is_still_admitted() {
+        let addr: SocketAddr = "127.0.0.1:9645".parse().unwrap();
+        let mut inbox = Inbox::default();
+        inbox.push(addr, NetMessage::GetAddr, MAX_FRAME);
+        assert_eq!(inbox.len(), 1, "a max-size frame must not be self-evicting");
+        assert_eq!(inbox.bytes, MAX_FRAME);
+
+        // An over-sized claim is clamped to the transport ceiling rather than
+        // trusted, so a bogus length cannot poison the accounting.
+        let mut inbox = Inbox::default();
+        inbox.push(addr, NetMessage::GetAddr, usize::MAX);
+        assert_eq!(inbox.bytes, MAX_FRAME, "cost is clamped to MAX_FRAME");
     }
 }

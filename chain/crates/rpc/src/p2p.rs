@@ -1804,6 +1804,52 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_of_v2_saturated_blocks_stays_under_the_frame() {
+        // POOL-V2 REGRESSION. The cold-sync outage at height 7168 was a
+        // count-only batch cap meeting blocks that were larger than anyone had
+        // planned for: the serving node's `write_frame` errored and dropped the
+        // link, and fresh nodes looped forever on zero connections.
+        //
+        // Pool-v2 is exactly that shape of surprise again. A shielded bundle is
+        // ~104 KB (96,586-byte proof + ciphertexts + ML-DSA pk/sig), so a block
+        // saturated with them reaches `MAX_BLOCK_WEIGHT` = 4 MiB — a thousand
+        // times a transfer-only block. Two such blocks already exceed the 6 MiB
+        // batch budget, so the SIZE cap is what stands between a v2-heavy chain
+        // and a repeat of 7168.
+        const MAX_BLOCK: usize = 4 * 1024 * 1024;
+        let n = size_capped_batch_len(SYNC_BATCH as usize, 12_000, |_| Some(MAX_BLOCK));
+        let bytes = n * MAX_BLOCK;
+
+        assert!(n >= 1, "the server must always make progress");
+        assert!(
+            bytes <= SYNC_BATCH_MAX_BYTES,
+            "a v2-saturated batch served {n} blocks = {bytes} bytes, over the \
+             {SYNC_BATCH_MAX_BYTES}-byte budget"
+        );
+        assert!(
+            bytes <= FRAME_CEILING,
+            "a v2-saturated batch must never reach the {FRAME_CEILING}-byte frame"
+        );
+        // A count-only cap would have served all 256 blocks = 1 GiB.
+        assert!(
+            n < SYNC_BATCH as usize,
+            "the size cap must bind before the count cap on v2-heavy blocks"
+        );
+    }
+
+    #[test]
+    fn a_single_oversized_block_is_still_served() {
+        // The batch loop serves at least one block even when it busts the
+        // budget — otherwise a chain containing one unusually large block
+        // would stall sync permanently, which is the 7168 failure by another
+        // route. That single block must still fit the transport frame.
+        const HUGE: usize = 5 * 1024 * 1024; // over the 6 MiB budget when paired
+        let n = size_capped_batch_len(SYNC_BATCH as usize, 12_000, |_| Some(HUGE));
+        assert_eq!(n, 1, "exactly one oversized block, never zero");
+        const { assert!(HUGE <= FRAME_CEILING) };
+    }
+
+    #[test]
     fn batch_never_exceeds_the_frame_across_mixed_sizes() {
         // Mixed small/large blocks (a realistic post-activity chain): whatever the cut,
         // the cumulative served bytes must never reach the transport frame ceiling.
