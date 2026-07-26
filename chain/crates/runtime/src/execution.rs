@@ -2506,7 +2506,7 @@ mod tests {
         let receipt = apply_transaction(&mut ledger, &stx, &active)
             .expect("an active tipped transfer is not dormant and must execute");
         assert!(
-            matches!(receipt.status, ExecutionStatus::Success { .. }),
+            matches!(receipt.status, ExecutionStatus::Success),
             "active fee-auction path must still succeed, got {:?}",
             receipt.status
         );

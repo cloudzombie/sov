@@ -31,11 +31,10 @@
 //! pure function of the state.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::OnceLock;
 
 use crate::domains::RESCUE_DOMAIN_MERKLE_NODE;
 use crate::hash::{merge_domain, PqDigest};
-use crate::tree::{MAX_TREE_LEAVES, TREE_DEPTH};
+use crate::tree::{empty_levels, MAX_TREE_LEAVES, TREE_DEPTH};
 
 /// How many recent v2 tree roots (anchors) consensus accepts a spend against
 /// (decision D5 — the same window shape as Orchard's, sized at 128). The ring
@@ -80,22 +79,11 @@ pub enum ShieldedV2StateError {
     /// defense in depth.
     #[error("pool-v2 state refuses the zero (dummy) digest")]
     ZeroDigest,
-    /// A persisted snapshot carried a non-canonical digest encoding.
-    #[error("non-canonical digest in pool-v2 snapshot ({0})")]
+    /// A digest carried a non-canonical field encoding (a limb `>= p`) —
+    /// either in a persisted snapshot or handed to a mutator. Such a digest
+    /// cannot survive a snapshot round-trip, so it never enters the state.
+    #[error("non-canonical digest in pool-v2 state ({0})")]
     Decode(&'static str),
-}
-
-/// `empty[l]` = digest of an empty subtree of height `l` (level 0 = leaf).
-/// Deterministic; computed once per process.
-fn empty_levels() -> &'static [PqDigest; TREE_DEPTH + 1] {
-    static EMPTY: OnceLock<[PqDigest; TREE_DEPTH + 1]> = OnceLock::new();
-    EMPTY.get_or_init(|| {
-        let mut empty = [PqDigest::ZERO; TREE_DEPTH + 1];
-        for l in 1..=TREE_DEPTH {
-            empty[l] = merge_domain(RESCUE_DOMAIN_MERKLE_NODE, empty[l - 1], empty[l - 1]);
-        }
-        empty
-    })
 }
 
 /// The root implied by a Merkle frontier of depth `ommers.len()`.
@@ -132,12 +120,12 @@ fn frontier_root(ommers: &[PqDigest], empty: &[PqDigest], size: u64) -> PqDigest
 fn frontier_append(ommers: &mut [PqDigest], size: u64, cm: PqDigest) -> bool {
     let mut acc = cm;
     let mut idx = size;
-    for level in 0..ommers.len() {
+    for slot in ommers.iter_mut() {
         if idx & 1 == 0 {
-            ommers[level] = acc;
+            *slot = acc;
             return true;
         }
-        acc = merge_domain(RESCUE_DOMAIN_MERKLE_NODE, ommers[level], acc);
+        acc = merge_domain(RESCUE_DOMAIN_MERKLE_NODE, *slot, acc);
         idx >>= 1;
     }
     false
@@ -283,10 +271,23 @@ impl ShieldedV2State {
         if commitments.contains(&PqDigest::ZERO) {
             return Err(ShieldedV2StateError::ZeroDigest);
         }
+        // Canonicality is a state invariant, not just a decoder rule: a digest
+        // with a limb >= p round-trips through `to_bytes` but is refused by
+        // `from_bytes`, so accepting one would make the state unrestorable from
+        // its own snapshot. Digests reaching here come from decoded wire
+        // bundles (already canonical), so this is defense in depth.
+        for cm in commitments {
+            if !cm.is_canonical() {
+                return Err(ShieldedV2StateError::Decode("commitment"));
+            }
+        }
         let mut batch = BTreeSet::new();
         for nf in nullifiers {
             if *nf == PqDigest::ZERO {
                 return Err(ShieldedV2StateError::ZeroDigest);
+            }
+            if !nf.is_canonical() {
+                return Err(ShieldedV2StateError::Decode("nullifier"));
             }
             let bytes = nf.to_bytes();
             if self.nullifiers.contains(&bytes) || !batch.insert(bytes) {
@@ -402,12 +403,7 @@ mod tests {
     /// depth 20. `reference_root_agrees_with_the_stark_reference_tree` proves
     /// this really is that algorithm.
     fn reference_root(leaves: &[PqDigest], depth: usize) -> PqDigest {
-        fn subtree(
-            leaves: &[PqDigest],
-            empty: &[PqDigest],
-            level: usize,
-            index: u64,
-        ) -> PqDigest {
+        fn subtree(leaves: &[PqDigest], empty: &[PqDigest], level: usize, index: u64) -> PqDigest {
             let first = (index as usize) << level;
             if first >= leaves.len() {
                 return empty[level];
@@ -565,7 +561,7 @@ mod tests {
         // the full 2^TREE_DEPTH again, `root()` would return the empty-tree
         // root for a full pool.
         assert_eq!(MAX_V2_NOTES, (1u64 << TREE_DEPTH) - 1);
-        assert!(MAX_V2_NOTES < (1u64 << TREE_DEPTH));
+        const { assert!(MAX_V2_NOTES < (1u64 << TREE_DEPTH)) };
         assert_eq!(MAX_V2_NOTES, crate::tree::MAX_TREE_LEAVES);
         // Every reachable append index has a free ommer slot, and every
         // reachable size is fully visible to the depth-TREE_DEPTH bit walk.
@@ -640,10 +636,9 @@ mod tests {
             ShieldedV2State::new().root(),
             "documenting WHY 2^TREE_DEPTH must be unreachable"
         );
-        assert!(
-            (1u64 << TREE_DEPTH) > MAX_V2_NOTES,
-            "and it is unreachable: no mutator can take size past MAX_V2_NOTES"
-        );
+        // ...and it is unreachable: no mutator can take size past
+        // MAX_V2_NOTES, which the build itself now enforces.
+        const { assert!((1u64 << TREE_DEPTH) > MAX_V2_NOTES) };
     }
 
     /// Release-only (~2 minutes): fill the REAL depth-20 tree to capacity with
@@ -671,7 +666,10 @@ mod tests {
             state.apply(&[], &[d(0)]),
             Err(ShieldedV2StateError::TreeFull)
         );
-        assert!(reference.append(d(0)).is_none(), "reference caps identically");
+        assert!(
+            reference.append(d(0)).is_none(),
+            "reference caps identically"
+        );
     }
 
     #[test]
@@ -776,6 +774,38 @@ mod tests {
             restored.anchors().collect::<Vec<_>>(),
             state.anchors().collect::<Vec<_>>(),
             "the anchor ring (including evictions) is reproduced exactly"
+        );
+    }
+
+    #[test]
+    fn apply_refuses_non_canonical_digests_so_snapshots_always_restore() {
+        // `PqDigest`'s limbs are a public field, so a hand-built digest can
+        // hold a limb >= p. It survives `to_bytes` but `from_bytes` refuses
+        // it — a state that accepted one could not be reloaded from its own
+        // snapshot. Refuse at the door instead, in both roles.
+        let non_canonical = PqDigest([u64::MAX, 0, 0, 0]);
+        assert!(!non_canonical.is_canonical());
+        assert!(PqDigest::from_bytes(&non_canonical.to_bytes()).is_none());
+
+        let mut state = ShieldedV2State::new();
+        let before = state.commitment();
+        assert_eq!(
+            state.apply(&[], &[non_canonical]),
+            Err(ShieldedV2StateError::Decode("commitment"))
+        );
+        assert_eq!(
+            state.apply(&[non_canonical], &[d(1)]),
+            Err(ShieldedV2StateError::Decode("nullifier"))
+        );
+        assert_eq!(state.commitment(), before, "rejected apply mutates nothing");
+        assert!(state.is_empty());
+
+        // Totality: whatever `apply` accepts, `restore` reproduces exactly.
+        state.apply(&[d(1)], &[d(2), d(3)]).expect("apply");
+        let (cms, nfs) = state.snapshot();
+        assert_eq!(
+            ShieldedV2State::restore(&cms, &nfs).expect("restore"),
+            state
         );
     }
 

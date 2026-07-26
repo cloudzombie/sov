@@ -1958,6 +1958,7 @@ impl Ledger {
     ///   empty v2 pool, exactly the state it was saved with;
     /// - a current blob can never mis-parse as legacy — the appended v2 entry
     ///   is trailing bytes to the legacy decoder (clean error).
+    ///
     /// There is no configuration in which committed pool-v2 state is silently
     /// dropped: the current writer always persists it, and only genuinely-old
     /// blobs (which by definition hold none) take the empty-v2 path.
