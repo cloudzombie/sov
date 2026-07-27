@@ -1354,7 +1354,10 @@ fn shielded_pools_view(
 /// The address is PUBLIC key material — a receiving address, not a secret — so it is
 /// written with normal permissions, unlike the keystore.
 fn export_v2_address(addr: &str, owner_tag: &str) -> Result<String, String> {
-    let dir = home_dir()?.join(".sov-station");
+    // Through `station_dir`, NOT `home_dir().join(".sov-station")` — otherwise a dev
+    // build with `SOV_STATION_DIR` set would still write into the operator's live
+    // wallet directory, which is the entire thing that override exists to prevent.
+    let dir = station_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(v2_address_filename(owner_tag));
     let body = format!(
@@ -11146,6 +11149,36 @@ mod tests {
             Some(v) => std::env::set_var("SOV_STATION_DIR", v),
             None => std::env::remove_var("SOV_STATION_DIR"),
         }
+    }
+
+    /// EVERY path under the data directory must be derived from `station_dir`.
+    ///
+    /// The override is only worth as much as its coverage: one function that still
+    /// builds its own `home_dir().join(".sov-station")` re-opens the live wallet
+    /// directory for a dev build, and it would do so silently. This is a source-level
+    /// check because the failure is a path that is never constructed at test time —
+    /// the pool-v2 address export was exactly such a site, added after the override
+    /// landed and missed by it.
+    #[test]
+    fn no_path_bypasses_the_station_dir_override() {
+        let src = include_str!("gui.rs");
+        // Scan the SHIPPING code only — this test module necessarily mentions the
+        // pattern it is looking for, and would otherwise flag itself.
+        let shipping = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let offenders: Vec<&str> = shipping
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//"))
+            // The one legitimate construction lives inside `station_dir` itself.
+            .filter(|l| l.contains(".sov-station") && l.contains("home_dir"))
+            .collect();
+        assert_eq!(
+            offenders.len(),
+            1,
+            "exactly one site may join home_dir with .sov-station (station_dir's own \
+             fallback); every other path must go through station_dir(). Found:\n{}",
+            offenders.join("\n")
+        );
     }
 
     use super::*;
