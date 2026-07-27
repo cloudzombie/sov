@@ -1273,7 +1273,13 @@ fn shielded_pools_view(
                     .deshield_resets_at
                     .filter(|_| real)
                     .map(|h| group_thousands(h as u128));
-                stat(ui, "window resets at block", resets.as_deref(), "", ty::BODY);
+                stat(
+                    ui,
+                    "window resets at block",
+                    resets.as_deref(),
+                    "",
+                    ty::BODY,
+                );
             },
         )
     };
@@ -1302,7 +1308,13 @@ fn shielded_pools_view(
                 );
                 ui.add_space(sp::S);
                 let window = real.then(|| group_thousands(info.deshield_window_blocks as u128));
-                stat(ui, "de-shield window", window.as_deref(), "blocks", ty::BODY);
+                stat(
+                    ui,
+                    "de-shield window",
+                    window.as_deref(),
+                    "blocks",
+                    ty::BODY,
+                );
                 ui.add_space(sp::S);
                 // The anchor is the Merkle root a spend proves membership against.
                 // Elided, because it is a 32-byte hash and only its ends are checkable.
@@ -5666,7 +5678,7 @@ fn interval_sparkline(ui: &mut egui::Ui, blocks: &[BlockRow], target_ms: u64) {
 }
 
 fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
-    ui.heading("Mining");
+    ui.label(egui::RichText::new("Mining").size(ty::TITLE).strong());
     ui.label(
         egui::RichText::new(
             "Proof of work: a miner hashes the block header with a changing nonce until the seal \
@@ -5688,50 +5700,72 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
     };
 
     // ── Hashpower hero — your measured rate vs the estimated network rate, up front ──
+    //
+    // Both figures go through `stat`, so they share the micro-label + tabular-figure
+    // treatment used everywhere else and the two columns line up on the same baseline.
+    // The network figure is an ESTIMATE derived from difficulty and observed block
+    // times, and its label says so — it is never presented as a measurement.
     card(ui, |ui| {
         ui.columns(2, |c| {
-            c[0].label(
-                egui::RichText::new("YOUR HASHPOWER")
-                    .small()
-                    .color(palette::text_dim()),
-            );
             let yours = if s.local_hashrate > 0 {
-                fmt_hashrate(s.local_hashrate as f64)
-            } else if s.syncing {
-                "paused — syncing".to_string()
+                Some(fmt_hashrate(s.local_hashrate as f64))
             } else {
-                "—".to_string()
+                // Not measured. While syncing that has a reason worth stating; either
+                // way it is NOT "0 H/s", which would read as hardware failure.
+                None
             };
-            c[0].label(
-                egui::RichText::new(yours)
-                    .size(26.0)
-                    .strong()
-                    .color(palette::accent_hi()),
-            );
-            c[1].label(
-                egui::RichText::new("NETWORK HASHPOWER (est)")
-                    .small()
+            stat(&mut c[0], "your hashpower", yours.as_deref(), "", ty::HERO);
+            if yours.is_none() {
+                c[0].label(
+                    egui::RichText::new(if s.syncing {
+                        "paused while syncing — the node joins the chain before extending it"
+                    } else {
+                        "not mining"
+                    })
+                    .size(ty::SMALL)
                     .color(palette::text_dim()),
+                );
+            }
+            let net = net_hps.map(fmt_hashrate);
+            stat(
+                &mut c[1],
+                "network hashpower (estimated)",
+                net.as_deref(),
+                "",
+                ty::HERO,
             );
             c[1].label(
-                egui::RichText::new(net_hps.map(fmt_hashrate).unwrap_or_else(|| "—".to_string()))
-                    .size(26.0)
-                    .strong()
-                    .color(palette::text()),
+                egui::RichText::new(if net.is_some() {
+                    "estimate: difficulty ÷ observed block interval"
+                } else {
+                    "needs difficulty and two recent blocks to estimate"
+                })
+                .size(ty::SMALL)
+                .color(palette::text_dim()),
             );
         });
     });
-    ui.add_space(8.0);
+    ui.add_space(sp::L);
 
     // ── Block cadence sparkline — recent intervals at a glance ──
     if s.blocks.len() > 2 {
         ui.label(
-            egui::RichText::new("Block cadence — recent intervals (newest →)")
-                .small()
+            egui::RichText::new("BLOCK CADENCE — RECENT INTERVALS (NEWEST →)")
+                .size(ty::MICRO)
                 .color(palette::text_dim()),
         );
         interval_sparkline(ui, &s.blocks, s.target_block_ms);
-        ui.add_space(8.0);
+        // The bars encode interval as HEIGHT and band as colour. Height alone is
+        // readable in greyscale, but the band boundaries are not, so they are named
+        // here rather than left to the reader to infer from hue.
+        ui.label(
+            egui::RichText::new(
+                "bar height = interval · line = target · within 2× target, 2–4×, beyond 4×",
+            )
+            .size(ty::MICRO)
+            .color(palette::text_dim()),
+        );
+        ui.add_space(sp::L);
     }
 
     // ── Proof-of-Work card — the algorithm, difficulty, target, and the live proof ──
@@ -5755,7 +5789,7 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
             .num_columns(2)
             .spacing([24.0, 6.0])
             .show(ui, |ui| {
-                kv(ui, "Difficulty", &s.difficulty);
+                kv(ui, "Difficulty", &fmt_difficulty(&s.difficulty));
                 if let Some(d) = diff {
                     if d > 1.0 {
                         kv(
@@ -5788,13 +5822,17 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
                 kv(
                     ui,
                     "Height",
-                    &s.height.map(|h| h.to_string()).unwrap_or_default(),
+                    &s.height
+                        .map(|h| group_thousands(h as u128))
+                        .unwrap_or_default(),
                 );
                 kv(ui, "Block reward", &format!("{} XUS", xus(&s.reward)));
                 kv(
                     ui,
                     "Mempool",
-                    &s.mempool.map(|m| m.to_string()).unwrap_or_default(),
+                    &s.mempool
+                        .map(|m| group_thousands(m as u128))
+                        .unwrap_or_default(),
                 );
             });
     });
@@ -5832,9 +5870,13 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
 
     // ── Recent proofs of work — per-block nonces + solve cadence ──
     if s.blocks.len() > 1 {
-        ui.add_space(10.0);
-        ui.label(egui::RichText::new("Recent proofs of work").strong());
-        ui.add_space(4.0);
+        ui.add_space(sp::XL);
+        ui.label(
+            egui::RichText::new("Recent proofs of work")
+                .size(ty::SECTION)
+                .strong(),
+        );
+        ui.add_space(sp::S);
         egui::ScrollArea::vertical()
             .id_salt("recent-pow")
             .max_height(180.0)
@@ -5845,22 +5887,30 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
                     .spacing([18.0, 4.0])
                     .show(ui, |ui| {
                         for h in ["Height", "Interval", "Nonce", "Miner"] {
-                            ui.label(egui::RichText::new(h).weak());
+                            ui.label(
+                                egui::RichText::new(h.to_uppercase())
+                                    .size(ty::MICRO)
+                                    .color(palette::text_dim()),
+                            );
                         }
                         ui.end_row();
                         for (i, b) in s.blocks.iter().enumerate() {
-                            ui.monospace(b.height.to_string());
+                            ui.label(num(group_thousands(b.height as u128)).size(ty::SMALL));
                             let interval = s
                                 .blocks
                                 .get(i + 1)
                                 .and_then(|older| b.timestamp_ms.checked_sub(older.timestamp_ms));
-                            ui.monospace(
-                                interval
-                                    .map(|ms| format!("{:.1}s", ms as f64 / 1000.0))
-                                    .unwrap_or_else(|| "—".to_string()),
-                            );
-                            ui.monospace(b.nonce.to_string());
-                            ui.monospace(short_id(&b.miner));
+                            // An interval needs the NEXT (older) block to exist. The
+                            // oldest row in the window has none, so it is an explicit
+                            // dash — not "0.0s", which would read as an instant block.
+                            match interval {
+                                Some(ms) => ui.label(
+                                    num(format!("{:.1}s", ms as f64 / 1000.0)).size(ty::SMALL),
+                                ),
+                                None => ui.label(num_unknown().size(ty::SMALL)),
+                            };
+                            ui.label(num(group_thousands(b.nonce as u128)).size(ty::SMALL));
+                            ui.label(num(short_id(&b.miner)).size(ty::SMALL));
                             ui.end_row();
                         }
                     });
@@ -5868,27 +5918,43 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
     }
 
     // ── Miner registry ──
-    ui.add_space(10.0);
-    ui.label(egui::RichText::new("Miner registry").strong());
-    ui.add_space(4.0);
+    ui.add_space(sp::XL);
+    ui.label(
+        egui::RichText::new("Miner registry")
+            .size(ty::SECTION)
+            .strong(),
+    );
+    ui.add_space(sp::S);
     egui::Grid::new("miners")
         .num_columns(4)
         .striped(true)
         .spacing([20.0, 4.0])
         .show(ui, |ui| {
             for h in ["Account", "Blocks", "First", "Last"] {
-                ui.label(egui::RichText::new(h).weak());
+                ui.label(
+                    egui::RichText::new(h.to_uppercase())
+                        .size(ty::MICRO)
+                        .color(palette::text_dim()),
+                );
             }
             ui.end_row();
             if s.miners.is_empty() {
-                ui.label("—");
+                ui.label(
+                    egui::RichText::new(if s.online {
+                        "no miner has been seen in the recent blocks this node holds"
+                    } else {
+                        "no node is answering — the miner registry is unknown, not empty"
+                    })
+                    .size(ty::SMALL)
+                    .color(palette::text_dim()),
+                );
                 ui.end_row();
             }
             for m in &s.miners {
-                ui.monospace(short_id(&m.account));
-                ui.monospace(m.blocks.to_string());
-                ui.monospace(m.first.to_string());
-                ui.monospace(m.last.to_string());
+                ui.label(num(short_id(&m.account)).size(ty::SMALL));
+                ui.label(num(group_thousands(m.blocks as u128)).size(ty::SMALL));
+                ui.label(num(group_thousands(m.first as u128)).size(ty::SMALL));
+                ui.label(num(group_thousands(m.last as u128)).size(ty::SMALL));
                 ui.end_row();
             }
         });
@@ -8274,7 +8340,7 @@ impl Station {
             // scan that has not run yields `None`, which the view renders as "unknown",
             // never as a zero balance.
             let v1_own = (for_this && sv.scanned_height > 0)
-                .then(|| (sv.balance as u128, sv.notes, sv.scanned_height));
+                .then_some((sv.balance as u128, sv.notes, sv.scanned_height));
             shielded_pools_view(ui, &snap, v1_own);
             if sv.scanning {
                 ui.add_space(sp::S);
@@ -11512,6 +11578,271 @@ mod tests {
         assert_ne!(dw, palette::warning(), "warning differs by mode");
         assert_ne!(dl, palette::link(), "link differs by mode");
         // Restore the process-wide default so nothing else observes light mode.
+        palette::set_dark(true);
+    }
+
+    // ── Pool v1 / v2 surfaces ────────────────────────────────────────────────
+    //
+    // These cover the pure logic behind every pool-v2 pathway: the wire→struct
+    // mapping, the THREE-WAY state selection that keeps "not active yet" from ever
+    // reading as "empty", and the display maths for a ~1.8 KB address.
+
+    /// The reply the live mainnet node CANNOT give (it predates the method), used to
+    /// exercise the dormant path. Field names mirror `sov_getShieldedV2Info`.
+    fn v2_reply(active: bool) -> serde_json::Value {
+        serde_json::json!({
+            "active": active,
+            "poolValue": "0",
+            "noteCount": 0,
+            "nullifierCount": 0,
+            "anchor": "00".repeat(32),
+            "deshieldableNowGrains": "0",
+            "deshieldLimitGrains": "2100000000000000",
+            "deshieldWindowBlocks": 576,
+            "windowResetsAtHeight": 12086,
+            "height": 12570,
+        })
+    }
+
+    #[test]
+    fn shielded_v2_info_requires_the_activation_flag() {
+        // `active` is the ONLY thing separating Dormant from Active, so a reply we
+        // cannot read it from must not parse at all — otherwise the UI would render a
+        // confident "NOT ACTIVE YET, 0 XUS" it never actually learned from a node.
+        assert!(shielded_v2_info(&serde_json::Value::Null).is_none());
+        assert!(shielded_v2_info(&serde_json::json!({})).is_none());
+        assert!(
+            shielded_v2_info(&serde_json::json!({ "active": "false" })).is_none(),
+            "a STRING is not the boolean flag; refuse rather than coerce"
+        );
+        // A well-formed reply parses every field through.
+        let got = shielded_v2_info(&v2_reply(false)).expect("well-formed reply parses");
+        assert!(!got.active);
+        assert_eq!(got.deshield_window_blocks, 576);
+        assert_eq!(got.deshield_limit, 2_100_000_000_000_000);
+        assert_eq!(got.height, 12570);
+        assert_eq!(got.anchor.len(), 64);
+    }
+
+    #[test]
+    fn pool_v2_state_keeps_all_three_cases_apart() {
+        let dormant = shielded_v2_info(&v2_reply(false)).unwrap();
+        let live = shielded_v2_info(&v2_reply(true)).unwrap();
+
+        // 1. Node too old / unreachable → UNAVAILABLE. This is the case the live
+        //    mainnet node at 127.0.0.1:8645 actually produces today: it answers
+        //    `-32601 method not found`, the poller stores None, and we must NOT
+        //    conclude the pool is dormant-and-empty from a question nobody answered.
+        assert_eq!(
+            PoolState::classify_v2(true, None),
+            PoolState::Unavailable,
+            "an unanswered query is UNKNOWN, never an empty pool"
+        );
+        // 2. Offline outranks any stale reading we may still be holding.
+        assert_eq!(
+            PoolState::classify_v2(false, Some(&live)),
+            PoolState::Unavailable,
+            "a figure we can no longer confirm is not a figure we may present"
+        );
+        // 3. Answered + bit 2 unarmed → DORMANT (zero is a consensus proof).
+        assert_eq!(
+            PoolState::classify_v2(true, Some(&dormant)),
+            PoolState::Dormant
+        );
+        // 4. Answered + armed → ACTIVE (zero would be a real balance).
+        assert_eq!(PoolState::classify_v2(true, Some(&live)), PoolState::Active);
+
+        // The three must be DISTINGUISHABLE without colour: distinct words AND
+        // distinct shapes. Colour is the third, redundant channel.
+        let all = [
+            PoolState::Unavailable,
+            PoolState::Dormant,
+            PoolState::Active,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.word(), b.word(), "states must differ in WORDS");
+                assert_ne!(a.glyph(), b.glyph(), "states must differ in SHAPE");
+                assert_ne!(a.color(), b.color(), "and in colour too");
+                assert_ne!(
+                    a.explanation(Pool::V2),
+                    b.explanation(Pool::V2),
+                    "each state needs its own sentence"
+                );
+            }
+        }
+
+        // Only UNAVAILABLE forbids printing digits. Dormant DOES print — its zero is
+        // a real reading, and suppressing it would hide the very fact we want shown.
+        assert!(!PoolState::Unavailable.figures_are_real());
+        assert!(PoolState::Dormant.figures_are_real());
+        assert!(PoolState::Active.figures_are_real());
+    }
+
+    #[test]
+    fn pool_v1_is_never_dormant_and_never_fakes_a_zero() {
+        // v1 has been live since genesis: the only question is whether the node told
+        // us anything, so "dormant" is not one of its possible states.
+        assert_eq!(PoolState::classify_v1(true, true), PoolState::Active);
+        assert_eq!(
+            PoolState::classify_v1(true, false),
+            PoolState::Unavailable,
+            "a node that does not serve sov_getShieldedInfo leaves v1 UNKNOWN, not 0"
+        );
+        assert_eq!(PoolState::classify_v1(false, true), PoolState::Unavailable);
+        assert_ne!(PoolState::classify_v1(true, true), PoolState::Dormant);
+        assert_ne!(PoolState::classify_v1(true, false), PoolState::Dormant);
+    }
+
+    #[test]
+    fn pool_v1_is_never_described_as_post_quantum() {
+        // The single most damaging thing this UI could claim. v1 is Orchard/Halo2 and
+        // its privacy is discrete-log based; only v2 is post-quantum.
+        assert_eq!(Pool::V1.pq_claim(), "NOT post-quantum");
+        assert_eq!(Pool::V2.pq_claim(), "post-quantum");
+        assert!(
+            !Pool::V1.crypto().to_lowercase().contains("kem"),
+            "v1 must not name post-quantum primitives"
+        );
+        assert!(Pool::V2.crypto().contains("ML-KEM-768"));
+        // And the v1 "active" sentence must itself carry the disclaimer, because it is
+        // the one an operator reads in the normal, everyday case.
+        assert!(PoolState::Active
+            .explanation(Pool::V1)
+            .contains("NOT post-quantum"));
+    }
+
+    #[test]
+    fn a_v2_send_is_never_offered() {
+        // Pool v2 is a hard consensus reject while dormant. The refusal lives in
+        // `SendRoute`: the v2 route deliberately fails `is_valid()`, which is what
+        // keeps the Send button disabled. This pins that so no future edit can make
+        // a v2 send appear possible by "fixing" the route.
+        assert!(
+            !SendRoute::ShieldedV2Unsupported.is_valid(),
+            "a v2 recipient must never enable Send"
+        );
+    }
+
+    #[test]
+    fn truncate_middle_is_char_safe_and_only_elides_when_needed() {
+        // A no-op below the threshold: a short address is shown whole, not pointlessly
+        // ellipsised.
+        assert_eq!(truncate_middle("abc", 2, 2), "abc");
+        assert_eq!(truncate_middle("", 4, 4), "");
+        // Elision keeps exactly `head` and `tail` characters around one ellipsis.
+        let s: String = std::iter::repeat_n('x', 200).collect();
+        let t = truncate_middle(&s, 22, 12);
+        assert_eq!(t.chars().count(), 22 + 1 + 12);
+        assert!(t.contains('…'));
+        assert!(t.starts_with(&"x".repeat(22)));
+        // MULTI-BYTE safety: slicing by bytes here would panic mid-sequence. The real
+        // input is bech32m ASCII, but a panic in a wallet is never acceptable, so the
+        // char-boundary guarantee is pinned rather than assumed.
+        let wide: String = std::iter::repeat_n('é', 100).collect();
+        let tw = truncate_middle(&wide, 5, 5);
+        assert_eq!(tw.chars().count(), 11);
+        assert!(tw.starts_with("ééééé") && tw.ends_with("ééééé"));
+    }
+
+    #[test]
+    fn v2_address_export_filename_is_bound_to_the_owner_and_path_safe() {
+        // The tag is hex from the chain, but it reaches a filesystem path, so anything
+        // that is not a hex digit is dropped rather than trusted.
+        assert_eq!(
+            v2_address_filename("00ff00ff00ff00ff00ff"),
+            "sov-pool-v2-address-00ff00ff00ff00ff.txt"
+        );
+        for bad in ["../../etc/passwd", "a/b", "..", "", "zzz"] {
+            let f = v2_address_filename(bad);
+            assert!(
+                !f.contains('/') && !f.contains(".."),
+                "unsafe name from {bad:?}: {f}"
+            );
+            assert!(f.ends_with(".txt"));
+        }
+        // Two different wallets never collide on one file.
+        assert_ne!(v2_address_filename("aaaa"), v2_address_filename("bbbb"));
+        // A tag with no hex at all still yields a usable, generic name.
+        assert_eq!(v2_address_filename("zzz"), "sov-pool-v2-address.txt");
+    }
+
+    #[test]
+    fn difficulty_formats_without_inventing_a_value() {
+        assert_eq!(fmt_difficulty("1234567.8901"), "1,234,567");
+        assert_eq!(fmt_difficulty("42"), "42");
+        // Absent stays absent — `kv` turns "" into an em-dash. A value the node did
+        // not send must never become "0".
+        assert_eq!(fmt_difficulty(""), "");
+        assert_eq!(fmt_difficulty("   "), "");
+        // Unparseable is passed through verbatim rather than prettified into a lie.
+        assert_eq!(fmt_difficulty("NaN"), "NaN");
+    }
+
+    #[test]
+    fn hashrate_units_are_consistent_and_scale_at_the_right_boundaries() {
+        assert_eq!(fmt_hashrate(0.0), "0 H/s");
+        assert_eq!(fmt_hashrate(999.0), "999 H/s");
+        assert_eq!(fmt_hashrate(1_000.0), "1.00 kH/s");
+        assert_eq!(fmt_hashrate(1_500_000.0), "1.50 MH/s");
+        assert_eq!(fmt_hashrate(2_000_000_000.0), "2.00 GH/s");
+    }
+
+    #[test]
+    fn link_state_keeps_offline_isolated_and_synced_apart_by_shape() {
+        let snap = |online, syncing, peers: Option<usize>| Snapshot {
+            online,
+            syncing,
+            peers,
+            ..Default::default()
+        };
+        assert_eq!(LinkState::of(&snap(false, false, None)), LinkState::Offline);
+        assert_eq!(
+            LinkState::of(&snap(true, true, Some(3))),
+            LinkState::Syncing
+        );
+        assert_eq!(
+            LinkState::of(&snap(true, false, Some(3))),
+            LinkState::Connected
+        );
+        assert_eq!(
+            LinkState::of(&snap(true, false, Some(0))),
+            LinkState::Isolated,
+            "up but peerless is its own state, not 'connected'"
+        );
+        // Previously OFFLINE, NOT CONNECTED and CONNECTED were all drawn as a filled
+        // dot separated only by hue. Shapes must now be distinct.
+        let all = [
+            LinkState::Offline,
+            LinkState::Syncing,
+            LinkState::Connected,
+            LinkState::Isolated,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.glyph(), b.glyph(), "link states must differ in SHAPE");
+                assert_ne!(a.word(), b.word());
+            }
+        }
+    }
+
+    #[test]
+    fn the_pool_state_palette_works_in_both_themes() {
+        // Light mode was historically an afterthought; the two new signal colours must
+        // be real light-mode values, not the dark ones reused.
+        for dark in [true, false] {
+            palette::set_dark(dark);
+            let (d, u) = (palette::dormant(), palette::unknown());
+            assert_ne!(d, u, "dormant and unknown must not collide (dark={dark})");
+            assert_ne!(d, palette::warning(), "dormant is not a warning");
+            assert_ne!(d, palette::error(), "dormant is not an error");
+            assert_ne!(u, palette::text(), "unknown must be dimmer than body text");
+        }
+        palette::set_dark(true);
+        let dark_pair = (palette::dormant(), palette::unknown());
+        palette::set_dark(false);
+        assert_ne!(dark_pair.0, palette::dormant(), "dormant differs by mode");
+        assert_ne!(dark_pair.1, palette::unknown(), "unknown differs by mode");
         palette::set_dark(true);
     }
 }
