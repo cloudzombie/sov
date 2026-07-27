@@ -60,6 +60,11 @@ fi
 STEP=0
 fail() { echo "${RED}${BOLD}✗ GATE FAILED:${RST} $*" >&2; exit 1; }
 ok()   { echo "${GRN}✓${RST} $*"; }
+# A non-fatal advisory. Distinct from skip(): skip() means "a check did not run and
+# --strict forbids that", whereas warn() means "the check ran and could not reach a
+# verdict for a reason outside this repository". A release must not be hostage to a
+# third party's downtime, so warn() never exits non-zero even under --strict.
+warn() { echo "${YEL}⚠ ${RST}$*"; }
 skip() {
   if [ "$STRICT" = "1" ]; then fail "$* (—strict: no skips allowed in CI)"; fi
   echo "${YEL}⁃ SKIP:${RST} $* ${DIM}(CI runs this unconditionally)${RST}"
@@ -153,6 +158,46 @@ ok "consensus invariants + cross-impl KAT vectors hold"
 # a batch of fresh wallets and proves ZERO collisions plus a statistical randomness
 # battery (monobit · byte χ² · Shannon entropy · serial correlation) on the RAW
 # entropy that seeds them — so a biased/stuck RNG can never ship in a release.
+# ── CHECKPOINT STALENESS ──────────────────────────────────────────────────────
+# The mainnet assumevalid anchor is NOT self-maintaining, and has now gone stale
+# three times (5000 -> 6800 -> 8300 -> 12800). Every time, the same field failure:
+# a fresh node fast-syncs to the anchor, then re-runs RandomX for thousands of
+# blocks, starving its own P2P thread until it drops every peer and loops on zero
+# connections. Refreshing the anchor without a guard just schedules the next one.
+#
+# So the gate maintains it. If the newest baked checkpoint has fallen more than
+# CHECKPOINT_MAX_LAG_BLOCKS behind the live tip, the release is refused.
+#
+# The tip is read from a public relay. If NO relay answers, this is a WARNING and
+# not a failure: the release must not be hostage to someone else's downtime, and a
+# stale anchor degrades sync speed rather than correctness.
+banner "Checkpoint freshness (assumevalid anchor vs live tip)"
+CP_MAX_LAG="$(grep -oE 'CHECKPOINT_MAX_LAG_BLOCKS: u64 = [0-9_]+' chain/crates/rpc/src/daemon.rs | grep -oE '[0-9_]+$' | tr -d _)"
+CP_NEWEST="$(grep -oE '^\s+[0-9]+,$' -A0 chain/crates/rpc/src/daemon.rs >/dev/null 2>&1; \
+  awk '/const MAINNET_CHECKPOINTS/,/^\];/' chain/crates/rpc/src/daemon.rs \
+  | grep -oE '^[[:space:]]+[0-9]+,$' | tr -d ' ,' | sort -n | tail -1)"
+: "${CP_MAX_LAG:=2000}"
+if [ -z "${CP_NEWEST:-}" ]; then
+  fail "could not read the newest MAINNET_CHECKPOINTS height from daemon.rs"
+fi
+CP_TIP=""
+for relay in 137.184.83.91 143.198.219.31 164.92.141.24; do
+  CP_TIP="$(curl -s --max-time 8 -X POST "http://$relay:8645" \
+    -H 'content-type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"sov_getHeight","params":{}}' 2>/dev/null \
+    | sed -n 's/.*"result":[[:space:]]*\([0-9]*\).*/\1/p')"
+  [ -n "$CP_TIP" ] && break
+done
+if [ -z "$CP_TIP" ]; then
+  warn "no relay answered — cannot check checkpoint freshness (newest anchor: $CP_NEWEST). NOT failing the release for someone else's downtime."
+else
+  CP_LAG=$(( CP_TIP - CP_NEWEST ))
+  if [ "$CP_LAG" -gt "$CP_MAX_LAG" ]; then
+    fail "assumevalid checkpoint is STALE: newest anchor $CP_NEWEST, live tip $CP_TIP (lag $CP_LAG > $CP_MAX_LAG). A fresh node would re-run RandomX for ~$CP_LAG blocks and stall its own P2P. Pin a new checkpoint in MAINNET_CHECKPOINTS (confirm the hash on ALL THREE relays first, at a depth well past finality), then re-run."
+  fi
+  ok "checkpoint fresh — anchor $CP_NEWEST, tip $CP_TIP (lag $CP_LAG <= $CP_MAX_LAG)"
+fi
+
 banner "Key pipeline (collision-free + randomness battery)"
 ( cd chain && cargo run --quiet -p sov-rpc --bin sov-selfcheck -- keys --count 3000 ) \
   || fail "key-generation self-check failed (collision or randomness battery)"
@@ -181,6 +226,19 @@ cargo clippy --manifest-path tools/sov-stratum/Cargo.toml --all-targets -- -D wa
 cargo test --manifest-path tools/sov-stratum/Cargo.toml \
   || fail "sov-stratum: tests failed"
 ok "sov-stratum bridge builds, lints, and tests clean"
+
+# ── 6e. the sharechain (tools/sov-sharechain/) ──────────────────────────────
+# Also a SEPARATE cargo workspace. It decides who a pool pays, so a regression
+# here is a regression in somebody's income even though it touches no consensus
+# code — it must not be able to bypass the gate either.
+banner "Sharechain (tools/sov-sharechain/): fmt · clippy · tests"
+cargo fmt --manifest-path tools/sov-sharechain/Cargo.toml --all -- --check \
+  || fail "sov-sharechain: formatting drift"
+cargo clippy --manifest-path tools/sov-sharechain/Cargo.toml --all-targets -- -D warnings \
+  || fail "sov-sharechain: clippy issues"
+cargo test --manifest-path tools/sov-sharechain/Cargo.toml \
+  || fail "sov-sharechain: tests failed"
+ok "sov-sharechain builds, lints, and tests clean"
 
 # ── 7. wasm contracts (mirror CI's `contracts` job exactly) ──────────────────
 # Scoped to chain/contracts — the no_std guest crate — NOT the whole workspace.

@@ -44,10 +44,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fips203::ml_kem_768;
-use fips203::traits::{Decaps as _, Encaps as _, KeyGen as _, SerDes as _};
-use snow::{Builder, TransportState};
+use snow::TransportState;
 
+use crate::link::{noise_handshake, pq_handshake};
 use crate::message::NetMessage;
 use crate::pq::PqChannel;
 
@@ -58,10 +57,6 @@ const MAX_FRAME: usize = 8 * 1024 * 1024;
 /// Noise caps one transport message at 65535 bytes; 16 of those are the AEAD tag,
 /// leaving this much plaintext per chunk. Larger application frames are split.
 const NOISE_MAX_PLAINTEXT: usize = 65535 - 16;
-
-/// The Noise pattern + cipher suite: XX (mutual, no pre-shared static keys) over
-/// X25519, ChaCha20-Poly1305, and BLAKE2s.
-const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 
 /// How long the Noise handshake may take before the connection is abandoned.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1190,148 +1185,6 @@ fn setup_connection(
     Ok(())
 }
 
-/// Perform a Noise XX handshake over `stream`, returning the transport-mode cipher
-/// and the handshake hash (a unique per-connection channel fingerprint, identical
-/// on both ends, used for `Hello` channel binding). The static key is generated per
-/// connection; peer identity is authenticated by the application-level signed
-/// [`Hello`](NetMessage::Hello) once the channel is up.
-fn noise_handshake(
-    stream: &mut TcpStream,
-    initiator: bool,
-) -> io::Result<(TransportState, Vec<u8>)> {
-    let params = NOISE_PARAMS
-        .parse()
-        .map_err(|_| io::Error::other("invalid Noise params"))?;
-    let builder = Builder::new(params);
-    let keypair = builder
-        .generate_keypair()
-        .map_err(|e| io::Error::other(format!("noise keygen: {e}")))?;
-    let builder = builder.local_private_key(&keypair.private);
-    let mut hs = if initiator {
-        builder.build_initiator()
-    } else {
-        builder.build_responder()
-    }
-    .map_err(|e| io::Error::other(format!("noise build: {e}")))?;
-
-    let mut buf = [0u8; 65535];
-    // XX is three messages: -> e ; <- e,ee,s,es ; -> s,se. The initiator writes
-    // the 1st and 3rd, the responder the 2nd.
-    if initiator {
-        let n = hs
-            .write_message(&[], &mut buf)
-            .map_err(|e| io::Error::other(format!("noise msg1: {e}")))?;
-        write_raw(stream, &buf[..n])?;
-        let msg = read_raw(stream)?;
-        hs.read_message(&msg, &mut buf)
-            .map_err(|e| io::Error::other(format!("noise msg2: {e}")))?;
-        let n = hs
-            .write_message(&[], &mut buf)
-            .map_err(|e| io::Error::other(format!("noise msg3: {e}")))?;
-        write_raw(stream, &buf[..n])?;
-    } else {
-        let msg = read_raw(stream)?;
-        hs.read_message(&msg, &mut buf)
-            .map_err(|e| io::Error::other(format!("noise msg1: {e}")))?;
-        let n = hs
-            .write_message(&[], &mut buf)
-            .map_err(|e| io::Error::other(format!("noise msg2: {e}")))?;
-        write_raw(stream, &buf[..n])?;
-        let msg = read_raw(stream)?;
-        hs.read_message(&msg, &mut buf)
-            .map_err(|e| io::Error::other(format!("noise msg3: {e}")))?;
-    }
-    // Capture the handshake hash before consuming the handshake state. Both ends
-    // derive the identical value, so it uniquely identifies this channel.
-    let handshake_hash = hs.get_handshake_hash().to_vec();
-    let transport = hs
-        .into_transport_mode()
-        .map_err(|e| io::Error::other(format!("noise transport: {e}")))?;
-    Ok((transport, handshake_hash))
-}
-
-/// Run the hybrid post-quantum key exchange inside the freshly-established
-/// Noise channel: the initiator sends an ephemeral ML-KEM-768 encapsulation
-/// key; the responder encapsulates and returns the ciphertext; both derive
-/// the same 32-byte KEM secret and build the inner [`PqChannel`] bound to
-/// this connection's Noise handshake hash. Any failure aborts the connection
-/// — there is **no fallback** to a classical-only channel.
-fn pq_handshake(
-    stream: &mut TcpStream,
-    noise: &mut TransportState,
-    initiator: bool,
-    handshake_hash: &[u8],
-) -> io::Result<PqChannel> {
-    if initiator {
-        let (ek, dk) = ml_kem_768::KG::try_keygen()
-            .map_err(|e| io::Error::other(format!("ml-kem keygen: {e}")))?;
-        noise_send(stream, noise, &ek.into_bytes())?;
-        let ct_bytes = noise_recv(stream, noise)?;
-        let ct: [u8; ml_kem_768::CT_LEN] = ct_bytes
-            .try_into()
-            .map_err(|_| io::Error::other("ml-kem ciphertext has the wrong length"))?;
-        let ct = ml_kem_768::CipherText::try_from_bytes(ct)
-            .map_err(|e| io::Error::other(format!("ml-kem ciphertext: {e}")))?;
-        let secret = dk
-            .try_decaps(&ct)
-            .map_err(|e| io::Error::other(format!("ml-kem decaps: {e}")))?;
-        Ok(PqChannel::new(handshake_hash, &secret.into_bytes(), true))
-    } else {
-        let ek_bytes = noise_recv(stream, noise)?;
-        let ek: [u8; ml_kem_768::EK_LEN] = ek_bytes
-            .try_into()
-            .map_err(|_| io::Error::other("ml-kem encaps key has the wrong length"))?;
-        let ek = ml_kem_768::EncapsKey::try_from_bytes(ek)
-            .map_err(|e| io::Error::other(format!("ml-kem encaps key: {e}")))?;
-        let (secret, ct) = ek
-            .try_encaps()
-            .map_err(|e| io::Error::other(format!("ml-kem encaps: {e}")))?;
-        noise_send(stream, noise, &ct.into_bytes())?;
-        Ok(PqChannel::new(handshake_hash, &secret.into_bytes(), false))
-    }
-}
-
-/// Send one Noise-encrypted message (single chunk; the KEM material fits well
-/// under the 64 KiB Noise cap), framed with a 4-byte length.
-fn noise_send(stream: &mut TcpStream, noise: &mut TransportState, data: &[u8]) -> io::Result<()> {
-    let mut buf = [0u8; 65535];
-    let n = noise
-        .write_message(data, &mut buf)
-        .map_err(|e| io::Error::other(format!("noise encrypt: {e}")))?;
-    write_raw(stream, &buf[..n])
-}
-
-/// Receive one Noise-encrypted message framed with a 4-byte length.
-fn noise_recv(stream: &mut TcpStream, noise: &mut TransportState) -> io::Result<Vec<u8>> {
-    let ct = read_raw(stream)?;
-    let mut buf = [0u8; 65535];
-    let n = noise
-        .read_message(&ct, &mut buf)
-        .map_err(|e| io::Error::other(format!("noise decrypt: {e}")))?;
-    Ok(buf[..n].to_vec())
-}
-
-/// Write a raw, *unencrypted* length-prefixed frame — used only for the Noise
-/// handshake messages, before the encrypted channel exists.
-fn write_raw(stream: &mut TcpStream, data: &[u8]) -> io::Result<()> {
-    stream.write_all(&(data.len() as u32).to_be_bytes())?;
-    stream.write_all(data)?;
-    stream.flush()
-}
-
-/// Read a raw, *unencrypted* length-prefixed handshake frame.
-fn read_raw(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
-    let mut len = [0u8; 4];
-    stream.read_exact(&mut len)?;
-    let n = u32::from_be_bytes(len) as usize;
-    if n == 0 || n > 65535 {
-        return Err(io::Error::other("invalid handshake frame length"));
-    }
-    let mut data = vec![0u8; n];
-    stream.read_exact(&mut data)?;
-    Ok(data)
-}
-
 /// A per-node-instance nonce (pid + time), embedded in the discovery beacon so a
 /// node can recognize and ignore its OWN announcement looped back to it — different
 /// processes/machines get different values; the same node always sends the same one.
@@ -1720,6 +1573,11 @@ fn write_frame(peer: &Peer, message: &NetMessage) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The handshake now lives in `crate::link` (it was MOVED, not copied). These
+    // tests still exercise it from here, which is the point: the same coverage
+    // that guarded the transport before the extraction guards it after.
+    use crate::link::{noise_send, pq_handshake, read_raw, write_raw, NOISE_PARAMS};
+    use snow::Builder;
     use sov_primitives::Hash;
     use std::time::{Duration, Instant};
 

@@ -844,7 +844,50 @@ const MAINNET_CHECKPOINTS: &[(u64, &str)] = &[
         8300,
         "98a4763ac0379f31aa1bfa861544979024d6bf3690ba92a88fff98346af40a4a",
     ),
+    // Pinned 2026-07-27 at tip 13027 (this block is ~227 deep — far past finality).
+    // The canonical hash was independently confirmed IDENTICAL on all three live
+    // relays (SFO/Frankfurt/Singapore) before pinning.
+    //
+    // The 8300 anchor had gone stale by ~4,700 blocks — the WORST drift yet, and the
+    // third time this has happened (5000 -> 6800 -> 8300 -> here). A fresh node
+    // fast-synced only to 8300 and then re-ran RandomX for every block above it:
+    // CPU-bound work that starves the P2P thread, so peers time out and the node
+    // loops on 0 connections. Moving the anchor to 12800 cuts that to ~230 blocks.
+    //
+    // Refreshing alone would just schedule the next occurrence, so this lands with a
+    // STALENESS GUARD: `checkpoint_staleness` in the release gate fails the build when
+    // the newest anchor falls too far behind the live tip. See scripts/release-gate.sh.
+    //
+    // Weak-subjectivity anchor, genesis-safe, additive — a chain reaching 12800 with a
+    // different hash is still rejected by the hash pin.
+    (
+        12800,
+        "91be1fa3add5a9bf2b7a40c1a3130d45b3e3ed35e8f04f0c91c80d9abafda475",
+    ),
 ];
+
+/// How far the newest baked checkpoint may fall behind the live tip before the
+/// release gate refuses to cut a release.
+///
+/// This exists because the anchor has now gone stale THREE times, each time
+/// producing the same field failure: a fresh node re-runs RandomX for thousands
+/// of blocks, starves its own P2P thread, and loops on zero peers. The anchor is
+/// not self-maintaining, so the gate maintains it.
+///
+/// 2,000 blocks is ~3.5 days at the 2.5-minute target — comfortably longer than a
+/// release cycle, short enough that a fresh node never faces more than a few
+/// minutes of catch-up validation.
+pub const CHECKPOINT_MAX_LAG_BLOCKS: u64 = 2_000;
+
+/// The newest baked checkpoint height for a chain (0 when none are baked).
+/// Exposed so the release gate can compare it against the live tip.
+pub fn newest_baked_checkpoint(chain_id: &str) -> u64 {
+    baked_checkpoints(chain_id)
+        .iter()
+        .map(|(h, _)| *h)
+        .max()
+        .unwrap_or(0)
+}
 
 /// The baked checkpoints for a chain, parsed to `(height, Hash)`. Empty for any non-
 /// mainnet chain (dev/test/testnet), so nothing is ever assumed-valid there.
@@ -1831,17 +1874,38 @@ impl Daemon {
                     .as_ref()
                     .map(|s| s.should_gate_mining())
                     .unwrap_or(false);
-                let phase =
-                    if sync_status.is_some() && peers == 0 && start_at.elapsed() < CONNECT_GRACE {
-                        // P2P is active but no peer has connected yet — wait (grace), so the
-                        // handshake gets full CPU and we don't mine ahead of the network. With
-                        // no P2P at all (standalone), there is nothing to wait for, so mine.
-                        MinePhase::Connecting
-                    } else if behind {
-                        MinePhase::Syncing
-                    } else {
-                        MinePhase::Mining
-                    };
+                // ASSUMEVALID SAFETY (finding A2): never mine on a chain whose newest
+                // pinned checkpoint has not actually been MATCHED.
+                //
+                // The hash pin only fires for a block AT a checkpoint height, so a branch
+                // that stops one block short of the newest checkpoint is pinned by nothing
+                // — yet every block on it is below the checkpoint height and therefore
+                // takes the PoW skip. A fabricated branch with no real work can be fed to
+                // a node that has not reached the checkpoint, and (because chainwork comes
+                // from DECLARED bits) can even outweigh the honest chain.
+                //
+                // Skipping the seal to sync fast is a reasonable trade. Producing blocks
+                // on top of a chain that nothing has pinned is not: it converts a local
+                // sync artefact into work published to the network. So mining waits until
+                // the checkpoint is satisfied. Chains with no checkpoints (dev/test) are
+                // unaffected — `checkpoint_satisfied()` is true for them.
+                let unpinned = node
+                    .lock()
+                    .map(|n| !n.chain().checkpoint_satisfied())
+                    .unwrap_or(false);
+                let phase = if unpinned {
+                    MinePhase::Syncing
+                } else if sync_status.is_some() && peers == 0 && start_at.elapsed() < CONNECT_GRACE
+                {
+                    // P2P is active but no peer has connected yet — wait (grace), so the
+                    // handshake gets full CPU and we don't mine ahead of the network. With
+                    // no P2P at all (standalone), there is nothing to wait for, so mine.
+                    MinePhase::Connecting
+                } else if behind {
+                    MinePhase::Syncing
+                } else {
+                    MinePhase::Mining
+                };
                 if last_phase != Some(phase) {
                     match phase {
                         MinePhase::Connecting => {

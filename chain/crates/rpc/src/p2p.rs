@@ -1234,6 +1234,42 @@ impl SyncState {
                     tcp.penalize_peer(peer, OVERSIZE_RESPONSE_PENALTY);
                     return;
                 }
+                // Linkage first: if this node is still proving its chain
+                // descends from the pinned checkpoint, these headers may be that
+                // proof. Each batch is verified as it lands, so a peer feeding a
+                // forged chain is cut off at its first bad header rather than
+                // after thousands are buffered.
+                {
+                    let mut consumed = false;
+                    if let Ok(mut n) = node.lock() {
+                        if !n.chain().checkpoint_linkage_ready() {
+                            let (want, _) = n.chain().linkage_progress();
+                            let starts_right = headers
+                                .first()
+                                .map(|h| h.height.get() == want.max(1))
+                                .unwrap_or(false);
+                            if starts_right {
+                                consumed = true;
+                                match n.chain_mut().extend_checkpoint_linkage(&headers) {
+                                    Ok(true) => p2p_log(
+                                        &self.log,
+                                        "✓ checkpoint linkage PROVEN — historical blocks may now \
+                                         skip re-verification",
+                                    ),
+                                    Ok(false) => {}
+                                    Err(_) => {
+                                        // A forged or gapped batch. Progress was
+                                        // reset by the chain; penalize and move on.
+                                        tcp.penalize_peer(peer, INVALID_BLOCK_PENALTY);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if consumed {
+                        return;
+                    }
+                }
                 match headers_fork_point(node, &headers) {
                     Some(fork) => {
                         self.bt_step.remove(&peer); // forward mode
@@ -1426,6 +1462,44 @@ impl SyncState {
         };
         let connected: HashSet<SocketAddr> = tcp.connected_peers().into_iter().collect();
         self.retain_connected(&connected);
+
+        // LINKAGE FIRST (finding A3). Until this node has PROVEN that its chain
+        // descends from a pinned checkpoint, the assumevalid seal-skip is not
+        // available and every historical block costs a full RandomX verification
+        // — thousands of them on a fresh node, which is exactly the stall the
+        // checkpoint exists to prevent.
+        //
+        // The proof is a chain of headers, and hash-linking costs a blake3 each
+        // rather than a RandomX evaluation, so this is cheap and worth doing
+        // before bodies. Headers are requested from where the proof left off,
+        // stopping at the pinned hash.
+        if let Some((_, pin_hash)) = {
+            let n = node.lock().ok();
+            n.and_then(|n| {
+                (!n.chain().checkpoint_linkage_ready()).then(|| n.chain().newest_checkpoint())
+            })
+            .flatten()
+        } {
+            let from = node
+                .lock()
+                .ok()
+                .and_then(|n| n.chain().linkage_progress().1);
+            let locator: Vec<Hash> = match from {
+                Some(h) => vec![h],
+                None => build_locator(node).into_iter().take(1).collect(),
+            };
+            if !locator.is_empty() {
+                for peer in connected.iter().take(1) {
+                    tcp.send(
+                        *peer,
+                        &NetMessage::GetHeaders {
+                            locator: locator.clone(),
+                            stop: pin_hash,
+                        },
+                    );
+                }
+            }
+        }
 
         // A live, un-timed-out request is outstanding: give it time rather than
         // re-asking or thrashing to another peer.

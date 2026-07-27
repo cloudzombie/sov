@@ -1,0 +1,34 @@
+[package]
+name = "sov-sharechain"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Decentralized (non-custodial) pool sharechain for SOV: PPLNS accounting over a share DAG, with the payout rule enforced by the sharechain rather than by an operator."
+
+# Standalone tool — intentionally NOT a member of the chain workspace, exactly like
+# sov-stratum, so it can never affect `chain/` builds or consensus artifacts.
+#
+# THIS CRATE HAS NO CONSENSUS SURFACE. SOV sees only ordinary blocks containing
+# ordinary `Transfer` actions. Nothing here changes block/header/tx encoding, the
+# state root, emission, difficulty, the chain spec, or any KAT vector. The sharechain
+# is a agreement ABOUT who gets paid; the payment itself is a plain transfer the STF
+# already executes.
+#
+# No secret material is handled: payout account ids are public, and no keys or seeds
+# enter this process — the block producer signs its own payout transfers.
+
+[dependencies]
+sov-primitives = { path = "../../chain/crates/primitives" }
+# The REAL retarget: `Difficulty::lwma`, the same LWMA-1 the chain uses for blocks.
+# Reused rather than reimplemented — a second copy of a difficulty rule is a second
+# thing that can drift, and share accounting depends on it being exactly right.
+sov-mining = { path = "../../chain/crates/mining" }
+# The PQ channel (Noise + ML-KEM sealing) reused for share gossip. Only the
+# BYTE-level channel is reused — `NetMessage` and `TcpNode` are untouched, so a
+# bug in share decoding cannot reach block or transaction relay.
+sov-network = { path = "../../chain/crates/network" }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
