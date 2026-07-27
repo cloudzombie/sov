@@ -275,3 +275,183 @@ pub fn verify_bundle_for_carrier(
         window_update,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sov_shielded_pq::bundle::SpendBundle;
+    use sov_shielded_pq::hd::PqShieldedKey;
+    use sov_shielded_pq::wallet::{authorize_for_carrier, build_shield, build_spend};
+    use sov_shielded_pq::wire::encode_bundle;
+
+    const SIGNER: &str = "usa.reserve.sov";
+    const XUS: u128 = 100_000_000;
+
+    fn key(byte: u8) -> PqShieldedKey {
+        PqShieldedKey::from_leaf_seed(&[byte; 32])
+    }
+
+    fn policy() -> MiningPolicy {
+        MiningPolicy::mainnet_like()
+    }
+
+    fn signer() -> AccountId {
+        AccountId::new(SIGNER).expect("valid account id")
+    }
+
+    /// A carrier-bound, encoded shield of `xus` XUS into pool v2.
+    fn shield_bundle(k: &PqShieldedKey, xus: u128, nonce: u64) -> (SpendBundle, Vec<u8>) {
+        let grains = u64::try_from(xus * XUS).expect("fits");
+        let mut bundle = build_shield(k, &k.address(), grains, 0).expect("build shield");
+        authorize_for_carrier(&mut bundle, k, SIGNER, nonce).expect("carrier-bind");
+        let bytes = encode_bundle(&bundle);
+        (bundle, bytes)
+    }
+
+    /// An honest shield must verify and report the exact turnstile effect.
+    #[test]
+    fn an_honest_shield_verifies_and_reports_exact_effects() {
+        let k = key(1);
+        let (_, bytes) = shield_bundle(&k, 5, 0);
+        let ledger = Ledger::default();
+        let effects = verify_bundle_for_carrier(
+            &bytes,
+            &ledger,
+            &policy(),
+            1,
+            &signer(),
+            0,
+            Balance::from_grains(10 * XUS),
+        )
+        .expect("an honest shield must verify");
+        assert_eq!(effects.shield_in.grains(), 5 * XUS, "value entering the pool");
+        assert_eq!(effects.deshield_out.grains(), 0, "a shield takes nothing out");
+        assert!(
+            effects.nullifiers.is_empty(),
+            "a shield spends no notes, so it must publish NO nullifiers"
+        );
+        assert!(
+            !effects.commitments.is_empty(),
+            "a shield must append at least one note commitment"
+        );
+    }
+
+    /// The carrier binding is the whole authorization story: a bundle proved
+    /// and signed for one {signer, nonce} must NOT be liftable onto another
+    /// transaction. This is the replay vector.
+    #[test]
+    fn a_bundle_cannot_be_lifted_onto_another_carrier() {
+        let k = key(2);
+        let (_, bytes) = shield_bundle(&k, 5, 7);
+        let ledger = Ledger::default();
+        let ok = |nonce: u64, who: &str| {
+            verify_bundle_for_carrier(
+                &bytes,
+                &ledger,
+                &policy(),
+                1,
+                &AccountId::new(who).expect("id"),
+                nonce,
+                Balance::from_grains(10 * XUS),
+            )
+        };
+        assert!(ok(7, SIGNER).is_ok(), "its own carrier must verify");
+        assert!(
+            matches!(ok(8, SIGNER), Err(ShieldedV2Error::CarrierAuth)),
+            "a DIFFERENT nonce must be refused — otherwise the bundle replays"
+        );
+        assert!(
+            matches!(ok(7, "miner.sov"), Err(ShieldedV2Error::CarrierAuth)),
+            "a DIFFERENT signer must be refused — otherwise the bundle is stealable"
+        );
+    }
+
+    /// A shield for more than the signer holds must be refused BEFORE any
+    /// state is touched — the pool must never be credited value the
+    /// transparent ledger cannot pay.
+    #[test]
+    fn a_shield_beyond_the_signer_balance_is_refused() {
+        let k = key(3);
+        let (_, bytes) = shield_bundle(&k, 5, 0);
+        let ledger = Ledger::default();
+        let out = verify_bundle_for_carrier(
+            &bytes,
+            &ledger,
+            &policy(),
+            1,
+            &signer(),
+            0,
+            Balance::from_grains(XUS), // only 1 XUS, shielding 5
+        );
+        assert!(
+            matches!(out, Err(ShieldedV2Error::InsufficientBalance(_))),
+            "expected InsufficientBalance, got {out:?}"
+        );
+    }
+
+    /// Any mutation of the encoded bundle must fail closed — decode error,
+    /// structure error, bad authorization or bad proof, never silent
+    /// acceptance and never a panic.
+    #[test]
+    fn every_single_byte_mutation_fails_closed() {
+        let k = key(4);
+        let (_, bytes) = shield_bundle(&k, 5, 0);
+        let ledger = Ledger::default();
+        // Sample across the encoding rather than all ~100 KB (each rejection
+        // is cheap, but the proof-verifying paths are not).
+        let probes: Vec<usize> = (0..bytes.len()).step_by(bytes.len() / 64 + 1).collect();
+        for i in probes {
+            let mut bad = bytes.clone();
+            bad[i] ^= 0x01;
+            if bad == bytes {
+                continue;
+            }
+            let out = verify_bundle_for_carrier(
+                &bad,
+                &ledger,
+                &policy(),
+                1,
+                &signer(),
+                0,
+                Balance::from_grains(10 * XUS),
+            );
+            assert!(
+                out.is_err(),
+                "flipping a bit at offset {i} produced an ACCEPTED bundle"
+            );
+        }
+    }
+
+    /// Spending a note requires its anchor to be in the ring. A spend proved
+    /// against a tree this chain has never seen must be refused.
+    #[test]
+    fn a_spend_against_an_unknown_anchor_is_refused() {
+        let k = key(5);
+        // Fund a store on a private tree the ledger knows nothing about.
+        let (bundle, _) = shield_bundle(&k, 5, 0);
+        let mut store = sov_shielded_pq::scan::PqNoteStore::new(0);
+        store.ingest_block(&k, 1, [9u8; 32], &[&bundle]);
+        assert!(store.balance() > 0, "the test store must hold a note");
+
+        let built = build_spend(&k, &store, None, XUS as u64, 0).expect("build spend");
+        let mut spend = built.bundle;
+        authorize_for_carrier(&mut spend, &k, SIGNER, 0).expect("carrier-bind");
+        let bytes = encode_bundle(&spend);
+
+        // The consensus ledger never saw that tree, so its anchor is unknown.
+        let ledger = Ledger::default();
+        let out = verify_bundle_for_carrier(
+            &bytes,
+            &ledger,
+            &policy(),
+            1,
+            &signer(),
+            0,
+            Balance::from_grains(10 * XUS),
+        );
+        assert!(
+            matches!(out, Err(ShieldedV2Error::UnknownAnchor(_))),
+            "expected UnknownAnchor, got {out:?}"
+        );
+    }
+}

@@ -59,7 +59,7 @@ use sov_shielded::{
 use sov_shielded_pq::bundle::SpendBundle;
 use sov_shielded_pq::hd::PqShieldedKey;
 use sov_shielded_pq::scan::PqNoteStore;
-use sov_shielded_pq::wallet::{build_shield, build_spend};
+use sov_shielded_pq::wallet::{authorize_for_carrier, build_shield, build_spend};
 use sov_shielded_pq::wire::{decode_bundle, encode_bundle};
 use sov_types::{Action, SignedTransaction, Transaction};
 use sov_wallet::{HdWallet, SOV_COIN_TYPE};
@@ -234,7 +234,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             println!("proving the v2 shield (STARK, ~25s)...");
             let bundle = build_shield(&key, &key.address(), amount_grains, fee_grains)
                 .map_err(|e| e.to_string())?;
-            let txid = submit_shielded_v2_bundle(&client, &keypair, &signer, &bundle)?;
+            let txid = submit_shielded_v2_bundle(&client, &keypair, &key, &signer, &bundle)?;
             println!("submitted — waiting for on-chain confirmation...");
             await_receipt(&client, &txid, 120)?;
             println!(
@@ -268,7 +268,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             println!("proving the v2 de-shield (STARK, ~25s)...");
             let built = build_spend(&key, &store, None, amount_grains, fee_grains)
                 .map_err(|e| e.to_string())?;
-            let txid = submit_shielded_v2_bundle(&client, &keypair, &account, &built.bundle)?;
+            let txid = submit_shielded_v2_bundle(&client, &keypair, &key, &account, &built.bundle)?;
             println!("submitted — waiting for on-chain confirmation...");
             await_receipt(&client, &txid, 120)?;
             println!(
@@ -325,7 +325,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             println!("proving the private v2 transfer (STARK, ~25s)...");
             let built = build_spend(&key, &store, Some(&recipient), amount_grains, fee_grains)
                 .map_err(|e| e.to_string())?;
-            let txid = submit_shielded_v2_bundle(&client, &keypair, &signer, &built.bundle)?;
+            let txid = submit_shielded_v2_bundle(&client, &keypair, &key, &signer, &built.bundle)?;
             println!("submitted — waiting for on-chain confirmation...");
             await_receipt(&client, &txid, 120)?;
             println!(
@@ -844,17 +844,25 @@ fn signer_for(args: &[String], keypair: &Keypair) -> Result<AccountId, Box<dyn E
 fn submit_shielded_v2_bundle(
     client: &RpcClient,
     keypair: &Keypair,
+    pq_key: &PqShieldedKey,
     signer: &AccountId,
     bundle: &SpendBundle,
 ) -> Result<Hash, Box<dyn Error>> {
     let nonce = client.next_nonce(signer)?;
     let domain = client.signing_domain()?;
+    // Bind the bundle to THIS carrier. Consensus verifies the ML-DSA
+    // authorization over `carrier_sighash(digest, {signer, nonce})`, not over
+    // the bundle digest alone, so this step is what makes the bundle
+    // admissible at all — and what stops it being lifted onto another
+    // transaction. It happens here, after the nonce is known.
+    let mut bundle = bundle.clone();
+    authorize_for_carrier(&mut bundle, pq_key, signer.as_str(), nonce)?;
     let tx = Transaction {
         signer: signer.clone(),
         public_key: keypair.public_key(),
         nonce,
         action: Action::ShieldedV2 {
-            bundle: encode_bundle(bundle),
+            bundle: encode_bundle(&bundle),
         },
     };
     let stx = SignedTransaction::sign_in(tx, keypair, domain.as_ref())?;

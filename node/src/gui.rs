@@ -27,7 +27,10 @@ use sov_shielded::{
     encode_shielded, encode_shielded_v2, shielded_transfer_with_change, unshield_amount_multi,
     AnyAddress, NoteStore, Receiver, ShieldedBundle, ShieldedKey, ShieldedParams, UnifiedAddress,
 };
+use sov_shielded_pq::bundle::SpendBundle;
 use sov_shielded_pq::hd::PqShieldedKey;
+use sov_shielded_pq::scan::PqNoteStore;
+use sov_shielded_pq::wire::decode_bundle;
 use sov_types::{Action, SignedTransaction, Transaction};
 use sov_wallet::{generate_mnemonic, HdWallet};
 use zeroize::Zeroize;
@@ -1228,7 +1231,11 @@ struct PoolRow {
 /// Build the rows. Pure data, so the table's CONTENT is decided in one place and the
 /// rendering below is only layout — which is what makes the two pools provably
 /// row-aligned rather than aligned by careful hand-editing of two separate columns.
-fn pool_rows(s: &Snapshot, v1_own: Option<(u128, usize, u64)>) -> Vec<PoolRow> {
+fn pool_rows(
+    s: &Snapshot,
+    v1_own: Option<(u128, usize, u64)>,
+    v2_own: Option<(u128, usize, u64)>,
+) -> Vec<PoolRow> {
     let v1_state = PoolState::classify_v1(s.online, s.shielded_v1_available);
     let v2_state = PoolState::classify_v2(s.online, s.shielded_v2.as_ref());
     let v1_real = v1_state.figures_are_real();
@@ -1285,14 +1292,16 @@ fn pool_rows(s: &Snapshot, v1_own: Option<(u128, usize, u64)>) -> Vec<PoolRow> {
                 ),
                 (true, Some((b, _, _))) => Cell::Amount(b),
             },
-            // This station does not scan v2, and while dormant there is provably
-            // nothing to scan.
-            v2: match v2_state {
-                PoolState::Dormant => Cell::Impossible(V2_DORMANT),
-                PoolState::Unavailable => Cell::Unknown,
-                PoolState::Active => {
-                    Cell::NotReported("Pool v2 is active, but this station does not scan it yet.")
-                }
+            // Pool v2 is scanned by trial decapsulation, so the same rule as v1
+            // applies: an unscanned wallet is UNKNOWN, never zero.
+            v2: match (v2_state, v2_own) {
+                (PoolState::Dormant, _) => Cell::Impossible(V2_DORMANT),
+                (PoolState::Unavailable, _) => Cell::Unknown,
+                (PoolState::Active, None) => Cell::NotReported(
+                    "This wallet's pool-v2 notes have not been scanned yet, so its balance is \
+                     unknown — which is not the same as zero. Press \"Scan pool v2\" below.",
+                ),
+                (PoolState::Active, Some((b, _, _))) => Cell::Amount(b),
             },
         },
         PoolRow {
@@ -1423,10 +1432,15 @@ fn pool_note(ui: &mut egui::Ui, pool: Pool, state: PoolState, extra: &str) {
 /// figure like `110,557.53450464 XUS` the table collapses to one pool above the other,
 /// each full width. That threshold is computed from the width the content actually
 /// needs, not guessed.
-fn shielded_pools_view(ui: &mut egui::Ui, s: &Snapshot, v1_own: Option<(u128, usize, u64)>) {
+fn shielded_pools_view(
+    ui: &mut egui::Ui,
+    s: &Snapshot,
+    v1_own: Option<(u128, usize, u64)>,
+    v2_own: Option<(u128, usize, u64)>,
+) {
     let v1_state = PoolState::classify_v1(s.online, s.shielded_v1_available);
     let v2_state = PoolState::classify_v2(s.online, s.shielded_v2.as_ref());
-    let rows = pool_rows(s, v1_own);
+    let rows = pool_rows(s, v1_own, v2_own);
 
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = sp::M;
@@ -2293,6 +2307,19 @@ struct ShieldedView {
     message: String,
 }
 
+/// The selected wallet's scanned POOL-V2 view. Separate from [`ShieldedView`]
+/// because the pools are separate value spaces: a v1 balance must never be
+/// displayed as, or mistaken for, a v2 one.
+#[derive(Clone, Default)]
+struct ShieldedV2View {
+    scanning: bool,
+    account: String,
+    balance: u64, // unspent pool-v2 balance, in grains
+    notes: usize, // unspent v2 note count
+    scanned_height: u64,
+    message: String,
+}
+
 /// Cumulative coinbase your wallets have earned, summed from the chain's per-block
 /// coinbase (paid entirely to the miner). Computed on demand (a full scan), cached here.
 #[derive(Clone, Default)]
@@ -2720,6 +2747,7 @@ pub struct Station {
     action: Arc<Mutex<ActionState>>,
     params: Arc<Mutex<Option<Arc<ShieldedParams>>>>,
     shielded: Arc<Mutex<ShieldedView>>,
+    shielded_v2: Arc<Mutex<ShieldedV2View>>,
     earnings: Arc<Mutex<EarningsView>>,
     /// The MASTER session passphrase that encrypts the wallet store. Set ONLY via a
     /// confirmed first-run setup or a VERIFIED unlock/keystore-load — never typed
@@ -2988,6 +3016,7 @@ impl Station {
             action: Arc::new(Mutex::new(ActionState::default())),
             params: Arc::new(Mutex::new(None)),
             shielded: Arc::new(Mutex::new(ShieldedView::default())),
+            shielded_v2: Arc::new(Mutex::new(ShieldedV2View::default())),
             earnings: Arc::new(Mutex::new(EarningsView::default())),
             copied_at: None,
             activity: Arc::new(Mutex::new(Vec::new())),
@@ -3535,6 +3564,49 @@ impl Station {
                         v.message = format!("scanned to height {}", store.scanned_height());
                     }
                     Err(e) => v.message = format!("scan failed: {e}"),
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Scan the selected wallet's POOL-V2 notes off-thread. Mirrors
+    /// [`Self::scan_shielded`]; the two views are independent so a v1 scan
+    /// failure can never blank a v2 balance (or the reverse).
+    fn scan_shielded_v2(&self, ctx: &egui::Context) {
+        if !self.require_signing() {
+            return; // watch-only has no spend key
+        }
+        let Some(w) = self.wallets.get(self.selected) else {
+            return;
+        };
+        let seed = w.seed;
+        let account = w.account.clone();
+        let rpc = self
+            .config
+            .lock()
+            .map(|c| c.rpc.clone())
+            .unwrap_or_default();
+        let view = self.shielded_v2.clone();
+        let ctx = ctx.clone();
+        if let Ok(mut v) = view.lock() {
+            v.scanning = true;
+            v.account = account.clone();
+            v.message = "scanning pool v2 (trial decapsulation)…".to_string();
+        }
+        std::thread::spawn(move || {
+            let result = scan_store_v2(&rpc, seed);
+            if let Ok(mut v) = view.lock() {
+                v.scanning = false;
+                match result {
+                    Ok(store) => {
+                        v.account = account;
+                        v.balance = store.balance();
+                        v.notes = store.unspent_count();
+                        v.scanned_height = store.scanned_height();
+                        v.message = format!("scanned to height {}", store.scanned_height());
+                    }
+                    Err(e) => v.message = format!("pool-v2 scan failed: {e}"),
                 }
             }
             ctx.request_repaint();
@@ -8203,6 +8275,7 @@ impl Station {
         let mut do_send = false;
         let mut do_private_send = false;
         let mut do_scan = false;
+        let mut do_scan_v2 = false;
         let mut do_rescan = false;
         let mut do_deshield = false;
         let mut do_build_unsigned = false;
@@ -8681,7 +8754,17 @@ impl Station {
                 sv.notes,
                 sv.scanned_height,
             ));
-            shielded_pools_view(ui, &snap, v1_own);
+            let v2v = self
+                .shielded_v2
+                .lock()
+                .map(|v| v.clone())
+                .unwrap_or_default();
+            let v2_own = (v2v.account == account && v2v.scanned_height > 0).then_some((
+                v2v.balance as u128,
+                v2v.notes,
+                v2v.scanned_height,
+            ));
+            shielded_pools_view(ui, &snap, v1_own, v2_own);
             if sv.scanning {
                 ui.add_space(sp::S);
                 ui.horizontal(|ui| {
@@ -8691,6 +8774,40 @@ impl Station {
                             .size(ty::SMALL)
                             .color(palette::text_dim()),
                     );
+                });
+            }
+            // Pool v2 is only scannable when it is actually live; offering the
+            // control while dormant would invite the conclusion that a zero
+            // balance means "no funds" rather than "no pool yet".
+            if matches!(
+                PoolState::classify_v2(snap.online, snap.shielded_v2.as_ref()),
+                PoolState::Active
+            ) {
+                ui.add_space(sp::S);
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!v2v.scanning && !busy, |ui| {
+                        if ui
+                            .button("Scan pool v2")
+                            .on_hover_text(
+                                "Trial-decapsulate this chain's pool-v2 notes with this \
+                                 wallet's ML-KEM key. Slower than a v1 scan by design — a \
+                                 post-quantum pool has no ECDH detection shortcut.",
+                            )
+                            .clicked()
+                        {
+                            do_scan_v2 = true;
+                        }
+                    });
+                    if v2v.scanning {
+                        ui.spinner();
+                    }
+                    if !v2v.message.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&v2v.message)
+                                .size(ty::SMALL)
+                                .color(palette::text_dim()),
+                        );
+                    }
                 });
             }
 
@@ -9399,6 +9516,9 @@ impl Station {
         if do_scan {
             self.scan_shielded(&ctx);
         }
+        if do_scan_v2 {
+            self.scan_shielded_v2(&ctx);
+        }
         if do_rescan {
             self.rescan_shielded(&ctx);
         }
@@ -9996,6 +10116,15 @@ fn note_store_path(store_id: &str) -> Result<PathBuf, String> {
         .join(format!("{store_id}.store")))
 }
 
+/// As [`note_store_path`], for the POOL-V2 note cache. A distinct suffix, because
+/// the two pools are separate value spaces with different note formats — loading
+/// one as the other must be impossible, not merely unlikely.
+fn note_store_v2_path(store_id: &str) -> Result<PathBuf, String> {
+    Ok(station_dir()?
+        .join("notes")
+        .join(format!("{store_id}.v2.store")))
+}
+
 /// Encrypt `plaintext` with the 32-byte device `key` (ChaCha20-Poly1305, random
 /// 12-byte nonce prepended) — the note cache holds note secrets, so it is never
 /// written in the clear.
@@ -10179,6 +10308,89 @@ fn scan_store(rpc: &str, seed: [u8; 32]) -> Result<NoteStore, String> {
     }
 
     // Persist the updated cache (encrypted, owner-only).
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let enc = encrypt_blob(&dkey, &store.to_bytes())?;
+    std::fs::write(&path, &enc).map_err(|e| e.to_string())?;
+    restrict_to_owner(&path);
+    Ok(store)
+}
+
+/// Scan the chain for this wallet's POOL-V2 (post-quantum) notes, mirroring
+/// [`scan_store`] one-for-one — same cache discipline, same reorg reconciliation,
+/// same fail-closed receipt filter — over `Action::ShieldedV2` bundles.
+///
+/// Pool v2 detection cannot use pool v1's ECDH trick: ML-KEM has no shared
+/// secret until a decapsulation happens, so every v2 ciphertext must be
+/// trial-decapsulated. That cost is why the cache matters here even more than
+/// it does for v1.
+fn scan_store_v2(rpc: &str, seed: [u8; 32]) -> Result<PqNoteStore, String> {
+    let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(15));
+    let key = PqShieldedKey::from_leaf_seed(&seed);
+    let store_id = Keypair::hybrid_from_seed(seed)
+        .public_key()
+        .implicit_account_id()
+        .to_string();
+    let path = note_store_v2_path(&store_id)?;
+    let dkey = notes_cache_key(&seed);
+
+    let mut store = std::fs::read(&path)
+        .ok()
+        .and_then(|enc| decrypt_blob(&dkey, &enc))
+        .and_then(|bytes| PqNoteStore::from_bytes(&bytes))
+        .unwrap_or_else(|| PqNoteStore::new(0));
+
+    let tip = client.height().map_err(|e| e.to_string())?;
+
+    // Same reorg reconciliation as v1: never extend an orphaned branch.
+    if let Some((tip_h, cached_hash)) = store.tip_checkpoint() {
+        if canonical_hash(&client, tip_h)? != Some(cached_hash) {
+            let mut fork = None;
+            for (h, our_hash) in store.checkpoints().into_iter().rev() {
+                if canonical_hash(&client, h)? == Some(our_hash) {
+                    fork = Some(h);
+                    break;
+                }
+            }
+            match fork {
+                Some(f) if store.rollback_to(f) => {}
+                _ => store = PqNoteStore::new(store.birthday()),
+            }
+        }
+    }
+
+    for h in (store.scanned_height() + 1)..=tip {
+        let block = client
+            .block_by_height(h)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("block {h} unavailable; will resume"))?;
+        // Fail-closed on receipts exactly as v1 does: a v2 bundle whose
+        // transaction did not APPLY must never credit the wallet.
+        let receipts = client
+            .call("sov_getBlockReceipts", json!({ "height": h }))
+            .map_err(|e| e.to_string())?;
+        let receipts = receipts.as_array();
+        let bundles: Vec<SpendBundle> = block
+            .transactions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, stx)| match &stx.transaction.action {
+                Action::ShieldedV2 { bundle }
+                    if receipts
+                        .and_then(|rs| rs.get(i))
+                        .map(receipt_succeeded)
+                        .unwrap_or(false) =>
+                {
+                    decode_bundle(bundle).ok()
+                }
+                _ => None,
+            })
+            .collect();
+        let refs: Vec<&SpendBundle> = bundles.iter().collect();
+        store.ingest_block(&key, h, *block.hash().as_bytes(), &refs);
+    }
+
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }

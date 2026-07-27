@@ -32,6 +32,7 @@
 use crate::air::NUM_SLOTS;
 use crate::auth::AuthKeypair;
 use crate::bundle::{bundle_digest, SpendBundle};
+use crate::carrier::{sign_in_carrier, CarrierContext};
 use crate::encrypt::{encrypt_note, NoteCiphertext};
 use crate::hd::{PqAddress, PqShieldedKey};
 use crate::note::{Note, MAX_NOTE_VALUE};
@@ -315,9 +316,83 @@ fn finish(
     })
 }
 
+/// Bind a built bundle to the transaction that will carry it.
+///
+/// [`build_shield`] and [`build_spend`] sign the bundle digest, which proves
+/// the bundle's own integrity but says nothing about WHICH transaction may
+/// carry it. Consensus ([`crate::carrier::verify_carrier_auth`]) requires the
+/// stronger statement: a signature over `carrier_sighash(digest, {signer,
+/// nonce})`. Without this step a bundle is inadmissible — and, worse, a bundle
+/// bound to nothing could be lifted onto someone else's transaction.
+///
+/// It is separate from building because the nonce is only known at submit
+/// time, after the ~25 s proving work is already done. Call it last, with the
+/// exact `{signer, nonce}` the carrier transaction will use.
+pub fn authorize_for_carrier(
+    bundle: &mut SpendBundle,
+    key: &PqShieldedKey,
+    signer: &str,
+    nonce: u64,
+) -> Result<(), SpendBuildError> {
+    let (auth_pk, auth_sig) = sign_in_carrier(
+        key.auth_key(),
+        &bundle.public_inputs,
+        &bundle.output_ciphertexts,
+        &CarrierContext {
+            signer: signer.as_bytes(),
+            nonce,
+        },
+    )
+    .map_err(|e| SpendBuildError::Auth(e.to_string()))?;
+    bundle.auth_pk = auth_pk;
+    bundle.auth_sig = auth_sig;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::carrier::verify_carrier_auth;
+
+    /// A built bundle is NOT admissible until it is carrier-bound, and once
+    /// bound it is bound to exactly ONE {signer, nonce}.
+    ///
+    /// This is a regression test for a real defect: `build_shield` signed the
+    /// bundle digest, but consensus requires a signature over
+    /// `carrier_sighash(digest, {signer, nonce})`. Every wallet-built v2
+    /// bundle was therefore rejected with `CarrierAuth`, and the whole pool-v2
+    /// transaction path was non-functional end to end. It was invisible
+    /// because the CLI's dormancy guard refuses before a bundle is ever built.
+    #[test]
+    fn a_bundle_must_be_carrier_bound_and_binds_to_exactly_one_carrier() {
+        let k = PqShieldedKey::from_leaf_seed(&[7u8; 32]);
+        let ctx = |signer: &'static str, nonce: u64| CarrierContext {
+            signer: signer.as_bytes(),
+            nonce,
+        };
+        let mut b = build_shield(&k, &k.address(), 100_000_000, 0).expect("build");
+
+        assert!(
+            !verify_carrier_auth(&b, &ctx("usa.reserve.sov", 0)),
+            "an UNBOUND bundle must not satisfy consensus carrier auth"
+        );
+
+        authorize_for_carrier(&mut b, &k, "usa.reserve.sov", 0).expect("authorize");
+        assert!(
+            verify_carrier_auth(&b, &ctx("usa.reserve.sov", 0)),
+            "after binding, its own carrier must verify"
+        );
+        assert!(
+            !verify_carrier_auth(&b, &ctx("usa.reserve.sov", 1)),
+            "a different NONCE must not verify — else the bundle replays"
+        );
+        assert!(
+            !verify_carrier_auth(&b, &ctx("miner.sov", 0)),
+            "a different SIGNER must not verify — else the bundle is stealable"
+        );
+    }
+
+
     use crate::prover::verify_spend;
     use crate::wire::encode_bundle;
 
