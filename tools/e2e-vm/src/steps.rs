@@ -1896,18 +1896,75 @@ fn step_reorg_with_v2(ctx: &mut Ctx) -> Result<(String, Value), String> {
         ));
     }
 
-    // Every node must converge on the SAME v2 state — the reorg-relevant
-    // property, since a node that resolved the fork differently would carry a
-    // different nullifier set.
+    // Every node must converge on the SAME v2 state — a node that resolved a
+    // fork differently would carry a different nullifier set.
     let (nodes, anchor) = v2_anchor_agreement(ctx)?;
-    let obs = ctx.rpc("node-4");
-    let counts = v2_nullifier_count(&obs)?;
+
+    // COLD-BOOT REPLAY of pool-v2 state. A reorg and a replay run on the same
+    // machinery — the ledger's undo/redo path — so this proves the v2 pool is
+    // reconstructed EXACTLY from the block log rather than trusted from a
+    // snapshot: same anchor, same nullifier set, same pool value.
+    //
+    // Honesty about scope: the local backend puts every node on loopback with
+    // a shared seed list, so it cannot partition the network into two mining
+    // branches, and a genuine multi-node reorg is therefore out of reach here.
+    // The consensus half — that disconnecting a block restores the v2 pool
+    // bit-for-bit and frees its nullifiers — is asserted directly against the
+    // ledger in `sov_state::shielded_v2_reorg_tests`.
+    let victim = "node-4";
+    let plan = ctx.net.plan(victim).clone();
+    let rpc4 = ctx.rpc(victim);
+    let before_anchor = v2_anchor(&rpc4)?;
+    let before_nullifiers = v2_nullifier_count(&rpc4)?;
+    let before_pool = rpc4.pool_v2_grains()?;
+    let h_pin = rpc4.height()?;
+
+    ctx.backend.stop(victim)?;
+    if !ctx.backend.remove_data_file(&plan, "chainstate.snapshot")? {
+        return Err("chainstate.snapshot vanished before deletion".to_string());
+    }
+    ctx.backend.start(&plan, &ctx.rpcd)?;
+    poll(
+        "node-4 to serve RPC after a cold boot with pool-v2 state",
+        Duration::from_secs(180),
+        Duration::from_millis(300),
+        || Ok(rpc4.healthy().then_some(())),
+    )?;
+    poll(
+        &format!("node-4 to replay back past height {h_pin}"),
+        Duration::from_secs(300),
+        Duration::from_millis(500),
+        || Ok((rpc4.height()? >= h_pin).then_some(())),
+    )?;
+
+    let after_anchor = v2_anchor(&rpc4)?;
+    let after_nullifiers = v2_nullifier_count(&rpc4)?;
+    let after_pool = rpc4.pool_v2_grains()?;
+    if after_anchor != before_anchor {
+        return Err(format!(
+            "cold-boot replay produced a DIFFERENT pool-v2 anchor: {after_anchor} != \
+             {before_anchor}"
+        ));
+    }
+    if after_nullifiers != before_nullifiers {
+        return Err(format!(
+            "cold-boot replay produced a different pool-v2 nullifier count: {after_nullifiers} \
+             != {before_nullifiers} — a rebuilt node would accept or refuse different spends"
+        ));
+    }
+    if after_pool != before_pool {
+        return Err(format!(
+            "cold-boot replay produced a different pool-v2 value: {after_pool} != {before_pool}"
+        ));
+    }
 
     Ok((
         format!(
-            "a pool-v2 spend was mined and every one of the {nodes} nodes converged on the same \
-             v2 state: identical anchor {anchor} and {counts} published nullifiers, with pool \
-             value conserved at {pool_before} grains across the private transfer"
+            "a pool-v2 spend published its nullifier and moved the anchor with pool value \
+             conserved at {pool_before} grains; all {nodes} nodes agree on anchor {anchor}; and \
+             node-4 cold-booted with its snapshot DELETED reproduced the pool-v2 state exactly \
+             from the block log — same anchor, same {after_nullifiers} nullifiers, same pool \
+             value (the undo/redo path a reorg runs on)"
         ),
         json!({
             "spend_tx": tx,
@@ -1915,6 +1972,14 @@ fn step_reorg_with_v2(ctx: &mut Ctx) -> Result<(String, Value), String> {
             "anchor": { "before": anchor_before, "after": anchor_after },
             "pool_v2_grains_conserved": pool_before.to_string(),
             "nodes_agreeing": nodes,
+            "cold_boot_replay": {
+                "height_pinned": h_pin,
+                "anchor_reproduced": after_anchor,
+                "nullifiers_reproduced": after_nullifiers,
+                "pool_value_reproduced": after_pool.to_string(),
+            },
+            "multi_node_reorg": "out of reach on the local loopback backend; the consensus \
+                                 undo path is asserted in sov_state::shielded_v2_reorg_tests",
         }),
     ))
 }

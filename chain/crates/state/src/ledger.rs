@@ -3074,3 +3074,98 @@ mod supply_accounting_tests {
         assert_eq!(l.shielded_v2_value().grains(), 400);
     }
 }
+
+#[cfg(test)]
+mod shielded_v2_reorg_tests {
+    use super::*;
+    use sov_shielded_pq::PqDigest;
+
+    fn digest(byte: u8) -> PqDigest {
+        let mut b = [0u8; 32];
+        // Keep every limb well below the field modulus so the digest is
+        // canonical (the pool refuses non-canonical ones by design).
+        b[0] = byte;
+        b[8] = byte;
+        b[16] = byte;
+        b[24] = byte;
+        PqDigest::from_bytes(&b).expect("canonical digest")
+    }
+
+    /// **The reorg property.** Disconnecting a block that carried a pool-v2
+    /// spend must restore the pool EXACTLY: the published nullifier must stop
+    /// being spent (or the note is burned forever on an orphaned branch), the
+    /// commitment must leave the tree, the anchor must return to its old
+    /// value, and the pool's value counter must roll back with it.
+    ///
+    /// This is the consensus half of `reorg-with-v2-state`: the five-node
+    /// harness cannot partition loopback nodes into competing branches, so the
+    /// undo machinery a reorg actually runs on is asserted here instead.
+    #[test]
+    fn disconnecting_a_block_restores_the_v2_pool_exactly() {
+        let mut l = Ledger::default();
+        // A pre-existing note, so the rollback target is not the empty tree.
+        l.apply_shielded_v2(&[], &[digest(1)]).expect("seed");
+        l.add_shielded_v2_value(Balance::from_grains(500))
+            .expect("seed value");
+
+        let root_before = l.shielded_v2().root();
+        let notes_before = l.shielded_v2().note_count();
+        let nullifiers_before = l.shielded_v2().nullifier_count();
+        let value_before = l.shielded_v2_value();
+        let state_root_before = l.state_root();
+
+        // Connect a block that spends the note and creates a new one, and
+        // de-shields some value out of the pool.
+        l.begin_undo();
+        let nf = digest(2);
+        l.apply_shielded_v2(&[nf], &[digest(3)]).expect("spend");
+        l.sub_shielded_v2_value(Balance::from_grains(100))
+            .expect("de-shield");
+        let undo = l.take_undo();
+
+        assert!(l.shielded_v2().nullifier_seen(&nf), "the spend registered");
+        assert_ne!(l.shielded_v2().root(), root_before, "the anchor moved");
+        assert_eq!(l.shielded_v2_value().grains(), 400);
+
+        // Disconnect it.
+        l.apply_undo(undo);
+
+        assert!(
+            !l.shielded_v2().nullifier_seen(&nf),
+            "an orphaned nullifier must NOT stay spent — the note would be \
+             unspendable forever on the surviving branch"
+        );
+        assert_eq!(l.shielded_v2().root(), root_before, "anchor restored");
+        assert_eq!(l.shielded_v2().note_count(), notes_before);
+        assert_eq!(l.shielded_v2().nullifier_count(), nullifiers_before);
+        assert_eq!(l.shielded_v2_value(), value_before, "pool value restored");
+        assert_eq!(
+            l.state_root(),
+            state_root_before,
+            "the state root must be restored BIT-FOR-BIT, or nodes that \
+             reorged and nodes that never saw the block would disagree"
+        );
+    }
+
+    /// A note spent on an orphaned branch must be re-spendable on the branch
+    /// that wins — the same nullifier, accepted again after the rollback.
+    #[test]
+    fn a_note_spent_on_an_orphaned_branch_is_spendable_again() {
+        let mut l = Ledger::default();
+        l.apply_shielded_v2(&[], &[digest(1)]).expect("seed");
+
+        l.begin_undo();
+        let nf = digest(7);
+        l.apply_shielded_v2(&[nf], &[digest(8)]).expect("branch A");
+        let undo = l.take_undo();
+        // While branch A stands, re-spending is refused.
+        assert!(l.apply_shielded_v2(&[nf], &[digest(9)]).is_err());
+
+        l.apply_undo(undo);
+
+        // On the winning branch the very same note spends cleanly.
+        l.apply_shielded_v2(&[nf], &[digest(9)])
+            .expect("the note must be spendable on the branch that wins");
+        assert!(l.shielded_v2().nullifier_seen(&nf));
+    }
+}
