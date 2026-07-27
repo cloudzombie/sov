@@ -175,14 +175,85 @@ fn clock_hms() -> String {
 /// cannot grow without bound. Real operational logs (startup, replay timing, RPC
 /// up, block production, errors), surfaced in the Node tab.
 fn push_log(logs: &Arc<Mutex<Vec<String>>>, msg: impl Into<String>) {
+    let line = format!("{}  {}", clock_hms(), msg.into());
+    // PERSIST FIRST. This buffer used to be memory-only, so every operational
+    // log an operator might need — the sync that stalled, the error before a
+    // close — died with the process. A log you cannot read after a crash is
+    // not a log; the crash is exactly when you need it.
+    append_session_log(&line);
     if let Ok(mut v) = logs.lock() {
-        v.push(format!("{}  {}", clock_hms(), msg.into()));
+        v.push(line);
         let n = v.len();
         // Keep a deep ring buffer so an operator can scroll back through a whole
         // session's history (peering churn, sync, restarts) when diagnosing.
         if n > 5_000 {
             v.drain(0..n - 5_000);
         }
+    }
+}
+
+/// Path of this session's log: `<station_dir>/logs/station-<unix_secs>.log`.
+///
+/// One file per run, stamped at first write, so a crash's log is never mixed
+/// with the next launch's — the first question after a close is "what did THAT
+/// run do", and interleaved sessions make it unanswerable.
+fn session_log_path() -> Option<&'static std::path::Path> {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = station_dir().ok()?.join("logs");
+        std::fs::create_dir_all(&dir).ok()?;
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = dir.join(format!("station-{stamp}.log"));
+        // Head the file with the build, so a log always identifies which binary
+        // produced it. Version confusion is not hypothetical here.
+        let _ = std::fs::write(
+            &path,
+            format!("sov-station {} — session log\n", env!("CARGO_PKG_VERSION")),
+        );
+        prune_old_session_logs(&dir);
+        Some(path)
+    })
+    .as_deref()
+}
+
+/// Append one line to the session log. Best-effort and never fatal: logging
+/// that can take the app down is worse than no logging.
+fn append_session_log(line: &str) {
+    use std::io::Write;
+    let Some(path) = session_log_path() else {
+        return;
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Keep the newest [`MAX_SESSION_LOGS`] logs; delete the rest.
+///
+/// Unbounded logs are their own failure — a wallet that fills the disk is a
+/// wallet that stops working.
+fn prune_old_session_logs(dir: &std::path::Path) {
+    const MAX_SESSION_LOGS: usize = 20;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut logs: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("station-"))
+        .collect();
+    if logs.len() <= MAX_SESSION_LOGS {
+        return;
+    }
+    // Oldest first by name — the stamp is fixed-width unix seconds, so
+    // lexicographic order IS chronological order.
+    logs.sort_by_key(|e| e.file_name());
+    let excess = logs.len() - MAX_SESSION_LOGS;
+    for e in logs.into_iter().take(excess) {
+        let _ = std::fs::remove_file(e.path());
     }
 }
 
@@ -9944,6 +10015,57 @@ fn spawn_poller(snapshot: Arc<Mutex<Snapshot>>, config: Arc<Mutex<Config>>, ctx:
 
 #[cfg(test)]
 mod tests {
+    /// Operational logs must survive the process.
+    ///
+    /// This buffer was memory-only, so the sync that stalled and the error
+    /// before a close both died with the app — and a close is precisely when
+    /// the log matters. Pins that `push_log` reaches disk, that the file names
+    /// its build, and that old sessions are pruned so a wallet cannot fill the
+    /// disk.
+    #[test]
+    fn operational_logs_persist_to_disk_and_are_pruned() {
+        let dir = std::env::temp_dir().join(format!("sov-log-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let prev = std::env::var("SOV_STATION_DIR").ok();
+        std::env::set_var("SOV_STATION_DIR", &dir);
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        push_log(&logs, "sync stalled at height 12345");
+
+        let path = session_log_path().expect("a session log path");
+        let body = std::fs::read_to_string(path).expect("the log exists on disk");
+        assert!(
+            body.contains(env!("CARGO_PKG_VERSION")),
+            "the log must name the build that wrote it"
+        );
+        assert!(
+            body.contains("sync stalled at height 12345"),
+            "the logged line must actually be on disk"
+        );
+
+        // Pruning: 25 fabricated logs must fall back to the 20 newest.
+        let logdir = dir.join("logs");
+        for i in 0..25u32 {
+            let _ = std::fs::write(logdir.join(format!("station-{i:010}.log")), "x");
+        }
+        prune_old_session_logs(&logdir);
+        let remaining = std::fs::read_dir(&logdir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("station-"))
+            .count();
+        assert!(
+            remaining <= 20,
+            "old session logs must be pruned; {remaining} remain"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("SOV_STATION_DIR", v),
+            None => std::env::remove_var("SOV_STATION_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `SOV_STATION_DIR` must actually redirect the data directory.
     ///
     /// This path was hardcoded, so any build run from a working tree opened the
