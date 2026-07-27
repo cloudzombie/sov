@@ -14,7 +14,7 @@
 //! no finality gadget, no validator votes, and no proposer schedule; proof of
 //! work is the only authority.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use sov_mining::{Difficulty, MiningPolicy, Target, Work};
 use sov_primitives::{AccountId, Balance, BlockHeight, Hash, SigningDomain, TxDomainMode};
@@ -22,7 +22,7 @@ use sov_runtime::{
     apply_coinbase, apply_transaction, apply_transactions, BlockContext, BlockExecutionError,
 };
 use sov_state::{Ledger, UndoLog};
-use sov_types::{receipts_root, Block, Receipt, SignedTransaction};
+use sov_types::{receipts_root, Block, BlockHeader, Receipt, SignedTransaction};
 
 use crate::genesis::{GenesisConfig, GenesisError};
 
@@ -58,6 +58,18 @@ pub struct Blockchain {
     /// be fooled into following a forged long-range history that diverges from a
     /// known-good point. Empty by default.
     checkpoints: HashMap<u64, Hash>,
+    /// Hashes of headers PROVEN to be ancestors of a pinned checkpoint.
+    ///
+    /// The assumevalid PoW skip is only sound for a block that the pin actually
+    /// vouches for. Being *below* a checkpoint height does not do that — see
+    /// [`Blockchain::checkpoint_satisfied`] — so this set is the evidence, and it
+    /// is built only by [`Blockchain::install_checkpoint_linkage`], which walks a
+    /// header chain and verifies it links, hash by hash, up to the pin.
+    ///
+    /// Empty means "nothing is proven", and the skip is simply not taken: the node
+    /// verifies every seal. That is the SAFE default, and it is what an
+    /// un-linked node does.
+    linked_to_checkpoint: HashSet<Hash>,
     /// The version-bits mask this node commits in blocks it produces (its
     /// miner-signaled governance votes). `0` = signals nothing.
     signal_mask: u32,
@@ -556,6 +568,7 @@ impl Blockchain {
             genesis_ledger,
             genesis_hash,
             checkpoints: HashMap::new(),
+            linked_to_checkpoint: HashSet::new(),
             signal_mask: 0,
             coinbase_account: None,
             default_coinbase: genesis.coinbase,
@@ -576,6 +589,10 @@ impl Blockchain {
     /// match the pinned hash. See `checkpoints`.
     pub fn set_checkpoints(&mut self, checkpoints: impl IntoIterator<Item = (u64, Hash)>) {
         self.checkpoints = checkpoints.into_iter().collect();
+        // Any previously proven linkage was proven against the OLD pin set and
+        // says nothing about the new one. Dropping it fails safe: the node
+        // verifies every seal until linkage is proven again.
+        self.linked_to_checkpoint.clear();
     }
 
     /// ADD trusted checkpoints without discarding existing ones — so a node's baked
@@ -583,16 +600,143 @@ impl Blockchain {
     /// configured checkpoints coexist.
     pub fn add_checkpoints(&mut self, checkpoints: impl IntoIterator<Item = (u64, Hash)>) {
         self.checkpoints.extend(checkpoints);
+        // Adding a pin can move the NEWEST checkpoint, and any existing proof was
+        // built against the old one. Drop it and re-prove from whatever this node
+        // already holds: on a node that is already past the new pin this is free
+        // and instant, and on a fresh one it correctly proves nothing yet.
+        self.linked_to_checkpoint.clear();
+        self.relink_checkpoint_from_local();
     }
 
-    /// The height of the newest trusted checkpoint, or `0` if none are configured. Blocks
-    /// strictly below this are assumed-valid on import (their PoW/signatures are not
-    /// re-verified — the checkpoint transitively pins them), which is what lets a fresh
+    /// The height of the newest trusted checkpoint, or `0` if none are configured.
+    ///
+    /// NOTE: being below this height does NOT by itself make a block assumed-valid.
+    /// That takes a linkage proof — see `install_checkpoint_linkage`. Blocks
+    /// PROVEN to be ancestors of this checkpoint are assumed-valid on import
+    /// (their PoW is not re-verified), which is what lets a fresh
     /// node sync historical blocks at state-application speed instead of re-running every
     /// RandomX seal and hybrid signature. A chain with no checkpoints (dev/test) returns
     /// `0`, so nothing is ever skipped there and the KAT is unaffected.
     fn newest_checkpoint_height(&self) -> u64 {
         self.checkpoints.keys().copied().max().unwrap_or(0)
+    }
+
+    /// Prove, from a chain of headers, that they are ancestors of a pinned
+    /// checkpoint — and record them so the assumevalid seal-skip becomes sound.
+    ///
+    /// This is the fix for the height-vs-ancestry hole. The skip must apply only
+    /// to blocks the pin actually vouches for, and the pin vouches for exactly
+    /// one thing: the block whose hash it names, plus everything that block
+    /// transitively commits to through `prev_hash`. Height has nothing to do
+    /// with it.
+    ///
+    /// `headers` must be contiguous and ascending from height 0. The proof is:
+    ///
+    /// 1. header 0 is this chain's genesis (so the linkage is rooted in a block
+    ///    we already trust absolutely, not in whatever a peer sent first);
+    /// 2. every header links to its predecessor by `prev_hash`;
+    /// 3. a header sits at the newest checkpoint height and its hash equals the
+    ///    pin.
+    ///
+    /// Only then is every header up to the checkpoint recorded. A forged branch
+    /// fails at (3) — it cannot produce the pinned hash without a preimage — and
+    /// a branch spliced onto a forgery fails at (2).
+    ///
+    /// **No proof-of-work is verified here, and none needs to be.** Hash-linking
+    /// is what the pin commits to, and it costs a blake3 per header rather than a
+    /// RandomX evaluation — which is the entire reason this is worth doing: it
+    /// keeps historical sync cheap without trusting a peer's word for it.
+    ///
+    /// Returns the number of headers proven. Errors leave the existing linkage
+    /// untouched, so a bad batch can never weaken a good proof.
+    pub fn install_checkpoint_linkage(
+        &mut self,
+        headers: &[BlockHeader],
+    ) -> Result<usize, ChainError> {
+        let newest = self.newest_checkpoint_height();
+        let Some(&pinned) = self.checkpoints.get(&newest) else {
+            // Nothing pinned: there is nothing to prove, and nothing is skipped.
+            return Ok(0);
+        };
+        let Some(first) = headers.first() else {
+            return Err(ChainError::CheckpointMismatch { height: newest });
+        };
+        // (1) rooted in OUR genesis, not in whatever arrived first.
+        let genesis = self
+            .block_by_height(0)
+            .ok_or(ChainError::CheckpointMismatch { height: 0 })?
+            .hash();
+        if first.height.get() != 0 || first.hash() != genesis {
+            return Err(ChainError::CheckpointMismatch { height: 0 });
+        }
+
+        let mut proven: Vec<Hash> = Vec::with_capacity(headers.len());
+        let mut prev: Option<Hash> = None;
+        let mut reached_pin = false;
+
+        // EVERY header is checked, index 0 included — the pin may sit at genesis,
+        // and an earlier version of this loop skipped index 0 and so could never
+        // match such a pin. The tests below caught that.
+        for (i, h) in headers.iter().enumerate() {
+            // (2) contiguous, ascending, and linked to its predecessor.
+            if h.height.get() != i as u64 {
+                return Err(ChainError::CheckpointMismatch {
+                    height: h.height.get(),
+                });
+            }
+            if let Some(prev_hash) = prev {
+                if h.prev_hash != prev_hash {
+                    return Err(ChainError::CheckpointMismatch {
+                        height: h.height.get(),
+                    });
+                }
+            }
+            let hash = h.hash();
+            // (3) the pin itself.
+            if h.height.get() == newest {
+                if hash != pinned {
+                    return Err(ChainError::CheckpointMismatch { height: newest });
+                }
+                reached_pin = true;
+            }
+            proven.push(hash);
+            prev = Some(hash);
+            if reached_pin {
+                break;
+            }
+        }
+        if !reached_pin {
+            // The batch stopped short of the checkpoint, so it proves nothing —
+            // this is EXACTLY the forged-branch shape, and it is refused rather
+            // than partially trusted.
+            return Err(ChainError::CheckpointMismatch { height: newest });
+        }
+        let n = proven.len();
+        self.linked_to_checkpoint = proven.into_iter().collect();
+        Ok(n)
+    }
+
+    /// Rebuild the linkage proof from blocks this node already holds — no network
+    /// needed. Used after a restart or a log replay, where the chain is already on
+    /// disk and re-verifying every RandomX seal would be pure waste.
+    pub fn relink_checkpoint_from_local(&mut self) -> usize {
+        let newest = self.newest_checkpoint_height();
+        if self.checkpoints.is_empty() || self.height() < newest {
+            return 0;
+        }
+        let headers: Vec<BlockHeader> = (0..=newest)
+            .filter_map(|h| self.block_by_height(h).map(|b| b.header.clone()))
+            .collect();
+        if headers.len() as u64 != newest + 1 {
+            return 0;
+        }
+        self.install_checkpoint_linkage(&headers).unwrap_or(0)
+    }
+
+    /// Whether a block is a PROVEN ancestor of a pinned checkpoint, and so may
+    /// have its (expensive) seal skipped.
+    pub fn is_linked_to_checkpoint(&self, hash: &Hash) -> bool {
+        self.linked_to_checkpoint.contains(hash)
     }
 
     /// Whether this node has actually **matched** a pinned checkpoint on the chain
@@ -1721,16 +1865,28 @@ impl Blockchain {
                 got: block.header.bits,
             });
         }
-        // ASSUMEVALID (Bitcoin's model): a block strictly BELOW the newest trusted
-        // checkpoint is transitively pinned by that checkpoint's hash — a fake history
-        // reaching the checkpoint height is caught by the hash pin (CheckpointMismatch
-        // above), and the real one has valid PoW by definition — so re-running its
-        // (expensive) RandomX seal proves nothing here. Skipping it turns historical sync
-        // from RandomX-bound into cheap state application. The seal is still fully checked
-        // AT and ABOVE the newest checkpoint, and a chain with no checkpoints (dev/test)
-        // has `newest_checkpoint_height() == 0`, so nothing is ever skipped there and the
-        // KAT is byte-identical. (Signatures + roots are always verified below.)
-        let assume_valid = block.header.height.get() < self.newest_checkpoint_height();
+        // ASSUMEVALID — gated on ANCESTRY, not on height.
+        //
+        // The old rule skipped the seal for any block BELOW the newest checkpoint
+        // height, reasoning that such a block is "transitively pinned". It is not.
+        // The hash pin only fires for a block AT a checkpoint height, so a branch
+        // that stops one block SHORT of the checkpoint is pinned by nothing at all
+        // while every block on it still took the skip. And because chainwork is
+        // derived from DECLARED bits — whose retarget the forger computes from its
+        // own timestamps — such a branch can be minted at zero cost and still
+        // outweigh the honest chain on a node that has not yet reached the pin.
+        //
+        // The seal is now skipped only for a block PROVEN to be an ancestor of a
+        // pinned checkpoint by `install_checkpoint_linkage`, which walks the header
+        // chain from OUR genesis and checks it links, hash by hash, up to the pinned
+        // hash. That proof costs a blake3 per header instead of a RandomX
+        // evaluation, so historical sync stays cheap — the property this skip exists
+        // for — without taking a peer's word for anything.
+        //
+        // With no proof installed the set is empty and NOTHING is skipped: every
+        // seal is verified. That is the safe default, and it is what a chain with no
+        // checkpoints (dev/test) always does, so the KAT stays byte-identical.
+        let assume_valid = self.is_linked_to_checkpoint(&block.hash());
         if !assume_valid && !sha_target.is_met_by(&self.seal(&block.header)) {
             return Err(ChainError::PowInsufficient);
         }
@@ -5250,6 +5406,120 @@ mod assumevalid_ancestry_tests {
              must not count as satisfied — every block on it takes the PoW skip \
              while nothing vouches for any of them"
         );
+    }
+
+    /// Linkage must be ROOTED IN OUR GENESIS. A header chain that starts
+    /// somewhere else proves nothing, however well-formed it is.
+    #[test]
+    fn linkage_rooted_elsewhere_is_refused() {
+        let mut chain = fresh_chain();
+        let genesis = chain.block_by_height(0).expect("genesis").header.clone();
+        chain.set_checkpoints([(0, genesis.hash())]);
+
+        let mut forged = genesis.clone();
+        forged.timestamp_ms += 1; // a different genesis
+        assert_ne!(forged.hash(), genesis.hash());
+        assert!(
+            chain.install_checkpoint_linkage(&[forged]).is_err(),
+            "a linkage that does not start at OUR genesis must be refused"
+        );
+        assert!(!chain.is_linked_to_checkpoint(&genesis.hash()));
+    }
+
+    /// **The forged-branch case.** A header chain that stops SHORT of the pinned
+    /// checkpoint proves nothing and must leave the linkage empty — so every one
+    /// of its blocks keeps its seal verified.
+    ///
+    /// This is precisely the shape the old height-based rule accepted: below the
+    /// checkpoint height, therefore "assumed valid", therefore no proof-of-work
+    /// checked. Costing an attacker nothing.
+    #[test]
+    fn a_header_chain_that_stops_short_of_the_pin_proves_nothing() {
+        let mut chain = fresh_chain();
+        let genesis = chain.block_by_height(0).expect("genesis").header.clone();
+        // Pin something far above what we will supply.
+        chain.set_checkpoints([(500, Hash::from_bytes([3u8; 32]))]);
+
+        let out = chain.install_checkpoint_linkage(&[genesis.clone()]);
+        assert!(
+            out.is_err(),
+            "a batch that never reaches the pinned height must be refused, not \
+             partially trusted"
+        );
+        assert!(
+            !chain.is_linked_to_checkpoint(&genesis.hash()),
+            "nothing may be marked assumed-valid without a proof reaching the pin"
+        );
+    }
+
+    /// A wrong hash AT the pinned height is refused even when the chain links
+    /// perfectly up to it.
+    #[test]
+    fn linkage_to_the_wrong_hash_at_the_pin_is_refused() {
+        let mut chain = fresh_chain();
+        let genesis = chain.block_by_height(0).expect("genesis").header.clone();
+        chain.set_checkpoints([(0, Hash::from_bytes([4u8; 32]))]);
+        assert!(
+            chain
+                .install_checkpoint_linkage(&[genesis.clone()])
+                .is_err(),
+            "the pinned HEIGHT is reached but the HASH differs — refuse"
+        );
+        assert!(!chain.is_linked_to_checkpoint(&genesis.hash()));
+    }
+
+    /// The honest case: a chain linking to the pin is proven, and only then may
+    /// its blocks skip the seal.
+    #[test]
+    fn an_honest_chain_linking_to_the_pin_is_proven() {
+        let mut chain = fresh_chain();
+        let genesis = chain.block_by_height(0).expect("genesis").header.clone();
+        chain.set_checkpoints([(0, genesis.hash())]);
+
+        let n = chain
+            .install_checkpoint_linkage(&[genesis.clone()])
+            .expect("an honest linkage must be accepted");
+        assert_eq!(n, 1);
+        assert!(
+            chain.is_linked_to_checkpoint(&genesis.hash()),
+            "a proven ancestor of the pin may skip its seal"
+        );
+        // And something not in the proof still may not.
+        assert!(!chain.is_linked_to_checkpoint(&Hash::from_bytes([8u8; 32])));
+    }
+
+    /// Re-pinning drops any old proof: it was proven against a different pin and
+    /// says nothing about the new one. Failing safe means verifying every seal
+    /// again until a fresh proof lands.
+    #[test]
+    fn changing_the_checkpoints_invalidates_an_existing_proof() {
+        let mut chain = fresh_chain();
+        let genesis = chain.block_by_height(0).expect("genesis").header.clone();
+        chain.set_checkpoints([(0, genesis.hash())]);
+        chain
+            .install_checkpoint_linkage(&[genesis.clone()])
+            .expect("proven");
+        assert!(chain.is_linked_to_checkpoint(&genesis.hash()));
+
+        chain.set_checkpoints([(900, Hash::from_bytes([5u8; 32]))]);
+        assert!(
+            !chain.is_linked_to_checkpoint(&genesis.hash()),
+            "a proof against the OLD pin must not survive a re-pin"
+        );
+    }
+
+    /// A node that already holds the chain can rebuild the proof locally, with no
+    /// network — the restart / log-replay path.
+    #[test]
+    fn linkage_rebuilds_from_local_blocks() {
+        let mut chain = fresh_chain();
+        let genesis = chain.block_by_height(0).expect("genesis").header.clone();
+        chain.set_checkpoints([(0, genesis.hash())]);
+        assert!(!chain.is_linked_to_checkpoint(&genesis.hash()));
+
+        let n = chain.relink_checkpoint_from_local();
+        assert_eq!(n, 1, "the local chain reaches the pin, so it proves it");
+        assert!(chain.is_linked_to_checkpoint(&genesis.hash()));
     }
 
     /// The pin must be matched by HASH, not merely by having some block at that
