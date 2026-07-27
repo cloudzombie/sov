@@ -11659,6 +11659,11 @@ mod tests {
         for p in [
             peer_config_path(Network::Mainnet),
             theme_config_path(),
+            // The pid file matters most of all: `stop_tracked_node()` KILLS
+            // whatever pid it finds here, on every startup. Shared, launching a
+            // dev build terminates a process belonging to the operator's
+            // install — so an override that misses this one is not isolation.
+            node_pid_path(),
             expose_rpc_config_path(),
         ] {
             assert!(
