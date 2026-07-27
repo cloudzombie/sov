@@ -50,7 +50,8 @@ mod transfer;
 mod wallet;
 
 pub use address::{
-    decode_shielded, encode_shielded, AddressError, AnyAddress, Receiver, UnifiedAddress,
+    decode_shielded, decode_shielded_v2, encode_shielded, encode_shielded_v2, AddressError,
+    AnyAddress, Receiver, UnifiedAddress,
 };
 pub use keys::{ShieldedAddress, ShieldedKey};
 pub use pool::{mint_to_shielded, ShieldedBundle, ShieldedParams};

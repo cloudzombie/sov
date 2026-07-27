@@ -14,9 +14,11 @@
 
 pub mod execution;
 pub mod gas;
+pub mod shielded_v2;
 
 pub use execution::{
     apply_coinbase, apply_transaction, apply_transactions, BlockContext, BlockExecutionError,
     ExecutionError,
 };
 pub use gas::{gas_for, INTRINSIC_GAS, SHIELDED_VERIFY_GAS};
+pub use shielded_v2::{verify_bundle_for_carrier, ShieldedV2Error, V2Effects};

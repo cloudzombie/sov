@@ -49,7 +49,7 @@ struct Flags {
 
 impl Flags {
     fn parse(args: &[String]) -> Result<Self, String> {
-        const SWITCHES: [&str; 1] = ["keep"];
+        const SWITCHES: [&str; 2] = ["keep", "require-complete"];
         let mut opts = HashMap::new();
         let mut switches = Vec::new();
         let mut i = 0;
@@ -262,8 +262,21 @@ fn run(args: Vec<String>) -> Result<usize, String> {
         .iter()
         .filter(|s| s.status == Status::Fail)
         .count();
-    print_summary(&step_results, failed);
-    Ok(failed)
+    let skipped = step_results
+        .iter()
+        .filter(|s| s.status == Status::Skip)
+        .count();
+    // Release/full-green mode: a SKIP is a step that did not run, so it cannot
+    // evidence the behaviour it names. Counting it as success is how a harness
+    // reports green while testing nothing (audit PQV2-02). Under
+    // `--require-complete` every skip is fatal.
+    let require_complete = flags.has("require-complete");
+    print_summary(&step_results, failed, skipped, require_complete);
+    Ok(if require_complete {
+        failed + skipped
+    } else {
+        failed
+    })
 }
 
 /// Boot the initial nodes and run the matrix. Errors here still flow through

@@ -16,7 +16,13 @@
 //! 3. `cm_i` is a depth-20 Merkle leaf under `anchors[i]` (membership; each
 //!    input may use a DIFFERENT public anchor — D5's anchor-ring acceptance
 //!    is the native verifier's job)
-//! 4. `nullifiers[i] = merge_d(NF, nsk_i, rho_i)`            (nullifier)
+//! 4. `nullifiers[i] = merge_d(NF, nsk_i, rho_i; pos_i)`     (nullifier),
+//!    where `pos_i` is the leaf position of `cm_i` under `anchors[i]`,
+//!    reconstructed in-circuit from the SAME path bits that route step 3
+//!    and bound into sponge capacity element 2. Without it the nullifier
+//!    would be a function of `(nsk, rho)` only, so two notes of DIFFERENT
+//!    value sharing a `rho` would collide onto one nullifier and spending
+//!    either would strand the other (audit **PQV2-01**).
 //!
 //! **Per DUMMY input `i`:** `v_i = 0` (asserted on the committed value
 //! register), and the slot's nullifier hash runs under the distinct
@@ -65,7 +71,7 @@
 //!
 //! # Trace layout
 //!
-//! 31 columns × 1024 rows, in 8-row hash cycles (7 Rescue rounds + 1
+//! 32 columns × 1024 rows, in 8-row hash cycles (7 Rescue rounds + 1
 //! injection row):
 //!
 //! - Columns 0..12: the Rescue-Prime sponge state.
@@ -75,6 +81,8 @@
 //! - Columns 21..29: the eight value registers (4 input then 4 output),
 //!   constant over the whole active region.
 //! - Column 29/30: range-check bit / running-sum accumulator.
+//! - Column 31: Merkle leaf-position accumulator (`Σ bit_l·2^l`), zero at
+//!   each input-segment start and read into the nullifier sponge's capacity.
 //!
 //! Row map: input `i` occupies rows `192·i .. 192·i+191` (cycle 0 = owner
 //! tag, 1–2 = commitment, 3..22 = Merkle ×20 with the root on row
@@ -83,6 +91,10 @@
 //! `768+16·j+15`). Rows 832..1024 are padding (hash rounds only). The
 //! range check for value `m ∈ 0..8` runs in columns 29–30 over rows
 //! `64·m .. 64·m+61`, in parallel with the hash columns.
+//!
+//! Injection rows stamp each phase's DOMAIN into capacity element 1; the
+//! nullifier row additionally stamps the leaf position into capacity element
+//! 2. Capacity element 3 is unused and constrained to zero throughout.
 //!
 //! Injection rows wire each phase's output into the next phase's sponge
 //! input and stamp the next phase's DOMAIN into capacity element 1 — the
@@ -106,8 +118,9 @@ use winterfell::{
 pub const CYCLE_LENGTH: usize = 8;
 /// Total trace length: 104 active cycles padded to a power of two.
 pub const TRACE_LENGTH: usize = 1024;
-/// Trace width: 12 sponge + 4 rho + 4 nsk + 1 path bit + 8 values + 2 rc.
-pub const TRACE_WIDTH: usize = 31;
+/// Trace width: 12 sponge + 4 rho + 4 nsk + 1 path bit + 8 values + 2 rc
+/// + 1 Merkle leaf-position accumulator.
+pub const TRACE_WIDTH: usize = 32;
 /// Input and output slots per bundle (D2: fixed 4-in/4-out shape).
 pub const NUM_SLOTS: usize = 4;
 
@@ -123,6 +136,16 @@ pub const VAL_COL: usize = 21;
 pub const RC_BIT_COL: usize = 29;
 /// Range-check running-sum accumulator column.
 pub const RC_ACC_COL: usize = 30;
+/// Merkle leaf-position accumulator column (audit **PQV2-01**).
+///
+/// Reconstructs the spent note's leaf index from the *same* path bits
+/// ([`BIT_COL`]) that route the Merkle hash, as `Σ_level bit_level · 2^level`.
+/// The accumulated value is bound into the nullifier sponge's capacity
+/// element 2, which makes the nullifier unique per note *occurrence* rather
+/// than per `(nsk, rho)` pair. Because it is the same register that decides
+/// left/right at every level, a prover cannot claim membership along one path
+/// and a position from another.
+pub const POS_ACC_COL: usize = 31;
 
 /// Rows per input segment (24 cycles).
 pub const INPUT_SEGMENT_ROWS: usize = 24 * CYCLE_LENGTH;
@@ -246,7 +269,8 @@ impl ToElements<Felt> for BundlePublicInputs {
 //   119      range-check bit is boolean
 //   120..128 range-check landing: accumulator == value register (×8)
 //   128      value conservation (public t_in/t_out/fee folded in)
-const NUM_CONSTRAINTS: usize = 129;
+//   129      leaf-position accumulator recurrence (PQV2-01)
+const NUM_CONSTRAINTS: usize = 130;
 
 // Periodic column index map (must match `get_periodic_column_values`):
 //   0        hash-round mask (period 8)
@@ -256,6 +280,7 @@ const NUM_CONSTRAINTS: usize = 129;
 //   39 m_outseed     40..44 m_outseed_j  44 m_outcm
 //   45 m_acc         46 m_isbit        47..55 m_rcend_m
 //   55 m_bal         56 m_const_keys   57 m_const_vals
+//   58 m_pos_step    59 m_pos_weight
 const P_ROW0: usize = 25;
 const P_SEED_IN: usize = 26;
 const P_TAG: usize = 27;
@@ -273,7 +298,9 @@ const P_RCEND_M: usize = 47;
 const P_BAL: usize = 55;
 const P_CONST_KEYS: usize = 56;
 const P_CONST_VALS: usize = 57;
-const NUM_PERIODIC: usize = 58;
+const P_POS_STEP: usize = 58;
+const P_POS_W: usize = 59;
+const NUM_PERIODIC: usize = 60;
 
 /// The bundle AIR. See the module docs for the statement and trace layout.
 pub struct BundleAir {
@@ -297,7 +324,7 @@ impl Air for BundleAir {
         for idx in STATE_WIDTH..NUM_CONSTRAINTS {
             // Degree-2 constraints: Merkle bit selection + bit-binary
             // (75..84) and the range-check bit-binary (119).
-            let deg = if (75..84).contains(&idx) || idx == 119 {
+            let deg = if (75..84).contains(&idx) || idx == 119 || idx == 129 {
                 2
             } else {
                 1
@@ -308,7 +335,9 @@ impl Air for BundleAir {
             ));
         }
         // Assertion count depends on the (public) dummy pattern.
-        let mut num_assertions = 8 /* row-0 seed */ + NUM_SLOTS * 2 /* rc acc starts */;
+        let mut num_assertions = 8 /* row-0 seed */
+            + NUM_SLOTS * 2 /* rc acc starts */
+            + NUM_SLOTS /* leaf-position acc starts */;
         for i in 0..NUM_SLOTS {
             num_assertions += if pub_inputs.input_dummy[i] { 1 } else { 8 };
             num_assertions += if pub_inputs.output_dummy[i] { 1 } else { 4 };
@@ -353,6 +382,8 @@ impl Air for BundleAir {
         let m_bal = periodic_values[P_BAL];
         let m_const_keys = periodic_values[P_CONST_KEYS];
         let m_const_vals = periodic_values[P_CONST_VALS];
+        let m_pos_step = periodic_values[P_POS_STEP];
+        let pos_w = periodic_values[P_POS_W];
 
         let cap_seed = E::from(Felt::new(CAPACITY_SEED));
         let dom_tag = E::from(Felt::new(RESCUE_DOMAIN_OWNER_TAG));
@@ -463,7 +494,14 @@ impl Air for BundleAir {
         // capacity element 1 carries the REAL vs DUMMY nullifier domain
         // per the public dummy flag (per-input mask).
         result[84] = m_nf_any * (nxt[0] - cap_seed);
-        result[85] = m_nf_any * nxt[2];
+        // Capacity element 2 carries the note's Merkle leaf position — the
+        // occurrence binding of audit PQV2-01. `cur[POS_ACC_COL]` at this row
+        // is the accumulator's landed value: every path bit has been folded
+        // in (the last Merkle injection row precedes this one) and the step
+        // constraint has held it constant since. This is the SAME register
+        // that routed each Merkle level, so position and membership cannot
+        // disagree.
+        result[85] = m_nf_any * (nxt[2] - cur[POS_ACC_COL]);
         result[86] = m_nf_any * nxt[3];
         for k in 0..4 {
             result[87 + k] = m_nf_any * (nxt[4 + k] - cur[NSK_COL + k]);
@@ -518,6 +556,18 @@ impl Air for BundleAir {
             result[120 + m] = mask * (cur[RC_ACC_COL] - cur[VAL_COL + m]);
         }
 
+        // --- 129: leaf-position accumulator (PQV2-01). One constraint does
+        // both jobs: the weight column is 2^level on a Merkle injection row
+        // and ZERO everywhere else, so this reads as
+        //   pos' = pos + bit·2^level   on a Merkle row,
+        //   pos' = pos                 on every other row of the segment.
+        // Combined with the per-segment boundary assertion pos = 0, the
+        // accumulator at the nullifier seed row is exactly Σ bit_l·2^l — the
+        // leaf index of the authenticated path. The path bits are already
+        // boolean-constrained (result[83]) on precisely the rows where the
+        // weight is non-zero, so no non-binary filler can inflate the sum.
+        result[129] = m_pos_step * (nxt[POS_ACC_COL] - cur[POS_ACC_COL] - cur[BIT_COL] * pos_w);
+
         // --- 128: value conservation (D1). Only t_in/t_out/fee are public;
         // all eight values are private registers. Sound over the integers
         // by the 61-bit range checks + native public-leg bounds (see
@@ -547,6 +597,12 @@ impl Air for BundleAir {
         // Range-check accumulators start at 0 in every segment.
         for m in 0..2 * NUM_SLOTS {
             assertions.push(Assertion::single(RC_ACC_COL, rc_base(m), Felt::ZERO));
+        }
+        // The leaf-position accumulator starts at ZERO in every input
+        // segment. Without this the prover could seed it with an arbitrary
+        // offset and bind any position it liked into the nullifier.
+        for i in 0..NUM_SLOTS {
+            assertions.push(Assertion::single(POS_ACC_COL, input_base(i), Felt::ZERO));
         }
         // Real inputs: root and nullifier bound to the public inputs.
         // Dummy inputs: value register pinned to ZERO (the root/nullifier
@@ -665,6 +721,27 @@ impl Air for BundleAir {
             *v = Felt::ONE;
         }
         columns.push(m_vals);
+        // 58: leaf-position accumulator step — active on every transition
+        // from an input segment's first row up to (but not including) the row
+        // that seeds the nullifier hash. Because the weight column below is
+        // zero off the Merkle injection rows, this single mask supplies BOTH
+        // the accumulate step and the hold between levels.
+        let mut m_pos = vec![Felt::ZERO; TRACE_LENGTH];
+        for i in 0..NUM_SLOTS {
+            for v in m_pos.iter_mut().take(root_row(i)).skip(input_base(i)) {
+                *v = Felt::ONE;
+            }
+        }
+        columns.push(m_pos);
+        // 59: leaf-position bit weight — 2^level at the Merkle injection row
+        // for that level, zero everywhere else.
+        let mut pos_w = vec![Felt::ZERO; TRACE_LENGTH];
+        for i in 0..NUM_SLOTS {
+            for level in 0..TREE_DEPTH {
+                pos_w[merkle_inject_row(i, level)] = Felt::new(1u64 << level);
+            }
+        }
+        columns.push(pos_w);
         debug_assert_eq!(columns.len(), NUM_PERIODIC);
         columns
     }

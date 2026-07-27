@@ -51,6 +51,20 @@ impl EncryptionKeypair {
         Ok(EncryptionKeypair { ek, dk })
     }
 
+    /// Derive the keypair **deterministically** from the FIPS 203 keygen
+    /// seeds `(d, z)` — the recoverable-from-a-phrase path (D9). The HD
+    /// tier derives `d` and `z` from the BIP-44 leaf under two distinct
+    /// blake3 domains ([`crate::hd::PqShieldedKey`]); they are independent
+    /// by construction, which FIPS 203 requires (`z` is the
+    /// implicit-rejection secret and must not be derivable from `d`).
+    ///
+    /// Both seeds are zeroized by the caller; this function copies them
+    /// into `fips203`, whose key types zeroize on drop.
+    pub fn from_kem_seeds(d: &[u8; 32], z: &[u8; 32]) -> Self {
+        let (ek, dk) = ml_kem_768::KG::keygen_from_seed(*d, *z);
+        EncryptionKeypair { ek, dk }
+    }
+
     /// The public encapsulation key bytes (shared as the shielded address's
     /// encryption component).
     pub fn public_bytes(&self) -> [u8; KEM_PK_LEN] {

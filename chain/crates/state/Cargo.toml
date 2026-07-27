@@ -11,6 +11,7 @@ description = "Authenticated world state for SOV: a Sparse Merkle Tree, accounts
 sov-primitives = { path = "../primitives" }
 sov-crypto = { path = "../crypto" }
 sov-shielded = { path = "../shielded" }
+sov-shielded-pq = { path = "../shielded-pq" }
 sov-compliance = { path = "../compliance" }
 borsh.workspace = true
 serde.workspace = true

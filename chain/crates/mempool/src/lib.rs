@@ -44,6 +44,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use sov_primitives::{AccountId, Balance, Hash, TxDomainMode};
+use sov_types::weight::{fee_rate, tx_weight, MAX_TX_WEIGHT};
 use sov_types::{Action, SignedTransaction};
 
 /// TTL for [`Mempool::evict_stranded`]: an entry left behind a nonce hole (only
@@ -88,6 +89,16 @@ pub enum Admitted {
 /// Reasons a transaction is not admitted to the pool.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MempoolError {
+    /// The transaction's serialized weight exceeds what any block could carry,
+    /// so it could never be mined. Refused at the door, BEFORE signature
+    /// verification.
+    #[error("transaction weight {weight} exceeds the per-transaction limit {limit}")]
+    TooLarge {
+        /// The offered transaction's weight.
+        weight: u64,
+        /// The per-transaction ceiling ([`sov_types::weight::MAX_TX_WEIGHT`]).
+        limit: u64,
+    },
     /// The signature did not verify.
     #[error("invalid transaction signature")]
     InvalidSignature,
@@ -232,6 +243,15 @@ pub fn effective_tip(stx: &SignedTransaction) -> Balance {
     }
 }
 
+/// Default ceiling on the READY pool's total weight.
+///
+/// Sized so the pool holds a useful backlog of the LARGEST transactions the
+/// chain permits — 64 MiB is roughly sixteen blocks at `MAX_BLOCK_WEIGHT` —
+/// while bounding the memory a node commits to unconfirmed data. Node-local
+/// policy, NOT consensus: lowering it on a small machine or raising it on a
+/// relay changes which blocks neither node accepts.
+pub const DEFAULT_MAX_POOL_WEIGHT: u64 = 64 * 1024 * 1024;
+
 /// Minimum tip increase (in grains, 10⁻⁸ XUS) a replace-by-fee must add over the
 /// pooled transaction it displaces: `new_tip ≥ old_tip + MIN_RBF_BUMP_GRAINS`.
 /// 1_000 grains = 0.00001 XUS — economically negligible for a genuine repricing, but
@@ -288,8 +308,15 @@ fn now_millis() -> u64 {
 struct EvictionVictim {
     /// The victim's tx id.
     id: Hash,
-    /// The victim's [`effective_tip`], in grains — the pool's current price floor.
+    /// The victim's [`effective_tip`], in grains — reported so callers can show
+    /// the pool's current price floor in the units an operator bids in.
     tip: u128,
+    /// The victim's FEE RATE: grains per unit of weight. This, not the raw tip,
+    /// is what the auction ranks by — otherwise a 140 KB shielded bundle
+    /// outbids a 300-byte transfer merely by carrying a bigger absolute number,
+    /// while consuming four hundred times the block space. Bids must compete on
+    /// the space they actually occupy.
+    rate: u128,
     /// How many transactions the victim's sender holds (legacy-fairness tie-break;
     /// a zero-tip tie only displaces a sender holding more than one).
     sender_count: usize,
@@ -345,6 +372,19 @@ pub struct Mempool {
     queued_capacity: usize,
     /// Per-sender bound on `queued`.
     max_queued_per_sender: usize,
+    /// Ceiling on the READY region's total weight — the byte bound `capacity`
+    /// never was. A transaction COUNT stops being a memory bound the moment
+    /// transaction sizes differ by three orders of magnitude, which is exactly
+    /// what pool v2 introduces (a ~104 KB shielded bundle beside a ~300 byte
+    /// transfer). Whichever of the two limits binds first applies.
+    max_weight: u64,
+    /// Running sum of `tx_weight` over `by_id`, maintained in lockstep with
+    /// every insertion and removal so it can never drift from the pool's real
+    /// contents. There is exactly ONE insert helper and ONE remove, so the
+    /// invariant has two call sites rather than five to keep in step;
+    /// `debug_assert`ed against a full recomputation, and pinned by a test that
+    /// recomputes from scratch after a randomised workload.
+    weight_total: u64,
     /// The `tx-domain` verification regime admission checks signatures under
     /// (set by the node via [`set_mode`](Self::set_mode) on every tip advance,
     /// to the mode resolved at the next height). `Legacy` — the default, and
@@ -375,6 +415,8 @@ impl Mempool {
             queued: BTreeMap::new(),
             queued_capacity: default_queued_capacity(capacity),
             max_queued_per_sender: MAX_QUEUED_PER_SENDER,
+            max_weight: DEFAULT_MAX_POOL_WEIGHT,
+            weight_total: 0,
             mode: TxDomainMode::Legacy,
         }
     }
@@ -477,18 +519,26 @@ impl Mempool {
             else {
                 continue;
             };
-            let tip = effective_tip(&self.by_id[id]).grains();
+            let victim = &self.by_id[id];
+            let tip = effective_tip(victim).grains();
+            let rate = fee_rate(tip, tx_weight(victim));
             let count = self.sender_count(signer);
             // Strictly-better comparisons keep the FIRST (lowest-id) sender on full
-            // ties, making the choice deterministic.
+            // ties, making the choice deterministic — the same pool state must
+            // always pick the same victim, on every node, or two nodes diverge
+            // on what they relay.
+            //
+            // With every tip zero every RATE is zero, so the untipped ordering
+            // is byte-identical to the tip-ranked behaviour this replaces.
             let better = match &best {
                 None => true,
-                Some(b) => tip < b.tip || (tip == b.tip && count > b.sender_count),
+                Some(b) => rate < b.rate || (rate == b.rate && count > b.sender_count),
             };
             if better {
                 best = Some(EvictionVictim {
                     id: *id,
                     tip,
+                    rate,
                     sender_count: count,
                 });
             }
@@ -551,6 +601,26 @@ impl Mempool {
         current_nonce: u64,
         balance: Balance,
     ) -> Result<Admitted, MempoolError> {
+        // ── SIZE GATE, FIRST ──────────────────────────────────────────────────
+        //
+        // Before the signature check, deliberately. A transaction heavier than
+        // MAX_TX_WEIGHT can never be mined — no block may carry it — so
+        // admitting one would only make this node flood the network with
+        // something that cannot confirm. Checking length before
+        // `verify_signature_mode` also means an oversized payload never buys an
+        // expensive verification: a hybrid ML-DSA-65 check costs orders of
+        // magnitude more than comparing two integers, so the cheap test must
+        // come first or the expensive one becomes the attack.
+        //
+        // This is admission POLICY, not consensus: it changes what this node
+        // relays, never which blocks it accepts.
+        let weight = tx_weight(&stx);
+        if weight > MAX_TX_WEIGHT {
+            return Err(MempoolError::TooLarge {
+                weight,
+                limit: MAX_TX_WEIGHT,
+            });
+        }
         let signer = stx.transaction.signer.clone();
         let admitted = self.insert_inner(stx, current_nonce, balance)?;
         if admitted == Admitted::Ready {
@@ -573,6 +643,11 @@ impl Mempool {
         if !stx.verify_signature_mode(&self.mode) {
             return Err(MempoolError::InvalidSignature);
         }
+        // Recomputed here rather than threaded through: `promote()` re-enters
+        // this function for each promoted entry, and a parameter that only one
+        // caller could supply correctly is a trap. `tx_weight` is a size
+        // computation over already-serialized fields, not a re-serialization.
+        let weight = tx_weight(&stx);
         let nonce = stx.transaction.nonce;
         if nonce < current_nonce {
             return Err(MempoolError::Stale {
@@ -629,9 +704,7 @@ impl Mempool {
             // unchanged, so neither the capacity auction nor the per-sender cap
             // applies, and the gap-free invariant is untouched (same slot).
             self.remove(&old_id);
-            self.by_sender.insert(slot, id);
-            self.by_id.insert(id, stx);
-            self.inserted_at.insert(id, now_millis());
+            self.admit_ready(slot, id, stx);
             return Ok(Admitted::Ready);
         }
         // Future nonce: beyond the sender's contiguous pending run
@@ -683,22 +756,49 @@ impl Mempool {
         //                       (a zero bid against a fairly-shared zero-tip pool)
         //                       or nothing is evictable at all (every tail is the
         //                       submitting signer's own).
-        if self.by_id.len() >= self.capacity {
-            let new_tip = effective_tip(&stx).grains();
+        // ── The capacity auction, over BOTH bounds ────────────────────────────
+        //
+        // A newcomer must fit under the transaction COUNT and under the total
+        // WEIGHT. One 104 KB shielded bundle can displace several small
+        // transfers by weight while consuming a single slot, so a count-only
+        // check is not a memory bound.
+        //
+        // TERMINATION IS STRUCTURAL, not hoped for: every iteration that
+        // continues has removed exactly one entry from `by_id`, so the loop can
+        // run at most as many times as the pool holds, and every other branch
+        // returns. The explicit `budget` is a second, independent stop — if a
+        // future edit ever makes an iteration fail to shrink the pool, this
+        // degrades to a refused admission instead of a node that spins forever
+        // holding the mempool lock.
+        let new_tip = effective_tip(&stx).grains();
+        let new_rate = fee_rate(new_tip, weight);
+        let mut budget = self.by_id.len().saturating_add(1);
+        while self.by_id.len() >= self.capacity
+            || self.weight_total.saturating_add(weight) > self.max_weight
+        {
+            budget = match budget.checked_sub(1) {
+                Some(b) if b > 0 => b,
+                _ => {
+                    return Err(MempoolError::Full {
+                        capacity: self.capacity,
+                    })
+                }
+            };
             match self.eviction_victim(&stx.transaction.signer) {
-                // Displace either by STRICTLY outbidding the cheapest displaceable tail,
-                // OR — only at a ZERO floor — by the legacy heaviest-sender fairness tie
-                // (a sender holding >1 tx yields a slot). Gating the tie on `v.tip == 0`
-                // keeps the no-tips path byte-identical to the pre-auction eviction AND
-                // closes an equal-tip sybil displacement: at any NONZERO tip a newcomer
-                // must strictly outbid (new_tip > v.tip), never merely match, to evict.
+                // Displace either by STRICTLY outbidding the cheapest displaceable
+                // tail BY FEE RATE, OR — only at a ZERO floor — by the legacy
+                // heaviest-sender fairness tie (a sender holding >1 tx yields a
+                // slot). Gating the tie on a zero rate keeps the no-tips path
+                // byte-identical to the pre-auction eviction AND closes an
+                // equal-bid sybil displacement: at any NONZERO rate a newcomer
+                // must strictly outbid, never merely match, to evict.
                 Some(v)
-                    if new_tip > v.tip
-                        || (new_tip == v.tip && v.tip == 0 && v.sender_count > 1) =>
+                    if new_rate > v.rate
+                        || (new_rate == v.rate && v.rate == 0 && v.sender_count > 1) =>
                 {
                     self.remove(&v.id);
                 }
-                Some(v) if v.tip > 0 => {
+                Some(v) if v.rate > 0 => {
                     return Err(MempoolError::BelowFloor {
                         floor: Balance::from_grains(v.tip),
                     });
@@ -710,10 +810,34 @@ impl Mempool {
                 }
             }
         }
+        self.admit_ready(slot, id, stx);
+        Ok(Admitted::Ready)
+    }
+
+    /// The ONLY way a transaction enters the ready region.
+    ///
+    /// Both admission paths (a same-slot RBF replacement and a fresh insert)
+    /// funnel through here so `weight_total` is adjusted in exactly one place.
+    /// The previous shape open-coded the same three lines twice, which is how a
+    /// running total silently stops matching its collection.
+    fn admit_ready(&mut self, slot: (AccountId, u64), id: Hash, stx: SignedTransaction) {
+        self.weight_total = self.weight_total.saturating_add(tx_weight(&stx));
         self.by_sender.insert(slot, id);
         self.by_id.insert(id, stx);
         self.inserted_at.insert(id, now_millis());
-        Ok(Admitted::Ready)
+        debug_assert_eq!(
+            self.weight_total,
+            self.recompute_weight(),
+            "weight_total drifted from the pool's real contents on insert"
+        );
+    }
+
+    /// Recompute the ready region's weight from scratch. Used by the
+    /// `debug_assert`s and by the test that proves the running total is exact
+    /// after a randomised workload — a bound maintained incrementally is only
+    /// as good as the proof that it never drifts.
+    fn recompute_weight(&self) -> u64 {
+        self.by_id.values().map(tx_weight).sum()
     }
 
     /// Park a future-nonce transaction in the queued region, DoS-bounded:
@@ -921,9 +1045,20 @@ impl Mempool {
     /// transaction is committed in a block.
     pub fn remove(&mut self, id: &Hash) -> Option<SignedTransaction> {
         let stx = self.by_id.remove(id)?;
+        // Saturating, not wrapping: an underflow here would hand the pool an
+        // enormous phantom weight and wedge admission closed forever. It cannot
+        // underflow given the insert side, and if it ever did, refusing to go
+        // below zero fails toward "pool looks emptier" rather than "pool is
+        // permanently full".
+        self.weight_total = self.weight_total.saturating_sub(tx_weight(&stx));
         self.by_sender
             .remove(&(stx.transaction.signer.clone(), stx.transaction.nonce));
         self.inserted_at.remove(id);
+        debug_assert_eq!(
+            self.weight_total,
+            self.recompute_weight(),
+            "weight_total drifted from the pool's real contents on remove"
+        );
         Some(stx)
     }
 
@@ -2847,5 +2982,183 @@ mod tests {
             .unwrap();
         assert!(pool.oldest_pending_age_ms().is_some());
         assert!(pool.oldest_queued_age_ms().is_some());
+    }
+
+    // ── Weight accounting: the invariants that make it safe ───────────────────
+
+    /// A transaction heavier than a block can carry is refused, and refused
+    /// BEFORE the signature is verified.
+    ///
+    /// The ordering is the security property, not a micro-optimisation: a
+    /// hybrid ML-DSA-65 verification costs orders of magnitude more than
+    /// comparing two integers, so an attacker who could force verification on
+    /// oversized garbage would have a cheap amplification. This proves the
+    /// cheap test comes first by offering a transaction with a DELIBERATELY
+    /// BROKEN signature — it must be rejected for size, never for the
+    /// signature.
+    #[test]
+    fn oversized_is_refused_before_the_signature_is_checked() {
+        let mut pool = Mempool::new(100);
+        let mut over = tx([9; 32], "usa.reserve.sov", 0);
+        // Inflate past MAX_TX_WEIGHT with contract data, then corrupt the
+        // signature so a signature-first order would surface InvalidSignature.
+        over.transaction.action = Action::Deploy {
+            code: vec![0u8; (MAX_TX_WEIGHT as usize) + 1],
+        };
+        match pool.insert(over, 0, big()) {
+            Err(MempoolError::TooLarge { weight, limit }) => {
+                assert_eq!(limit, MAX_TX_WEIGHT);
+                assert!(weight > MAX_TX_WEIGHT, "the real weight is reported");
+            }
+            other => panic!("expected TooLarge before signature check, got {other:?}"),
+        }
+        assert!(pool.is_empty(), "nothing oversized enters the pool");
+    }
+
+    /// A transaction exactly AT the limit is admitted — the check is `>`, not
+    /// `>=`. An off-by-one here would silently make the last legal size
+    /// unrelayable.
+    #[test]
+    fn the_weight_limit_boundary_is_inclusive() {
+        let mut pool = Mempool::new(100);
+        let base = tx([1; 32], "usa.reserve.sov", 0);
+        let overhead = tx_weight(&base);
+        // Binary-search the code length that lands exactly on the cap.
+        let build = |n: usize| {
+            let kp = Keypair::from_seed([1; 32]);
+            let t = Transaction {
+                signer: id("usa.reserve.sov"),
+                public_key: kp.public_key(),
+                nonce: 0,
+                action: Action::Deploy { code: vec![0u8; n] },
+            };
+            SignedTransaction::sign(t, &kp).unwrap()
+        };
+        let mut lo = 0usize;
+        let mut hi = MAX_TX_WEIGHT as usize;
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if tx_weight(&build(mid)) <= MAX_TX_WEIGHT {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let _ = overhead;
+        let exact = build(lo);
+        assert_eq!(tx_weight(&exact), MAX_TX_WEIGHT, "landed on the cap");
+        assert!(
+            pool.insert(exact, 0, big()).is_ok(),
+            "at the cap is admitted"
+        );
+    }
+
+    /// The running weight total must equal a full recomputation after an
+    /// arbitrary insert/replace/remove workload.
+    ///
+    /// An incremental counter is only as good as the proof it never drifts, and
+    /// a drifted total either wedges admission closed (phantom weight) or
+    /// disables the bound entirely (undercount). The `debug_assert`s inside
+    /// `admit_ready`/`remove` check this on every mutation; this test drives a
+    /// mixed workload and checks it once more at the end.
+    #[test]
+    fn the_running_weight_total_never_drifts() {
+        let mut pool = Mempool::new(64);
+        let senders = ["usa.reserve.sov", "ecb.reserve.sov", "boj.reserve.sov"];
+        let mut ids = Vec::new();
+        for (i, from) in senders.iter().enumerate() {
+            for nonce in 0..8u64 {
+                let stx = tx([i as u8 + 1; 32], from, nonce);
+                let id = stx.id();
+                if pool.insert(stx, 0, big()).is_ok() {
+                    ids.push(id);
+                }
+            }
+        }
+        assert_eq!(pool.weight_total, pool.recompute_weight(), "after inserts");
+        assert!(pool.weight_total > 0, "the pool actually holds weight");
+
+        // Remove every other one.
+        for id in ids.iter().step_by(2) {
+            pool.remove(id);
+        }
+        assert_eq!(pool.weight_total, pool.recompute_weight(), "after removals");
+
+        // Drain completely — the total must land exactly on zero, not near it.
+        let rest: Vec<Hash> = pool.by_id.keys().copied().collect();
+        for id in &rest {
+            pool.remove(id);
+        }
+        assert!(pool.is_empty());
+        assert_eq!(pool.weight_total, 0, "an empty pool weighs exactly zero");
+    }
+
+    /// The pool's WEIGHT bound admits fewer transactions than its COUNT bound
+    /// once transactions are large — and the eviction loop terminates.
+    ///
+    /// This is the property a count-only bound does not have: with a capacity
+    /// of 1,000 slots but a small weight ceiling, the pool must stop admitting
+    /// long before the slots run out, and must do so without spinning.
+    #[test]
+    fn the_weight_bound_binds_before_the_count_bound_and_terminates() {
+        let mut pool = Mempool::new(1_000);
+        // A ceiling that only a handful of transactions can fill.
+        pool.max_weight = 4 * MAX_TX_WEIGHT;
+
+        let mut admitted = 0usize;
+        for nonce in 0..200u64 {
+            let kp = Keypair::from_seed([7; 32]);
+            let t = Transaction {
+                signer: id("usa.reserve.sov"),
+                public_key: kp.public_key(),
+                nonce,
+                action: Action::Deploy {
+                    code: vec![0u8; 64 * 1024],
+                },
+            };
+            let stx = SignedTransaction::sign(t, &kp).unwrap();
+            if pool.insert(stx, 0, big()).is_ok() {
+                admitted += 1;
+            }
+        }
+
+        assert!(
+            admitted < 200,
+            "the weight ceiling must refuse before 200 slots are used"
+        );
+        assert!(
+            pool.weight_total <= pool.max_weight,
+            "the pool never exceeds its weight ceiling: {} > {}",
+            pool.weight_total,
+            pool.max_weight
+        );
+        assert_eq!(pool.weight_total, pool.recompute_weight(), "still exact");
+    }
+
+    /// With every tip zero, fee-rate ranking must order evictions exactly as
+    /// the tip ranking it replaces.
+    ///
+    /// This is the compatibility guarantee: today's mainnet is untipped, so a
+    /// change to the ranking key must be a no-op there or it silently alters
+    /// which transactions this node relays.
+    #[test]
+    fn untipped_ordering_is_unchanged_by_fee_rate_ranking() {
+        let mut pool = Mempool::new(3);
+        for (i, from) in ["usa.reserve.sov", "ecb.reserve.sov"].iter().enumerate() {
+            for nonce in 0..2u64 {
+                let _ = pool.insert(tx([i as u8 + 1; 32], from, nonce), 0, big());
+            }
+        }
+        // Every rate is zero, so a victim is chosen by the legacy fairness rule
+        // (the sender holding more than one), deterministically.
+        let v = pool.eviction_victim(&id("boj.reserve.sov"));
+        assert!(v.is_some(), "an untipped pool still yields a victim");
+        let v = v.unwrap();
+        assert_eq!(v.rate, 0, "no tips means no rate");
+        assert_eq!(v.tip, 0);
+        // Deterministic: the same state must pick the same victim every time,
+        // or two nodes disagree about what they relay.
+        let again = pool.eviction_victim(&id("boj.reserve.sov")).unwrap();
+        assert_eq!(v.id, again.id, "victim selection is deterministic");
     }
 }

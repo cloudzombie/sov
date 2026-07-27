@@ -1,9 +1,14 @@
 //! # sov-shielded-pq — post-quantum shielded pool core (pool v2, pre-audit)
 //!
-//! **This crate is NOT wired into consensus, carries no `Action` variant,
-//! and nothing here enters the trust path until it has an external audit
-//! and parameter review** (the v0.2.0 program ships it DORMANT behind a
-//! BIP-9 deployment; see `notes/v0.2.0-program.md`).
+//! **Everything here is DORMANT: the `shielded-v2` deployment (signal
+//! bit 2) is defined but NOT armed, so no chain executes any of this code
+//! in consensus today, and nothing here enters the trust path until it has
+//! an external audit and parameter review** (see `notes/v0.2.0-program.md`).
+//! As of v0.2.0 slices S2a/S2b the pool's *consensus state shape* exists
+//! ([`state`], folded into the ledger root only once non-empty) and the
+//! `Action::ShieldedV2` carrier variant exists (appended, size-capped,
+//! hard-rejected `FeatureInactive` at execution) — both inert until an
+//! explicit, separately-audited arming release schedules bit 2.
 //!
 //! ## What it is
 //!
@@ -51,22 +56,31 @@
 pub mod air;
 pub mod auth;
 pub mod bundle;
+pub mod carrier;
 pub mod domains;
 pub mod encrypt;
 pub mod hash;
+pub mod hd;
 pub mod note;
 pub mod proof_frame;
 pub mod prover;
+pub mod scan;
+pub mod state;
 pub mod tree;
+pub mod wallet;
 pub mod wire;
 
 pub use air::BundlePublicInputs;
 pub use auth::AuthKeypair;
-pub use bundle::{bundle_digest, verify_bundle, BundleError, SpendBundle};
+pub use bundle::{bundle_digest, check_structure, verify_bundle, BundleError, SpendBundle};
+pub use carrier::{carrier_sighash, verify_carrier_auth, CarrierContext, SCHEME_SIGNER_NONCE};
 pub use encrypt::{encrypt_note, EncryptionKeypair, NoteCiphertext};
 pub use hash::PqDigest;
+pub use hd::{pq_hd_path, PqAddress, PqShieldedKey, PQ_ADDRESS_LEN, PQ_HD_PATH_TEMPLATE};
 pub use note::{Note, SpendingKey, MAX_NOTE_VALUE, VALUE_BITS};
 pub use proof_frame::{validate_proof_frame, ProofFrameError, MAX_PROOF_LEN};
 pub use prover::{decode_proof, prove_bundle, verify_spend, BundleSpend};
+pub use scan::{PqNoteStore, ScanStats, REORG_HORIZON};
+pub use state::{ShieldedV2State, ShieldedV2StateError, ANCHOR_RING_LEN, MAX_V2_NOTES};
 pub use tree::{CommitmentTree, MerklePath};
 pub use wire::{decode_bundle, encode_bundle, WireError, PROOF_VERSION_V1};

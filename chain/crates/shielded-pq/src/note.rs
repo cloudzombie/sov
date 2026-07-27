@@ -51,7 +51,7 @@ use crate::domains::{
     B3_NSK, B3_RHO, RESCUE_DOMAIN_COMMIT_STAGE1, RESCUE_DOMAIN_COMMIT_STAGE2,
     RESCUE_DOMAIN_NULLIFIER, RESCUE_DOMAIN_OWNER_TAG,
 };
-use crate::hash::{digest_from_bytes, merge_domain, PqDigest};
+use crate::hash::{digest_from_bytes, merge_domain, merge_domain_bound, PqDigest};
 
 /// Number of range-checked bits per value: every in-circuit value is proven
 /// `< 2^61`. See the module docs for why 61 (not 64) is the sound width.
@@ -91,10 +91,24 @@ impl SpendingKey {
         merge_domain(RESCUE_DOMAIN_OWNER_TAG, self.nsk, PqDigest::ZERO)
     }
 
-    /// Derive the nullifier for a note with randomness `rho`:
-    /// `nf = merge_d(NF, nsk, rho)`.
-    pub fn nullifier(&self, rho: PqDigest) -> PqDigest {
-        merge_domain(RESCUE_DOMAIN_NULLIFIER, self.nsk, rho)
+    /// Derive the nullifier for the note at Merkle leaf `position` with
+    /// randomness `rho`: `nf = merge_d(NF, nsk, rho; position)`.
+    ///
+    /// The position is bound into the sponge capacity (see
+    /// [`merge_domain_bound`]) because `(nsk, rho)` alone is **not** unique
+    /// per note occurrence. Two notes owned by one key that share a `rho`
+    /// commit differently — the commitment binds the value — yet would
+    /// produce one nullifier, so spending either would permanently strand the
+    /// other (audit **PQV2-01**). A leaf position is assigned by consensus,
+    /// is unique across the whole tree by construction, and is tied by the
+    /// AIR to the same authenticated path that proves membership, so it is a
+    /// sound occurrence identifier.
+    ///
+    /// This makes the nullifier a function of *where the note is*, so the
+    /// caller must pass the position it holds in the commitment tree — the
+    /// wallet records it at scan time.
+    pub fn nullifier(&self, rho: PqDigest, position: u64) -> PqDigest {
+        merge_domain_bound(RESCUE_DOMAIN_NULLIFIER, position, self.nsk, rho)
     }
 }
 

@@ -16,6 +16,7 @@ sov-pow = { path = "../pow" }
 sov-mining = { path = "../mining" }
 sov-vm = { path = "../vm" }
 sov-shielded = { path = "../shielded" }
+sov-shielded-pq = { path = "../shielded-pq" }
 sov-compliance = { path = "../compliance" }
 sov-intents = { path = "../intents" }
 sov-crypto = { path = "../crypto" }

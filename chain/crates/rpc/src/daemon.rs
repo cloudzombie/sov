@@ -869,9 +869,14 @@ struct BakedDeployments {
     /// The `tx-domain` hard-fork deployment (bit 0): chain-bound tx/intent signatures.
     tx_domain: sov_governance::Deployment,
     /// The `fee-auction` deployment (bit 1): the `Action::Tipped` envelope.
-    /// `None` for a preset that schedules no fee-auction fork (the E2E
-    /// rehearsal net arms bit 0 only).
+    /// `None` for a preset that schedules no fee-auction fork.
     fee_auction: Option<sov_governance::Deployment>,
+    /// The `shielded-v2` deployment (bit 2): the post-quantum pool.
+    /// `None` on MAINNET — bit 2 is defined and UNARMED there, and stays so
+    /// until the pool has passed external audit. The E2E rehearsal net arms
+    /// it so the harness can drive a REAL pool-v2 lifecycle (audit PQV2-02:
+    /// a release gate must not report green over untested v2 steps).
+    shielded_v2: Option<sov_governance::Deployment>,
     /// The tx-domain grace window `G` in blocks — consensus-critical once armed,
     /// baked here so no per-node divergence is possible.
     grace_blocks: u64,
@@ -907,6 +912,12 @@ const E2E_REHEARSAL_START_HEIGHT: u64 = 384;
 /// green run never depends on the timeout path (a run that somehow fails to
 /// signal must FAIL loudly on the activation assertion, not quietly `Failed`).
 const E2E_REHEARSAL_TIMEOUT_HEIGHT: u64 = 4_096;
+/// The E2E rehearsal net's `shielded-v2` signaling start height — one full
+/// window after `tx-domain`, so `Started` at 512, `LockedIn` at 544, `Active`
+/// at 576. The gap gives the harness a window in which pool v2 is provably
+/// DORMANT (a v2 action must be a hard, block-invalidating reject) before it
+/// becomes Active.
+const E2E_REHEARSAL_V2_START_HEIGHT: u64 = 512;
 
 /// The baked activation preset for a chain: the release-pinned MAINNET preset for
 /// mainnet; a small `tx-domain`-only REHEARSAL preset for the reserved
@@ -973,14 +984,25 @@ fn mainnet_deployments() -> BakedDeployments {
     BakedDeployments {
         tx_domain,
         fee_auction: Some(fee_auction),
+        // Pool v2 is NOT armed on mainnet. Bit 2 stays defined-and-unarmed
+        // until the circuit has passed external audit; `signal_mask` below is
+        // 0b11, so mainnet nodes do not even signal readiness for it.
+        shielded_v2: None,
         grace_blocks: 576,
         signal_mask: 0b11,
     }
 }
 
-/// The E2E harness rehearsal preset: `tx-domain` (bit 0) only, on compressed
-/// windows. Reachable ONLY from a chain id in the reserved
-/// [`E2E_REHEARSAL_CHAIN_PREFIX`] namespace.
+/// The E2E harness rehearsal preset: `tx-domain` (bit 0) and `shielded-v2`
+/// (bit 2), on compressed windows. Reachable ONLY from a chain id in the
+/// reserved [`E2E_REHEARSAL_CHAIN_PREFIX`] namespace — mainnet is matched
+/// first in [`baked_deployments`] and can never reach this.
+///
+/// `shielded-v2` starts a full window LATER than `tx-domain` so the harness
+/// can observe the pool while it is still dormant (a v2 action must be a hard
+/// reject), then drive a real activation and exercise the whole lifecycle.
+/// That ordering also lets it prove law F8: a pool-v1 note shielded before
+/// pool v2 existed is still spendable after v2 goes Active.
 fn e2e_rehearsal_deployments() -> BakedDeployments {
     let threshold =
         sov_governance::Threshold::new(9, 10).expect("rehearsal threshold 9/10 is valid");
@@ -997,11 +1019,25 @@ fn e2e_rehearsal_deployments() -> BakedDeployments {
         false,
     )
     .expect("rehearsal deployment is valid");
+    let shielded_v2 = sov_governance::Deployment::new(
+        sov_governance::SHIELDED_V2_DEPLOYMENT,
+        2,
+        BlockHeight::new(E2E_REHEARSAL_V2_START_HEIGHT),
+        BlockHeight::new(E2E_REHEARSAL_TIMEOUT_HEIGHT),
+        E2E_REHEARSAL_PERIOD,
+        threshold,
+        BlockHeight::new(0),
+        false,
+    )
+    .expect("rehearsal shielded-v2 deployment is valid");
     BakedDeployments {
         tx_domain,
         fee_auction: None,
+        shielded_v2: Some(shielded_v2),
         grace_blocks: 0,
-        signal_mask: 0b1,
+        // Signal readiness for bit 0 AND bit 2 (bit 1, fee-auction, is not
+        // scheduled on this net).
+        signal_mask: 0b101,
     }
 }
 
@@ -1025,6 +1061,9 @@ fn genesis_chain_with_baked_preset(genesis: &GenesisConfig) -> Result<Blockchain
         chain.set_tx_domain_deployment(baked.tx_domain);
         if let Some(fee_auction) = baked.fee_auction {
             chain.set_fee_auction_deployment(fee_auction);
+        }
+        if let Some(shielded_v2) = baked.shielded_v2 {
+            chain.set_shielded_v2_deployment(shielded_v2);
         }
         chain.set_tx_domain_grace_blocks(baked.grace_blocks);
         chain.set_signal_mask(baked.signal_mask);
@@ -2153,6 +2192,62 @@ mod tests {
     }
 
     #[test]
+    fn shielded_v2_bit_is_defined_but_not_armed() {
+        // v0.2.0 D13 pin: the `shielded-v2` deployment owns signal bit 2 in
+        // the registry (`sov_governance::BIT_SHIELDED_V2`) but v0.2.0 ARMS
+        // NOTHING — the mainnet preset schedules only bits 0 and 1 and its
+        // signal mask must not set bit 2. If this test ever fails, someone
+        // armed the PQ pool without the arming release + external audit the
+        // program mandates. (The registry also guarantees the bit cannot
+        // collide with the armed ones.)
+        assert_eq!(sov_governance::BIT_SHIELDED_V2, 2);
+        assert_eq!(sov_governance::SHIELDED_V2_DEPLOYMENT, "shielded-v2");
+        assert_ne!(
+            sov_governance::BIT_SHIELDED_V2,
+            sov_governance::BIT_TX_DOMAIN
+        );
+        assert_ne!(
+            sov_governance::BIT_SHIELDED_V2,
+            sov_governance::BIT_FEE_AUCTION
+        );
+        let baked = baked_deployments("sov-mainnet").expect("mainnet preset is baked");
+        assert_eq!(baked.tx_domain.bit, sov_governance::BIT_TX_DOMAIN);
+        assert_eq!(
+            baked.fee_auction.as_ref().map(|d| d.bit),
+            Some(sov_governance::BIT_FEE_AUCTION)
+        );
+        assert_eq!(
+            baked.signal_mask & (1 << sov_governance::BIT_SHIELDED_V2),
+            0,
+            "mainnet must NOT signal bit 2 — shielded-v2 is unarmed in v0.2.0"
+        );
+        assert!(
+            baked.shielded_v2.is_none(),
+            "mainnet must schedule NO shielded-v2 deployment — the pool ships \
+             dormant until the circuit passes external audit"
+        );
+        // The rehearsal namespace DOES arm bit 2 (audit PQV2-02: the release
+        // harness must be able to exercise a real v2 lifecycle rather than
+        // skipping every v2 step and still reporting green). That is sound
+        // precisely because the namespace is unreachable for any canonical
+        // network — asserted immediately below.
+        let rehearsal = baked_deployments("sov-e2e-v020-s8a").expect("rehearsal preset");
+        assert_ne!(
+            rehearsal.signal_mask & (1 << sov_governance::BIT_SHIELDED_V2),
+            0,
+            "the rehearsal net must signal bit 2 so activation can be driven"
+        );
+        assert!(rehearsal.shielded_v2.is_some());
+        // ...and no canonical chain id can ever pick up that preset.
+        for canonical in ["sov-mainnet", "sov-testnet-1", "sov-dev", "sov-test"] {
+            let armed = baked_deployments(canonical)
+                .map(|b| b.shielded_v2.is_some())
+                .unwrap_or(false);
+            assert!(!armed, "{canonical} must NOT arm shielded-v2");
+        }
+    }
+
+    #[test]
     fn e2e_rehearsal_namespace_arms_a_real_bit0_deployment_and_never_shadows_mainnet() {
         // The reserved harness namespace (`tools/e2e-vm`) gets a REAL BIP-9
         // deployment on compressed windows — the same state machine and the same
@@ -2170,13 +2265,24 @@ mod tests {
         assert!(!tx.lockinontimeout);
         assert!(
             baked.fee_auction.is_none(),
-            "the rehearsal net arms bit 0 ONLY"
+            "the rehearsal net schedules no fee-auction fork"
+        );
+        // shielded-v2 (bit 2) rides one window later, so the harness gets a
+        // stretch where the pool is provably DORMANT before it activates.
+        let v2 = baked.shielded_v2.as_ref().expect("rehearsal arms bit 2");
+        assert_eq!(v2.name, sov_governance::SHIELDED_V2_DEPLOYMENT);
+        assert_eq!(v2.bit, sov_governance::BIT_SHIELDED_V2);
+        assert_eq!(v2.start_height.get(), E2E_REHEARSAL_V2_START_HEIGHT);
+        assert_eq!(v2.period, E2E_REHEARSAL_PERIOD);
+        assert!(
+            v2.start_height.get() > tx.start_height.get(),
+            "v2 must start AFTER tx-domain so law F8 can be proven across it"
         );
         assert_eq!(
             baked.grace_blocks, 0,
             "no grace: post-activation txs are Bound-only immediately"
         );
-        assert_eq!(baked.signal_mask, 0b1, "signals bit 0 only");
+        assert_eq!(baked.signal_mask, 0b101, "signals bits 0 and 2");
 
         // With every block signaling bit 0 (the mask above), the compressed
         // schedule is exact and asserted here, not assumed by the harness:

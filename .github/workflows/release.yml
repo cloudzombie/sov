@@ -95,8 +95,61 @@ jobs:
       - name: HARD GATE — scripts/release-gate.sh --strict
         run: scripts/release-gate.sh --strict
 
+  # THE FIVE-NODE END-TO-END SUITE — a required release job (audit PQV2-02).
+  #
+  # This boots a real, isolated, loopback multi-node chain, mines it under real
+  # PoW, drives a genuine BIP-9 activation, and exercises both shielded pools
+  # end to end. `--require-complete` makes any SKIPPED step fatal: the harness
+  # previously exited 0 while skipping every pool-v2 step, so a release could be
+  # cut on a "GREEN" that had tested none of the feature it claimed to validate.
+  # A release now requires zero failures AND zero skips.
+  #
+  # It runs on the release path rather than every push because it mines a real
+  # chain to a real activation height (~25 minutes), which is not a per-commit
+  # cost — but it MUST gate a tag, which is what this job is.
+  e2e:
+    name: five-node E2E (both shielded pools · zero skips)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - name: Build the node and wallet binaries under test
+        run: cargo build --release --manifest-path chain/Cargo.toml --bin sov-rpcd --bin sov-wallet
+      - name: Run the matrix (skips are FATAL)
+        run: |
+          cargo run --release --manifest-path tools/e2e-vm/Cargo.toml -- run \
+            --backend local \
+            --require-complete \
+            --run-dir "$RUNNER_TEMP/sov-e2e" \
+            --report "$RUNNER_TEMP/sov-e2e-report.json"
+      - name: Assert the report itself records zero failures and zero skips
+        # Defence in depth: the exit code above already enforces this, but the
+        # report is the artifact humans read, so it must agree with the verdict.
+        run: |
+          python3 - "$RUNNER_TEMP/sov-e2e-report.json" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1]))
+          steps = report.get("steps", [])
+          bad = [s for s in steps if s.get("status") != "pass"]
+          if not steps:
+              sys.exit("::error::the E2E report contains NO steps")
+          if bad:
+              for s in bad:
+                  print(f"::error::step {s.get('name')} is {s.get('status')}: {s.get('detail')}")
+              sys.exit(f"{len(bad)} of {len(steps)} steps did not pass")
+          print(f"all {len(steps)} steps passed")
+          PY
+      - name: Upload the E2E report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-report
+          path: ${{ runner.temp }}/sov-e2e-report.json
+
   windows:
-    needs: gate
+    needs: [gate, e2e]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -137,7 +190,7 @@ jobs:
           path: dist/*.zip
 
   macos:
-    needs: gate
+    needs: [gate, e2e]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -202,7 +255,7 @@ jobs:
           path: dist/*.dmg
 
   linux:
-    needs: gate
+    needs: [gate, e2e]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

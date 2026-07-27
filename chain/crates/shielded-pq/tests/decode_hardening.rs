@@ -19,7 +19,7 @@ use sov_shielded_pq::proof_frame::{
     expected_context_bytes, validate_proof_frame, ProofFrameError, MAX_PROOF_LEN,
 };
 use sov_shielded_pq::prover::{
-    decode_proof, prove_bundle, verify_spend, BundleSpend, SpendProofError,
+    decode_proof, proof_options, prove_bundle, verify_spend, BundleSpend, SpendProofError,
 };
 use sov_shielded_pq::tree::CommitmentTree;
 use sov_shielded_pq::wire::{
@@ -178,14 +178,27 @@ fn zero_length_input_typed_reject() {
 /// proof context: TraceInfo (6 bytes for this circuit: width, aux width,
 /// aux rands, log2 length, u16 meta length) + modulus (1 length byte + 8
 /// bytes) + 1 (num_queries byte precedes blowup).
+/// The standard query count, derived — never hardcoded.
+fn expected_queries() -> u8 {
+    proof_options().num_queries() as u8
+}
+
 fn blowup_byte_offset(pub_inputs: &BundlePublicInputs) -> usize {
     // Locate it robustly: the context bytes are canonical, so scan for the
-    // options run [42, 8, 16] (num_queries, blowup, grinding) which occurs
-    // exactly once in the short context prefix.
+    // options run [num_queries, blowup, grinding], DERIVED from
+    // `proof_options()` rather than hardcoded — a parameter change must not
+    // silently break this locator (it did, when the options moved to a cubic
+    // extension for 128-bit PROVEN security).
+    let opts = proof_options();
+    let run = [
+        opts.num_queries() as u8,
+        opts.blowup_factor() as u8,
+        opts.grinding_factor() as u8,
+    ];
     let ctx = expected_context_bytes(pub_inputs);
     let pos = ctx
         .windows(3)
-        .position(|w| w == [42, 8, 16])
+        .position(|w| w == run)
         .expect("standard options bytes present in context");
     pos + 1
 }
@@ -199,7 +212,11 @@ fn raw_winterfell_decode_panics_on_corrupt_option_header() {
     let f = fixture();
     let mut corrupt = f.proof.clone();
     let off = blowup_byte_offset(&f.pub_inputs);
-    assert_eq!(corrupt[off], 8, "blowup byte located");
+    assert_eq!(
+        corrupt[off],
+        proof_options().blowup_factor() as u8,
+        "blowup byte located"
+    );
     corrupt[off] = 3;
     let raw = std::panic::catch_unwind(|| winterfell::Proof::from_bytes(&corrupt));
     assert!(
@@ -335,14 +352,15 @@ fn zero_unique_queries_typed_reject() {
     let ctx_len = expected_context_bytes(&f.pub_inputs).len();
     let mut corrupt = f.proof.clone();
     corrupt[ctx_len] = 0;
+    let q = expected_queries();
     assert!(matches!(
         decode_proof(&corrupt, &f.pub_inputs),
-        Err(SpendProofError::Frame(ProofFrameError::QueryCount(0, 42)))
+        Err(SpendProofError::Frame(ProofFrameError::QueryCount(0, e))) if e == q
     ));
-    corrupt[ctx_len] = 43;
+    corrupt[ctx_len] = expected_queries() + 1;
     assert!(matches!(
         decode_proof(&corrupt, &f.pub_inputs),
-        Err(SpendProofError::Frame(ProofFrameError::QueryCount(43, 42)))
+        Err(SpendProofError::Frame(ProofFrameError::QueryCount(got, e))) if got == q + 1 && e == q
     ));
 }
 
@@ -412,7 +430,10 @@ fn wire_kat_publics_header_pinned() {
     let header = &f.encoded[..1 + PUBLICS_LEN];
     assert_eq!(
         hex::encode(blake3::hash(header).as_bytes()),
-        "cb6562850769c8df761d2d73781c5179a442e8b723981ac1659da4546c697b1d",
+        // Re-pinned for the PQV2-01 nullifier fix: nullifiers are public
+        // inputs, so binding the leaf position into them necessarily moves
+        // this header digest. Free only because bit 2 is unarmed.
+        "ab5c6c0690676251ef487a58dd6c701980f41fe17323ea92bb4bce780496da35",
         "v1 wire publics-header KAT drifted"
     );
 }
@@ -426,7 +447,16 @@ fn context_bytes_kat_pinned() {
     let ctx = expected_context_bytes(&f.pub_inputs);
     assert_eq!(
         hex::encode(&ctx),
-        "1f00000a00000801000000ffffffff2a081002041f00000101b602",
+        // Re-pinned when the proof options moved to 64 queries / blowup 16 /
+        // CUBIC extension for 128-bit PROVEN security (was 42 / 8 / quadratic,
+        // which was 127 conjectured but only 75 proven). The options run in
+        // this KAT reads 40 10 10 03 = 64, 16, 16, cubic — previously
+        // 2a 08 10 02 = 42, 8, 16, quadratic. A drift here that is NOT an
+        // intentional parameter change is a consensus-visible bug.
+        // Re-pinned again for PQV2-01: the trace width went 31 -> 32 (0x1f ->
+        // 0x20) for the leaf-position accumulator column, and the constraint
+        // count rose with the accumulator recurrence.
+        "2000000a00000801000000ffffffff40101003041f00000101ca02",
         "canonical context KAT drifted"
     );
     // And it must literally prefix the honest proof.

@@ -102,6 +102,15 @@ pub struct Blockchain {
     /// byte-identical to pre-fork, so the genesis hash and every KAT vector are
     /// reproduced exactly and a chain that never schedules it is unaffected.
     fee_auction_deployment: Option<sov_governance::Deployment>,
+    /// The miner-signaled `shielded-v2` deployment (signal bit 2 — the
+    /// post-quantum shielded pool), if this chain schedules one. **No chain
+    /// does today**: v0.2.0 defines bit 2 but bakes NO schedule (D13), so this
+    /// is `None` on mainnet and every node, which keeps `Action::ShieldedV2` a
+    /// hard `FeatureInactive` reject at every height — execution, the genesis
+    /// hash, and every KAT vector byte-identical to a build without pool v2.
+    /// Arming is a later, separately-audited release that installs a
+    /// deployment here, exactly as v0.1.99 did for bits 0/1.
+    shielded_v2_deployment: Option<sov_governance::Deployment>,
     /// Transaction receipts for the **active chain**, indexed for RPC lookup.
     /// `active_receipts[h]` holds the receipts of the active block at height `h`
     /// (in transaction order); only heights with at least one transaction appear.
@@ -555,6 +564,7 @@ impl Blockchain {
             tx_domain_deployment: None,
             tx_domain_grace_blocks: TX_DOMAIN_GRACE_BLOCKS,
             fee_auction_deployment: None,
+            shielded_v2_deployment: None,
             active_receipts: HashMap::new(),
             tx_height: HashMap::new(),
             undo_ring: VecDeque::new(),
@@ -711,6 +721,21 @@ impl Blockchain {
         self.fee_auction_deployment = Some(deployment);
     }
 
+    /// Schedule the miner-signaled `shielded-v2` deployment (signal bit 2):
+    /// once `deployment` activates under the BIP-9/8 state machine,
+    /// `Action::ShieldedV2` executes the full pool-v2 path (carrier-bound
+    /// authorization, STARK verification, anchor ring, nullifier set,
+    /// turnstile, value balance, drain limiter). Dormant until activation —
+    /// pre-activation execution (and thus the genesis hash and every KAT
+    /// vector) is byte-identical: the variant stays a hard reject.
+    ///
+    /// **Nothing calls this on a real chain in v0.2.0.** Bit 2 is defined but
+    /// unarmed (D13); this exists so arming is a schedule change rather than
+    /// new consensus code, and so tests can drive a real activation.
+    pub fn set_shielded_v2_deployment(&mut self, deployment: sov_governance::Deployment) {
+        self.shielded_v2_deployment = Some(deployment);
+    }
+
     /// The live BIP-9/BIP-8 state of every registered governance deployment, evaluated
     /// over the ACTIVE chain's committed miner signals at the current height. This is
     /// read-only observability for `sov_getDeployments`; the exact same evaluation
@@ -744,7 +769,11 @@ impl Blockchain {
                 lockinontimeout: d.lockinontimeout,
             });
         }
-        if let Some(d) = &self.fee_auction_deployment {
+        for d in self
+            .fee_auction_deployment
+            .iter()
+            .chain(self.shielded_v2_deployment.iter())
+        {
             out.push(DeploymentStatus {
                 name: d.name.clone(),
                 bit: d.bit,
@@ -986,7 +1015,33 @@ impl Blockchain {
     /// evaluates activation over *that branch's* signals, exactly as
     /// [`resolved_tx_domain_with`](Self::resolved_tx_domain_with) does.
     fn fee_auction_active_with(&self, height: u64, signals: &sov_governance::SignalLog) -> bool {
-        let Some(deployment) = self.fee_auction_deployment.as_ref() else {
+        Self::deployment_active_at(self.fee_auction_deployment.as_ref(), height, signals)
+    }
+
+    /// Whether the miner-signaled `shielded-v2` deployment (bit 2) is `Active`
+    /// for a block at `height`, over the active chain's committed signals.
+    /// `false` on every chain today — no schedule is baked (D13) — which keeps
+    /// `Action::ShieldedV2` a hard reject and the pool-v2 state absent.
+    pub fn shielded_v2_active(&self, height: u64) -> bool {
+        self.shielded_v2_active_with(height, &self.signals)
+    }
+
+    /// As [`shielded_v2_active`](Self::shielded_v2_active), but over an
+    /// explicit signal history, so fork-choice replay of a competing branch
+    /// evaluates activation over *that branch's* signals.
+    fn shielded_v2_active_with(&self, height: u64, signals: &sov_governance::SignalLog) -> bool {
+        Self::deployment_active_at(self.shielded_v2_deployment.as_ref(), height, signals)
+    }
+
+    /// Whether `deployment` (if any) has reached `Active` at or below the
+    /// window boundary governing `height`, over `signals`. Shared by every
+    /// boolean deployment gate so they cannot drift apart.
+    fn deployment_active_at(
+        deployment: Option<&sov_governance::Deployment>,
+        height: u64,
+        signals: &sov_governance::SignalLog,
+    ) -> bool {
+        let Some(deployment) = deployment else {
             return false;
         };
         let period = deployment.period;
@@ -1364,6 +1419,7 @@ impl Blockchain {
             pq: self.resolved_pq(next_height),
             tx_domain: self.resolved_tx_domain_mode(next_height),
             fee_auction_active: self.fee_auction_active(next_height),
+            shielded_v2_active: self.shielded_v2_active(next_height),
         };
         apply_coinbase(&mut probe, &selection_ctx)?;
         let mut included = Vec::new();
@@ -1401,6 +1457,7 @@ impl Blockchain {
             pq: self.resolved_pq(next_height),
             tx_domain: self.resolved_tx_domain_mode(next_height),
             fee_auction_active: self.fee_auction_active(next_height),
+            shielded_v2_active: self.shielded_v2_active(next_height),
         };
         apply_coinbase(&mut scratch, &ctx)?;
         let receipts = apply_transactions(&mut scratch, &included, &ctx)?;
@@ -2074,6 +2131,7 @@ impl Blockchain {
             pq: self.resolved_pq_with(height, signals),
             tx_domain: self.resolved_tx_domain_mode_with(height, signals),
             fee_auction_active: self.fee_auction_active_with(height, signals),
+            shielded_v2_active: self.shielded_v2_active_with(height, signals),
         };
         apply_coinbase(ledger, &ctx)?;
         Ok(apply_transactions(ledger, &block.transactions, &ctx)?)
@@ -3350,6 +3408,62 @@ mod tests {
             chain.import_block(smuggled).is_err(),
             "a dormant Tipped tx must invalidate any block carrying it"
         );
+    }
+
+    #[test]
+    fn shielded_v2_is_dormant_everywhere() {
+        // v0.2.0 S2b: the `shielded-v2` deployment (bit 2) is DEFINED but NOT
+        // armed — there is no schedule on any chain, so `Action::ShieldedV2`
+        // is inert at every height: the producer excludes it, and a block
+        // smuggling one in is rejected on import. Pre-v2 behavior,
+        // byte-identical (the same dormant contract `Tipped` honored before
+        // the fee-auction activated). The chain state proves it too: the head
+        // state root of a chain that SAW a v2 tx offered equals one that
+        // never did.
+        let mut chain = fresh_chain();
+        let kp = Keypair::from_seed([2; 32]);
+        let tx = Transaction {
+            signer: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce: 0,
+            action: Action::ShieldedV2 {
+                bundle: vec![0xB0u8; 128],
+            },
+        };
+        let v2 = SignedTransaction::sign(tx, &kp).unwrap();
+
+        let empty = chain.produce_block(vec![v2.clone()], 2_000).unwrap();
+        assert!(
+            empty.transactions.is_empty(),
+            "producer must exclude a ShieldedV2 tx while dormant"
+        );
+        let smuggled = Block::assemble(
+            empty.header.height,
+            empty.header.prev_hash,
+            empty.header.state_root,
+            empty.header.receipts_root,
+            empty.header.timestamp_ms,
+            empty.header.proposer.clone(),
+            vec![v2],
+        );
+        assert!(
+            chain.import_block(smuggled).is_err(),
+            "a dormant ShieldedV2 tx must invalidate any block carrying it"
+        );
+        // The honest empty block imports, and the resulting state is exactly
+        // what a chain that never saw the v2 tx computes — including an
+        // untouched (empty, uncommitted) v2 pool.
+        let mut control = fresh_chain();
+        let control_block = control.produce_block(vec![], 2_000).unwrap();
+        chain.import_block(empty).unwrap();
+        control.import_block(control_block).unwrap();
+        assert_eq!(
+            chain.head().header.state_root,
+            control.head().header.state_root,
+            "state roots agree with a chain that never saw the v2 tx"
+        );
+        assert!(chain.ledger().shielded_v2().is_empty());
+        assert_eq!(chain.ledger().shielded_v2_value(), Balance::ZERO);
     }
 
     /// A signed `Tipped{tip, Transfer{to, amount}}` from `usa.reserve.sov`.

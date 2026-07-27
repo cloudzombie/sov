@@ -55,8 +55,37 @@ pub const B3_NOTE_AEAD: &str = "sov-shielded-pq:note-aead:v2";
 pub const B3_DETECTION_TAG: &str = "sov-shielded-pq:detect:v2";
 /// blake3 domain: the carrier bundle digest the ML-DSA-65 signature covers.
 pub const B3_BUNDLE_DIGEST: &str = "sov-shielded-pq:bundle:v2";
+/// blake3 domain: the CARRIER-BOUND authorization sighash (S2c) — the
+/// second, wrapping digest over `(bundle_digest, carrier context)` that the
+/// ML-DSA-65 signature actually covers, so an authorization cannot be lifted
+/// out of its transaction. See [`crate::carrier`].
+pub const B3_CARRIER_BINDING: &str = "sov-shielded-pq:carrier-binding:v2";
 /// blake3 domain: test fixtures only. Never used by protocol code.
 pub const B3_TEST: &str = "sov-shielded-pq:test:v2";
+
+// ---------------------------------------------------------------------------
+// HD derivation domains (decision D9). Each is applied to the SAME 32-byte
+// BIP-44 leaf seed (`m/44'/0x534F56'/account'/0'/index'`), so one 24-word
+// phrase restores the transparent, pool-v1 and pool-v2 tiers. Distinct
+// domains make the four v2 secrets mutually independent: recovering any one
+// of them reveals nothing about the others or about the leaf.
+// ---------------------------------------------------------------------------
+
+/// blake3 domain: the pool-v2 **spend seed** from the BIP-44 leaf (D9). The
+/// result is fed to [`crate::note::SpendingKey::from_seed`].
+pub const B3_HD_SPEND: &str = "sov-shielded-pq:hd-spend:v2";
+/// blake3 domain: the ML-KEM-768 keygen seed `d` from the BIP-44 leaf (D9).
+pub const B3_HD_KEM_D: &str = "sov-shielded-pq:hd-kem-d:v2";
+/// blake3 domain: the ML-KEM-768 implicit-rejection seed `z` from the BIP-44
+/// leaf (D9). FIPS 203 keygen takes `(d, z)`; they must be independent.
+pub const B3_HD_KEM_Z: &str = "sov-shielded-pq:hd-kem-z:v2";
+/// blake3 domain: the ML-DSA-65 carrier-auth seed from the BIP-44 leaf (D9).
+/// The result is fed to [`crate::auth::AuthKeypair::from_seed`].
+pub const B3_HD_AUTH: &str = "sov-shielded-pq:hd-auth:v2";
+/// blake3 domain: the per-wallet `rho` seed from the BIP-44 leaf (D9). The
+/// result is fed to [`crate::note::derive_rho`] to make each output note's
+/// randomness deterministic and recoverable from the phrase alone.
+pub const B3_HD_RHO: &str = "sov-shielded-pq:hd-rho:v2";
 
 /// All in-circuit Rescue domains (protocol ones; 0 is reserved upstream).
 pub const ALL_RESCUE_DOMAINS: [u64; 6] = [
@@ -69,7 +98,7 @@ pub const ALL_RESCUE_DOMAINS: [u64; 6] = [
 ];
 
 /// All blake3 derive-key domains.
-pub const ALL_B3_DOMAINS: [&str; 8] = [
+pub const ALL_B3_DOMAINS: [&str; 9] = [
     B3_NSK,
     B3_RHO,
     B3_AUTH_KEYGEN,
@@ -77,6 +106,7 @@ pub const ALL_B3_DOMAINS: [&str; 8] = [
     B3_NOTE_AEAD,
     B3_DETECTION_TAG,
     B3_BUNDLE_DIGEST,
+    B3_CARRIER_BINDING,
     B3_TEST,
 ];
 

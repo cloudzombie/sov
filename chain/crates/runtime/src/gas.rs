@@ -137,8 +137,26 @@ pub fn gas_for(action: &Action) -> u64 {
             };
             g.saturating_add(BOOKKEEPING_GAS)
         }
+        // Pool v2 (post-quantum shielded): pays for STARK proof verification
+        // plus its (large, ~40-62 KB) bundle bytes priced like calldata. NOT
+        // yet consensus-live: execution hard-rejects `ShieldedV2` as
+        // `FeatureInactive` while the `shielded-v2` deployment is unarmed, so
+        // this price is never charged on any chain today. Slice S2d owns the
+        // final weight/fee audit and may retune this BEFORE the arming
+        // release — after arming it is frozen like everything above.
+        Action::ShieldedV2 { bundle } => INTRINSIC_GAS
+            .saturating_add(SHIELDED_V2_VERIFY_GAS)
+            .saturating_add((bundle.len() as u64).saturating_mul(CALLDATA_GAS_PER_BYTE)),
     }
 }
+
+/// Extra gas for verifying a pool-v2 bundle's STARK proof. Native STARK
+/// verification is measured ~0.7 ms — the same order as the work
+/// [`SHIELDED_VERIFY_GAS`] prices for v1's Halo2 — so v2 keeps the same
+/// surcharge; the bundle's much larger byte footprint is priced separately,
+/// per byte (see [`gas_for`]). Dormant until the `shielded-v2` deployment is
+/// armed and active; final calibration is slice S2d's, before arming.
+pub const SHIELDED_V2_VERIFY_GAS: u64 = 500_000;
 
 /// Extra gas for verifying a settlement's embedded intent signature (a second
 /// Ed25519 verification beyond the transaction's own).

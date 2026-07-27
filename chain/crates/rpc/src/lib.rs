@@ -41,7 +41,11 @@
 //! Receipts (the recorded outcome of a transaction, incl. the exact failure
 //! reason for an included-but-rejected tx): `sov_getReceipt` (by `txId`),
 //! `sov_getBlockReceipts` (by `height`). Shielded pool + de-shield drain-limiter
-//! state: `sov_getShieldedInfo`.
+//! state: `sov_getShieldedInfo`; pool-v2 (post-quantum) state:
+//! `sov_getShieldedV2Info`, `sov_getShieldedV2Anchors`,
+//! `sov_shieldedV2NullifierSeen` — served even while the deployment is dormant,
+//! so a wallet can tell "the pool is empty" from "this node does not know
+//! about pool v2".
 //! Write: `sov_submitTransaction`. Mining work-distribution (out-of-process /
 //! Stratum): `sov_getBlockTemplate` (build + cache a candidate, return the header
 //! preimage to grind — additionally disclosing the candidate's `txCount` and a
@@ -62,6 +66,7 @@ use serde_json::{json, Value};
 use sov_chain::MiningCandidate;
 use sov_node::Node;
 use sov_primitives::{AccountId, Balance, Hash};
+use sov_shielded_pq::hash::PqDigest;
 use sov_types::{Block, BlockHeader, SignedTransaction};
 
 /// Serializes the CPU-/scheduler-heavy networking tests in this crate (real
@@ -752,22 +757,41 @@ fn call(
                 .total_supply()
                 .ok_or_else(|| RpcError::server("supply overflow"))?;
             let shielded = l.shielded_value();
+            let shielded_v2 = l.shielded_v2_value();
+            // BOTH pools hold shielded value. `total_supply()` counts both, so
+            // `transparent` must subtract both — otherwise, the moment signal
+            // bit 2 arms, pool-v2 value would be reported as TRANSPARENT: the
+            // liquid transparent supply overstated by exactly the v2 pool, and
+            // the privately-held share understated by the same amount. Both
+            // figures feed explorers and dashboards.
+            //
+            // This is byte-identical on every chain today, because
+            // `shielded_v2_value` is exactly zero until the (unarmed)
+            // `shielded-v2` deployment activates — which is precisely why it is
+            // correct to fix here, before it can ever misreport.
+            let shielded_total = shielded
+                .checked_add(shielded_v2)
+                .ok_or_else(|| RpcError::server("shielded supply overflow"))?;
             // Zcash-style "shielded supply": the fraction of the circulating
-            // supply currently held in the shielded pool. SOV has no pre-mine, so
-            // total supply IS the circulating supply (every coin was mined), and
-            // total_supply already counts shielded value — so this is the share of
-            // ALL coins that are shielded, exactly as Zcash reports it.
+            // supply held privately. SOV has no pre-mine, so total supply IS the
+            // circulating supply (every coin was mined), and total_supply
+            // already counts both pools — so this is the share of ALL coins that
+            // are shielded, across both pools.
             let shielded_percent = if total.grains() == 0 {
                 0.0
             } else {
-                (shielded.grains() as f64 / total.grains() as f64) * 100.0
+                (shielded_total.grains() as f64 / total.grains() as f64) * 100.0
             };
             Ok(json!({
                 "total": to_value(total),
                 "circulating": to_value(total),
                 "mined": to_value(l.mined_emitted()),
+                // `shielded` stays POOL V1 for compatibility with existing
+                // clients; the v2 and combined figures are additive fields.
                 "shielded": to_value(shielded),
-                "transparent": to_value(total.checked_sub(shielded).unwrap_or(total)),
+                "shieldedV2": to_value(shielded_v2),
+                "shieldedTotal": to_value(shielded_total),
+                "transparent": to_value(total.checked_sub(shielded_total).unwrap_or(total)),
                 "shieldedPercent": shielded_percent,
             }))
         }
@@ -953,6 +977,94 @@ fn call(
                 "deshieldableNowGrains": deshieldable_now.to_string(),
                 "windowResetsAtHeight": if window_blocks == 0 { 0 } else { start.saturating_add(window_blocks) },
                 "height": height,
+            }))
+        }
+        "sov_getShieldedV2Info" => {
+            // Pool v2 (post-quantum) state, mirroring `sov_getShieldedInfo` for
+            // pool v1 so a wallet can present both pools with one mental model:
+            // pool value, the live de-shield drain-limiter window, and the
+            // anchor/nullifier counts a client needs to build and check a spend.
+            //
+            // ALWAYS SERVED, even while dormant. A wallet must be able to tell
+            // "the pool is empty" from "this node does not know about pool v2",
+            // so `active` reports whether the `shielded-v2` deployment (signal
+            // bit 2) is live at this height. While it is false every field
+            // below is still true — the pool simply cannot be transacted with,
+            // and `Action::ShieldedV2` is a hard reject.
+            let c = node.chain();
+            let l = c.ledger();
+            let policy = c.mining_policy();
+            let height = c.height();
+            let v2 = l.shielded_v2();
+            let (start, spent) = l.deshield_v2_window();
+            let window_blocks = policy.deshield_window_blocks;
+            let limit = policy.deshield_limit_grains;
+            let elapsed = window_blocks != 0 && height.saturating_sub(start) >= window_blocks;
+            let spent_now = if elapsed { 0u128 } else { spent.grains() };
+            let pool = l.shielded_v2_value().grains();
+            let deshieldable_now = if window_blocks == 0 {
+                pool
+            } else {
+                limit.saturating_sub(spent_now).min(pool)
+            };
+            Ok(json!({
+                "active": c.shielded_v2_active(height),
+                "poolValue": to_value(l.shielded_v2_value()),
+                "noteCount": v2.note_count(),
+                "nullifierCount": v2.nullifier_count(),
+                "anchor": hex::encode(v2.root().to_bytes()),
+                "deshieldLimitGrains": limit.to_string(),
+                "deshieldWindowBlocks": window_blocks,
+                "windowStartHeight": start,
+                "windowSpentGrains": spent_now.to_string(),
+                "deshieldableNowGrains": deshieldable_now.to_string(),
+                "windowResetsAtHeight": if window_blocks == 0 { 0 } else { start.saturating_add(window_blocks) },
+                "height": height,
+            }))
+        }
+        "sov_getShieldedV2Anchors" => {
+            // The anchor ring: the last 128 accepted pool-v2 roots. A spend
+            // proves membership against one of these, so a wallet must know
+            // which are still accepted before it builds a proof — otherwise it
+            // spends prover time on a bundle consensus will reject.
+            let c = node.chain();
+            let anchors: Vec<Value> = c
+                .ledger()
+                .shielded_v2()
+                .anchors()
+                .map(|a| Value::String(hex::encode(a)))
+                .collect();
+            let height = c.height();
+            Ok(json!({
+                "active": c.shielded_v2_active(height),
+                "anchors": anchors,
+                "height": height,
+            }))
+        }
+        "sov_shieldedV2NullifierSeen" => {
+            // Has this nullifier already been spent? Lets a wallet detect a
+            // note it believes is unspent but the chain has already consumed
+            // (e.g. after restoring from a phrase on a second machine) without
+            // broadcasting a doomed transaction.
+            let raw = params
+                .get("nullifier")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcError::invalid_params("missing string param `nullifier`"))?;
+            let bytes = hex::decode(raw)
+                .map_err(|_| RpcError::invalid_params("`nullifier` must be hex"))?;
+            let arr: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| RpcError::invalid_params("`nullifier` must be 32 bytes"))?;
+            // A digest is field elements, not arbitrary bytes: reject a
+            // non-canonical value as bad params rather than panicking or
+            // silently answering about some other nullifier.
+            let nf = PqDigest::from_bytes(&arr)
+                .ok_or_else(|| RpcError::invalid_params("`nullifier` is not a canonical digest"))?;
+            let c = node.chain();
+            Ok(json!({
+                "seen": c.ledger().shielded_v2().nullifier_seen(&nf),
+                "height": c.height(),
             }))
         }
         "sov_getBlockDigest" => {

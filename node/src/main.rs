@@ -60,10 +60,62 @@ fn version_line() -> String {
 }
 
 fn main() {
+    install_panic_log();
     if let Err(e) = run(env::args().skip(1).collect()) {
         eprintln!("sov-station: {e}");
         std::process::exit(1);
     }
+}
+
+/// Record a panic to `<station_dir>/logs/panic-<unix_ms>.log` before dying.
+///
+/// A Rust panic exits WITHOUT producing a macOS `.ips` crash report, and
+/// Station previously wrote no diagnostics of any kind — so an operator whose
+/// wallet vanished mid-sync had literally nothing to look at, and neither did
+/// anyone trying to fix it. That is what happened to the first 0.2.2 build:
+/// it closed while syncing and left no evidence anywhere on the system.
+///
+/// The hook chains to the default handler, so stderr behaviour is unchanged;
+/// it only ADDS a durable record. It is deliberately dependency-free and
+/// best-effort: a logger that can itself fail loudly during a panic would turn
+/// a diagnosable crash into a confusing one.
+fn install_panic_log() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        // Same override the rest of the app honours, so a sandboxed dev build
+        // never writes into the operator's real directory.
+        let dir = std::env::var("SOV_STATION_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(
+                    std::env::var("HOME")
+                        .or_else(|_| std::env::var("USERPROFILE"))
+                        .unwrap_or_default(),
+                )
+                .join(".sov-station")
+            })
+            .join("logs");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let body = format!(
+                "sov-station {} panicked\n\
+                 when      : {stamp} (unix ms)\n\
+                 location  : {}\n\
+                 message   : {info}\n\
+                 backtrace :\n{:?}\n",
+                env!("CARGO_PKG_VERSION"),
+                info.location()
+                    .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                    .unwrap_or_else(|| "unknown".into()),
+                std::backtrace::Backtrace::force_capture(),
+            );
+            let _ = std::fs::write(dir.join(format!("panic-{stamp}.log")), body);
+        }
+        previous(info);
+    }));
 }
 
 fn run(args: Vec<String>) -> Result<(), String> {
@@ -533,5 +585,63 @@ mod tests {
             short_hash("abcdef0123456789abcdef0123456789"),
             "abcdef01234567...456789"
         );
+    }
+}
+
+#[cfg(test)]
+mod panic_log_tests {
+    /// The panic log must actually be written, into the OVERRIDDEN directory.
+    ///
+    /// An untested crash logger is worse than none: it creates the belief that
+    /// the next crash will be diagnosable. This spawns a real child process,
+    /// panics it, and reads the file back.
+    #[test]
+    fn a_panic_is_recorded_to_the_station_dir() {
+        // Re-exec this same test binary with a marker set, so the child runs
+        // the real `install_panic_log` path and then panics for real.
+        let dir = std::env::temp_dir().join(format!("sov-panic-log-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("panic_log_tests::child_that_panics")
+            .arg("--ignored")
+            .env("SOV_STATION_DIR", &dir)
+            .env("SOV_PANIC_LOG_CHILD", "1")
+            .output()
+            .expect("spawn child");
+        assert!(!out.status.success(), "the child must have panicked");
+
+        let logs = dir.join("logs");
+        let entries: Vec<_> = std::fs::read_dir(&logs)
+            .unwrap_or_else(|e| panic!("no logs directory at {logs:?}: {e}"))
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one panic log");
+
+        let body = std::fs::read_to_string(entries[0].path()).expect("read log");
+        assert!(body.contains("panicked"), "log names the event");
+        assert!(
+            body.contains(env!("CARGO_PKG_VERSION")),
+            "log records the version that crashed"
+        );
+        assert!(
+            body.contains("deliberate test panic"),
+            "log carries the panic message"
+        );
+        assert!(body.contains("location"), "log records where");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "child process for a_panic_is_recorded_to_the_station_dir"]
+    fn child_that_panics() {
+        if std::env::var("SOV_PANIC_LOG_CHILD").is_err() {
+            return;
+        }
+        super::install_panic_log();
+        panic!("deliberate test panic");
     }
 }

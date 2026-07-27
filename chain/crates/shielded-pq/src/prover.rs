@@ -2,9 +2,9 @@
 //! circuit ([`crate::air::BundleAir`]).
 
 use crate::air::{
-    input_base, merkle_inject_row, rc_base, BundleAir, BundlePublicInputs, ACTIVE_ROWS, BIT_COL,
-    CAPACITY_SEED, CYCLE_LENGTH, NSK_COL, NUM_SLOTS, OUTPUTS_START_ROW, RC_ACC_COL, RC_BIT_COL,
-    RHO_COL, TRACE_LENGTH, TRACE_WIDTH, VAL_COL,
+    input_base, merkle_inject_row, rc_base, root_row, BundleAir, BundlePublicInputs, ACTIVE_ROWS,
+    BIT_COL, CAPACITY_SEED, CYCLE_LENGTH, NSK_COL, NUM_SLOTS, OUTPUTS_START_ROW, POS_ACC_COL,
+    RC_ACC_COL, RC_BIT_COL, RHO_COL, TRACE_LENGTH, TRACE_WIDTH, VAL_COL,
 };
 use crate::domains::{
     RESCUE_DOMAIN_COMMIT_STAGE1, RESCUE_DOMAIN_COMMIT_STAGE2, RESCUE_DOMAIN_DUMMY_NULLIFIER,
@@ -57,16 +57,48 @@ pub enum SpendProofError {
     Verification(String),
 }
 
-/// Standard proof options: 42 FRI queries, blowup 8, 16 bits of grinding,
-/// quadratic extension field — ≥ 100 bits conjectured security against a
-/// classical adversary, and no number-theoretic assumptions a quantum
-/// adversary could break (hashes only).
+/// Standard proof options: 64 FRI queries, blowup 16, 16 bits of grinding,
+/// **cubic** extension field.
+///
+/// **128 bits PROVEN, not conjectured** — and that distinction is the whole
+/// reason for these values. Measured by `tests/security_level.rs`, which reads
+/// both figures off a real proof:
+///
+/// | parameters | conjectured | proven | proof |
+/// |---|---|---|---|
+/// | 42q / blowup 8 / quadratic (previous) | 127 | **75** | 53.8 KB |
+/// | 64q / blowup 16 / cubic (these) | 128 | **128** | 94.3 KB |
+///
+/// The previous set quoted 127 bits, but that was the *capacity-conjecture*
+/// figure; unconditionally it was 75 bits (50 under the unique-decoding
+/// bound). Relying on that conjecture became materially less defensible after
+/// the strongest up-to-capacity forms of it were disproved over large fields
+/// in late 2025.
+///
+/// Raising the query count alone does NOT fix it: under a quadratic extension
+/// proven security saturates at 86 bits no matter the budget — 200 queries and
+/// 3.4x the proof size buy nothing, because the ceiling is the extension
+/// field, not the number of queries. Goldilocks is a 64-bit base field, and a
+/// cubic extension is what lifts the ceiling.
+///
+/// The cost is honest and bounded: 1.75x proof size (53.8 KB -> 94.3 KB, a
+/// full bundle ~62 KB -> ~101 KB) for 75 -> 128 proven bits. That stays well
+/// inside `MAX_SHIELDED_V2_BUNDLE_BYTES` (144 KiB), which the weight schedule
+/// is already sized against.
+///
+/// Changing these AFTER the pool is armed would be a consensus change with its
+/// own deployment, since `verify_spend` accepts only proofs generated with
+/// exactly these options. Changing them while the pool is dormant costs
+/// nothing but a re-benchmark — which is why it is done now.
+///
+/// Soundness rests on hashes only: no number-theoretic assumption a quantum
+/// adversary could break.
 pub fn proof_options() -> ProofOptions {
     ProofOptions::new(
-        42,
-        8,
+        64,
         16,
-        FieldExtension::Quadratic,
+        16,
+        FieldExtension::Cubic,
         4,
         31,
         BatchingMethod::Linear,
@@ -158,6 +190,14 @@ pub fn build_bundle_columns(
         state[8..12].copy_from_slice(&right);
         state
     };
+    // As `merge_init`, but binding an occurrence scalar into capacity element
+    // 2 — the trace-side twin of `hash::merge_domain_bound`, used only by the
+    // nullifier hash (PQV2-01).
+    let merge_init_bound = |domain: u64, bind: u64, left: [Felt; 4], right: [Felt; 4]| {
+        let mut state = merge_init(domain, left, right);
+        state[2] = Felt::new(bind);
+        state
+    };
     // Non-constant, non-binary filler (see the AIR docs: released register
     // and bit cells carry filler so masked constraint polynomials attain
     // their declared degrees).
@@ -176,6 +216,7 @@ pub fn build_bundle_columns(
     let mut nullifiers = [PqDigest::ZERO; NUM_SLOTS];
     let mut input_dummy = [true; NUM_SLOTS];
     let mut in_values = [0u64; NUM_SLOTS];
+    let mut positions = [0u64; NUM_SLOTS];
 
     for i in 0..NUM_SLOTS {
         let (nsk, rho, value, position, siblings, nf_domain) = match spends.get(i) {
@@ -203,6 +244,7 @@ pub fn build_bundle_columns(
             ),
         };
         in_values[i] = value;
+        positions[i] = position;
         let seg_cycle = i * 24;
         // Cycle 0: owner_tag = merge_d(TAG, nsk, 0).
         let tag = run_cycle(
@@ -243,10 +285,14 @@ pub fn build_bundle_columns(
             debug_assert_eq!(anchors[i], s.path.compute_root(s.note.commitment()));
         }
         // Cycle 23: nf = merge_d(NF or DUMMY_NF, nsk, rho).
-        let nf = run_cycle(&mut cols, seg_cycle + 23, merge_init(nf_domain, nsk, rho));
+        let nf = run_cycle(
+            &mut cols,
+            seg_cycle + 23,
+            merge_init_bound(nf_domain, position, nsk, rho),
+        );
         if let Some(s) = spends.get(i) {
             nullifiers[i] = PqDigest::from_elements(nf);
-            debug_assert_eq!(nullifiers[i], s.key.nullifier(s.note.rho));
+            debug_assert_eq!(nullifiers[i], s.key.nullifier(s.note.rho, s.path.position));
         } else {
             // Dummy: the public nullifier stays ZERO; the in-trace dummy
             // digest is never surfaced.
@@ -349,6 +395,37 @@ pub fn build_bundle_columns(
         debug_assert_eq!(acc, v);
     }
 
+    // Leaf-position accumulator (PQV2-01): zero at each input-segment start,
+    // folds bit·2^level at every Merkle injection row, and holds constant in
+    // between — mirroring the AIR's single step constraint exactly. Beyond
+    // each segment's nullifier seed row the column is unconstrained, so it
+    // carries filler there (which also keeps the constraint polynomial at its
+    // declared degree).
+    for (row, cell) in cols[POS_ACC_COL].iter_mut().enumerate() {
+        *cell = filler(row, 32);
+    }
+    for (i, &position) in positions.iter().enumerate() {
+        let mut acc = 0u64;
+        let mut row = input_base(i);
+        for level in 0..TREE_DEPTH {
+            // Hold the running value up to and including this level's
+            // injection row; the bit folds in on the transition OUT of it.
+            let inject = merkle_inject_row(i, level);
+            while row <= inject {
+                cols[POS_ACC_COL][row] = Felt::new(acc);
+                row += 1;
+            }
+            acc += ((position >> level) & 1) << level;
+        }
+        // Hold the landed position through the nullifier seed row, where the
+        // AIR reads it into sponge capacity element 2.
+        while row <= root_row(i) {
+            cols[POS_ACC_COL][row] = Felt::new(acc);
+            row += 1;
+        }
+        debug_assert_eq!(acc, position, "position accumulator must land exactly");
+    }
+
     let pub_inputs = BundlePublicInputs {
         anchors,
         nullifiers,
@@ -373,6 +450,18 @@ pub struct BundleProver {
 }
 
 impl BundleProver {
+    /// A prover with EXPLICIT proof options — for parameter research only
+    /// (see `tests/security_level.rs`, which sweeps queries x blowup to find
+    /// the set that reaches a PROVEN security target). Consensus paths must
+    /// use [`BundleProver::new`]: `verify_spend` accepts only proofs produced
+    /// with the standard [`proof_options`].
+    pub fn with_options(pub_inputs: BundlePublicInputs, options: ProofOptions) -> Self {
+        Self {
+            pub_inputs,
+            options,
+        }
+    }
+
     /// A prover with the standard [`proof_options`] for the given publics.
     pub fn new(pub_inputs: BundlePublicInputs) -> Self {
         BundleProver {
@@ -497,26 +586,78 @@ pub fn verify_spend(
     proof_bytes: &[u8],
     pub_inputs: &BundlePublicInputs,
 ) -> Result<(), SpendProofError> {
-    // S1c/D15: decoding below goes through `decode_proof`, the single
-    // TOTAL decode entry point (frame pre-validation, then a
-    // catch_unwind-guarded winterfell decode).
-    if pub_inputs.transparent_in > MAX_NOTE_VALUE || pub_inputs.transparent_out > MAX_NOTE_VALUE {
-        return Err(SpendProofError::PublicInput("transparent leg too large"));
-    }
-    if pub_inputs.fee_grains > MAX_NOTE_VALUE {
-        return Err(SpendProofError::PublicInput("fee too large"));
-    }
-    for i in 0..NUM_SLOTS {
-        if pub_inputs.input_dummy[i]
-            && (pub_inputs.anchors[i] != PqDigest::ZERO
-                || pub_inputs.nullifiers[i] != PqDigest::ZERO)
+    // The bound check is not optional and not remembered: it is the ONLY way
+    // to obtain the `Bounded` token `verify_bounded` demands.
+    let bounded = Bounded::check(pub_inputs)?;
+    verify_bounded(proof_bytes, bounded)
+}
+
+/// Proof that a [`BundlePublicInputs`] has passed the native bound checks the
+/// in-circuit no-wrap argument depends on.
+///
+/// **Why this type exists.** Conservation is enforced in-circuit as field
+/// equality; that only implies INTEGER equality because neither side can wrap
+/// the Goldilocks modulus, and that in turn holds only because the public legs
+/// are bounded — a check that lives in the verifier, NOT in the AIR. A future
+/// call site that verified a proof without it would silently reintroduce field
+/// wraparound and unbounded inflation, and every existing test would still
+/// pass.
+///
+/// So the check is made structural rather than procedural: `Bounded` has a
+/// private field and exactly one constructor ([`Bounded::check`]), and
+/// [`verify_bounded`] accepts nothing else. Verifying without having bounded
+/// the publics is not something a caller can forget to do — it does not
+/// compile.
+#[derive(Clone, Copy)]
+pub struct Bounded<'a>(&'a BundlePublicInputs);
+
+impl<'a> Bounded<'a> {
+    /// Check the public inputs, yielding the token required to verify.
+    ///
+    /// Enforces the NATIVE public bounds (`transparent_in`,
+    /// `transparent_out`, `fee_grains` each `<= MAX_NOTE_VALUE` `< 2^61`; see
+    /// [`crate::note`]) and the dummy-slot zero convention (audit S1
+    /// follow-up): a dummy slot's anchor/nullifier/commitment publics must be
+    /// the zero digest, even for a caller bypassing
+    /// [`crate::bundle::verify_bundle`] — which remains the authoritative
+    /// convention layer (ciphertext rules, anchor ring, in-bundle nullifier
+    /// uniqueness live there).
+    pub fn check(pub_inputs: &'a BundlePublicInputs) -> Result<Self, SpendProofError> {
+        if pub_inputs.transparent_in > MAX_NOTE_VALUE || pub_inputs.transparent_out > MAX_NOTE_VALUE
         {
-            return Err(SpendProofError::PublicInput("nonzero dummy input publics"));
+            return Err(SpendProofError::PublicInput("transparent leg too large"));
         }
-        if pub_inputs.output_dummy[i] && pub_inputs.output_commitments[i] != PqDigest::ZERO {
-            return Err(SpendProofError::PublicInput("nonzero dummy output publics"));
+        if pub_inputs.fee_grains > MAX_NOTE_VALUE {
+            return Err(SpendProofError::PublicInput("fee too large"));
         }
+        for i in 0..NUM_SLOTS {
+            if pub_inputs.input_dummy[i]
+                && (pub_inputs.anchors[i] != PqDigest::ZERO
+                    || pub_inputs.nullifiers[i] != PqDigest::ZERO)
+            {
+                return Err(SpendProofError::PublicInput("nonzero dummy input publics"));
+            }
+            if pub_inputs.output_dummy[i] && pub_inputs.output_commitments[i] != PqDigest::ZERO {
+                return Err(SpendProofError::PublicInput("nonzero dummy output publics"));
+            }
+        }
+        Ok(Bounded(pub_inputs))
     }
+
+    /// The checked public inputs.
+    pub fn get(&self) -> &BundlePublicInputs {
+        self.0
+    }
+}
+
+/// Verify a bundle proof against public inputs that have ALREADY been bounded.
+///
+/// Takes [`Bounded`] rather than raw publics so the no-wrap premise cannot be
+/// skipped at any call site — see [`Bounded`].
+pub fn verify_bounded(proof_bytes: &[u8], bounded: Bounded<'_>) -> Result<(), SpendProofError> {
+    let pub_inputs = bounded.get();
+    // S1c/D15: decoding goes through `decode_proof`, the single TOTAL decode
+    // entry point (frame pre-validation, then a catch_unwind-guarded decode).
     let proof = decode_proof(proof_bytes, pub_inputs)?;
     let acceptable = AcceptableOptions::OptionSet(vec![proof_options()]);
     winterfell::verify::<BundleAir, CarrierHash, CarrierCoin, CarrierVc>(

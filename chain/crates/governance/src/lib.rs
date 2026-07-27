@@ -66,6 +66,27 @@ use sov_primitives::BlockHeight;
 /// version-bits blocks, leaving 29 usable bits, indices `0` through `28`).
 pub const MAX_SIGNAL_BIT: u8 = 28;
 
+// ── The signal-bit registry (forward-compat law F1) ──────────────────────────
+// ONE table owns every signaling bit SOV has ever assigned. Adding a deployment
+// means claiming the next bit HERE first; nothing else may reuse or renumber a
+// bit. Bits 3..=28 are reserved and unassigned.
+
+/// Signal bit 0 — the `tx-domain` hard fork (chain-bound tx/intent signatures).
+/// Armed and ACTIVATED on mainnet (v0.1.99, active at height 11520).
+pub const BIT_TX_DOMAIN: u8 = 0;
+/// Signal bit 1 — the `fee-auction` deployment (the `Action::Tipped` envelope).
+/// Armed and ACTIVATED on mainnet (v0.1.99, active at height 11520).
+pub const BIT_FEE_AUCTION: u8 = 1;
+/// Signal bit 2 — the `shielded-v2` deployment (the post-quantum shielded
+/// pool, v0.2.0 program). **DEFINED but NOT ARMED**: v0.2.0 assigns the bit
+/// and the name here (D13) but bakes NO start height, NO schedule, and does
+/// not signal it — arming is a later, separately-audited release using the
+/// same baked-preset mechanism as bits 0/1. Until then every `shielded-v2`
+/// consensus path is a hard `FeatureInactive` reject.
+pub const BIT_SHIELDED_V2: u8 = 2;
+/// The canonical deployment name for signal bit [`BIT_SHIELDED_V2`].
+pub const SHIELDED_V2_DEPLOYMENT: &str = "shielded-v2";
+
 /// Errors constructing or operating the governance machine.
 ///
 /// All variants describe a *caller* mistake (an invalid deployment definition or
