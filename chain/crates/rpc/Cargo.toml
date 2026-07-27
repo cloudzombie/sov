@@ -21,6 +21,7 @@ sov-mining = { path = "../mining" }
 sov-pow = { path = "../pow" }
 sov-runtime = { path = "../runtime" }
 sov-shielded = { path = "../shielded" }
+sov-shielded-pq = { path = "../shielded-pq" }
 sov-wallet = { path = "../wallet" }
 borsh.workspace = true
 hex.workspace = true

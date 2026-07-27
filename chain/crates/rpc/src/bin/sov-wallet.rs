@@ -4,6 +4,16 @@
 //! ```text
 //! sov-wallet <rpc_addr> balance  <account>
 //! sov-wallet <rpc_addr> transfer <seed_hex> <from> <to> <sov>
+//! sov-wallet <rpc_addr> z2-info
+//!     # POOL V2 (post-quantum) state: whether the deployment is active, pool
+//!     # value, note/nullifier counts, the current anchor, and the live
+//!     # de-shield window. Needs no seed.
+//! sov-wallet <rpc_addr> z2-address <seed_hex>
+//!     # the pool-v2 receiving address a seed controls
+//! sov-wallet <rpc_addr> z2-balance <seed_hex>
+//!     # scan for the seed's POOL-V2 notes (ML-KEM trial-decapsulation), and
+//!     # say plainly when the pool is dormant so an empty balance is never
+//!     # mistaken for lost funds
 //! sov-wallet <rpc_addr> z-balance <seed_hex>
 //!     # scan the chain for the seed's SHIELDED notes: note count, per-note
 //!     # values, total shielded balance, and the pool's live drain-limiter state
@@ -35,9 +45,13 @@ use sov_crypto::Keypair;
 use sov_primitives::{AccountId, Balance, Hash, GRAINS_PER_SOV};
 use sov_rpc::RpcClient;
 use sov_shielded::{
-    encode_shielded, shielded_transfer_with_change, unshield_amount_multi, AnyAddress, NoteStore,
-    Receiver, ShieldedBundle, ShieldedKey, ShieldedParams,
+    encode_shielded, encode_shielded_v2, shielded_transfer_with_change, unshield_amount_multi,
+    AnyAddress, NoteStore, Receiver, ShieldedBundle, ShieldedKey, ShieldedParams,
 };
+use sov_shielded_pq::bundle::SpendBundle;
+use sov_shielded_pq::hd::PqShieldedKey;
+use sov_shielded_pq::scan::PqNoteStore;
+use sov_shielded_pq::wire::decode_bundle;
 use sov_types::{Action, SignedTransaction, Transaction};
 use sov_wallet::{HdWallet, SOV_COIN_TYPE};
 
@@ -135,11 +149,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let addr = args.get(1).ok_or(
-        "usage: sov-wallet <rpc_addr> <balance|transfer|z-balance|unshield|z-send|keygen> ...",
+        "usage: sov-wallet <rpc_addr> \
+         <balance|transfer|z-balance|unshield|z-send|z2-info|z2-address|z2-balance|keygen> ...",
     )?;
-    let command = args
-        .get(2)
-        .ok_or("expected a command: balance | transfer | z-balance | unshield | z-send")?;
+    let command = args.get(2).ok_or(
+        "expected a command: balance | transfer | z-balance | unshield | z-send \
+             | z2-info | z2-address | z2-balance",
+    )?;
     let client = RpcClient::new(addr.clone());
 
     match command.as_str() {
@@ -185,6 +201,89 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         // Scan the chain for the seed's shielded notes and report the private
         // balance next to the pool's live drain-limiter state. Read-only.
+        "z2-info" => {
+            // Pool v2 (post-quantum) state, for a node that serves it. Kept
+            // separate from `z2-balance` so an operator can inspect the pool
+            // WITHOUT presenting a seed.
+            let client = RpcClient::new(addr.clone());
+            let info = client.call("sov_getShieldedV2Info", json!({}))?;
+            let active = info.get("active").and_then(Value::as_bool).unwrap_or(false);
+            println!(
+                "pool v2 status   : {}",
+                if active {
+                    "ACTIVE"
+                } else {
+                    "DORMANT (signal bit 2 not armed — v2 spends are rejected)"
+                }
+            );
+            let pool: Balance =
+                serde_json::from_value(info.get("poolValue").cloned().unwrap_or_default())?;
+            println!("pool v2 value    : {} XUS", xus(pool.grains()));
+            println!(
+                "notes / spent    : {} / {}",
+                info.get("noteCount").and_then(Value::as_u64).unwrap_or(0),
+                info.get("nullifierCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            );
+            println!(
+                "current anchor   : {}",
+                info.get("anchor").and_then(Value::as_str).unwrap_or("—")
+            );
+            println!(
+                "de-shieldable    : {} XUS (window resets at height {})",
+                xus(info
+                    .get("deshieldableNowGrains")
+                    .and_then(Value::as_str)
+                    .and_then(|v| v.parse::<u128>().ok())
+                    .unwrap_or(0)),
+                info.get("windowResetsAtHeight")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            );
+        }
+        "z2-address" => {
+            // OFFLINE-ish: derive and print the pool-v2 receiving address a
+            // seed controls. Needs no node.
+            let seed = seed_arg(&args, 3, "usage: z2-address <seed_hex>")?;
+            let key = PqShieldedKey::from_leaf_seed(&seed);
+            println!("pool v2 address  : {}", encode_shielded_v2(&key.address()));
+            println!(
+                "owner tag        : {}",
+                hex::encode(key.owner_tag().to_bytes())
+            );
+        }
+        "z2-balance" => {
+            let seed = seed_arg(&args, 3, "usage: z2-balance <seed_hex>")?;
+            let key = PqShieldedKey::from_leaf_seed(&seed);
+            let client = RpcClient::new(addr.clone()).with_timeout(Duration::from_secs(30));
+
+            // Be explicit when the pool cannot be used yet: an empty balance
+            // and a dormant deployment look identical otherwise, and a user
+            // should never conclude their funds vanished.
+            let info = client.call("sov_getShieldedV2Info", json!({}))?;
+            if !info.get("active").and_then(Value::as_bool).unwrap_or(false) {
+                println!(
+                    "NOTE: pool v2 is DORMANT on this chain (signal bit 2 not armed). \
+                     No v2 notes can exist yet; a zero balance below is expected."
+                );
+            }
+
+            println!("pool v2 address  : {}", encode_shielded_v2(&key.address()));
+            let store = scan_notes_v2(&client, &key)?;
+            println!("scanned height   : {}", store.scanned_height());
+            let unspent = store.unspent(&key);
+            println!("unspent notes    : {}", unspent.len());
+            let mut values: Vec<u64> = unspent.iter().map(|(n, _)| n.value_grains).collect();
+            values.sort_unstable_by(|a, b| b.cmp(a));
+            for (i, v) in values.iter().enumerate() {
+                println!("  note {:<3}       : {} XUS", i + 1, xus(u128::from(*v)));
+            }
+            println!(
+                "shielded balance : {} XUS",
+                xus(u128::from(store.balance()))
+            );
+        }
         "z-balance" => {
             let seed = seed_arg(&args, 3, "usage: z-balance <seed_hex>")?;
             let zkey = ShieldedKey::from_seed(seed).ok_or("shielded key derivation failed")?;
@@ -441,6 +540,54 @@ fn receipt_succeeded(v: &Value) -> bool {
 ///
 /// The CLI scans fresh from genesis every run (no cache file): deterministic,
 /// stateless, and immune to reorg-stale caches; cost is one pass over the chain.
+/// Scan the chain for the seed's POOL-V2 notes.
+///
+/// The pool-v1 twin of this function, `scan_notes`, is the model. The
+/// difference that matters: a v2 note is found by ML-KEM trial-decapsulation
+/// rather than an ECDH tag, so every output ciphertext in every accepted
+/// bundle is attempted — see `sov_shielded_pq::scan`, which rejects a failed
+/// decap in microseconds via a short detection checksum before doing any AEAD
+/// work.
+///
+/// Only bundles in transactions whose RECEIPT SUCCEEDED are ingested: a
+/// transaction can be mined and fail, and treating a failed bundle's outputs
+/// as spendable notes would show a balance the chain does not agree with.
+fn scan_notes_v2(client: &RpcClient, key: &PqShieldedKey) -> Result<PqNoteStore, Box<dyn Error>> {
+    let tip = client.height()?;
+    let mut store = PqNoteStore::new(0);
+    if tip > 0 {
+        println!("scanning blocks 1..={tip} for pool-v2 notes...");
+    }
+    for h in 1..=tip {
+        let block = retrying(|| client.block_by_height(h))?
+            .ok_or_else(|| format!("block {h} unavailable — re-run to rescan"))?;
+        let receipts = retrying(|| client.call("sov_getBlockReceipts", json!({ "height": h })))?;
+        if h % 1000 == 0 {
+            println!("  ...scanned {h}/{tip}");
+        }
+        let receipts = receipts.as_array();
+        let bundles: Vec<SpendBundle> = block
+            .transactions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, stx)| match &stx.transaction.action {
+                Action::ShieldedV2 { bundle }
+                    if receipts
+                        .and_then(|rs| rs.get(i))
+                        .map(receipt_succeeded)
+                        .unwrap_or(false) =>
+                {
+                    decode_bundle(bundle).ok()
+                }
+                _ => None,
+            })
+            .collect();
+        let refs: Vec<&SpendBundle> = bundles.iter().collect();
+        store.ingest_block(key, h, *block.hash().as_bytes(), &refs);
+    }
+    Ok(store)
+}
+
 fn scan_notes(client: &RpcClient, zkey: &ShieldedKey) -> Result<NoteStore, Box<dyn Error>> {
     let tip = client.height()?;
     let mut store = NoteStore::new(0);
