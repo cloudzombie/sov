@@ -67,6 +67,7 @@ pub mod prover;
 pub mod scan;
 pub mod state;
 pub mod tree;
+pub mod wallet;
 pub mod wire;
 
 pub use air::BundlePublicInputs;
