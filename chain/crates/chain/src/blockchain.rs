@@ -758,7 +758,7 @@ impl Blockchain {
 
     /// Feed the next batch of headers toward a linkage proof.
     ///
-    /// This is the streaming form of [`install_checkpoint_linkage`], for a node
+    /// This is the streaming form of [`Blockchain::install_checkpoint_linkage`], for a node
     /// syncing from peers: headers arrive a batch at a time, and each batch is
     /// verified against the same three rules as it lands — rooted in OUR
     /// genesis, linked by `prev_hash`, and reaching the pinned hash.
