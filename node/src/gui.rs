@@ -9139,25 +9139,44 @@ fn block_time(ts_ms: u64) -> String {
 }
 
 fn blocks_panel(ui: &mut egui::Ui, s: &Snapshot, selected: &mut Option<u64>) {
-    ui.heading("Blocks");
+    ui.label(egui::RichText::new("Blocks").size(ty::TITLE).strong());
     ui.label(
         egui::RichText::new(
             "each block's coinbase — newly minted issuance, paid entirely to the miner (no tax)",
         )
-        .weak(),
+        .size(ty::SMALL)
+        .color(palette::text_dim()),
     );
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("click a height to inspect the block →").weak());
+        ui.label(
+            egui::RichText::new("click a height to inspect the block →")
+                .size(ty::SMALL)
+                .color(palette::text_dim()),
+        );
         ui.hyperlink_to("open explorer ↗", EXPLORER_URL);
     });
-    ui.add_space(8.0);
+    ui.add_space(sp::M);
     if s.blocks.is_empty() {
-        empty_state(
-            ui,
-            "▦",
-            "No blocks yet",
-            "Start the local node (Node tab) to begin mining — solved blocks appear here.",
-        );
+        // "No blocks yet" is only true if we actually heard from a node. Offline, the
+        // recent-block list is UNKNOWN — and telling an operator their chain is empty
+        // when the truth is that nothing answered is the same class of mistake as
+        // showing a dormant pool as a zero balance.
+        if s.online {
+            empty_state(
+                ui,
+                "▦",
+                "No blocks yet",
+                "Start the local node (Node tab) to begin mining — solved blocks appear here.",
+            );
+        } else {
+            empty_state(
+                ui,
+                "?",
+                "Recent blocks unavailable",
+                "No node is answering, so the recent-block list is unknown — not empty. \
+                 Connect to a node or start a local one from the Node tab.",
+            );
+        }
         return;
     }
     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -9166,22 +9185,26 @@ fn blocks_panel(ui: &mut egui::Ui, s: &Snapshot, selected: &mut Option<u64>) {
             .striped(true)
             .spacing([18.0, 5.0])
             .show(ui, |ui| {
-                for h in ["Height", "Time", "Miner", "Coinbase"] {
-                    ui.label(egui::RichText::new(h).weak());
+                for h in ["Height", "Time", "Miner", "Coinbase (XUS)"] {
+                    ui.label(
+                        egui::RichText::new(h.to_uppercase())
+                            .size(ty::MICRO)
+                            .color(palette::text_dim()),
+                    );
                 }
                 ui.end_row();
                 for b in &s.blocks {
                     // Height opens the in-app block-detail view (seal, nonce, hashes).
                     if ui
-                        .link(egui::RichText::new(b.height.to_string()).monospace())
+                        .link(num(group_thousands(b.height as u128)).size(ty::SMALL))
                         .on_hover_text("Inspect this block")
                         .clicked()
                     {
                         *selected = Some(b.height);
                     }
-                    ui.monospace(block_time(b.timestamp_ms));
-                    ui.monospace(short(&b.miner));
-                    ui.monospace(xus(&b.reward));
+                    ui.label(num(block_time(b.timestamp_ms)).size(ty::SMALL));
+                    ui.label(num(short(&b.miner)).size(ty::SMALL));
+                    ui.label(num(xus(&b.reward)).size(ty::SMALL));
                     ui.end_row();
                 }
             });
