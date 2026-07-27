@@ -24,9 +24,10 @@ use sov_rpc::{
     P2pHandle, RpcClient, SyncShared,
 };
 use sov_shielded::{
-    encode_shielded, shielded_transfer_with_change, unshield_amount_multi, AnyAddress, NoteStore,
-    Receiver, ShieldedBundle, ShieldedKey, ShieldedParams, UnifiedAddress,
+    encode_shielded, encode_shielded_v2, shielded_transfer_with_change, unshield_amount_multi,
+    AnyAddress, NoteStore, Receiver, ShieldedBundle, ShieldedKey, ShieldedParams, UnifiedAddress,
 };
+use sov_shielded_pq::hd::PqShieldedKey;
 use sov_types::{Action, SignedTransaction, Transaction};
 use sov_wallet::{generate_mnemonic, HdWallet};
 use zeroize::Zeroize;
@@ -90,6 +91,112 @@ struct BlockRow {
     tx_count: usize,
 }
 
+/// Pool v2 (post-quantum shielded) state, exactly as `sov_getShieldedV2Info` reported
+/// it. Every field is a real number the node supplied; nothing here is derived or
+/// estimated. The struct existing at all means the node ANSWERED — see [`PoolV2State`]
+/// for what its absence means.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct ShieldedV2Info {
+    /// Whether the `shielded-v2` deployment (signal bit 2) is live at `height`.
+    /// While false, `Action::ShieldedV2` is a hard consensus reject on every node.
+    active: bool,
+    pool_grains: u128,
+    note_count: u64,
+    nullifier_count: u64,
+    /// The current pool-v2 anchor (Merkle root) a spend would prove membership against.
+    anchor: String,
+    deshieldable_now: u128,
+    deshield_limit: u128,
+    deshield_window_blocks: u64,
+    window_resets_at: u64,
+    height: u64,
+}
+
+/// The three states a pool-v2 surface can be in. **These must never be collapsed.**
+///
+/// The whole reason this enum exists: an operator who reads "not active yet" as "empty"
+/// concludes their funds vanished, and an operator who reads "unavailable" as "empty"
+/// concludes the same. A bare `0` next to the word "balance" is capable of causing that
+/// mistake, so no v2 surface in this app renders one without the state beside it.
+///
+/// The distinction is not cosmetic — it is three genuinely different facts:
+///   * [`Unavailable`](Self::Unavailable) — we asked and got nothing. We do not know
+///     the pool value. Not zero: *unknown*.
+///   * [`Dormant`](Self::Dormant)     — we know the value, and we know it is zero
+///     **because consensus forbids anything else**: no `Action::ShieldedV2` has ever
+///     been accepted, so no note can exist. Zero is a proof, not a balance.
+///   * [`Active`](Self::Active)       — we know the value and it is a live balance.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PoolV2State {
+    Unavailable,
+    Dormant,
+    Active,
+}
+
+impl PoolV2State {
+    /// Classify from what the poller actually obtained. `online` is the node's
+    /// reachability; `info` is `Some` only when `sov_getShieldedV2Info` answered.
+    ///
+    /// Note the ordering: an unreachable node is `Unavailable` even if a stale `info`
+    /// is still in the snapshot, because a figure we can no longer confirm is not a
+    /// figure we may present as current.
+    fn classify(online: bool, info: Option<&ShieldedV2Info>) -> Self {
+        match (online, info) {
+            (false, _) | (true, None) => PoolV2State::Unavailable,
+            (true, Some(i)) if i.active => PoolV2State::Active,
+            (true, Some(_)) => PoolV2State::Dormant,
+        }
+    }
+
+    /// The state as a WORD — always rendered, never replaced by colour alone.
+    fn word(self) -> &'static str {
+        match self {
+            PoolV2State::Unavailable => "UNAVAILABLE",
+            PoolV2State::Dormant => "NOT ACTIVE YET",
+            PoolV2State::Active => "ACTIVE",
+        }
+    }
+
+    /// The state as a distinct SHAPE — legible in greyscale, so the signal survives
+    /// any colour-vision deficiency and any monochrome screenshot.
+    fn glyph(self) -> &'static str {
+        match self {
+            PoolV2State::Unavailable => "?", // we do not know
+            PoolV2State::Dormant => "◌",     // defined, not filled in
+            PoolV2State::Active => "●",      // live
+        }
+    }
+
+    fn color(self) -> egui::Color32 {
+        match self {
+            PoolV2State::Unavailable => palette::unknown(),
+            PoolV2State::Dormant => palette::dormant(),
+            PoolV2State::Active => palette::success(),
+        }
+    }
+
+    /// The one-sentence explanation that must accompany any zero on a v2 surface.
+    /// Phrased so that each state is unmistakable for the other two.
+    fn explanation(self) -> &'static str {
+        match self {
+            PoolV2State::Unavailable => {
+                "This node did not report pool-v2 state — it is unreachable, or it \
+                 predates pool v2. The pool's value is UNKNOWN from here; it is not zero. \
+                 Point the station at a node that serves sov_getShieldedV2Info."
+            }
+            PoolV2State::Dormant => {
+                "Pool v2 is defined in consensus but its activation signal (bit 2) is not \
+                 armed, so every v2 spend is rejected by every node. Nothing has ever \
+                 entered this pool and nothing can yet — a zero here is the deployment \
+                 being dormant, NOT a balance that went missing."
+            }
+            PoolV2State::Active => {
+                "Pool v2 is live at this height. The figures below are real balances."
+            }
+        }
+    }
+}
+
 /// The live state the poller writes and the UI reads.
 #[derive(Clone, Default)]
 struct Snapshot {
@@ -123,6 +230,14 @@ struct Snapshot {
     /// The de-shield drain-limiter's full per-window cap (grains), so the wallet can
     /// show "X of LIMIT this window". `None`/0 when the limiter is disabled.
     deshield_limit: Option<u128>,
+    /// True when `sov_getShieldedInfo` ANSWERED this poll. Distinct from "the pool is
+    /// empty": a node that does not serve the method leaves every v1 figure unknown,
+    /// and the UI must say so rather than render a zero.
+    shielded_v1_available: bool,
+    /// Pool v2 (post-quantum) state from `sov_getShieldedV2Info`. `None` means the
+    /// node did not answer — it is offline, or too old to know pool v2 exists. That
+    /// is a THIRD state, distinct from both "dormant" and "empty"; see [`PoolV2State`].
+    shielded_v2: Option<ShieldedV2Info>,
     error: Option<String>,
     updated_ms: u64,
     /// LIVE peer/sync telemetry, read in-process from the embedded node every frame
@@ -303,6 +418,123 @@ mod palette {
     pub fn tint(c: Color32, alpha: u8) -> Color32 {
         Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
     }
+
+    /// "Armed but not yet in force" — a deployment that is defined in consensus and
+    /// waiting on activation. Deliberately NOT `warning` (nothing is wrong) and NOT
+    /// `error` (nothing failed): a dormant pool is the system working as designed.
+    /// A cool slate-blue, distinguishable from the green/amber/red signal family for
+    /// the common red-green deficiencies — and never used without a word beside it.
+    pub fn dormant() -> Color32 {
+        pick(rgb(125, 148, 176), rgb(85, 105, 133))
+    }
+
+    /// "We do not know" — the node did not answer. Deliberately the dimmest thing on
+    /// screen: absent knowledge must never look like a measured value.
+    pub fn unknown() -> Color32 {
+        pick(rgb(110, 118, 129), rgb(130, 138, 148))
+    }
+}
+
+/// The type scale, in points. ONE ladder, adhered to — the codebase had a scatter of
+/// ad-hoc `.size(11.0) / .size(15.0) / .size(26.0)` calls with no relationship between
+/// them. Ratios are ~1.2 (minor third), which keeps the steps distinguishable without
+/// the jump to a consumer-app "hero" scale. An operator console earns attention with
+/// weight and position, not size.
+mod ty {
+    /// The single largest number on a screen (a hero metric). At most one per panel.
+    pub const HERO: f32 = 24.0;
+    /// Panel headings.
+    pub const TITLE: f32 = 16.0;
+    /// Section headings inside a panel.
+    pub const SECTION: f32 = 13.5;
+    /// Default body text.
+    pub const BODY: f32 = 13.0;
+    /// Secondary/explanatory text and dense table cells.
+    pub const SMALL: f32 = 11.5;
+    /// The uppercase micro-label above a statistic.
+    pub const MICRO: f32 = 10.5;
+}
+
+/// The spacing scale, in points — a 4pt grid. Every `add_space` in code this agent
+/// touches uses one of these, so vertical rhythm is consistent instead of a drift of
+/// 2.0/4.0/6.0/8.0/10.0/28.0 magic numbers.
+mod sp {
+    pub const XS: f32 = 2.0;
+    pub const S: f32 = 4.0;
+    pub const M: f32 = 8.0;
+    pub const L: f32 = 12.0;
+    pub const XL: f32 = 20.0;
+}
+
+/// A NUMBER that changes: rendered in the monospace face so its digits are tabular
+/// and the value does not jitter horizontally as it ticks. Every live figure in this
+/// app — heights, balances, hashrate, counters, anchors — goes through here.
+///
+/// This is not decoration. On a proportional face `1` is narrower than `8`, so a
+/// height counting 11111 → 11112 visibly shifts every column to its right once a
+/// second, which is exactly the motion an operator's eye is drawn to. Tabular figures
+/// make a changing number readable at a glance.
+fn num(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text).monospace()
+}
+
+/// A number that is UNKNOWN — the node did not supply it. An em-dash in the dimmest
+/// colour, never a zero. The whole honesty posture of this app in one function: a
+/// value we do not have must not be renderable as a value we do.
+fn num_unknown() -> egui::RichText {
+    egui::RichText::new("—")
+        .monospace()
+        .color(palette::unknown())
+}
+
+/// One statistic: a dim uppercase micro-label with the value in tabular figures
+/// beneath it. `unit` is rendered small and dim beside the value so the magnitude
+/// reads first and the unit second. `value` of `None` renders as explicitly unknown.
+fn stat(ui: &mut egui::Ui, label: &str, value: Option<&str>, unit: &str, size: f32) {
+    ui.vertical(|ui| {
+        ui.label(
+            egui::RichText::new(label.to_uppercase())
+                .size(ty::MICRO)
+                .color(palette::text_dim()),
+        );
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = sp::S;
+            match value {
+                Some(v) => ui.label(num(v).size(size).strong().color(palette::text())),
+                None => ui.label(num_unknown().size(size)),
+            };
+            if !unit.is_empty() && value.is_some() {
+                ui.label(
+                    egui::RichText::new(unit)
+                        .size(ty::SMALL)
+                        .color(palette::text_dim()),
+                );
+            }
+        });
+    });
+}
+
+/// A status chip that encodes state with a SHAPE GLYPH + a WORD + a colour — never
+/// colour alone. `glyph` must differ per state (not just hue): this is a financial
+/// tool and a colourblind operator has to read it correctly in greyscale.
+fn state_chip(ui: &mut egui::Ui, glyph: &str, word: &str, col: egui::Color32) {
+    egui::Frame::none()
+        .fill(palette::tint(col, 28))
+        .stroke(egui::Stroke::new(1.0, palette::tint(col, 140)))
+        .rounding(egui::Rounding::same(4.0))
+        .inner_margin(egui::Margin::symmetric(7.0, 2.0))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = sp::S;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(glyph).size(ty::SMALL).color(col));
+                ui.label(
+                    egui::RichText::new(word)
+                        .size(ty::MICRO)
+                        .strong()
+                        .color(col),
+                );
+            });
+        });
 }
 
 /// Install the cohesive theme in the requested mode (dark or light). Sets the active
@@ -746,6 +978,227 @@ fn qr_widget(ui: &mut egui::Ui, data: &str, size: f32) {
     }
 }
 
+/// Write a wallet's pool-v2 address to a plain text file under `~/.sov-station/`, with
+/// a header naming what it is and stating plainly that the pool is not active. Returns
+/// the path written.
+///
+/// This exists because **a file is the honest transport for 1,957 characters.** A QR
+/// code cannot hold it legibly and no one will retype it; the realistic ways this
+/// address reaches a counterparty are the clipboard and a file, so the app provides
+/// both rather than pretending a scan is possible.
+///
+/// The address is PUBLIC key material — a receiving address, not a secret — so it is
+/// written with normal permissions, unlike the keystore.
+fn export_v2_address(addr: &str, owner_tag: &str) -> Result<String, String> {
+    let dir = home_dir()?.join(".sov-station");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(v2_address_filename(owner_tag));
+    let body = format!(
+        "SOV pool-v2 (post-quantum shielded) receiving address\n\
+         owner tag : {owner_tag}\n\
+         length    : {} characters\n\
+         \n\
+         POOL V2 IS NOT ACTIVE. Its consensus activation signal (bit 2) is not armed,\n\
+         so every pool-v2 spend is rejected by every node. Nothing can be sent to this\n\
+         address yet. It is derived from your seed and is safe to record now.\n\
+         \n\
+         {addr}\n",
+        addr.chars().count()
+    );
+    std::fs::write(&path, body).map_err(|e| e.to_string())?;
+    Ok(path.display().to_string())
+}
+
+/// The pool-v2 receive presentation.
+///
+/// ## Why this looks nothing like the other three receive addresses
+///
+/// A `xusq1…` address carries an ML-KEM-768 encapsulation key: 1,184 bytes of public
+/// key material plus a 32-byte owner tag, which is 1,216 bytes and ~1,957 bech32m
+/// characters. That is not a long string, it is three orders of magnitude past what an
+/// address widget is built for, and it does not compress — the bytes are pseudorandom
+/// by construction.
+///
+/// Four presentations were considered:
+///   * **QR code — rejected.** The payload needs QR version 40 (177×177 modules) even
+///     in uppercase-alphanumeric mode. In the 132 px the other addresses use, one
+///     module is under a pixel; at a scannable ~4 px/module it would need a 700 px
+///     square, larger than the panel, and would still fail on a phone camera at any
+///     realistic distance. Rendering one would be a control that *looks* like it works.
+///   * **Full inline wrap — rejected.** ~25 wrapped lines pushes every control below it
+///     off screen and makes the Receive view unusable for the addresses that do work.
+///   * **Truncation only — rejected.** Nothing to hand a counterparty.
+///   * **Adopted: a verifiable fingerprint, an elided address, a bounded scroll well,
+///     and two real export paths.** The 32-byte owner tag is what a human can actually
+///     compare aloud or by eye; the head…tail elision confirms at a glance that the
+///     right thing is on the clipboard; the scroll well makes the full value inspectable
+///     without letting it consume the layout; and clipboard + file are the only two ways
+///     a string this size genuinely moves between machines.
+///
+/// The dormancy disclosure is rendered FIRST, above the address, so it cannot be
+/// scrolled past or missed.
+fn v2_address_block(
+    ui: &mut egui::Ui,
+    addr: &str,
+    owner_tag: &str,
+    state: PoolV2State,
+    did_copy: &mut bool,
+) {
+    ui.add_space(sp::S);
+    card(ui, |ui| {
+        // 1. State first — before the address, never after it.
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("POOL V2 · POST-QUANTUM")
+                    .size(ty::MICRO)
+                    .color(palette::text_dim()),
+            );
+            state_chip(ui, state.glyph(), state.word(), state.color());
+        });
+        ui.add_space(sp::S);
+        ui.label(
+            egui::RichText::new(state.explanation())
+                .size(ty::SMALL)
+                .color(palette::text()),
+        );
+        if state != PoolV2State::Active {
+            ui.add_space(sp::XS);
+            ui.label(
+                egui::RichText::new(
+                    "This address is derived from your seed, so it is correct and worth \
+                     recording now — but no one can pay it until the pool activates.",
+                )
+                .size(ty::SMALL)
+                .color(palette::text_dim()),
+            );
+        }
+
+        ui.add_space(sp::M);
+        ui.separator();
+        ui.add_space(sp::M);
+
+        // 2. The fingerprint an operator can actually verify by eye.
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("OWNER TAG")
+                    .size(ty::MICRO)
+                    .color(palette::text_dim()),
+            );
+            ui.label(num(owner_tag).size(ty::SMALL).color(palette::text()));
+            copy_glyph(ui, owner_tag);
+        });
+        ui.label(
+            egui::RichText::new(
+                "The address's 32-byte fingerprint — short enough to read out or compare \
+                 against a backup. The full address below is too long to check by eye.",
+            )
+            .size(ty::SMALL)
+            .color(palette::text_dim()),
+        );
+
+        ui.add_space(sp::M);
+
+        // 3. The address: elided head…tail for at-a-glance identity.
+        let len = addr.chars().count();
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("ADDRESS")
+                    .size(ty::MICRO)
+                    .color(palette::text_dim()),
+            );
+            ui.label(
+                egui::RichText::new(format!("{} characters", group_thousands(len as u128)))
+                    .size(ty::MICRO)
+                    .color(palette::text_dim()),
+            );
+        });
+        ui.label(num(truncate_middle(addr, 22, 12)).size(ty::SMALL));
+
+        ui.add_space(sp::S);
+
+        // 4. The full value — inspectable, but bounded so it can never eat the panel.
+        egui::Frame::none()
+            .fill(palette::field())
+            .stroke(egui::Stroke::new(1.0, palette::border()))
+            .rounding(egui::Rounding::same(4.0))
+            .inner_margin(egui::Margin::same(6.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::ScrollArea::vertical()
+                    .id_salt("v2_addr_full")
+                    .max_height(84.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Selectable so it can be copied by hand in part, e.g. to
+                        // diff two addresses; `wrap` keeps it inside the well.
+                        ui.add(
+                            egui::Label::new(num(addr).size(10.5).color(palette::text_dim()))
+                                .wrap()
+                                .selectable(true),
+                        );
+                    });
+            });
+
+        ui.add_space(sp::M);
+
+        // 5. The two transports that actually work at this size.
+        ui.horizontal(|ui| {
+            if ui
+                .button("Copy address")
+                .on_hover_text("Put all of it on the clipboard.")
+                .clicked()
+            {
+                ui.output_mut(|o| o.copied_text = addr.to_owned());
+                *did_copy = true;
+            }
+            if ui
+                .button("Export to file…")
+                .on_hover_text(
+                    "Write the address to a text file under ~/.sov-station/, with a header \
+                     recording that the pool is not active yet.",
+                )
+                .clicked()
+            {
+                let msg = match export_v2_address(addr, owner_tag) {
+                    Ok(p) => format!("✓ v2 address written to {p}"),
+                    Err(e) => format!("✗ could not write the v2 address file: {e}"),
+                };
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(v2_export_msg_id(), msg));
+            }
+            ui.label(
+                egui::RichText::new("no QR code — see below")
+                    .size(ty::MICRO)
+                    .color(palette::text_dim()),
+            );
+        });
+        // The export result, if one happened this session.
+        if let Some(msg) = ui.ctx().data(|d| d.get_temp::<String>(v2_export_msg_id())) {
+            ui.add_space(sp::S);
+            status_label(ui, &msg);
+        }
+
+        ui.add_space(sp::S);
+        // The absent QR is a deliberate decision, so it is explained rather than
+        // silently missing — an operator wondering "where is the QR?" gets an answer.
+        ui.label(
+            egui::RichText::new(
+                "No QR code is shown: an ML-KEM-768 encapsulation key needs a 177×177-module \
+                 QR, which is not scannable at any size that fits this window. Post-quantum \
+                 key material does not compress. Use Copy or Export instead.",
+            )
+            .size(ty::SMALL)
+            .color(palette::text_dim()),
+        );
+    });
+}
+
+/// egui-memory key for the last v2-address export result (so the message survives the
+/// frame the button was clicked in, without adding a `Station` field).
+fn v2_export_msg_id() -> egui::Id {
+    egui::Id::new("sov_v2_export_msg")
+}
+
 fn field(v: &Value, key: &str) -> String {
     match v.get(key) {
         Some(Value::String(s)) => s.clone(),
@@ -790,6 +1243,77 @@ fn short(s: &str) -> String {
     }
 }
 
+/// Elide the middle of a long string, keeping `head` leading and `tail` trailing
+/// CHARACTERS. Char-safe (never splits a UTF-8 sequence, so it cannot panic on any
+/// input), and a no-op when the string already fits — so a short address is shown
+/// whole rather than pointlessly ellipsised.
+///
+/// This is the display half of the pool-v2 address problem: an `xusq1…` address is
+/// ~1,957 characters, and the only parts a human can meaningfully verify by eye are
+/// its ends. The full value is always available to copy — this never becomes the only
+/// form on screen.
+fn truncate_middle(s: &str, head: usize, tail: usize) -> String {
+    let n = s.chars().count();
+    if n <= head + tail + 1 {
+        return s.to_string();
+    }
+    let start: String = s.chars().take(head).collect();
+    let end: String = s.chars().skip(n - tail).collect();
+    format!("{start}…{end}")
+}
+
+/// A filesystem-safe filename for exporting a pool-v2 address, bound to the owner tag
+/// so two wallets' exports can never be confused for one another. The tag is hex from
+/// the chain, but this defends against any non-hex input reaching a path anyway.
+fn v2_address_filename(owner_tag_hex: &str) -> String {
+    let tag: String = owner_tag_hex
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(16)
+        .collect();
+    if tag.is_empty() {
+        "sov-pool-v2-address.txt".to_string()
+    } else {
+        format!("sov-pool-v2-address-{tag}.txt")
+    }
+}
+
+/// A grains figure that arrived as a JSON *string* (the wire form for values that can
+/// exceed 2^53). Absent or unparseable → 0, but callers only reach here once the RPC
+/// has ANSWERED, so a 0 is the node's own reading and never a stand-in for "unknown" —
+/// that case is the absence of the whole [`ShieldedV2Info`].
+fn grains_field(v: &Value, key: &str) -> u128 {
+    v.get(key)
+        .and_then(Value::as_str)
+        .and_then(|x| x.parse::<u128>().ok())
+        .unwrap_or(0)
+}
+
+/// Parse a `sov_getShieldedV2Info` reply. Pure — the unit under test for the wire→UI
+/// mapping, so a field rename on the node side fails a test rather than silently
+/// rendering zeros in a wallet.
+fn shielded_v2_info(v: &Value) -> ShieldedV2Info {
+    ShieldedV2Info {
+        active: v.get("active").and_then(Value::as_bool).unwrap_or(false),
+        // `poolValue` is a Balance, which serialises as a grains string.
+        pool_grains: field(v, "poolValue").parse::<u128>().unwrap_or(0),
+        note_count: v.get("noteCount").and_then(Value::as_u64).unwrap_or(0),
+        nullifier_count: v.get("nullifierCount").and_then(Value::as_u64).unwrap_or(0),
+        anchor: field(v, "anchor"),
+        deshieldable_now: grains_field(v, "deshieldableNowGrains"),
+        deshield_limit: grains_field(v, "deshieldLimitGrains"),
+        deshield_window_blocks: v
+            .get("deshieldWindowBlocks")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        window_resets_at: v
+            .get("windowResetsAtHeight")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        height: v.get("height").and_then(Value::as_u64).unwrap_or(0),
+    }
+}
+
 /// One full poll of the node into a fresh snapshot.
 fn poll(client: &RpcClient, cfg: &Config) -> Snapshot {
     let mut s = Snapshot::default();
@@ -820,6 +1344,7 @@ fn poll(client: &RpcClient, cfg: &Config) -> Snapshot {
         s.supply_total = field(&v, "total");
     }
     if let Ok(v) = client.call("sov_getShieldedInfo", json!({})) {
+        s.shielded_v1_available = true;
         s.shielded_pool = field(&v, "poolValue");
         s.deshieldable_now = v
             .get("deshieldableNowGrains")
@@ -831,6 +1356,14 @@ fn poll(client: &RpcClient, cfg: &Config) -> Snapshot {
             .and_then(Value::as_str)
             .and_then(|x| x.parse::<u128>().ok());
     }
+    // Pool v2 (post-quantum). A node too old to know the method exists simply errors,
+    // and we leave this `None` — which the UI renders as the explicitly UNAVAILABLE
+    // state, never as an empty pool. Served even while the deployment is dormant, so
+    // an answer here is a real reading whatever `active` says.
+    s.shielded_v2 = client
+        .call("sov_getShieldedV2Info", json!({}))
+        .ok()
+        .map(|v| shielded_v2_info(&v));
     if let Ok(v) = client.call("sov_getDifficulty", json!({})) {
         s.difficulty = field(&v, "sha256d");
         s.pow_algo = field(&v, "algo");
@@ -979,6 +1512,19 @@ struct LoadedWallet {
     seed: [u8; 32],
     shielded: String,
     unified: String,
+    /// The POOL-V2 (post-quantum) receiving address this seed controls, `xusq1…`.
+    /// Derived exactly as `sov-wallet z2-address <seed_hex>` does — same key, same
+    /// encoding — so the two always agree.
+    ///
+    /// Derived and displayable TODAY even though the pool is dormant: the address is
+    /// a property of the seed, not of the deployment, so an operator can record it in
+    /// their backup now. Nothing can be sent to it until bit 2 arms, and every surface
+    /// that shows it says so.
+    shielded_v2: String,
+    /// The v2 owner tag (32-byte hex) — the short, human-checkable fingerprint of the
+    /// v2 address. At ~1,957 characters the address itself cannot be compared by eye;
+    /// this can.
+    v2_owner_tag: String,
     /// The BIP-39 recovery phrase, when known (generated/imported here, or loaded
     /// from a keystore that stored it). `None` for a wallet restored from a raw
     /// seed only — that wallet still works, but its phrase cannot be re-shown
@@ -1012,6 +1558,11 @@ impl LoadedWallet {
             .and_then(|id| UnifiedAddress::new(Some(id), Some(zkey.address())).ok())
             .map(|u| u.encode())
             .unwrap_or_default();
+        // Pool v2 (post-quantum). Same derivation the CLI's `z2-address` uses, so the
+        // station and the wallet binary always agree on what a seed controls.
+        let pqkey = PqShieldedKey::from_leaf_seed(&seed);
+        let shielded_v2 = encode_shielded_v2(&pqkey.address());
+        let v2_owner_tag = hex_lower(&pqkey.owner_tag().to_bytes());
         Ok(LoadedWallet {
             label,
             account,
@@ -1019,6 +1570,8 @@ impl LoadedWallet {
             seed,
             shielded,
             unified,
+            shielded_v2,
+            v2_owner_tag,
             mnemonic,
             operate_as: None,
             watch_only: false,
@@ -1040,6 +1593,10 @@ impl LoadedWallet {
             seed: [0u8; 32],
             shielded: String::new(), // no viewing key without the seed
             unified: String::new(),
+            // A watch-only wallet holds no seed, so it cannot derive a v2 address.
+            // Left empty and rendered as "not derivable" — never as a placeholder.
+            shielded_v2: String::new(),
+            v2_owner_tag: String::new(),
             mnemonic: None,
             operate_as: None,
             watch_only: true,
@@ -1240,6 +1797,10 @@ enum ReceiveKind {
     Shielded,
     Unified,
     Account,
+    /// The pool-v2 (post-quantum) receiving address. Selectable so an operator can
+    /// SEE and BACK UP the address their seed controls — it is derivable today. It is
+    /// not payable today, and the view says so before showing the address, never after.
+    ShieldedV2,
 }
 
 /// A send awaiting the user's explicit confirmation (the review-before-broadcast
@@ -6732,6 +7293,14 @@ impl Station {
                 w.watch_only,
             )
         });
+        // The pool-v2 address + its owner tag, cloned alongside `sel` (kept out of that
+        // tuple so the existing destructuring is untouched). Empty for a watch-only
+        // wallet, which holds no seed to derive them from.
+        let (v2_addr, v2_tag) = self
+            .wallets
+            .get(self.selected)
+            .map(|w| (w.shielded_v2.clone(), w.v2_owner_tag.clone()))
+            .unwrap_or_default();
         let mut do_set_operate = false;
         let mut do_clear_operate = false;
         let mut do_register_named = false;
@@ -6996,7 +7565,7 @@ impl Station {
 
             // ── Receive ──
             ui.separator();
-            ui.label(egui::RichText::new("Receive").strong());
+            ui.label(egui::RichText::new("Receive").strong().size(ty::SECTION));
             ui.horizontal(|ui| {
                 ui.selectable_value(
                     &mut self.receive_kind,
@@ -7005,32 +7574,69 @@ impl Station {
                 );
                 ui.selectable_value(&mut self.receive_kind, ReceiveKind::Unified, "Unified");
                 ui.selectable_value(&mut self.receive_kind, ReceiveKind::Account, "Account");
+                // Pool v2 is marked in the tab strip itself, so its state is visible
+                // BEFORE it is selected — an operator never clicks in expecting a
+                // working receive address and discovers the dormancy afterwards.
+                ui.selectable_value(
+                    &mut self.receive_kind,
+                    ReceiveKind::ShieldedV2,
+                    "Post-quantum (v2) ◌",
+                )
+                .on_hover_text(
+                    "The xusq1… address this seed controls in the post-quantum shielded \
+                     pool. The pool is NOT ACTIVE yet — the address is shown so you can \
+                     record it, but nothing can be sent to it.",
+                );
             });
             let recv_addr = match self.receive_kind {
                 ReceiveKind::Shielded => shielded.clone(),
                 ReceiveKind::Unified => unified.clone(),
                 ReceiveKind::Account => account.clone(),
+                ReceiveKind::ShieldedV2 => v2_addr.clone(),
             };
-            ui.horizontal(|ui| {
-                qr_widget(ui, &recv_addr, 132.0);
-                ui.vertical(|ui| {
-                    if self.receive_kind == ReceiveKind::Shielded {
-                        ui.label(
-                            egui::RichText::new("private — recommended receive address")
-                                .small()
-                                .color(named_color(true)),
-                        );
-                    }
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(&recv_addr).monospace().size(11.0))
-                            .wrap(),
+            if self.receive_kind == ReceiveKind::ShieldedV2 {
+                // Pool v2 gets its own presentation. It is NOT a peer of the three
+                // working addresses above, for two independent reasons — it is not
+                // payable, and it is ~1,957 characters — and pretending otherwise
+                // would be both dishonest and unusable.
+                if v2_addr.is_empty() {
+                    ui.add_space(sp::S);
+                    empty_hint(
+                        ui,
+                        "No v2 address for this wallet",
+                        "A pool-v2 address is derived from a seed. This wallet is \
+                         watch-only — it holds a public key and no seed, so there is \
+                         nothing to derive from. Load the wallet from its recovery \
+                         phrase to see its v2 address.",
                     );
-                    if ui.button("Copy address").clicked() {
-                        ui.output_mut(|o| o.copied_text = recv_addr.clone());
-                        did_copy = true;
-                    }
+                } else {
+                    let v2_state = PoolV2State::classify(s.online, s.shielded_v2.as_ref());
+                    v2_address_block(ui, &v2_addr, &v2_tag, v2_state, &mut did_copy);
+                }
+            } else {
+                ui.horizontal(|ui| {
+                    qr_widget(ui, &recv_addr, 132.0);
+                    ui.vertical(|ui| {
+                        if self.receive_kind == ReceiveKind::Shielded {
+                            ui.label(
+                                egui::RichText::new("✓ private — recommended receive address")
+                                    .size(ty::SMALL)
+                                    .color(named_color(true)),
+                            );
+                        }
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&recv_addr).monospace().size(ty::SMALL),
+                            )
+                            .wrap(),
+                        );
+                        if ui.button("Copy address").clicked() {
+                            ui.output_mut(|o| o.copied_text = recv_addr.clone());
+                            did_copy = true;
+                        }
+                    });
                 });
-            });
+            }
 
             // ── Send ──
             ui.separator();

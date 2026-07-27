@@ -12,6 +12,11 @@ sov-rpc = { path = "../chain/crates/rpc" }
 sov-crypto = { path = "../chain/crates/crypto" }
 sov-wallet = { path = "../chain/crates/wallet" }
 sov-shielded = { path = "../chain/crates/shielded" }
+# Pool v2 (post-quantum) key derivation, so the Receive view can show the
+# `xusq1…` address a wallet's seed controls. READ-ONLY use: the deployment is
+# dormant (signal bit 2 unarmed), so the station derives and displays the
+# address but can never build a v2 spend.
+sov-shielded-pq = { path = "../chain/crates/shielded-pq" }
 sov-types = { path = "../chain/crates/types" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
