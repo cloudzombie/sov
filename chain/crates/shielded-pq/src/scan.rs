@@ -21,7 +21,7 @@
 //!
 //! # What a scan must get right
 //!
-//! [`PqNoteStore`] mirrors the pool-v1 [`NoteStore`] discipline
+//! [`PqNoteStore`] mirrors the pool-v1 `NoteStore` discipline
 //! (`sov_shielded::NoteStore`) one-for-one, because the failure modes are
 //! identical:
 //!

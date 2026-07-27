@@ -271,7 +271,7 @@ impl UnifiedAddress {
     ///
     /// Receivers are emitted in ascending typecode order — transparent
     /// (`0x00`), pool v1 (`0x01`), then pool v2 (`0x02`, as
-    /// [`UA_V2_CHUNKS`] consecutive records). The order is fixed so the
+    /// `UA_V2_CHUNKS` consecutive records). The order is fixed so the
     /// encoding is canonical and `encode(decode(s)) == s`.
     pub fn encode(&self) -> String {
         let mut payload = Vec::new();

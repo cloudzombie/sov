@@ -1,7 +1,7 @@
 //! Wallet-level spend construction for pool v2 — the layer between a note
 //! store and [`crate::prover`].
 //!
-//! [`prove_bundle`](crate::prover::prove_bundle) takes exact spends and outputs
+//! [`crate::prover::prove_bundle`] takes exact spends and outputs
 //! and produces a proof. It does not choose which notes to spend, compute
 //! change, encrypt to a recipient, or authorize the carrier. Without that layer
 //! the pool is readable but unusable: a wallet can show a balance and never
