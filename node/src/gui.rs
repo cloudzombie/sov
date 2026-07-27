@@ -1061,8 +1061,12 @@ fn qr_widget(ui: &mut egui::Ui, data: &str, size: f32) {
 /// A grains figure rendered as XUS, or the explicit unknown dash when the pool's
 /// figures are not real readings. This is the choke point that enforces the honesty
 /// rule for every number on the pools view: `real == false` cannot print a digit.
+/// `xus`, not `grains_to_xus_plain`: the plain form deliberately omits thousands
+/// separators because it round-trips into the amount INPUT fields, and reusing it for
+/// display printed `110557.53450464` where the rest of the app shows `110,557.53450464`.
+/// Display and input are different jobs; this is the display one.
 fn pool_amount(ui: &mut egui::Ui, label: &str, grains: u128, real: bool, size: f32) {
-    let shown = real.then(|| grains_to_xus_plain(grains));
+    let shown = real.then(|| xus(&grains.to_string()));
     stat(ui, label, shown.as_deref(), "XUS", size);
 }
 
@@ -1136,7 +1140,7 @@ fn pool_column(
             Some(g) => stat(
                 ui,
                 "your balance",
-                Some(&grains_to_xus_plain(g)),
+                Some(&xus(&g.to_string())),
                 "XUS",
                 ty::HERO,
             ),
@@ -8339,8 +8343,11 @@ impl Station {
             // `v1_own` is `Some` only when THIS wallet has actually been scanned; a
             // scan that has not run yields `None`, which the view renders as "unknown",
             // never as a zero balance.
-            let v1_own = (for_this && sv.scanned_height > 0)
-                .then_some((sv.balance as u128, sv.notes, sv.scanned_height));
+            let v1_own = (for_this && sv.scanned_height > 0).then_some((
+                sv.balance as u128,
+                sv.notes,
+                sv.scanned_height,
+            ));
             shielded_pools_view(ui, &snap, v1_own);
             if sv.scanning {
                 ui.add_space(sp::S);
@@ -11824,6 +11831,337 @@ mod tests {
                 assert_ne!(a.word(), b.word());
             }
         }
+    }
+
+    /// Render `add` in a headless egui frame and return every string that was actually
+    /// PAINTED, in paint order.
+    ///
+    /// This is the difference between testing what the code intends and testing what an
+    /// operator sees. The claims that matter here — "no zero without its state beside
+    /// it", "v1 is never called post-quantum", "unavailable prints a dash, not a digit"
+    /// — are claims about pixels, so they are asserted against the text that reached the
+    /// painter rather than against the helpers that were supposed to produce it.
+    fn painted_text(add: impl Fn(&mut egui::Ui)) -> String {
+        let ctx = egui::Context::default();
+        // Wide enough to take the two-column branch of the layout.
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 1200.0),
+            )),
+            ..Default::default()
+        };
+        let run = |i| {
+            ctx.run(i, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| add(ui));
+            })
+        };
+        // Frame 1 establishes layout (egui sizes many widgets from the previous
+        // frame's measurements); frame 2 is the one that paints a settled screen.
+        let _ = run(input());
+        let out = run(input());
+        fn walk(shapes: &[egui::Shape], into: &mut String) {
+            for s in shapes {
+                match s {
+                    egui::Shape::Text(t) => {
+                        into.push_str(t.galley.text());
+                        into.push('\n');
+                    }
+                    egui::Shape::Vec(v) => walk(v, into),
+                    _ => {}
+                }
+            }
+        }
+        let mut text = String::new();
+        for cs in &out.shapes {
+            walk(std::slice::from_ref(&cs.shape), &mut text);
+        }
+        text
+    }
+
+    /// A snapshot shaped like the LIVE mainnet node this was developed against:
+    /// online, height 12,570, serving v1 with a real pool value, and NOT serving
+    /// `sov_getShieldedV2Info`.
+    fn live_like_snapshot() -> Snapshot {
+        Snapshot {
+            online: true,
+            height: Some(12_570),
+            shielded_v1_available: true,
+            shielded_pool: "11055753450464".to_string(),
+            deshieldable_now: Some(11_055_753_450_464),
+            deshield_limit: Some(2_100_000_000_000_000),
+            deshield_resets_at: Some(12_086),
+            shielded_v2: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_two_pool_view_never_prints_a_bare_zero_for_an_unavailable_pool() {
+        // THE case the live node produces today: v1 answers, v2 does not exist.
+        let snap = live_like_snapshot();
+        let out = painted_text(|ui| shielded_pools_view(ui, &snap, Some((500_000_000, 3, 12_500))));
+
+        // Both pools are present and each carries its state IN WORDS.
+        assert!(out.contains("Pool v1"), "v1 column missing:\n{out}");
+        assert!(out.contains("Pool v2"), "v2 column missing:\n{out}");
+        assert!(out.contains("ACTIVE"), "v1 state word missing:\n{out}");
+        assert!(
+            out.contains("UNAVAILABLE"),
+            "v2 must say UNAVAILABLE when the node does not serve the RPC:\n{out}"
+        );
+        // ...and the word that would be WRONG here is absent: the node being too old
+        // is NOT the same fact as the deployment being dormant.
+        assert!(
+            !out.contains("NOT ACTIVE YET"),
+            "an unanswered query must not be reported as dormancy:\n{out}"
+        );
+        // The v2 figures are dashes, not digits. This is the honesty invariant: an
+        // unavailable pool cannot render a number that looks like a measurement.
+        assert!(
+            out.contains('—'),
+            "unavailable figures must render as the explicit unknown dash:\n{out}"
+        );
+        assert!(
+            out.contains("is UNKNOWN from here"),
+            "the unavailable sentence must say the value is unknown, not zero:\n{out}"
+        );
+        // v1's real figures DID come through, so "unavailable" is not suppressing
+        // everything indiscriminately.
+        // Grouped thousands, matching every other amount in the app. Rendering this
+        // through the input-field formatter produced an ungrouped `110557.53450464`,
+        // which only showed up by reading the painted output.
+        assert!(
+            out.contains("110,557.53450464"),
+            "v1's real pool value should render with grouped thousands:\n{out}"
+        );
+        assert!(
+            out.contains("21,000,000"),
+            "the de-shield window cap should be grouped too:\n{out}"
+        );
+        // And the post-quantum labelling is correct in both directions, on screen.
+        assert!(
+            out.contains("NOT post-quantum"),
+            "v1 must be labelled NOT post-quantum on screen:\n{out}"
+        );
+        assert!(out.contains("Orchard / Halo2"), "v1 crypto named:\n{out}");
+        assert!(
+            out.contains("ML-KEM-768 / STARK"),
+            "v2 crypto named:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_dormant_pool_v2_says_dormant_and_explains_the_zero() {
+        // A node that DOES serve the RPC while bit 2 is unarmed.
+        let mut snap = live_like_snapshot();
+        snap.shielded_v2 = shielded_v2_info(&v2_reply(false));
+        let out = painted_text(|ui| shielded_pools_view(ui, &snap, Some((0, 0, 12_500))));
+
+        assert!(
+            out.contains("NOT ACTIVE YET"),
+            "a dormant pool must say so:\n{out}"
+        );
+        assert!(
+            !out.contains("UNAVAILABLE"),
+            "an ANSWERED query is not unavailable:\n{out}"
+        );
+        // The zero is present AND explained — this is the sentence that stops an
+        // operator concluding their funds vanished.
+        assert!(
+            out.contains("bit 2") && out.contains("NOT a balance that went missing"),
+            "a dormant zero must be explained beside it:\n{out}"
+        );
+        assert!(
+            out.contains("No v2 note can exist yet"),
+            "the 'your balance' line must explain WHY it is not a number:\n{out}"
+        );
+        // Nothing on this surface may suggest a v2 send is possible.
+        let lower = out.to_lowercase();
+        assert!(
+            !lower.contains("send to pool v2") && !lower.contains("shield to v2"),
+            "no v2 send may be offered while dormant:\n{out}"
+        );
+    }
+
+    #[test]
+    fn an_unscanned_v1_wallet_shows_unknown_rather_than_a_zero_balance() {
+        // The trap: a wallet that has not been scanned has an UNKNOWN balance. Showing
+        // "0 XUS" there is how a user with real shielded funds concludes they are gone.
+        let snap = live_like_snapshot();
+        let out = painted_text(|ui| shielded_pools_view(ui, &snap, None));
+        assert!(
+            out.contains("Not scanned yet"),
+            "an unscanned wallet must say so:\n{out}"
+        );
+        assert!(
+            out.contains("which is not the same as zero"),
+            "and must say plainly that unknown is not zero:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_real_v2_address_is_the_size_the_ui_claims_and_matches_the_cli() {
+        // Every design decision in the receive view rests on the address being ~1.8 KB
+        // of bech32m. That number is asserted here against a REAL derivation rather
+        // than trusted from a comment — if the encoding ever changes, the reasoning
+        // ("no QR code, elide the middle, export to a file") has to be revisited, and
+        // this test is what forces that.
+        let seed = [7u8; 32];
+        let key = PqShieldedKey::from_leaf_seed(&seed);
+        let addr = encode_shielded_v2(&key.address());
+
+        assert!(addr.starts_with("xusq1"), "unexpected HRP: {}", &addr[..16]);
+        let n = addr.chars().count();
+        assert_eq!(
+            n, 1957,
+            "the v2 address is {n} chars; the receive view's design assumes 1,957"
+        );
+        // Far past anything a QR code can carry legibly, which is the documented
+        // reason there is no QR: even alphanumeric mode tops out well below this.
+        assert!(n > 1_500);
+
+        // Same seed ⇒ same address, every time. This is what lets an operator record
+        // the address today and trust it after the pool activates.
+        let again = encode_shielded_v2(&PqShieldedKey::from_leaf_seed(&seed).address());
+        assert_eq!(addr, again, "derivation must be deterministic");
+        // A different seed must give a different address.
+        let other = encode_shielded_v2(&PqShieldedKey::from_leaf_seed(&[8u8; 32]).address());
+        assert_ne!(addr, other);
+
+        // The owner tag is the short fingerprint the UI asks a human to compare, so it
+        // must actually be comparable: 32 bytes as 64 hex characters.
+        let tag = hex_lower(&key.owner_tag().to_bytes());
+        assert_eq!(tag.len(), 64, "owner tag must be 32 bytes of hex");
+        // The elided form the view shows keeps both ends of the real address.
+        let shown = truncate_middle(&addr, 22, 12);
+        assert!(shown.starts_with("xusq1"));
+        assert!(addr.ends_with(shown.rsplit('…').next().unwrap()));
+    }
+
+    #[test]
+    fn the_two_pool_view_survives_a_narrow_window() {
+        // The minimum window is 720x480. Below ~720 px of content width the view
+        // stacks to one column rather than squeezing two unreadable ones — and, more
+        // importantly, every state word and every explanation must still be painted.
+        let snap = live_like_snapshot();
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(680.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let run = |i| {
+            ctx.run(i, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        shielded_pools_view(ui, &snap, None);
+                    });
+                });
+            })
+        };
+        let _ = run(input());
+        let out = run(input());
+        let mut text = String::new();
+        fn walk(shapes: &[egui::Shape], into: &mut String) {
+            for s in shapes {
+                match s {
+                    egui::Shape::Text(t) => {
+                        into.push_str(t.galley.text());
+                        into.push('\n');
+                    }
+                    egui::Shape::Vec(v) => walk(v, into),
+                    _ => {}
+                }
+            }
+        }
+        for cs in &out.shapes {
+            walk(std::slice::from_ref(&cs.shape), &mut text);
+        }
+        assert!(text.contains("Pool v1"), "v1 lost when narrow:\n{text}");
+        assert!(text.contains("Pool v2"), "v2 lost when narrow:\n{text}");
+        assert!(
+            text.contains("UNAVAILABLE"),
+            "the state word must survive a narrow window:\n{text}"
+        );
+        assert!(
+            text.contains("NOT post-quantum"),
+            "the v1 disclaimer must survive a narrow window:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_v2_receive_block_discloses_dormancy_before_the_address() {
+        // The address is derivable today and payable never (while dormant), so the
+        // disclosure has to come FIRST — an operator must not read an address, copy
+        // it, hand it out, and only then learn nothing can be sent to it.
+        let addr = format!("xusq1{}", "q".repeat(1_952));
+        let tag = "ab".repeat(32);
+        for state in [PoolState::Dormant, PoolState::Unavailable] {
+            let mut copied = false;
+            let out = painted_text(|ui| {
+                let mut c = false;
+                v2_address_block(ui, &addr, &tag, state, &mut c);
+            });
+            let _ = &mut copied;
+
+            let state_at = out.find(state.word()).unwrap_or(usize::MAX);
+            let addr_at = out.find("ADDRESS").unwrap_or(0);
+            assert!(
+                state_at < addr_at,
+                "{:?}: the state must be painted before the address:\n{out}",
+                state
+            );
+            // The address's LENGTH is stated, so the operator understands why it is
+            // elided and why there is no QR code.
+            assert!(
+                out.contains("1,957 characters"),
+                "{:?}: the address length must be stated:\n{out}",
+                state
+            );
+            assert!(
+                out.contains("No QR code is shown"),
+                "{:?}: the missing QR must be explained, not silently absent:\n{out}",
+                state
+            );
+            // The elided form is shown, never the full 1,957 characters inline.
+            assert!(out.contains('…'), "{:?}: elision missing:\n{out}", state);
+            // The owner tag is the eye-checkable fingerprint.
+            assert!(
+                out.contains("OWNER TAG") && out.contains(&tag),
+                "{:?}: the owner tag must be shown in full:\n{out}",
+                state
+            );
+            // And the non-active states say the address is not payable yet.
+            assert!(
+                out.contains("no one can pay it until the pool activates"),
+                "{:?}: unpayability must be stated:\n{out}",
+                state
+            );
+        }
+    }
+
+    #[test]
+    fn the_node_status_band_states_the_link_in_words_when_offline() {
+        // The degraded screen an operator actually hits. Nothing may render as a
+        // confident number when no node answered.
+        let out = painted_text(|ui| node_panel(ui, &Snapshot::default()));
+        assert!(out.contains("OFFLINE"), "offline must be stated:\n{out}");
+        assert!(
+            out.contains("No node is answering"),
+            "and explained:\n{out}"
+        );
+        assert!(
+            out.contains('—'),
+            "height/peers/mempool must be dashes, not zeros:\n{out}"
+        );
+        // A zero here would read as "the chain is at height 0" / "no transactions".
+        assert!(
+            !out.contains("CONNECTED"),
+            "offline must not also claim connectivity:\n{out}"
+        );
     }
 
     #[test]
