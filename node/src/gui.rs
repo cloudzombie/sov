@@ -1143,7 +1143,6 @@ fn qr_widget(ui: &mut egui::Ui, data: &str, size: f32) {
 ///     stronger and more reassuring fact than "unknown".
 ///   * [`Amount`](Self::Amount)/[`Count`](Self::Count) — a real reading.
 enum Cell {
-    Chip(&'static str, &'static str, egui::Color32),
     Text(String),
     Amount(u128),
     Count(u64),
@@ -1164,7 +1163,6 @@ impl Cell {
 
     fn render(&self, ui: &mut egui::Ui) {
         match self {
-            Cell::Chip(glyph, word, col) => state_chip(ui, glyph, word, *col),
             Cell::Text(t) => {
                 ui.label(
                     egui::RichText::new(t)
@@ -1259,11 +1257,9 @@ fn pool_rows(s: &Snapshot, v1_own: Option<(u128, usize, u64)>) -> Vec<PoolRow> {
     };
 
     vec![
-        PoolRow {
-            label: "status",
-            v1: Cell::Chip(v1_state.glyph(), v1_state.word(), v1_state.color()),
-            v2: Cell::Chip(v2_state.glyph(), v2_state.word(), v2_state.color()),
-        },
+        // No STATUS row: each pool's panel heading already carries its state
+        // chip. Repeating it here drew the same chip twice in the same column,
+        // inches apart, which is noise rather than emphasis.
         PoolRow {
             label: "cryptography",
             v1: Cell::Text(Pool::V1.crypto().to_string()),
@@ -1376,19 +1372,11 @@ fn pool_rows(s: &Snapshot, v1_own: Option<(u128, usize, u64)>) -> Vec<PoolRow> {
 /// The per-pool prose that must accompany any zero: the state sentence, plus the
 /// wallet-specific note where there is one.
 fn pool_note(ui: &mut egui::Ui, pool: Pool, state: PoolState, extra: &str) {
-    card(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = sp::M;
-            ui.label(
-                egui::RichText::new(pool.name())
-                    .size(ty::SECTION)
-                    .strong()
-                    .color(palette::text()),
-            );
-            state_chip(ui, state.glyph(), state.word(), state.color());
-        });
-        ui.add_space(sp::S);
+    // No title and no state chip here: this renders INSIDE the pool's own panel,
+    // which already carries both. It used to repeat them — the chip was drawn
+    // three times per pool (panel heading, STATUS row, and again here) and the
+    // name twice, which is most of what made the view look noisy.
+    {
         ui.label(
             egui::RichText::new(state.explanation(pool))
                 .size(ty::SMALL)
@@ -1406,7 +1394,7 @@ fn pool_note(ui: &mut egui::Ui, pool: Pool, state: PoolState, extra: &str) {
                     .color(palette::text_dim()),
             );
         }
-    });
+    }
 }
 
 /// **The two-pool view.** SOV has two shielded pools, and the single most dangerous
@@ -1492,84 +1480,6 @@ fn shielded_pools_view(ui: &mut egui::Ui, s: &Snapshot, v1_own: Option<(u128, us
     let needed = label_w + 2.0 * value_w + 3.0 * gap;
     let side_by_side = avail >= needed;
 
-    let grid = |ui: &mut egui::Ui, headers: Vec<(&str, PoolState)>, pick: usize| {
-        // `pick` is 0 for "both", 1 for v1 only, 2 for v2 only (the stacked mode).
-        let cols = headers.len() + 1;
-        let col_w = if side_by_side {
-            ((ui.available_width() - label_w - cols as f32 * gap) / headers.len() as f32)
-                .max(value_w)
-        } else {
-            (ui.available_width() - label_w - 2.0 * gap).max(value_w)
-        };
-        egui::Grid::new(format!("pool-grid-{pick}"))
-            .num_columns(cols)
-            .striped(true)
-            .spacing([gap, 6.0])
-            .show(ui, |ui| {
-                // Header row — also where the column widths are pinned, by allocating
-                // exactly `col_w` in each value column so neither pool can be sized by
-                // whichever happens to hold the longer string.
-                ui.allocate_space(egui::vec2(label_w, 0.0));
-                for (name, st) in &headers {
-                    ui.horizontal(|ui| {
-                        ui.set_min_width(col_w);
-                        ui.spacing_mut().item_spacing.x = sp::M;
-                        ui.label(
-                            egui::RichText::new(*name)
-                                .size(ty::SECTION)
-                                .strong()
-                                .color(palette::text()),
-                        );
-                        state_chip(ui, st.glyph(), st.word(), st.color());
-                    });
-                }
-                ui.end_row();
-
-                for r in &rows {
-                    ui.label(
-                        egui::RichText::new(r.label.to_uppercase())
-                            .size(ty::MICRO)
-                            .color(palette::text_dim()),
-                    );
-                    if pick == 0 || pick == 1 {
-                        ui.horizontal(|ui| {
-                            ui.set_min_width(col_w);
-                            r.v1.render(ui);
-                        });
-                    }
-                    if pick == 0 || pick == 2 {
-                        ui.horizontal(|ui| {
-                            ui.set_min_width(col_w);
-                            r.v2.render(ui);
-                        });
-                    }
-                    ui.end_row();
-                }
-            });
-    };
-
-    if side_by_side {
-        card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            grid(ui, vec![("Pool v1", v1_state), ("Pool v2", v2_state)], 0);
-        });
-    } else {
-        // Stacked: each pool full width, one above the other. The wallet panel is
-        // already inside a vertical ScrollArea, so the extra height scrolls rather
-        // than clipping — nothing becomes unreachable at the minimum window size.
-        card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            grid(ui, vec![("Pool v1", v1_state)], 1);
-        });
-        ui.add_space(sp::M);
-        card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            grid(ui, vec![("Pool v2", v2_state)], 2);
-        });
-    }
-
-    ui.add_space(sp::M);
-
     // ── The prose that must sit beside any zero ───────────────────────────────
     let v1_extra = match (v1_state, v1_own) {
         (PoolState::Unavailable, _) => String::new(),
@@ -1589,16 +1499,124 @@ fn shielded_pools_view(ui: &mut egui::Ui, s: &Snapshot, v1_own: Option<(u128, us
         _ => String::new(),
     };
 
+    // ── Two INDEPENDENT panels, with a draggable split ────────────────────────
+    //
+    // Previously this was one wide grid holding both pools, which had two faults
+    // an operator could see at a glance: the value columns split ALL remaining
+    // width, so on a wide window each pool's figures sat at the far left of an
+    // enormous cell with a canyon between them; and the pools then appeared a
+    // SECOND time below as prose cards, so everything was stated twice.
+    //
+    // Each pool is now a self-contained panel — its own heading, state chip,
+    // rows and note — and the divider between them is draggable, so an operator
+    // can widen whichever pool they are actually reading. The split is a
+    // FRACTION, so it survives window resizing instead of stranding a pane.
+    // ── Two EQUAL panels, responsive and capped ───────────────────────────────
+    //
+    // Equal by construction, because the whole point of putting the pools side
+    // by side is comparison: unequal panes make one look more substantial than
+    // the other and invite reading a layout accident as a difference in the
+    // data. A draggable split is deliberately NOT offered — it can only make
+    // them unequal, which destroys the one property this layout exists for.
+    //
+    // Capped, because uncapped they stretched to opposite edges of a wide
+    // display with a canyon of dead space between the figures. The cap is the
+    // width the content actually needs — the label column plus the widest real
+    // value plus padding — so a wider window centres the pair instead of
+    // inflating it.
     if side_by_side {
-        ui.columns(2, |c| {
-            pool_note(&mut c[0], Pool::V1, v1_state, &v1_extra);
-            pool_note(&mut c[1], Pool::V2, v2_state, &v2_extra);
+        let avail = ui.available_width();
+        let gap = sp::L;
+        let natural = label_w + value_w + 4.0 * sp::M;
+        let col_w = ((avail - gap) * 0.5).min(natural).max(value_w);
+        // LEFT-ALIGNED, not centred. Centring left a wide empty margin on the
+        // left of a large window while every other element on the page starts
+        // at the same gutter — the pools looked detached from the panel rather
+        // than part of it.
+        ui.horizontal_top(|ui| {
+            for (pool, state, extra, pick) in [
+                (Pool::V1, v1_state, &v1_extra, 1usize),
+                (Pool::V2, v2_state, &v2_extra, 2usize),
+            ] {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(col_w, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(col_w);
+                        ui.set_max_width(col_w);
+                        pool_panel(ui, pool, state, &rows, pick, label_w, extra);
+                    },
+                );
+                if pick == 1 {
+                    ui.add_space(gap);
+                }
+            }
         });
     } else {
-        pool_note(ui, Pool::V1, v1_state, &v1_extra);
+        // Narrow: stacked, full width each. The wallet panel is already inside a
+        // vertical ScrollArea, so extra height scrolls rather than clipping —
+        // nothing becomes unreachable at the minimum window size.
+        pool_panel(ui, Pool::V1, v1_state, &rows, 1, label_w, &v1_extra);
         ui.add_space(sp::M);
-        pool_note(ui, Pool::V2, v2_state, &v2_extra);
+        pool_panel(ui, Pool::V2, v2_state, &rows, 2, label_w, &v2_extra);
     }
+}
+
+/// One pool, complete and self-contained: heading, state chip, its rows, and the
+/// prose that must accompany a zero. `pick` selects which side of each row to
+/// render (1 = v1, 2 = v2).
+#[allow(clippy::too_many_arguments)]
+fn pool_panel(
+    ui: &mut egui::Ui,
+    pool: Pool,
+    state: PoolState,
+    rows: &[PoolRow],
+    pick: usize,
+    label_w: f32,
+    extra: &str,
+) {
+    card(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = sp::M;
+            ui.label(
+                egui::RichText::new(pool.name())
+                    .size(ty::SECTION)
+                    .strong()
+                    .color(palette::text()),
+            );
+            state_chip(ui, state.glyph(), state.word(), state.color());
+        });
+        ui.add_space(sp::S);
+        egui::Grid::new(format!("pool-grid-{pick}"))
+            .num_columns(2)
+            .striped(true)
+            .spacing([sp::M, 6.0])
+            .show(ui, |ui| {
+                for r in rows {
+                    ui.horizontal(|ui| {
+                        ui.set_min_width(label_w);
+                        ui.label(
+                            egui::RichText::new(r.label.to_uppercase())
+                                .size(ty::MICRO)
+                                .color(palette::text_dim()),
+                        );
+                    });
+                    if pick == 1 {
+                        r.v1.render(ui);
+                    } else {
+                        r.v2.render(ui);
+                    }
+                    ui.end_row();
+                }
+            });
+        // The prose belongs INSIDE the pool it describes. It used to be repeated
+        // as a separate card below both pools, which said everything twice; the
+        // sentences themselves are load-bearing, though — they are what stops an
+        // operator reading a dormant or unscanned zero as vanished funds.
+        ui.add_space(sp::S);
+        pool_note(ui, pool, state, extra);
+    });
 }
 
 /// The address is PUBLIC key material — a receiving address, not a secret — so it is
@@ -5602,10 +5620,72 @@ fn node_log_panel(ui: &mut egui::Ui, logs: &[String]) {
     // A tall, scrollable, monospace view so an operator can watch live activity and
     // scroll back through the whole session — the primary window into what the node
     // is doing (peering, sync, restarts, errors).
+    // USER-RESIZABLE, gripped from the TOP.
+    //
+    // The log is the bottom-most thing on the tab, so the natural gesture is to
+    // pull its top edge UPWARD to make it taller — the same way a docked console
+    // drawer behaves. A handle underneath would ask the operator to drag the
+    // page downward to reveal more of something already below the fold.
+    //
+    // Two bugs made the first attempt inert. The panel renders INSIDE the Node
+    // tab's `ScrollArea`, where `available_height()` is not the visible height —
+    // so the clamp computed from it was meaningless — and a bare
+    // `allocate_exact_size` drag inside a scroll area is swallowed as a scroll.
+    // The ceiling now comes from the actual viewport, and the handle is an
+    // explicit `interact` with its own id, so the drag belongs to the handle.
+    const LOG_MIN_H: f32 = 160.0;
+    const LOG_DEFAULT_H: f32 = 520.0;
+    let h_id = ui.id().with("node_log_height");
+    let mut h = ui
+        .ctx()
+        .data(|d| d.get_temp::<f32>(h_id))
+        .unwrap_or(LOG_DEFAULT_H);
+    // Ceiling from the real viewport, leaving room for the chrome above.
+    let max_h = (ui.ctx().screen_rect().height() - 260.0).max(LOG_MIN_H);
+    h = h.clamp(LOG_MIN_H, max_h);
+
+    // ── The grip, ABOVE the log ───────────────────────────────────────────────
+    let (bar, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 12.0), egui::Sense::hover());
+    let resp = ui.interact(bar, h_id.with("grip"), egui::Sense::drag());
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    if resp.dragged() {
+        // Dragging UP (negative y) makes it TALLER.
+        h = (h - resp.drag_delta().y).clamp(LOG_MIN_H, max_h);
+        ui.ctx().data_mut(|d| d.insert_temp(h_id, h));
+    }
+    if resp.double_clicked() {
+        ui.ctx().data_mut(|d| d.insert_temp(h_id, LOG_DEFAULT_H));
+    }
+    let col = if resp.dragged() {
+        palette::accent()
+    } else if resp.hovered() {
+        palette::accent_hi()
+    } else {
+        palette::border()
+    };
+    let cx = bar.center().x;
+    for dy in [-2.5f32, 0.5, 3.5] {
+        ui.painter().line_segment(
+            [
+                egui::pos2(cx - 18.0, bar.center().y + dy),
+                egui::pos2(cx + 18.0, bar.center().y + dy),
+            ],
+            egui::Stroke::new(1.0, col),
+        );
+    }
+
+    // A tall, scrollable, monospace view so an operator can watch live activity and
+    // scroll back through the whole session — the primary window into what the node
+    // is doing (peering, sync, restarts, errors).
     egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_min_height(h);
+        ui.set_max_height(h);
         egui::ScrollArea::vertical()
             .id_salt("node_log_scroll")
-            .max_height(520.0)
+            .max_height(h)
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
@@ -10860,9 +10940,24 @@ fn lan_ipv4() -> Option<String> {
 /// File holding the running local node's PID, so it can be stopped even across a
 /// GUI restart (otherwise an orphaned node keeps mining with no way to halt it).
 fn node_pid_path() -> PathBuf {
-    // Legacy sov-rpcd pidfile cleanup — a fixed location (not per-network), since it
-    // only reaps a leftover subprocess from older builds.
-    std::env::temp_dir().join("sov-station-node.pid")
+    // PER DATA DIRECTORY, not a machine-wide fixed path.
+    //
+    // This was `/tmp/sov-station-node.pid`, shared by every Station on the
+    // machine — and `stop_tracked_node()` KILLS whatever pid it finds there, on
+    // startup. So launching any second Station (a dev build, a release
+    // candidate) terminated the node subprocess belonging to the operator's
+    // installed copy. An override that isolates the wallet but leaves a
+    // kill-on-startup pointing at a shared file is not isolation.
+    //
+    // Falls back to the old location only if the data directory is
+    // unresolvable, so the legacy reap still works on a broken environment.
+    match station_dir() {
+        Ok(d) => {
+            let _ = std::fs::create_dir_all(&d);
+            d.join("node.pid")
+        }
+        Err(_) => std::env::temp_dir().join("sov-station-node.pid"),
+    }
 }
 
 /// The PID recorded in the pidfile, if any.
@@ -11483,6 +11578,8 @@ mod tests {
             None => std::env::remove_var("SOV_STATION_DIR"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Serialises the tests that mutate `SOV_STATION_DIR`.
     ///
     /// Rust runs tests in parallel threads of ONE process, so the environment is
