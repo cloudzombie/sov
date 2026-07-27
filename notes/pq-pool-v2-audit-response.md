@@ -63,9 +63,22 @@ Two separate defects; both addressed.
    `shielded-v2` deployment at all; a test asserts no canonical chain id
    (`sov-mainnet`, `sov-testnet-1`, `sov-dev`, `sov-test`) can arm bit 2.
 
-**Still open from this finding:** nothing in `scripts/` or `.github/` invokes
-the harness, so the five-node suite is not yet a required release job. That
-wiring is the remaining half of "make it a gate".
+3. *It was not a gate.* Nothing in `scripts/` or `.github/` invoked the harness
+   at all, so it could not block anything. `release.yml` now carries an `e2e`
+   job that runs the five-node matrix with `--require-complete`, and every
+   build job `needs: [gate, e2e]` — so a tag cannot produce artifacts unless
+   the suite ran with zero failures AND zero skips. The job also re-reads the
+   emitted report and fails if any step is not `pass`, because the report is
+   the artifact humans read and it must agree with the exit code.
+
+   It runs on the release path rather than every push because it mines a real
+   chain to a real activation height (~25 minutes) — not a per-commit cost, but
+   exactly what a tag should have to earn.
+
+**Status:** verified GREEN end to end — 15 steps, 0 failed, 0 skipped, exit 0
+under `--require-complete`, with the full pool-v2 lifecycle (shield, private
+send, de-shield, v1->v2 migration) driven through real STARK proofs and real
+consensus on a live five-node chain.
 
 ## Found during remediation, NOT in the audit — carrier binding (High)
 
