@@ -1,0 +1,26 @@
+[package]
+name = "sov-sharechain"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Decentralized (non-custodial) pool sharechain for SOV: PPLNS accounting over a share DAG, with the payout rule enforced by the sharechain rather than by an operator."
+
+# Standalone tool — intentionally NOT a member of the chain workspace, exactly like
+# sov-stratum, so it can never affect `chain/` builds or consensus artifacts.
+#
+# THIS CRATE HAS NO CONSENSUS SURFACE. SOV sees only ordinary blocks containing
+# ordinary `Transfer` actions. Nothing here changes block/header/tx encoding, the
+# state root, emission, difficulty, the chain spec, or any KAT vector. The sharechain
+# is a agreement ABOUT who gets paid; the payment itself is a plain transfer the STF
+# already executes.
+#
+# No secret material is handled: payout account ids are public, and no keys or seeds
+# enter this process — the block producer signs its own payout transfers.
+
+[dependencies]
+sov-primitives = { path = "../../chain/crates/primitives" }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

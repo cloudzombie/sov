@@ -227,6 +227,19 @@ cargo test --manifest-path tools/sov-stratum/Cargo.toml \
   || fail "sov-stratum: tests failed"
 ok "sov-stratum bridge builds, lints, and tests clean"
 
+# ── 6e. the sharechain (tools/sov-sharechain/) ──────────────────────────────
+# Also a SEPARATE cargo workspace. It decides who a pool pays, so a regression
+# here is a regression in somebody's income even though it touches no consensus
+# code — it must not be able to bypass the gate either.
+banner "Sharechain (tools/sov-sharechain/): fmt · clippy · tests"
+cargo fmt --manifest-path tools/sov-sharechain/Cargo.toml --all -- --check \
+  || fail "sov-sharechain: formatting drift"
+cargo clippy --manifest-path tools/sov-sharechain/Cargo.toml --all-targets -- -D warnings \
+  || fail "sov-sharechain: clippy issues"
+cargo test --manifest-path tools/sov-sharechain/Cargo.toml \
+  || fail "sov-sharechain: tests failed"
+ok "sov-sharechain builds, lints, and tests clean"
+
 # ── 7. wasm contracts (mirror CI's `contracts` job exactly) ──────────────────
 # Scoped to chain/contracts — the no_std guest crate — NOT the whole workspace.
 # A workspace-wide wasm build pulls in std-only deps (getrandom without `js`) that
