@@ -10704,17 +10704,56 @@ fn kill_other_instances() {
     }
     #[cfg(unix)]
     {
-        if let Ok(out) = Command::new("pgrep").arg("-x").arg(&name).output() {
-            for pid in String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter_map(|l| l.trim().parse::<u32>().ok())
-            {
-                if pid != self_pid {
-                    kill_pid(pid);
+        // SCOPED BY DATA DIRECTORY, not by process name.
+        //
+        // This used to `pgrep -x sov-station` and kill EVERY match, so starting
+        // any second Station — a development build from a working tree, a
+        // release candidate being smoke-tested — killed the operator's running
+        // wallet. The guard exists to stop two instances fighting over ONE data
+        // directory and one set of ports; it was never meant to stop two
+        // isolated instances coexisting.
+        //
+        // Now only an instance recorded in THIS data directory's `station.pid`
+        // is a conflict. Two Stations with different `SOV_STATION_DIR` values
+        // share nothing and leave each other alone.
+        let Ok(dir) = station_dir() else { return };
+        let pidfile = dir.join("station.pid");
+        if let Ok(text) = std::fs::read_to_string(&pidfile) {
+            if let Ok(prev) = text.trim().parse::<u32>() {
+                // Only kill it if it is (a) not us and (b) still a live process
+                // of the same name — a stale pid file after a crash must never
+                // let us kill whatever unrelated process later reused the id.
+                if prev != self_pid && pid_is_named(prev, &name) {
+                    kill_pid(prev);
                 }
             }
         }
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(&pidfile, self_pid.to_string());
     }
+}
+
+/// Whether `pid` is live AND its executable name is `name`.
+///
+/// A pid file can outlive a crash, and the operating system reuses process ids.
+/// Killing on the recorded number alone would eventually kill an unrelated
+/// process, so identity is confirmed before any signal is sent.
+#[cfg(unix)]
+fn pid_is_named(pid: u32, name: &str) -> bool {
+    Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                == name
+        })
+        .unwrap_or(false)
 }
 
 /// The testnet-1 genesis spec, COMPILED INTO the binary so a shipped app is fully
