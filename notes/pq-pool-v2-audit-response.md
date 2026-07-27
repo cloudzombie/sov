@@ -67,6 +67,34 @@ Two separate defects; both addressed.
 the harness, so the five-node suite is not yet a required release job. That
 wiring is the remaining half of "make it a gate".
 
+## Found during remediation, NOT in the audit — carrier binding (High)
+
+The audit did not catch this, and neither did any test at any layer: the
+pool-v2 transaction path did not work at all.
+
+`build_shield` / `build_spend` signed `bundle_digest(...)`. Consensus
+(`verify_carrier_auth`) requires a signature over
+`carrier_sighash(digest, {signer, nonce})`. Every bundle the wallet built was
+therefore rejected with `CarrierAuth` — no v2 shield, send or de-shield could
+ever have been mined.
+
+Why every layer missed it is the lesson worth keeping:
+
+- the CLI's `require_v2_active` refuses while bit 2 is dormant, which happens
+  BEFORE a bundle is ever built — so live CLI checks only ever exercised the
+  dormancy guard and the cross-pool address refusal;
+- `chain/crates/runtime/src/shielded_v2.rs`, the whole 8-stage consensus
+  verifier, had ZERO tests;
+- the only two v2 execution tests both assert a v2 action is REJECTED;
+- the E2E harness skipped all six v2 steps and still reported green.
+
+**Every layer tested that pool v2 is refused. No layer tested that it works.**
+
+Fixed with `authorize_for_carrier`, applied at submit time in both clients.
+The runtime module now has 8 tests, including the first that proves a v2
+transaction is ACCEPTED, plus double-spend, replay/theft, unknown anchor,
+insufficient balance, and byte-mutation-fails-closed.
+
 ## Medium findings — **OPEN**
 
 None of these are fixed. They are stated here so they are not lost.

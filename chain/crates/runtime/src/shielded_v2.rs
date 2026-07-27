@@ -324,8 +324,16 @@ mod tests {
             Balance::from_grains(10 * XUS),
         )
         .expect("an honest shield must verify");
-        assert_eq!(effects.shield_in.grains(), 5 * XUS, "value entering the pool");
-        assert_eq!(effects.deshield_out.grains(), 0, "a shield takes nothing out");
+        assert_eq!(
+            effects.shield_in.grains(),
+            5 * XUS,
+            "value entering the pool"
+        );
+        assert_eq!(
+            effects.deshield_out.grains(),
+            0,
+            "a shield takes nothing out"
+        );
         assert!(
             effects.nullifiers.is_empty(),
             "a shield spends no notes, so it must publish NO nullifiers"

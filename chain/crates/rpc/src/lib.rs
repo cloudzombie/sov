@@ -757,22 +757,41 @@ fn call(
                 .total_supply()
                 .ok_or_else(|| RpcError::server("supply overflow"))?;
             let shielded = l.shielded_value();
+            let shielded_v2 = l.shielded_v2_value();
+            // BOTH pools hold shielded value. `total_supply()` counts both, so
+            // `transparent` must subtract both — otherwise, the moment signal
+            // bit 2 arms, pool-v2 value would be reported as TRANSPARENT: the
+            // liquid transparent supply overstated by exactly the v2 pool, and
+            // the privately-held share understated by the same amount. Both
+            // figures feed explorers and dashboards.
+            //
+            // This is byte-identical on every chain today, because
+            // `shielded_v2_value` is exactly zero until the (unarmed)
+            // `shielded-v2` deployment activates — which is precisely why it is
+            // correct to fix here, before it can ever misreport.
+            let shielded_total = shielded
+                .checked_add(shielded_v2)
+                .ok_or_else(|| RpcError::server("shielded supply overflow"))?;
             // Zcash-style "shielded supply": the fraction of the circulating
-            // supply currently held in the shielded pool. SOV has no pre-mine, so
-            // total supply IS the circulating supply (every coin was mined), and
-            // total_supply already counts shielded value — so this is the share of
-            // ALL coins that are shielded, exactly as Zcash reports it.
+            // supply held privately. SOV has no pre-mine, so total supply IS the
+            // circulating supply (every coin was mined), and total_supply
+            // already counts both pools — so this is the share of ALL coins that
+            // are shielded, across both pools.
             let shielded_percent = if total.grains() == 0 {
                 0.0
             } else {
-                (shielded.grains() as f64 / total.grains() as f64) * 100.0
+                (shielded_total.grains() as f64 / total.grains() as f64) * 100.0
             };
             Ok(json!({
                 "total": to_value(total),
                 "circulating": to_value(total),
                 "mined": to_value(l.mined_emitted()),
+                // `shielded` stays POOL V1 for compatibility with existing
+                // clients; the v2 and combined figures are additive fields.
                 "shielded": to_value(shielded),
-                "transparent": to_value(total.checked_sub(shielded).unwrap_or(total)),
+                "shieldedV2": to_value(shielded_v2),
+                "shieldedTotal": to_value(shielded_total),
+                "transparent": to_value(total.checked_sub(shielded_total).unwrap_or(total)),
                 "shieldedPercent": shielded_percent,
             }))
         }

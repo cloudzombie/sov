@@ -54,8 +54,8 @@ use sov_primitives::{AccountId, Balance, Hash, GRAINS_PER_SOV};
 use sov_rpc::RpcClient;
 use sov_shielded::{
     decode_shielded_v2, encode_shielded, encode_shielded_v2, shielded_transfer_with_change,
-    unshield_amount_multi,
-    AnyAddress, NoteStore, Receiver, ShieldedBundle, ShieldedKey, ShieldedParams,
+    unshield_amount_multi, AnyAddress, NoteStore, Receiver, ShieldedBundle, ShieldedKey,
+    ShieldedParams,
 };
 use sov_shielded_pq::bundle::SpendBundle;
 use sov_shielded_pq::hd::PqShieldedKey;
@@ -215,8 +215,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "shield2" => {
             // Transparent ledger -> pool v2. No input notes, so no scan and no
             // witnesses: the value enters through the transparent leg.
-            let usage =
-                "usage: shield2 <seed_hex> <xus> [--to <xusq1…>] [--fee <xus>] [--ed25519]";
+            let usage = "usage: shield2 <seed_hex> <xus> [--to <xusq1…>] [--fee <xus>] [--ed25519]";
             let seed = seed_arg(&args, 3, usage)?;
             let sov: u128 = args.get(4).ok_or(usage)?.parse()?;
             let amount = Balance::from_sov(sov)?;

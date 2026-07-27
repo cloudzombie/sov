@@ -3013,3 +3013,64 @@ mod tests {
         assert_eq!(p.signers, signers);
     }
 }
+
+#[cfg(test)]
+mod supply_accounting_tests {
+    use super::*;
+
+    /// Value in EITHER shielded pool is supply, and neither pool is
+    /// transparent. This pins the accounting `sov_getSupply` reports: a
+    /// consumer computing `total - shielded_v1` alone would count pool-v2
+    /// value as liquid transparent supply the moment bit 2 arms.
+    #[test]
+    fn both_shielded_pools_count_as_supply_and_neither_is_transparent() {
+        let mut l = Ledger::default();
+        let base = l.total_supply().expect("supply");
+
+        l.add_shielded_value(Balance::from_grains(700)).expect("v1");
+        l.add_shielded_v2_value(Balance::from_grains(300))
+            .expect("v2");
+
+        let total = l.total_supply().expect("supply");
+        assert_eq!(
+            total.grains(),
+            base.grains() + 1_000,
+            "both pools must be counted in total supply"
+        );
+        assert_eq!(l.shielded_value().grains(), 700);
+        assert_eq!(l.shielded_v2_value().grains(), 300);
+
+        // The transparent figure a client should compute.
+        let shielded_total = l.shielded_value().grains() + l.shielded_v2_value().grains();
+        assert_eq!(shielded_total, 1_000);
+        assert_eq!(
+            total.grains() - shielded_total,
+            base.grains(),
+            "subtracting BOTH pools recovers the transparent supply; subtracting only \
+             pool v1 would overstate it by the pool-v2 balance"
+        );
+    }
+
+    /// Moving value from pool v1 to pool v2 conserves supply exactly — the
+    /// invariant a v1->v2 migration rests on.
+    #[test]
+    fn migrating_between_pools_conserves_total_supply() {
+        let mut l = Ledger::default();
+        l.add_shielded_value(Balance::from_grains(1_000))
+            .expect("v1");
+        let before = l.total_supply().expect("supply");
+
+        l.sub_shielded_value(Balance::from_grains(400))
+            .expect("out");
+        l.add_shielded_v2_value(Balance::from_grains(400))
+            .expect("in");
+
+        assert_eq!(
+            l.total_supply().expect("supply").grains(),
+            before.grains(),
+            "a v1 -> v2 migration must be supply-neutral"
+        );
+        assert_eq!(l.shielded_value().grains(), 600);
+        assert_eq!(l.shielded_v2_value().grains(), 400);
+    }
+}

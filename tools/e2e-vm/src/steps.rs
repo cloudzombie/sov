@@ -1708,10 +1708,28 @@ fn step_unshield_v2(ctx: &mut Ctx) -> Result<(String, Value), String> {
         ));
     }
     // The turnstile moved value between spaces; it must not have CREATED any.
+    //
+    // TOTAL supply is the wrong thing to pin: the chain keeps mining while the
+    // de-shield confirms, so emission legitimately raises it. The real
+    // conservation statement is that the SHIELDED total fell by exactly the
+    // de-shielded amount — value left the pool and went nowhere else.
     let supply_after = obs.supply()?;
-    if supply_after != supply_before {
+    let shielded_before = shielded_total_grains(&supply_before)?;
+    let shielded_after = shielded_total_grains(&supply_after)?;
+    if shielded_before.saturating_sub(shielded_after) != xus(1) {
         return Err(format!(
-            "total supply changed across a v2 de-shield: {supply_before} -> {supply_after}"
+            "a 1 XUS de-shield moved the shielded total by {} grains, not {}: {supply_before} -> \
+             {supply_after}",
+            shielded_before.saturating_sub(shielded_after),
+            xus(1)
+        ));
+    }
+    // ...and total supply may only have grown by whole coinbase emissions.
+    let total_before = supply_field_grains(&supply_before, "total")?;
+    let total_after = supply_field_grains(&supply_after, "total")?;
+    if total_after < total_before {
+        return Err(format!(
+            "total supply DECREASED across a v2 de-shield: {total_before} -> {total_after}"
         ));
     }
 
@@ -1783,10 +1801,17 @@ fn step_v1_to_v2_migration(ctx: &mut Ctx) -> Result<(String, Value), String> {
 
     // Conservation across the whole migration: value left v1, arrived in v2,
     // and no supply was created anywhere.
+    // As in `unshield-v2`: emission keeps raising TOTAL supply while the two
+    // legs confirm, so the invariant that actually holds is that the combined
+    // shielded total is unchanged — value left pool v1 and arrived in pool v2,
+    // and none was created or destroyed in between.
     let supply_after = obs.supply()?;
-    if supply_after != supply_before {
+    let shielded_before = shielded_total_grains(&supply_before)?;
+    let shielded_after = shielded_total_grains(&supply_after)?;
+    if shielded_before != shielded_after {
         return Err(format!(
-            "total supply changed across a v1->v2 migration: {supply_before} -> {supply_after}"
+            "a v1->v2 migration changed the combined shielded total: {shielded_before} -> \
+             {shielded_after} grains ({supply_before} -> {supply_after})"
         ));
     }
     let z2_after = z2balance(ctx, &addr, &user1.seed_hex)?;
@@ -1892,6 +1917,26 @@ fn step_reorg_with_v2(ctx: &mut Ctx) -> Result<(String, Value), String> {
             "nodes_agreeing": nodes,
         }),
     ))
+}
+
+/// One numeric field of `sov_getSupply`, in grains.
+fn supply_field_grains(supply: &Value, field: &str) -> Result<u128, String> {
+    supply
+        .get(field)
+        .and_then(grains_of)
+        .ok_or_else(|| format!("supply lacks a parseable `{field}`: {supply}"))
+}
+
+/// Value held across BOTH shielded pools, in grains. Prefers the explicit
+/// `shieldedTotal`; falls back to v1 + v2 so the step still works against a
+/// node that predates that field.
+fn shielded_total_grains(supply: &Value) -> Result<u128, String> {
+    if let Some(t) = supply.get("shieldedTotal").and_then(grains_of) {
+        return Ok(t);
+    }
+    let v1 = supply_field_grains(supply, "shielded")?;
+    let v2 = supply.get("shieldedV2").and_then(grains_of).unwrap_or(0);
+    Ok(v1 + v2)
 }
 
 /// Pool v2's current anchor (commitment-tree root) at one node.

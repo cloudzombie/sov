@@ -392,7 +392,6 @@ mod tests {
         );
     }
 
-
     use crate::prover::verify_spend;
     use crate::wire::encode_bundle;
 
