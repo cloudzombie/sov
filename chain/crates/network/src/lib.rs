@@ -13,11 +13,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod link;
 pub mod message;
 pub mod pq;
 pub mod tcp;
 pub mod transport;
 
+pub use link::{LinkRead, SealedLink};
 pub use message::{
     handshake_bytes, NetMessage, NetworkError, MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION,
 };
