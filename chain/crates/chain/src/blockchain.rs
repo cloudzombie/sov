@@ -595,6 +595,42 @@ impl Blockchain {
         self.checkpoints.keys().copied().max().unwrap_or(0)
     }
 
+    /// Whether this node has actually **matched** a pinned checkpoint on the chain
+    /// it is building — not merely climbed past its height.
+    ///
+    /// This is the difference between "pinned" and "assumed". The hash pin in
+    /// `validate_header_for` only fires for a block AT a checkpoint height, so a
+    /// branch that stops one block SHORT of the newest checkpoint is pinned by
+    /// nothing at all. Every block on it sits below the checkpoint height and so
+    /// takes the assumevalid PoW skip — meaning a fabricated sub-checkpoint branch
+    /// carrying NO valid proof-of-work is accepted block for block.
+    ///
+    /// A block's chainwork is derived from its DECLARED `bits`, and the retarget
+    /// rule those bits must satisfy is computed from the branch's own timestamps —
+    /// so a forger who never has to produce real work can mint a high-difficulty,
+    /// high-chainwork branch for free and win heaviest-work fork choice on a node
+    /// that has not yet reached the checkpoint.
+    ///
+    /// Returns true when there are no checkpoints at all (dev/test chains, which
+    /// never skip anything), or when the active chain holds a block at the newest
+    /// checkpoint height whose hash equals the pin.
+    pub fn checkpoint_satisfied(&self) -> bool {
+        // "No checkpoints" is `is_empty()`, NOT `height == 0`. Height 0 is a
+        // perfectly legal pin (genesis), and conflating the two would report a
+        // chain as satisfied whose genesis pin does not match — the exact
+        // height-vs-identity confusion this function exists to remove.
+        if self.checkpoints.is_empty() {
+            return true;
+        }
+        let newest = self.newest_checkpoint_height();
+        let Some(&expected) = self.checkpoints.get(&newest) else {
+            return true;
+        };
+        self.block_by_height(newest)
+            .map(|b| b.hash() == expected)
+            .unwrap_or(false)
+    }
+
     /// The network identifier.
     pub fn chain_id(&self) -> &str {
         &self.chain_id
@@ -2657,7 +2693,7 @@ mod tests {
 
     /// A chain with one validator (key seed [1]) and a funded usa account
     /// (key seed [2], 1000 SOV).
-    fn fresh_chain() -> Blockchain {
+    pub(crate) fn fresh_chain() -> Blockchain {
         let config = GenesisConfig {
             chain_id: "sov-test".into(),
             timestamp_ms: 1_000,
@@ -5177,5 +5213,70 @@ mod tests {
             .resume_from_snapshot(ledger, receipts, Hash::digest(b"wrong head"), 5, &log)
             .unwrap();
         assert!(!ok, "a snapshot head off the heaviest chain is rejected");
+    }
+}
+
+#[cfg(test)]
+mod assumevalid_ancestry_tests {
+    use super::tests::fresh_chain;
+    use super::*;
+
+    /// A checkpoint far above anything the test chain will reach.
+    const FAR_CHECKPOINT: u64 = 1_000_000;
+
+    /// **Finding A2.** A chain is only "pinned" once a pinned checkpoint has
+    /// actually been MATCHED — climbing past its height is not the same thing,
+    /// and being below it is not the same thing either.
+    ///
+    /// The assumevalid PoW skip applies to every block below the newest
+    /// checkpoint height. The hash pin, however, only fires for a block AT a
+    /// checkpoint height. So a branch that stops short of the checkpoint is
+    /// pinned by nothing while still taking the skip — which is exactly the
+    /// state in which a node must not treat its chain as trustworthy.
+    #[test]
+    fn a_chain_below_the_newest_checkpoint_is_not_satisfied() {
+        let mut chain = fresh_chain();
+        assert!(
+            chain.checkpoint_satisfied(),
+            "a chain with NO checkpoints must be satisfied — dev/test chains skip \
+             nothing, so there is nothing to pin"
+        );
+
+        // Pin a checkpoint the chain has not reached.
+        chain.set_checkpoints([(FAR_CHECKPOINT, Hash::from_bytes([7u8; 32]))]);
+        assert!(
+            !chain.checkpoint_satisfied(),
+            "a chain sitting BELOW its newest checkpoint has matched no pin, so it \
+             must not count as satisfied — every block on it takes the PoW skip \
+             while nothing vouches for any of them"
+        );
+    }
+
+    /// The pin must be matched by HASH, not merely by having some block at that
+    /// height. A forged branch that reaches the checkpoint height with a
+    /// different block is the case the pin exists to catch.
+    #[test]
+    fn a_wrong_hash_at_the_checkpoint_height_does_not_satisfy_it() {
+        let chain = fresh_chain();
+        let genesis_hash = chain.block_by_height(0).expect("genesis block").hash();
+
+        // Pin height 0 to the REAL genesis hash: satisfied.
+        let mut good = fresh_chain();
+        good.set_checkpoints([(0, genesis_hash)]);
+        assert!(
+            good.checkpoint_satisfied(),
+            "the real block at a pinned height must satisfy the pin"
+        );
+
+        // Pin height 0 to a DIFFERENT hash: not satisfied, even though a block
+        // exists at that height.
+        let mut bad = fresh_chain();
+        bad.set_checkpoints([(0, Hash::from_bytes([9u8; 32]))]);
+        assert!(
+            !bad.checkpoint_satisfied(),
+            "a block at the pinned height whose HASH differs must NOT satisfy the \
+             pin — otherwise the pin checks height and not identity, which is the \
+             whole vulnerability"
+        );
     }
 }
