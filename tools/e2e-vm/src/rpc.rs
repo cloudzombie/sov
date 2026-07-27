@@ -131,6 +131,42 @@ impl Rpc {
         self.call("sov_getDeployments", json!({}))
     }
 
+    /// Pool-v2 (post-quantum) state. Always served, even while the pool is
+    /// dormant, so a client can distinguish "empty pool" from "node does not
+    /// know about pool v2".
+    pub fn shielded_v2_info(&self) -> Result<Value, String> {
+        self.call("sov_getShieldedV2Info", json!({}))
+    }
+
+    /// Value held in pool v2, in grains.
+    pub fn pool_v2_grains(&self) -> Result<u128, String> {
+        let info = self.shielded_v2_info()?;
+        info.get("poolValue")
+            .and_then(grains_of)
+            .ok_or_else(|| format!("{}: unparseable poolValue in {info}", self.addr))
+    }
+
+    /// Whether the `shielded-v2` deployment (signal bit 2) is Active at this
+    /// node's current height.
+    pub fn shielded_v2_active(&self) -> Result<bool, String> {
+        let info = self.shielded_v2_info()?;
+        info.get("active")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| format!("{}: no `active` flag in {info}", self.addr))
+    }
+
+    /// Whether a pool-v2 nullifier has been published on this chain.
+    pub fn shielded_v2_nullifier_seen(&self, nf_hex: &str) -> Result<bool, String> {
+        let v = self.call(
+            "sov_shieldedV2NullifierSeen",
+            json!({ "nullifier": nf_hex }),
+        )?;
+        v.get("seen")
+            .and_then(Value::as_bool)
+            .or_else(|| v.as_bool())
+            .ok_or_else(|| format!("{}: unparseable nullifierSeen reply {v}", self.addr))
+    }
+
     pub fn difficulty(&self) -> Result<Value, String> {
         self.call("sov_getDifficulty", json!({}))
     }
