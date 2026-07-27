@@ -1058,46 +1058,255 @@ fn qr_widget(ui: &mut egui::Ui, data: &str, size: f32) {
 /// address reaches a counterparty are the clipboard and a file, so the app provides
 /// both rather than pretending a scan is possible.
 ///
-/// A grains figure rendered as XUS, or the explicit unknown dash when the pool's
-/// figures are not real readings. This is the choke point that enforces the honesty
-/// rule for every number on the pools view: `real == false` cannot print a digit.
-/// `xus`, not `grains_to_xus_plain`: the plain form deliberately omits thousands
-/// separators because it round-trips into the amount INPUT fields, and reusing it for
-/// display printed `110557.53450464` where the rest of the app shows `110,557.53450464`.
-/// Display and input are different jobs; this is the display one.
-fn pool_amount(ui: &mut egui::Ui, label: &str, grains: u128, real: bool, size: f32) {
-    let shown = real.then(|| xus(&grains.to_string()));
-    stat(ui, label, shown.as_deref(), "XUS", size);
-}
-
-/// A count rendered in tabular figures, or the explicit unknown dash. Same rule.
-fn pool_count(ui: &mut egui::Ui, label: &str, n: u64, real: bool) {
-    let shown = real.then(|| group_thousands(n as u128));
-    stat(ui, label, shown.as_deref(), "", ty::BODY);
-}
-
-/// One pool's column in the two-pool view: identity, cryptography, state, figures.
+/// One cell of the pool comparison table.
 ///
-/// The layout is identical for v1 and v2 on purpose. Two pools presented in two
-/// different shapes read as two unrelated features; presented in the same shape they
-/// read as what they are — the same mechanism, twice, with different cryptography and
-/// different activation status. That comparison is the whole point of the view, and it
-/// is what makes "v1 is live and NOT post-quantum, v2 is post-quantum and NOT live"
-/// legible in one glance instead of requiring the operator to hold two panels in mind.
-fn pool_column(
-    ui: &mut egui::Ui,
-    pool: Pool,
-    state: PoolState,
-    // The pool total the node reported, and whether we may print it.
-    pool_grains: u128,
-    // "Your" balance in this pool: `Some` only when a real scan produced it.
-    own: Option<u128>,
-    own_note: &str,
-    body: impl FnOnce(&mut egui::Ui, bool),
-) {
-    let real = state.figures_are_real();
+/// The variants exist to keep four *different* absences from collapsing into one
+/// ambiguous blank, which is the same discipline the three-state model applies to the
+/// pool as a whole:
+///   * [`Unknown`](Self::Unknown)     — the node did not answer, so we have no reading.
+///   * [`NotReported`](Self::NotReported) — the node answered, but this pool's RPC does
+///     not expose this figure. The pool HAS the quantity; we simply are not told it.
+///     Reporting that as "unknown" would imply the node is degraded when it is not.
+///   * [`Impossible`](Self::Impossible) — the quantity cannot exist yet. A dormant v2
+///     pool has no balance because consensus rejects every v2 spend, which is a
+///     stronger and more reassuring fact than "unknown".
+///   * [`Amount`](Self::Amount)/[`Count`](Self::Count) — a real reading.
+enum Cell {
+    Chip(&'static str, &'static str, egui::Color32),
+    Text(String),
+    Amount(u128),
+    Count(u64),
+    Hash(String),
+    Unknown,
+    NotReported(&'static str),
+    Impossible(&'static str),
+}
+
+impl Cell {
+    /// An amount that is only real when `real`; otherwise the explicit unknown.
+    fn amount(v: Option<u128>) -> Self {
+        match v {
+            Some(g) => Cell::Amount(g),
+            None => Cell::Unknown,
+        }
+    }
+
+    fn render(&self, ui: &mut egui::Ui) {
+        match self {
+            Cell::Chip(glyph, word, col) => state_chip(ui, glyph, word, *col),
+            Cell::Text(t) => {
+                ui.label(
+                    egui::RichText::new(t)
+                        .size(ty::SMALL)
+                        .color(palette::text()),
+                );
+            }
+            Cell::Amount(g) => {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = sp::S;
+                    ui.label(num(xus(&g.to_string())).size(ty::BODY).strong());
+                    ui.label(
+                        egui::RichText::new("XUS")
+                            .size(ty::MICRO)
+                            .color(palette::text_dim()),
+                    );
+                });
+            }
+            Cell::Count(n) => {
+                ui.label(num(group_thousands(*n as u128)).size(ty::BODY).strong());
+            }
+            Cell::Hash(h) => {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = sp::S;
+                    ui.label(num(short(h)).size(ty::SMALL));
+                    copy_glyph(ui, h);
+                });
+            }
+            // The three absences, each visually distinct and each explained on hover.
+            Cell::Unknown => {
+                ui.label(num_unknown().size(ty::BODY))
+                    .on_hover_text("The node did not report this. It is unknown — not zero.");
+            }
+            Cell::NotReported(why) => {
+                ui.label(
+                    egui::RichText::new("not reported")
+                        .size(ty::SMALL)
+                        .italics()
+                        .color(palette::text_dim()),
+                )
+                .on_hover_text(*why);
+            }
+            Cell::Impossible(why) => {
+                ui.label(
+                    egui::RichText::new("cannot exist yet")
+                        .size(ty::SMALL)
+                        .italics()
+                        .color(palette::dormant()),
+                )
+                .on_hover_text(*why);
+            }
+        }
+    }
+}
+
+/// One row of the comparison: a label and the same quantity for each pool.
+struct PoolRow {
+    label: &'static str,
+    v1: Cell,
+    v2: Cell,
+}
+
+/// Build the rows. Pure data, so the table's CONTENT is decided in one place and the
+/// rendering below is only layout — which is what makes the two pools provably
+/// row-aligned rather than aligned by careful hand-editing of two separate columns.
+fn pool_rows(s: &Snapshot, v1_own: Option<(u128, usize, u64)>) -> Vec<PoolRow> {
+    let v1_state = PoolState::classify_v1(s.online, s.shielded_v1_available);
+    let v2_state = PoolState::classify_v2(s.online, s.shielded_v2.as_ref());
+    let v1_real = v1_state.figures_are_real();
+    let v2_real = v2_state.figures_are_real();
+    let info = s.shielded_v2.clone().unwrap_or_default();
+
+    // v1's RPC simply does not carry these; that is not a fault and must not read as one.
+    const V1_NO_NOTES: &str =
+        "sov_getShieldedInfo does not report pool-v1 note or nullifier counts. The pool \
+         has them; this node's RPC does not expose them.";
+    const V1_NO_ANCHOR: &str =
+        "sov_getShieldedInfo does not report the pool-v1 anchor. The pool has one; this \
+         node's RPC does not expose it.";
+    // While v2 is dormant no note can exist, so this is stronger than "unknown".
+    const V2_DORMANT: &str =
+        "Pool v2 is not active: consensus rejects every v2 spend while signal bit 2 is \
+         unarmed, so no note, nullifier or balance can exist yet. This is not a missing \
+         balance.";
+
+    // A quantity that only exists once v2 is live. Dormant ⇒ provably nothing;
+    // unavailable ⇒ genuinely unknown; active ⇒ the real reading.
+    let v2_live = |c: Cell| match v2_state {
+        PoolState::Active => c,
+        PoolState::Dormant => Cell::Impossible(V2_DORMANT),
+        PoolState::Unavailable => Cell::Unknown,
+    };
+
+    vec![
+        PoolRow {
+            label: "status",
+            v1: Cell::Chip(v1_state.glyph(), v1_state.word(), v1_state.color()),
+            v2: Cell::Chip(v2_state.glyph(), v2_state.word(), v2_state.color()),
+        },
+        PoolRow {
+            label: "cryptography",
+            v1: Cell::Text(Pool::V1.crypto().to_string()),
+            v2: Cell::Text(Pool::V2.crypto().to_string()),
+        },
+        PoolRow {
+            // Stated in words for BOTH pools, including the negative one. v1 is
+            // Orchard/Halo2 and its privacy is discrete-log based; presenting it as
+            // quantum-safe is the most damaging thing this table could do.
+            label: "post-quantum",
+            v1: Cell::Text(Pool::V1.pq_claim().to_string()),
+            v2: Cell::Text(Pool::V2.pq_claim().to_string()),
+        },
+        PoolRow {
+            label: "your balance",
+            v1: match (v1_real, v1_own) {
+                (false, _) => Cell::Unknown,
+                // Not scanned is UNKNOWN, never zero — a user with real shielded funds
+                // must not be told they have none because a scan has not run.
+                (true, None) => Cell::NotReported(
+                    "This wallet has not been scanned yet, so its shielded balance is \
+                     unknown — which is not the same as zero. Press \"Scan pool\" below.",
+                ),
+                (true, Some((b, _, _))) => Cell::Amount(b),
+            },
+            // This station does not scan v2, and while dormant there is provably
+            // nothing to scan.
+            v2: match v2_state {
+                PoolState::Dormant => Cell::Impossible(V2_DORMANT),
+                PoolState::Unavailable => Cell::Unknown,
+                PoolState::Active => {
+                    Cell::NotReported("Pool v2 is active, but this station does not scan it yet.")
+                }
+            },
+        },
+        PoolRow {
+            label: "pool total",
+            v1: Cell::amount(v1_real.then(|| s.shielded_pool.parse::<u128>().unwrap_or(0))),
+            v2: v2_live(Cell::Amount(info.pool_grains)),
+        },
+        PoolRow {
+            label: "de-shieldable now",
+            v1: Cell::amount(s.deshieldable_now.filter(|_| v1_real)),
+            v2: v2_live(Cell::Amount(info.deshieldable_now)),
+        },
+        PoolRow {
+            label: "de-shield cap / window",
+            v1: Cell::amount(s.deshield_limit.filter(|_| v1_real)),
+            v2: if v2_real {
+                Cell::Amount(info.deshield_limit)
+            } else {
+                Cell::Unknown
+            },
+        },
+        PoolRow {
+            label: "window",
+            v1: match (v1_real, s.deshield_resets_at) {
+                (true, Some(h)) => {
+                    Cell::Text(format!("resets at block {}", group_thousands(h as u128)))
+                }
+                (true, None) => {
+                    Cell::NotReported("This node did not report a window reset height.")
+                }
+                (false, _) => Cell::Unknown,
+            },
+            v2: if v2_real {
+                Cell::Text(format!(
+                    "{} blocks",
+                    group_thousands(info.deshield_window_blocks as u128)
+                ))
+            } else {
+                Cell::Unknown
+            },
+        },
+        PoolRow {
+            label: "notes in pool",
+            v1: if v1_real {
+                Cell::NotReported(V1_NO_NOTES)
+            } else {
+                Cell::Unknown
+            },
+            v2: v2_live(Cell::Count(info.note_count)),
+        },
+        PoolRow {
+            label: "nullifiers spent",
+            v1: if v1_real {
+                Cell::NotReported(V1_NO_NOTES)
+            } else {
+                Cell::Unknown
+            },
+            v2: v2_live(Cell::Count(info.nullifier_count)),
+        },
+        PoolRow {
+            label: "anchor",
+            v1: if v1_real {
+                Cell::NotReported(V1_NO_ANCHOR)
+            } else {
+                Cell::Unknown
+            },
+            v2: match (v2_state, info.anchor.is_empty()) {
+                (PoolState::Active, false) => Cell::Hash(info.anchor.clone()),
+                (PoolState::Active, true) => Cell::Unknown,
+                (PoolState::Dormant, _) => Cell::Impossible(V2_DORMANT),
+                (PoolState::Unavailable, _) => Cell::Unknown,
+            },
+        },
+    ]
+}
+
+/// The per-pool prose that must accompany any zero: the state sentence, plus the
+/// wallet-specific note where there is one.
+fn pool_note(ui: &mut egui::Ui, pool: Pool, state: PoolState, extra: &str) {
     card(ui, |ui| {
-        // ── Identity ──────────────────────────────────────────────────────────
+        ui.set_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = sp::M;
             ui.label(
@@ -1108,72 +1317,24 @@ fn pool_column(
             );
             state_chip(ui, state.glyph(), state.word(), state.color());
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = sp::S;
-            ui.label(
-                egui::RichText::new(pool.crypto())
-                    .size(ty::MICRO)
-                    .color(palette::text_dim()),
-            );
-            ui.label(
-                egui::RichText::new("·")
-                    .size(ty::MICRO)
-                    .color(palette::text_dim()),
-            );
-            // The post-quantum claim is never implied by adjacency or colour: v1 says
-            // "NOT post-quantum" in words, on its own card, every time it is drawn.
-            ui.label(
-                egui::RichText::new(pool.pq_claim())
-                    .size(ty::MICRO)
-                    .strong()
-                    .color(match pool {
-                        Pool::V1 => palette::text_dim(),
-                        Pool::V2 => palette::dormant(),
-                    }),
-            );
-        });
-
-        ui.add_space(sp::M);
-
-        // ── Your balance — the one figure an operator looks for first ─────────
-        match own {
-            Some(g) => stat(
-                ui,
-                "your balance",
-                Some(&xus(&g.to_string())),
-                "XUS",
-                ty::HERO,
-            ),
-            None => stat(ui, "your balance", None, "XUS", ty::HERO),
-        }
-        if !own_note.is_empty() {
-            ui.label(
-                egui::RichText::new(own_note)
-                    .size(ty::SMALL)
-                    .color(palette::text_dim()),
-            );
-        }
-
-        ui.add_space(sp::M);
-        ui.separator();
-        ui.add_space(sp::M);
-
-        // ── Pool-wide figures ─────────────────────────────────────────────────
-        pool_amount(ui, "pool total", pool_grains, real, ty::TITLE);
         ui.add_space(sp::S);
-        body(ui, real);
-
-        // ── The explanation that must sit beside any zero ─────────────────────
-        ui.add_space(sp::M);
         ui.label(
             egui::RichText::new(state.explanation(pool))
                 .size(ty::SMALL)
-                .color(if real {
+                .color(if state.figures_are_real() {
                     palette::text_dim()
                 } else {
                     palette::text()
                 }),
         );
+        if !extra.is_empty() {
+            ui.add_space(sp::XS);
+            ui.label(
+                egui::RichText::new(extra)
+                    .size(ty::SMALL)
+                    .color(palette::text_dim()),
+            );
+        }
     });
 }
 
@@ -1181,26 +1342,32 @@ fn pool_column(
 /// thing this app can do is let an operator confuse them — or confuse "not active yet"
 /// with "your money is gone".
 ///
-/// So they are drawn side by side, in one frame, in one identical layout, with:
-///   * the cryptography NAMED on each (Orchard/Halo2 vs ML-KEM-768/STARK), and the
-///     post-quantum claim spelled out in words on both — including the negative one;
-///   * a three-state chip per pool (glyph + word + colour, never colour alone);
-///   * every figure routed through [`pool_amount`]/[`pool_count`], which physically
-///     cannot print a digit for a pool whose state is `Unavailable`;
-///   * a sentence under each pool that distinguishes its state from the other two.
+/// ## Why a table, and why it is responsive rather than user-draggable
 ///
-/// It stacks to one column below ~720 px so a narrow window degrades to scrolling
-/// rather than to two unreadably-thin columns.
-fn shielded_pools_view(
-    ui: &mut egui::Ui,
-    s: &Snapshot,
-    // The wallet's scanned v1 position: `Some((balance_grains, notes, height))` only
-    // when THIS wallet has actually been scanned. `None` renders as "not scanned",
-    // never as zero — an unscanned wallet has an unknown balance, not an empty one.
-    v1_own: Option<(u128, usize, u64)>,
-) {
+/// This was first built as two side-by-side cards. That looked reasonable and was
+/// subtly wrong: two independently-flowing columns only line up by coincidence. As
+/// soon as one pool's explanatory line wrapped to two lines, or one column had an
+/// extra figure, every row below it drifted against its counterpart — so "pool total"
+/// in v1 sat beside "de-shieldable now" in v2. For a comparison, that is not cosmetic:
+/// the whole value of putting the pools together is reading ACROSS a row, and drift
+/// makes the reader compare the wrong quantities.
+///
+/// A `Grid` fixes it by construction — a row's height is the max of its cells, so the
+/// two pools cannot drift — and the three column widths are pinned in the header, so
+/// the pools are always exactly equal and never sized by whichever happened to contain
+/// the longer string.
+///
+/// It is deliberately NOT user-resizable. A draggable splitter here would let the
+/// operator make the two pools unequal, destroying the one property the layout exists
+/// to guarantee. Instead it is fully responsive: the columns divide the available
+/// width, and below the point where a value column would become too narrow to hold a
+/// figure like `110,557.53450464 XUS` the table collapses to one pool above the other,
+/// each full width. That threshold is computed from the width the content actually
+/// needs, not guessed.
+fn shielded_pools_view(ui: &mut egui::Ui, s: &Snapshot, v1_own: Option<(u128, usize, u64)>) {
     let v1_state = PoolState::classify_v1(s.online, s.shielded_v1_available);
     let v2_state = PoolState::classify_v2(s.online, s.shielded_v2.as_ref());
+    let rows = pool_rows(s, v1_own);
 
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = sp::M;
@@ -1218,136 +1385,148 @@ fn shielded_pools_view(
             .color(palette::text_dim()),
         );
     });
-    ui.add_space(sp::S);
+    ui.add_space(sp::M);
 
-    let v1_pool = s.shielded_pool.parse::<u128>().unwrap_or(0);
-    let v1_own_note = match (v1_state, v1_own) {
-        (PoolState::Unavailable, _) => "This node did not report the pool; your balance \
-                                        cannot be confirmed from here."
-            .to_string(),
+    // ── Column sizing, from the content ───────────────────────────────────────
+    //
+    // The widest value any cell holds is a full-precision amount plus its unit
+    // (`110,557.53450464 XUS`), measured in the real font rather than assumed, so the
+    // collapse threshold tracks the actual type scale instead of a magic number.
+    let value_w = ui
+        .fonts(|f| {
+            f.layout_no_wrap(
+                "110,557.53450464 XUS".to_owned(),
+                egui::FontId::monospace(ty::BODY),
+                palette::text(),
+            )
+            .size()
+            .x
+        })
+        .max(120.0);
+    let label_w = ui
+        .fonts(|f| {
+            f.layout_no_wrap(
+                "de-shield cap / window".to_owned(),
+                egui::FontId::proportional(ty::SMALL),
+                palette::text(),
+            )
+            .size()
+            .x
+        })
+        .max(100.0);
+
+    let gap = 18.0;
+    let avail = ui.available_width();
+    // Two value columns plus the label column, plus the grid's own spacing.
+    let needed = label_w + 2.0 * value_w + 3.0 * gap;
+    let side_by_side = avail >= needed;
+
+    let grid = |ui: &mut egui::Ui, headers: Vec<(&str, PoolState)>, pick: usize| {
+        // `pick` is 0 for "both", 1 for v1 only, 2 for v2 only (the stacked mode).
+        let cols = headers.len() + 1;
+        let col_w = if side_by_side {
+            ((ui.available_width() - label_w - cols as f32 * gap) / headers.len() as f32)
+                .max(value_w)
+        } else {
+            (ui.available_width() - label_w - 2.0 * gap).max(value_w)
+        };
+        egui::Grid::new(format!("pool-grid-{pick}"))
+            .num_columns(cols)
+            .striped(true)
+            .spacing([gap, 6.0])
+            .show(ui, |ui| {
+                // Header row — also where the column widths are pinned, by allocating
+                // exactly `col_w` in each value column so neither pool can be sized by
+                // whichever happens to hold the longer string.
+                ui.allocate_space(egui::vec2(label_w, 0.0));
+                for (name, st) in &headers {
+                    ui.horizontal(|ui| {
+                        ui.set_min_width(col_w);
+                        ui.spacing_mut().item_spacing.x = sp::M;
+                        ui.label(
+                            egui::RichText::new(*name)
+                                .size(ty::SECTION)
+                                .strong()
+                                .color(palette::text()),
+                        );
+                        state_chip(ui, st.glyph(), st.word(), st.color());
+                    });
+                }
+                ui.end_row();
+
+                for r in &rows {
+                    ui.label(
+                        egui::RichText::new(r.label.to_uppercase())
+                            .size(ty::MICRO)
+                            .color(palette::text_dim()),
+                    );
+                    if pick == 0 || pick == 1 {
+                        ui.horizontal(|ui| {
+                            ui.set_min_width(col_w);
+                            r.v1.render(ui);
+                        });
+                    }
+                    if pick == 0 || pick == 2 {
+                        ui.horizontal(|ui| {
+                            ui.set_min_width(col_w);
+                            r.v2.render(ui);
+                        });
+                    }
+                    ui.end_row();
+                }
+            });
+    };
+
+    if side_by_side {
+        card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            grid(ui, vec![("Pool v1", v1_state), ("Pool v2", v2_state)], 0);
+        });
+    } else {
+        // Stacked: each pool full width, one above the other. The wallet panel is
+        // already inside a vertical ScrollArea, so the extra height scrolls rather
+        // than clipping — nothing becomes unreachable at the minimum window size.
+        card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            grid(ui, vec![("Pool v1", v1_state)], 1);
+        });
+        ui.add_space(sp::M);
+        card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            grid(ui, vec![("Pool v2", v2_state)], 2);
+        });
+    }
+
+    ui.add_space(sp::M);
+
+    // ── The prose that must sit beside any zero ───────────────────────────────
+    let v1_extra = match (v1_state, v1_own) {
+        (PoolState::Unavailable, _) => String::new(),
         (_, None) => "Not scanned yet — press \"Scan pool\" below. Your balance is unknown \
                       until then, which is not the same as zero."
             .to_string(),
         (_, Some((_, notes, h))) => format!(
-            "{} unspent note(s), scanned to height {}",
+            "{} unspent note(s), scanned to height {}.",
             group_thousands(notes as u128),
             group_thousands(h as u128)
         ),
     };
-    // A v2 balance is not merely unknown, it is IMPOSSIBLE while dormant — consensus
-    // rejects every v2 spend, so no note can exist to be worth anything. That is a
-    // stronger and more reassuring statement than "unknown", and it is the true one.
-    let v2_own_note = match v2_state {
-        PoolState::Unavailable => "This node did not report the pool; nothing about your \
-                                   v2 position can be confirmed from here."
-            .to_string(),
+    let v2_extra = match v2_state {
         PoolState::Dormant => "No v2 note can exist yet: consensus rejects every v2 spend \
                                while bit 2 is unarmed. This is not a missing balance."
             .to_string(),
-        PoolState::Active => "Pool v2 is active; this station does not yet scan it.".to_string(),
+        _ => String::new(),
     };
 
-    let narrow = ui.available_width() < 720.0;
-    let draw_v1 = |ui: &mut egui::Ui| {
-        pool_column(
-            ui,
-            Pool::V1,
-            v1_state,
-            v1_pool,
-            v1_own.map(|(b, _, _)| b),
-            &v1_own_note,
-            |ui, real| {
-                pool_amount(
-                    ui,
-                    "de-shieldable now",
-                    s.deshieldable_now.unwrap_or(0),
-                    real && s.deshieldable_now.is_some(),
-                    ty::BODY,
-                );
-                ui.add_space(sp::S);
-                pool_amount(
-                    ui,
-                    "de-shield cap / window",
-                    s.deshield_limit.unwrap_or(0),
-                    real && s.deshield_limit.is_some(),
-                    ty::BODY,
-                );
-                ui.add_space(sp::S);
-                let resets = s
-                    .deshield_resets_at
-                    .filter(|_| real)
-                    .map(|h| group_thousands(h as u128));
-                stat(
-                    ui,
-                    "window resets at block",
-                    resets.as_deref(),
-                    "",
-                    ty::BODY,
-                );
-            },
-        )
-    };
-    let draw_v2 = |ui: &mut egui::Ui| {
-        let info = s.shielded_v2.clone().unwrap_or_default();
-        pool_column(
-            ui,
-            Pool::V2,
-            v2_state,
-            info.pool_grains,
-            // Never a number: this station does not scan v2, so it has no reading to
-            // report — and while dormant there is provably nothing to read.
-            None,
-            &v2_own_note,
-            move |ui, real| {
-                pool_count(ui, "notes", info.note_count, real);
-                ui.add_space(sp::S);
-                pool_count(ui, "nullifiers spent", info.nullifier_count, real);
-                ui.add_space(sp::S);
-                pool_amount(
-                    ui,
-                    "de-shieldable now",
-                    info.deshieldable_now,
-                    real,
-                    ty::BODY,
-                );
-                ui.add_space(sp::S);
-                let window = real.then(|| group_thousands(info.deshield_window_blocks as u128));
-                stat(
-                    ui,
-                    "de-shield window",
-                    window.as_deref(),
-                    "blocks",
-                    ty::BODY,
-                );
-                ui.add_space(sp::S);
-                // The anchor is the Merkle root a spend proves membership against.
-                // Elided, because it is a 32-byte hash and only its ends are checkable.
-                ui.label(
-                    egui::RichText::new("ANCHOR")
-                        .size(ty::MICRO)
-                        .color(palette::text_dim()),
-                );
-                if real && !info.anchor.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.label(num(short(&info.anchor)).size(ty::SMALL));
-                        copy_glyph(ui, &info.anchor);
-                    });
-                } else {
-                    ui.label(num_unknown().size(ty::BODY));
-                }
-            },
-        )
-    };
-
-    if narrow {
-        draw_v1(ui);
-        ui.add_space(sp::M);
-        draw_v2(ui);
-    } else {
+    if side_by_side {
         ui.columns(2, |c| {
-            draw_v1(&mut c[0]);
-            draw_v2(&mut c[1]);
+            pool_note(&mut c[0], Pool::V1, v1_state, &v1_extra);
+            pool_note(&mut c[1], Pool::V2, v2_state, &v2_extra);
         });
+    } else {
+        pool_note(ui, Pool::V1, v1_state, &v1_extra);
+        ui.add_space(sp::M);
+        pool_note(ui, Pool::V2, v2_state, &v2_extra);
     }
 }
 
@@ -12286,6 +12465,137 @@ mod tests {
         let shown = truncate_middle(&addr, 22, 12);
         assert!(shown.starts_with("xusq1"));
         assert!(addr.ends_with(shown.rsplit('…').next().unwrap()));
+    }
+
+    /// Render at an explicit width and return the painted text.
+    fn painted_at_width(w: f32, add: impl Fn(&mut egui::Ui)) -> String {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(w, 2400.0),
+            )),
+            ..Default::default()
+        };
+        let run = |i| {
+            ctx.run(i, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| add(ui));
+                });
+            })
+        };
+        let _ = run(input());
+        let out = run(input());
+        let mut text = String::new();
+        fn walk(shapes: &[egui::Shape], into: &mut String) {
+            for s in shapes {
+                match s {
+                    egui::Shape::Text(t) => {
+                        into.push_str(t.galley.text());
+                        into.push('\n');
+                    }
+                    egui::Shape::Vec(v) => walk(v, into),
+                    _ => {}
+                }
+            }
+        }
+        for cs in &out.shapes {
+            walk(std::slice::from_ref(&cs.shape), &mut text);
+        }
+        text
+    }
+
+    #[test]
+    fn the_two_pool_view_reflows_across_the_whole_window_range() {
+        // The owner's report was that the pool areas "seemed off" and were not
+        // resizable. The table must survive the entire range the window can take —
+        // from the 720x480 minimum through a maximised display — never losing a pool,
+        // a state word, or the post-quantum disclaimer.
+        let snap = live_like_snapshot();
+        let mut counts = Vec::new();
+        for w in [560.0, 700.0, 900.0, 1200.0, 1800.0, 2560.0] {
+            let out = painted_at_width(w, |ui| {
+                shielded_pools_view(ui, &snap, Some((500_000_000, 3, 12_500)))
+            });
+            for needle in [
+                "Pool v1",
+                "Pool v2",
+                "ACTIVE",
+                "UNAVAILABLE",
+                "NOT post-quantum",
+                "POOL TOTAL",
+                "NULLIFIERS SPENT",
+                "ANCHOR",
+                "110,557.53450464",
+            ] {
+                assert!(
+                    out.contains(needle),
+                    "at width {w}, {needle:?} was not painted:\n{out}"
+                );
+            }
+            counts.push((
+                w,
+                out.matches("Pool v1").count(),
+                out.matches("Pool v2").count(),
+                out.matches("POOL TOTAL").count(),
+            ));
+        }
+        // Reflowing must not duplicate or drop anything: whatever the layout, each
+        // pool is named the same number of times and each metric row appears once per
+        // pool. Collapsing to stacked is a change of ARRANGEMENT, not of content.
+        let first = counts[0];
+        for c in &counts {
+            assert_eq!(
+                (c.1, c.2, c.3),
+                (first.1, first.2, first.3),
+                "content changed when reflowing: {counts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_four_kinds_of_absence_stay_distinct_in_the_table() {
+        // Four different reasons a cell has no number, which must not collapse into
+        // one ambiguous blank:
+        //   —                 the node did not answer (unknown)
+        //   not reported      the node answered; this RPC does not carry the figure
+        //   cannot exist yet  consensus forbids it (dormant v2)
+        //   a real figure     an actual reading
+        let mut snap = live_like_snapshot();
+
+        // v1 live, v2 absent: v1's anchor is "not reported" (its RPC lacks it), while
+        // v2's is a bare dash (nobody answered). Conflating these would tell an
+        // operator their live v1 pool is degraded.
+        let out = painted_at_width(1400.0, |ui| {
+            shielded_pools_view(ui, &snap, Some((500_000_000, 3, 12_500)))
+        });
+        assert!(
+            out.contains("not reported"),
+            "v1's un-exposed figures must say 'not reported':\n{out}"
+        );
+        assert!(
+            out.contains('—'),
+            "v2's unanswered figures must be the unknown dash:\n{out}"
+        );
+        assert!(
+            !out.contains("cannot exist yet"),
+            "nothing is provably impossible when v2 is merely UNAVAILABLE:\n{out}"
+        );
+
+        // Now v2 answers and is dormant: its figures become provably impossible,
+        // which is a stronger and more reassuring statement than "unknown".
+        snap.shielded_v2 = shielded_v2_info(&v2_reply(false));
+        let out = painted_at_width(1400.0, |ui| {
+            shielded_pools_view(ui, &snap, Some((500_000_000, 3, 12_500)))
+        });
+        assert!(
+            out.contains("cannot exist yet"),
+            "a dormant v2 pool's figures cannot exist, not merely unknown:\n{out}"
+        );
+        assert!(
+            out.contains("NOT ACTIVE YET"),
+            "and the state word must be present:\n{out}"
+        );
     }
 
     #[test]
