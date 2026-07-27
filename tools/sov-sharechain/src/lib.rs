@@ -43,6 +43,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod wire;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use sov_mining::Difficulty;

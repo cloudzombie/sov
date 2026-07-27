@@ -24,6 +24,10 @@ sov-primitives = { path = "../../chain/crates/primitives" }
 # Reused rather than reimplemented — a second copy of a difficulty rule is a second
 # thing that can drift, and share accounting depends on it being exactly right.
 sov-mining = { path = "../../chain/crates/mining" }
+# The PQ channel (Noise + ML-KEM sealing) reused for share gossip. Only the
+# BYTE-level channel is reused — `NetMessage` and `TcpNode` are untouched, so a
+# bug in share decoding cannot reach block or transaction relay.
+sov-network = { path = "../../chain/crates/network" }
 
 [lints.rust]
 unsafe_code = "forbid"

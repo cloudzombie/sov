@@ -63,11 +63,32 @@ timestamps are **self-reported by whoever found them**, so a miner who lies abou
 timing must not be able to move everyone's difficulty — there is a test for
 exactly that, and one for a share claiming to precede its parent.
 
-**Not yet built:** the P2P channel that gossips shares between peers.
+### Gossip
 
-That one is left deliberately rather than for lack of time. Shares need their own
-logical channel on `sov-network` — the same crate carrying block and transaction
-relay — so adding a message type there widens the blast radius from "a standalone
-tool" to "the transport consensus peers depend on". A malformed share message
-must not be able to perturb block relay. That wants deliberate design and its own
-adversarial tests, not a tack-on to this commit.
+Shares gossip on their **own port** with their **own** message type. They are
+deliberately *not* added to `sov-network`'s `NetMessage`: that enum is decoded by
+the transport every consensus peer depends on for block and transaction relay,
+and running a second protocol through the same decoder would widen the blast
+radius of a bug here from "the pool misbehaves" to "block relay misbehaves".
+
+What *is* reused is `sov_network::PqChannel` — the same Noise + ML-KEM sealing
+the node uses — for the bytes on the wire. The cryptography is reused; the
+decoder is not shared.
+
+It is worth being precise about what that channel does and does not buy, because
+a secure channel is easy to over-trust. Encryption gives confidentiality and peer
+authentication. It gives **nothing** about whether a share is honest: an
+authenticated peer can send a forged share exactly as easily as an anonymous one.
+Share integrity comes from the seal and from `ShareChain::accept`, which every
+peer runs independently. So the decoder's rule is: **decode is total, and nothing
+it produces is trusted** — a decoded message is a claim, and it becomes state
+only after the sharechain's rules accept it.
+
+Every length is bounded before a byte is allocated, because the length is
+attacker-chosen. The tests assert what that is worth: every truncation of every
+message, and every single-bit corruption of a batch, must return rather than
+panic or allocate wildly — a panic in a decoder is a remote crash.
+
+**Still to wire:** the socket loop itself (listener, dial, peer set). The format
+and the ingest rules — the parts hostile bytes actually reach — are done and
+tested.
