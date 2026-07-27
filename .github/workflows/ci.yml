@@ -24,6 +24,12 @@ jobs:
             echo "xus-miner belongs in https://github.com/cloudzombie/xus-miner" >&2
             exit 1
           fi
+      - name: TX Cannon remains external
+        run: |
+          if test -n "$(git ls-files 'tools/tx-cannon/**')"; then
+            echo "tools/tx-cannon belongs in https://github.com/cloudzombie/sov-tx-cannon" >&2
+            exit 1
+          fi
 
   # The RELEASE VERSION CONTRACT guards (scripts/version-contract.sh and
   # scripts/verify-artifact-version.sh) are the last thing standing between a typo and a
@@ -329,13 +335,18 @@ jobs:
       - name: Tests (vitest)
         run: npm test
 
-  # Standalone operator tools (tools/conformance, tools/tx-cannon, tools/sov-stratum) are intentionally
+  # Standalone operator tools (tools/conformance, tools/sov-stratum) are intentionally
   # NOT chain-workspace members but depend on the real chain crates by path — so a
   # chain API change can silently break them. Compile them here so they can't bit-rot;
   # fully gate the Stratum bridge because it accepts untrusted miner input and is the
   # first practical path to external hashpower.
+  #
+  # TX Cannon was gated here until it moved to its own repository
+  # (https://github.com/cloudzombie/sov-tx-cannon). It consumes these same crates as git
+  # dependencies pinned to a RELEASE TAG, so a change on this branch cannot break its
+  # build — it picks the change up only when that pin is deliberately bumped.
   tools:
-    name: tools (conformance · tx-cannon · sov-stratum)
+    name: tools (conformance · sov-stratum)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -349,21 +360,9 @@ jobs:
         with:
           workspaces: |
             tools/conformance
-            tools/tx-cannon
             tools/sov-stratum
-      # tx-cannon links eframe/egui; install the standard egui Linux build deps so the
-      # native GUI binary links on the headless runner.
-      - name: Install egui build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev \
-            libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev
       - name: Build conformance
         run: cargo build --manifest-path tools/conformance/Cargo.toml
-      - name: Build tx-cannon
-        run: cargo build --manifest-path tools/tx-cannon/Cargo.toml
-      - name: Test tx-cannon
-        run: cargo test --manifest-path tools/tx-cannon/Cargo.toml
       - name: Format sov-stratum
         run: cargo fmt --manifest-path tools/sov-stratum/Cargo.toml --all -- --check
       - name: Clippy sov-stratum (deny warnings)

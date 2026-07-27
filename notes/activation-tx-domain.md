@@ -38,7 +38,8 @@ un-upgraded node **rejects** a correctly-bound tx (so it forks off). Therefore:
    - [ ] Rust wallet (`chain/crates/wallet`)
    - [ ] SOV Station (`node/`)
    - [ ] `tools/conformance`
-   - [ ] `tools/tx-cannon`
+   - [ ] SOV TX Cannon — external repo https://github.com/cloudzombie/sov-tx-cannon
+         (done there, then bump its pinned chain tag)
 2. **Grace-window gate refinement** (v0.1.94 consensus, still DORMANT) — so there is no sharp
    cliff: for a height range `[H_a, H_a+G)` the node accepts EITHER legacy OR bound signatures;
    `≥ H_a+G` bound-only (full replay protection). Removes the boundary problem where an in-flight
@@ -79,8 +80,9 @@ There is deliberately NO manual "sign the miners" command. After Phase-2:
 2. Enter recipient + amount → **Send**. Station calls `sov_getSigningDomain` and signs bound (post-
    activation) or legacy (before) automatically — no command to type. Identical UX to today.
 3. If ever sweeping via a script/CLI instead of the GUI, that path must also query
-   `sov_getSigningDomain` and `sign_in(domain)` — same rule (Phase-2 covers tx-cannon/conformance).
+   `sov_getSigningDomain` and `sign_in(domain)` — same rule (Phase-2 covers TX Cannon/conformance).
 
 ## Immediate next action
 Build **Phase-2 client signing** (step 1) — additive, dormant, activates nothing. `sov_getSigningDomain`
-RPC is DONE; next the SDK (second client), then the Rust signers (wallet, Station, conformance, tx-cannon).
+RPC is DONE; next the SDK (second client), then the Rust signers (wallet, Station, conformance,
+TX Cannon — the last one in https://github.com/cloudzombie/sov-tx-cannon).

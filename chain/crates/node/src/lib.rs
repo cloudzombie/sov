@@ -12,3 +12,4 @@
 pub mod node;
 
 pub use node::{Node, NodeError, Produced};
+pub use sov_mempool::Admitted;

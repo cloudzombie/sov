@@ -2866,6 +2866,155 @@ mod tests {
     }
 
     #[test]
+    fn mempool_histogram_info_and_queued_flag_over_the_real_socket() {
+        // End-to-end over a real RPC socket, exactly as XUS Miner calls it:
+        // `sov_getMempoolHistogram` serves the client's contracted shape
+        // (txCount / maxBlockTxs / buckets highest-first with decimal-string
+        // feeRateGrains), a future-nonce submission reports `queued: true` and
+        // never inflates the mineable count, `sov_getMempoolInfo` reports both
+        // regions, and `sov_estimateFee` carries the additive floorGrains.
+        use crate::RpcClient;
+        use sov_types::{Action, Transaction};
+        let genesis = gate_test_genesis();
+        let dir = std::env::temp_dir().join(format!(
+            "sov-histogram-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let signer = AccountId::new("val01.node.sov").unwrap();
+        let kp = Keypair::from_seed([7; 32]);
+        let self_transfer = |nonce: u64| {
+            SignedTransaction::sign(
+                Transaction {
+                    signer: signer.clone(),
+                    public_key: kp.public_key(),
+                    nonce,
+                    action: Action::Transfer {
+                        to: signer.clone(),
+                        amount: Balance::ZERO,
+                    },
+                },
+                &kp,
+            )
+            .unwrap()
+        };
+        let daemon = Daemon::new(
+            &genesis,
+            &dir,
+            1024,
+            256,
+            vec![(signer.clone(), Keypair::from_seed([7; 32]))],
+        )
+        .unwrap();
+        let _serial = crate::NET_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let handle = daemon.run("127.0.0.1:0", 1, 20, false, 50).unwrap();
+        let client = RpcClient::new(handle.rpc_addr().to_string());
+
+        // One ready (nonce 0) and one FUTURE (nonce 2 — behind the missing 1).
+        let ready = client
+            .call(
+                "sov_submitTransaction",
+                serde_json::to_value(self_transfer(0)).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(ready.get("accepted"), Some(&serde_json::json!(true)));
+        assert_eq!(ready.get("queued"), Some(&serde_json::json!(false)));
+        let future = client
+            .call(
+                "sov_submitTransaction",
+                serde_json::to_value(self_transfer(2)).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(future.get("accepted"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            future.get("queued"),
+            Some(&serde_json::json!(true)),
+            "a future-nonce admission must disclose it was parked"
+        );
+
+        // Histogram: exactly the client-contract shape; only the READY tx counts.
+        let hist = client
+            .call("sov_getMempoolHistogram", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(hist.get("txCount"), Some(&serde_json::json!(1)));
+        assert_eq!(hist.get("maxBlockTxs"), Some(&serde_json::json!(256)));
+        let buckets = hist.get("buckets").unwrap().as_array().unwrap();
+        assert_eq!(buckets.len(), 1, "one zero-tip bucket");
+        assert_eq!(
+            buckets[0].get("feeRateGrains"),
+            Some(&serde_json::json!("0")),
+            "decimal-string grains, the codebase convention"
+        );
+        assert_eq!(buckets[0].get("txCount"), Some(&serde_json::json!(1)));
+        // The SIZE dimension: real summed Borsh bytes of the bucket's txs, and the
+        // block's byte budget alongside its transaction budget — so a client packs
+        // projected blocks against whichever limit binds first.
+        let bucket_bytes = buckets[0]
+            .get("totalBytes")
+            .and_then(serde_json::Value::as_u64)
+            .expect("every bucket reports its summed serialized bytes");
+        assert!(bucket_bytes > 0, "a pooled tx has a real, nonzero size");
+        let max_block_bytes = hist
+            .get("maxBlockBytes")
+            .and_then(serde_json::Value::as_u64)
+            .expect("the elastic block-size cap is disclosed");
+        assert!(
+            max_block_bytes >= 1024 * 1024,
+            "the elastic cap never drops below its 1 MiB floor: {max_block_bytes}"
+        );
+        // Both prices: the forming block's marginal tip and the pool's admission
+        // floor. Free room in both here, so both are an honest zero.
+        assert_eq!(hist.get("floorGrains"), Some(&serde_json::json!("0")));
+        assert_eq!(hist.get("poolFloorGrains"), Some(&serde_json::json!("0")));
+        // The client contract: bucket counts sum EXACTLY to the headline txCount.
+        let bucket_total: u64 = buckets
+            .iter()
+            .map(|b| {
+                b.get("txCount")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap()
+            })
+            .sum();
+        assert_eq!(
+            bucket_total,
+            hist.get("txCount").unwrap().as_u64().unwrap(),
+            "buckets account for every ready transaction, exactly once"
+        );
+
+        // Operator info: both regions visible, ages present for occupied regions.
+        let info = client
+            .call("sov_getMempoolInfo", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(info.get("txCount"), Some(&serde_json::json!(1)));
+        assert_eq!(info.get("queuedCount"), Some(&serde_json::json!(1)));
+        assert_eq!(info.get("capacity"), Some(&serde_json::json!(1024)));
+        assert_eq!(info.get("maxPerSender"), Some(&serde_json::json!(16)));
+        assert_eq!(info.get("queuedCapacity"), Some(&serde_json::json!(64)));
+        assert_eq!(info.get("maxQueuedPerSender"), Some(&serde_json::json!(16)));
+        assert_eq!(
+            info.get("nextBlockFloorGrains"),
+            Some(&serde_json::json!("0")),
+            "free room in the next block → floor 0"
+        );
+        assert!(info.get("oldestPendingAgeMs").unwrap().is_u64());
+        assert!(info.get("oldestQueuedAgeMs").unwrap().is_u64());
+
+        // estimateFee: the additive floorGrains field rides along.
+        let fee = client
+            .call("sov_estimateFee", serde_json::json!({"kind": "transfer"}))
+            .unwrap();
+        assert_eq!(fee.get("floorGrains"), Some(&serde_json::json!("0")));
+        assert!(fee.get("feeGrains").is_some(), "existing fields unchanged");
+
+        handle.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn mining_is_gated_while_behind_then_resumes_when_caught_up() {
         // The bootstrap-correctness guarantee: a node that is BEHIND a heavier peer
         // chain does not mine (it would only fork), and it resumes mining the instant

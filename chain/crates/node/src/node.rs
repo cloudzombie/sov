@@ -17,7 +17,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sov_chain::{Blockchain, ChainError, MiningCandidate};
-use sov_mempool::{Mempool, MempoolError};
+use sov_mempool::{Admitted, Mempool, MempoolError};
 use sov_primitives::{AccountId, Hash};
 use sov_types::{Action, Block, Receipt, SignedTransaction};
 
@@ -87,9 +87,72 @@ impl Node {
         &self.chain
     }
 
-    /// Number of pooled transactions.
+    /// Number of READY (mineable) pooled transactions. Queued future-nonce
+    /// entries are reported by [`mempool_queued_len`](Self::mempool_queued_len).
     pub fn mempool_len(&self) -> usize {
         self.mempool.len()
+    }
+
+    /// Number of QUEUED (future-nonce, not yet mineable) pooled transactions.
+    pub fn mempool_queued_len(&self) -> usize {
+        self.mempool.queued_len()
+    }
+
+    /// The per-block transaction capacity this node builds templates with — the
+    /// packing unit `sov_getMempoolHistogram` clients project blocks by.
+    pub fn max_block_txs(&self) -> usize {
+        self.max_block_txs
+    }
+
+    /// The byte budget of the next block — the consensus elastic block-size cap
+    /// for a block extending the current head. Together with
+    /// [`max_block_txs`](Self::max_block_txs) it is the pair of limits a
+    /// projected block is packed against.
+    pub fn max_block_bytes(&self) -> usize {
+        self.chain.next_block_size_limit()
+    }
+
+    /// Effective-tip histogram of the ready mempool, highest bucket first,
+    /// bounded at `max_buckets`. See [`Mempool::tip_histogram`].
+    pub fn mempool_tip_histogram(&self, max_buckets: usize) -> Vec<sov_mempool::TipBucket> {
+        self.mempool.tip_histogram(max_buckets)
+    }
+
+    /// The mempool ADMISSION floor in grains — what a new transaction must beat
+    /// to displace a slot in a full pool, `0` while the pool has room. See
+    /// [`Mempool::pool_floor_grains`].
+    pub fn mempool_pool_floor_grains(&self) -> u128 {
+        self.mempool.pool_floor_grains()
+    }
+
+    /// Ages (ms) of the oldest ready and oldest queued mempool entries —
+    /// `(pending, queued)`, `None` for an empty region.
+    pub fn mempool_oldest_ages_ms(&self) -> (Option<u64>, Option<u64>) {
+        (
+            self.mempool.oldest_pending_age_ms(),
+            self.mempool.oldest_queued_age_ms(),
+        )
+    }
+
+    /// The live next-block auction floor in grains: the marginal (lowest)
+    /// effective tip in a full forming template, or 0 while the next block still
+    /// has free room. A new transaction tipping MORE than this displaces the
+    /// template's cheapest slot — the real "fee to get in".
+    pub fn next_block_floor_grains(&self) -> u128 {
+        self.mempool
+            .nth_highest_tip(self.max_block_txs)
+            .unwrap_or(0)
+    }
+
+    /// The mempool's configured bounds:
+    /// `(capacity, max_per_sender, queued_capacity, max_queued_per_sender)`.
+    pub fn mempool_limits(&self) -> (usize, usize, usize, usize) {
+        (
+            self.mempool.capacity(),
+            self.mempool.max_per_sender(),
+            self.mempool.queued_capacity(),
+            self.mempool.max_queued_per_sender(),
+        )
     }
 
     /// The next nonce a new transaction from `signer` should use: the account's
@@ -103,7 +166,9 @@ impl Node {
     }
 
     /// Submit a transaction to the pool, validating it against current state.
-    pub fn submit(&mut self, stx: SignedTransaction) -> Result<(), NodeError> {
+    /// Returns whether it was admitted [`Admitted::Ready`] (mineable now) or
+    /// parked [`Admitted::Queued`] (future nonce; promoted when the gap fills).
+    pub fn submit(&mut self, stx: SignedTransaction) -> Result<Admitted, NodeError> {
         // Mirror the runtime's authorization at admission: a validly *signed*
         // transaction that names an account whose key it does not control is
         // rejected here, not admitted and then failed in execution — which would
@@ -416,6 +481,106 @@ mod tests {
             2,
             "pool drained → pure on-chain nonce"
         );
+    }
+
+    #[test]
+    fn future_nonce_queues_never_mines_early_and_promotes_end_to_end() {
+        // Bitcoin-like waiting at the node level: a future-nonce submission is
+        // accepted (Queued), a produced block NEVER includes it while its gap is
+        // open, and once the gap-filler arrives the whole run mines in order.
+        let mut node = devnet_node();
+        let usa = id("usa.reserve.sov");
+
+        // Nonce 1 first (nonce 0 still missing) → parked, not mineable.
+        assert!(matches!(
+            node.submit(usa_transfer("ecb.reserve.sov", 5, 1)),
+            Ok(Admitted::Queued)
+        ));
+        assert_eq!(node.mempool_len(), 0);
+        assert_eq!(node.mempool_queued_len(), 1);
+
+        // A block produced NOW is empty — the queued tx is never proposed.
+        let empty = node.produce(1_000).unwrap();
+        assert!(empty.block.transactions.is_empty());
+        assert_eq!(node.mempool_queued_len(), 1, "still parked after the block");
+
+        // The gap-filler lands → both become ready and mine in nonce order.
+        assert!(matches!(
+            node.submit(usa_transfer("ecb.reserve.sov", 5, 0)),
+            Ok(Admitted::Ready)
+        ));
+        assert_eq!(node.mempool_len(), 2);
+        assert_eq!(node.mempool_queued_len(), 0);
+        let produced = node.produce(2_000).unwrap();
+        assert_eq!(produced.block.transactions.len(), 2);
+        assert_eq!(produced.block.transactions[0].transaction.nonce, 0);
+        assert_eq!(produced.block.transactions[1].transaction.nonce, 1);
+        assert_eq!(node.chain().ledger().account(&usa).nonce, 2);
+        assert_eq!(node.mempool_len(), 0);
+    }
+
+    #[test]
+    fn next_block_floor_is_zero_with_room_and_marginal_when_full() {
+        // With max_block_txs = 2 and tips 7/4/2 pooled from three senders, the
+        // forming template holds {7, 4} → the floor is the marginal tip 4; with
+        // fewer ready txs than capacity the floor is 0 (free room).
+        let config = GenesisConfig {
+            chain_id: "sov-devnet".into(),
+            timestamp_ms: 0,
+            accounts: vec![
+                GenesisAccount {
+                    account: id("val01.node.sov"),
+                    key: Keypair::from_seed([1; 32]).public_key(),
+                    balance: Balance::ZERO,
+                },
+                GenesisAccount {
+                    account: id("usa.reserve.sov"),
+                    key: Keypair::from_seed([2; 32]).public_key(),
+                    balance: Balance::from_sov(1_000).unwrap(),
+                },
+                GenesisAccount {
+                    account: id("ecb.reserve.sov"),
+                    key: Keypair::from_seed([3; 32]).public_key(),
+                    balance: Balance::from_sov(1_000).unwrap(),
+                },
+                GenesisAccount {
+                    account: id("boj.reserve.sov"),
+                    key: Keypair::from_seed([4; 32]).public_key(),
+                    balance: Balance::from_sov(1_000).unwrap(),
+                },
+            ],
+            mining: sov_mining::MiningPolicy::test(),
+            vesting: vec![],
+        };
+        let mut node = Node::new(Blockchain::new(&config).unwrap(), 1024, 2);
+        node.set_coinbase(id("val01.node.sov"));
+        let tip_tx = |seed: [u8; 32], from: &str, tip: u128| {
+            let kp = Keypair::from_seed(seed);
+            let t = sov_types::Transaction {
+                signer: id(from),
+                public_key: kp.public_key(),
+                nonce: 0,
+                action: Action::Tipped {
+                    tip: Balance::from_grains(tip),
+                    inner: Box::new(Action::Transfer {
+                        to: id("val01.node.sov"),
+                        amount: Balance::from_sov(1).unwrap(),
+                    }),
+                },
+            };
+            SignedTransaction::sign(t, &kp).unwrap()
+        };
+        assert_eq!(node.next_block_floor_grains(), 0, "empty pool → no floor");
+        node.submit(tip_tx([2; 32], "usa.reserve.sov", 7)).unwrap();
+        assert_eq!(node.next_block_floor_grains(), 0, "free room → no floor");
+        node.submit(tip_tx([3; 32], "ecb.reserve.sov", 4)).unwrap();
+        assert_eq!(
+            node.next_block_floor_grains(),
+            4,
+            "template full: marginal tip"
+        );
+        node.submit(tip_tx([4; 32], "boj.reserve.sov", 2)).unwrap();
+        assert_eq!(node.next_block_floor_grains(), 4, "2 waits below the floor");
     }
 
     #[test]
