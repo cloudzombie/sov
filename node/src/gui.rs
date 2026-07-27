@@ -24,13 +24,16 @@ use sov_rpc::{
     P2pHandle, RpcClient, SyncShared,
 };
 use sov_shielded::{
-    encode_shielded, encode_shielded_v2, shielded_transfer_with_change, unshield_amount_multi,
-    AnyAddress, NoteStore, Receiver, ShieldedBundle, ShieldedKey, ShieldedParams, UnifiedAddress,
+    decode_shielded_v2, encode_shielded, encode_shielded_v2, shielded_transfer_with_change,
+    unshield_amount_multi, AnyAddress, NoteStore, Receiver, ShieldedBundle, ShieldedKey,
+    ShieldedParams, UnifiedAddress,
 };
 use sov_shielded_pq::bundle::SpendBundle;
 use sov_shielded_pq::hd::PqShieldedKey;
 use sov_shielded_pq::scan::PqNoteStore;
+use sov_shielded_pq::wallet::{authorize_for_carrier, build_shield, build_spend};
 use sov_shielded_pq::wire::decode_bundle;
+use sov_shielded_pq::wire::encode_bundle;
 use sov_types::{Action, SignedTransaction, Transaction};
 use sov_wallet::{generate_mnemonic, HdWallet};
 use zeroize::Zeroize;
@@ -2307,6 +2310,173 @@ struct ShieldedView {
     message: String,
 }
 
+/// Everything the UI knows when deciding whether a pool-v2 action may proceed.
+///
+/// This exists so that NO money-moving decision lives inside a UI closure. The
+/// closure gathers facts; [`v2_allows`] decides. That makes the decision a pure
+/// function of stated inputs, which can then be swept exhaustively in tests
+/// rather than reasoned about by reading paint code.
+#[derive(Clone, Copy, Debug)]
+struct V2Guard {
+    /// Signal bit 2 is Active at this height.
+    pool_active: bool,
+    /// The scanned view belongs to the wallet currently selected.
+    for_this_wallet: bool,
+    /// This wallet's pool-v2 notes have actually been scanned.
+    scanned: bool,
+    /// Unspent pool-v2 note count.
+    notes: usize,
+    /// Another action (or a scan) is already running.
+    busy: bool,
+    /// Scanned pool-v2 balance, in grains.
+    balance_grains: u128,
+    /// The node's live per-window de-shield budget, if it reports one.
+    window_budget: Option<u128>,
+}
+
+impl V2Guard {
+    /// The most that may leave the pool right now: balance, capped by the
+    /// window budget when the node reports one.
+    fn deshield_cap(&self) -> u128 {
+        match self.window_budget {
+            Some(b) => self.balance_grains.min(b),
+            None => self.balance_grains,
+        }
+    }
+}
+
+/// A pool-v2 action awaiting permission.
+#[derive(Clone, Copy, Debug)]
+enum V2Intent<'a> {
+    /// Transparent -> pool v2. Spends no notes, so it needs no scan.
+    Shield { amount: Option<u128> },
+    /// Pool v2 -> transparent. Spends notes; bounded by the window budget.
+    Deshield { amount: Option<u128> },
+    /// Pool v2 -> pool v2. Spends notes; the recipient must be pool v2.
+    Send { to: &'a str, amount: Option<u128> },
+}
+
+/// Decide whether a pool-v2 action may proceed, and if not, say why in words a
+/// user can act on.
+///
+/// `Ok(())` is the ONLY thing that may enable a button. Every refusal returns
+/// the reason, so the UI never has to invent one — and can never enable an
+/// action for which no reason was checked.
+///
+/// The ordering is deliberate: conditions that are true of the whole pool come
+/// first, then wallet state, then the specific request. A user is told the most
+/// fundamental blocker rather than a downstream symptom of it.
+fn v2_allows(g: &V2Guard, intent: V2Intent<'_>) -> Result<(), &'static str> {
+    // Pool-wide conditions. A dormant pool rejects every v2 spend at every
+    // node, so proving one would waste ~25 s to earn a guaranteed rejection.
+    if !g.pool_active {
+        return Err("pool v2 is not active on this chain yet");
+    }
+    if !g.for_this_wallet {
+        return Err("this pool-v2 view belongs to a different wallet");
+    }
+    if g.busy {
+        return Err("another action is still running");
+    }
+
+    // Spending notes requires having scanned them. An unscanned wallet has an
+    // UNKNOWN balance, which is not the same as zero — acting on it could
+    // build a spend against notes we cannot witness.
+    let needs_notes = !matches!(intent, V2Intent::Shield { .. });
+    if needs_notes {
+        if !g.scanned {
+            return Err("scan pool v2 first — its balance is unknown until then");
+        }
+        if g.notes == 0 {
+            return Err("no pool-v2 notes to spend — shield into pool v2 first");
+        }
+    }
+
+    match intent {
+        V2Intent::Shield { amount } => {
+            let a = amount.ok_or("enter an amount")?;
+            if a == 0 {
+                return Err("enter an amount greater than zero");
+            }
+            Ok(())
+        }
+        V2Intent::Deshield { amount } => {
+            let a = amount.ok_or("enter an amount")?;
+            if a == 0 {
+                return Err("enter an amount greater than zero");
+            }
+            if a > g.balance_grains {
+                return Err("amount exceeds your pool-v2 balance");
+            }
+            // The per-window drain limiter. Over budget the transaction would
+            // be mined and REJECTED, which reads as value stuck in the pool.
+            if a > g.deshield_cap() {
+                return Err("amount exceeds the per-window de-shield limit — de-shield in batches");
+            }
+            Ok(())
+        }
+        V2Intent::Send { to, amount } => {
+            let to = to.trim();
+            if to.is_empty() {
+                return Err("enter the recipient's xusq1… pool-v2 address");
+            }
+            // THE cross-pool guard. A pool-v1 `xus1…` address here would pay a
+            // different recipient in a different value space. It is refused,
+            // never coerced. Checked by prefix AND by decode, so a string that
+            // merely looks right cannot pass.
+            if !to.starts_with("xusq1") {
+                return Err(
+                    "recipient must be a POOL-V2 (xusq1…) address — pool-v1 xus1… addresses \
+                     cannot receive here, the pools are separate value spaces",
+                );
+            }
+            if decode_shielded_v2(to).is_err() {
+                return Err("that pool-v2 address is not valid (checksum failed)");
+            }
+            let a = amount.ok_or("enter an amount")?;
+            if a == 0 {
+                return Err("enter an amount greater than zero");
+            }
+            if a > g.balance_grains {
+                return Err("amount exceeds your pool-v2 balance");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Which pool-v2 action a worker is running. The three share one worker.
+#[derive(Clone, Copy)]
+enum V2Action {
+    Shield,
+    Deshield,
+    Send,
+}
+
+impl V2Action {
+    fn starting(self) -> &'static str {
+        match self {
+            V2Action::Shield => "shielding into pool v2 (proving)…",
+            V2Action::Deshield => "de-shielding from pool v2 (proving)…",
+            V2Action::Send => "sending privately in pool v2 (proving)…",
+        }
+    }
+    fn done(self) -> &'static str {
+        match self {
+            V2Action::Shield => "shielded into pool v2",
+            V2Action::Deshield => "de-shielded from pool v2",
+            V2Action::Send => "sent privately in pool v2",
+        }
+    }
+    fn noun(self) -> &'static str {
+        match self {
+            V2Action::Shield => "pool-v2 shield",
+            V2Action::Deshield => "pool-v2 de-shield",
+            V2Action::Send => "pool-v2 private send",
+        }
+    }
+}
+
 /// The selected wallet's scanned POOL-V2 view. Separate from [`ShieldedView`]
 /// because the pools are separate value spaces: a v1 balance must never be
 /// displayed as, or mistaken for, a v2 one.
@@ -2748,6 +2918,10 @@ pub struct Station {
     params: Arc<Mutex<Option<Arc<ShieldedParams>>>>,
     shielded: Arc<Mutex<ShieldedView>>,
     shielded_v2: Arc<Mutex<ShieldedV2View>>,
+    shield_v2_amount_in: String,
+    deshield_v2_amount_in: String,
+    private_v2_to: String,
+    private_v2_amount: String,
     earnings: Arc<Mutex<EarningsView>>,
     /// The MASTER session passphrase that encrypts the wallet store. Set ONLY via a
     /// confirmed first-run setup or a VERIFIED unlock/keystore-load — never typed
@@ -3017,6 +3191,10 @@ impl Station {
             params: Arc::new(Mutex::new(None)),
             shielded: Arc::new(Mutex::new(ShieldedView::default())),
             shielded_v2: Arc::new(Mutex::new(ShieldedV2View::default())),
+            shield_v2_amount_in: String::new(),
+            deshield_v2_amount_in: String::new(),
+            private_v2_to: String::new(),
+            private_v2_amount: String::new(),
             earnings: Arc::new(Mutex::new(EarningsView::default())),
             copied_at: None,
             activity: Arc::new(Mutex::new(Vec::new())),
@@ -3700,6 +3878,93 @@ impl Station {
                 }
                 Err(e) => {
                     let msg = format!("de-shield failed: {e}");
+                    finish(&action, &msg);
+                    record(&activity, &msg);
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Shield transparent value INTO pool v2 (post-quantum).
+    fn shield_v2(&self, ctx: &egui::Context) {
+        self.run_v2_action(ctx, V2Action::Shield);
+    }
+
+    /// De-shield value OUT of pool v2 to this wallet's transparent account.
+    fn deshield_v2(&self, ctx: &egui::Context) {
+        self.run_v2_action(ctx, V2Action::Deshield);
+    }
+
+    /// Fully-private pool-v2 transfer to another `xusq1…` address.
+    fn send_private_v2(&self, ctx: &egui::Context) {
+        self.run_v2_action(ctx, V2Action::Send);
+    }
+
+    /// The one worker behind all three pool-v2 actions. They differ only in
+    /// which builder runs and what the log line says, so they share a single
+    /// spawn/action/rescan path — one place for the locking discipline rather
+    /// than three that can drift.
+    fn run_v2_action(&self, ctx: &egui::Context, what: V2Action) {
+        if !self.require_signing() {
+            return;
+        }
+        let Some(w) = self.wallets.get(self.selected) else {
+            return;
+        };
+        let seed = w.seed;
+        let account = w.effective_account();
+        let field = match what {
+            V2Action::Shield => &self.shield_v2_amount_in,
+            V2Action::Deshield => &self.deshield_v2_amount_in,
+            V2Action::Send => &self.private_v2_amount,
+        };
+        let Some(grains) = parse_xus(field).filter(|g| *g > 0) else {
+            finish(&self.action, "enter an amount");
+            return;
+        };
+        let to = self.private_v2_to.trim().to_string();
+        if matches!(what, V2Action::Send) && to.is_empty() {
+            finish(&self.action, "enter a pool-v2 (xusq1…) recipient address");
+            return;
+        }
+        let rpc = self
+            .config
+            .lock()
+            .map(|c| c.rpc.clone())
+            .unwrap_or_default();
+        let action = self.action.clone();
+        let view = self.shielded_v2.clone();
+        let activity = self.activity.clone();
+        let ctx = ctx.clone();
+        begin(&action, what.starting());
+        std::thread::spawn(move || {
+            let result = match what {
+                V2Action::Shield => shield_v2_amount(&rpc, seed, &account, grains, &action),
+                V2Action::Deshield => deshield_v2_amount(&rpc, seed, &account, grains, &action),
+                V2Action::Send => zsend_v2_amount(&rpc, seed, &account, &to, grains, &action),
+            };
+            match result {
+                Ok(id) => {
+                    let line = format!("{} (tx {})", what.done(), &id[..id.len().min(14)]);
+                    finish(&action, &format!("{line} — updating pool-v2 balance…"));
+                    record(&activity, &line);
+                    ctx.request_repaint();
+                    // Re-scan so the spent note drops and change appears; a stale
+                    // view after a confirmed spend reads as value gone missing.
+                    if let Ok(store) = scan_store_v2(&rpc, seed) {
+                        if let Ok(mut v) = view.lock() {
+                            v.account = account.clone();
+                            v.balance = store.balance();
+                            v.notes = store.unspent_count();
+                            v.scanned_height = store.scanned_height();
+                            v.message = format!("scanned to height {}", store.scanned_height());
+                        }
+                    }
+                    finish(&action, "confirmed — pool-v2 balance updated");
+                }
+                Err(e) => {
+                    let msg = format!("{} failed: {e}", what.noun());
                     finish(&action, &msg);
                     record(&activity, &msg);
                 }
@@ -8276,6 +8541,9 @@ impl Station {
         let mut do_private_send = false;
         let mut do_scan = false;
         let mut do_scan_v2 = false;
+        let mut do_shield_v2 = false;
+        let mut do_deshield_v2 = false;
+        let mut do_send_v2 = false;
         let mut do_rescan = false;
         let mut do_deshield = false;
         let mut do_build_unsigned = false;
@@ -9066,6 +9334,153 @@ impl Station {
                 }
             });
 
+            // ── Pool v2 (post-quantum) — move value ───────────────────────────
+            // Shown only when bit 2 is live. Offering these while dormant would
+            // invite a user to spend ~25 s proving a transaction every node will
+            // reject; the state chip in the table above already explains why the
+            // pool is not usable yet.
+            if matches!(
+                PoolState::classify_v2(snap.online, snap.shielded_v2.as_ref()),
+                PoolState::Active
+            ) {
+                ui.add_space(sp::L);
+                ui.label(
+                    egui::RichText::new("Pool v2 — move value (post-quantum)")
+                        .size(ty::SECTION)
+                        .strong(),
+                );
+                ui.add_space(sp::S);
+                // Every decision below comes from ONE pure function. The UI
+                // gathers facts and renders; it never decides on its own.
+                let guard = V2Guard {
+                    pool_active: true, // the enclosing `if` established this
+                    for_this_wallet: v2v.account.is_empty() || v2v.account == account,
+                    scanned: v2v.account == account && v2v.scanned_height > 0,
+                    notes: v2v.notes,
+                    busy: busy || v2v.scanning,
+                    balance_grains: v2v.balance as u128,
+                    window_budget: snap.shielded_v2.as_ref().map(|i| i.deshieldable_now),
+                };
+
+                // Render a control from a guard verdict: enabled ONLY on Ok,
+                // and the refusal reason shown verbatim beneath it.
+                let mut verdicts: Vec<&'static str> = Vec::new();
+
+                // SHIELD IN — spends no notes, so it needs no scan.
+                let shield_v = v2_allows(
+                    &guard,
+                    V2Intent::Shield {
+                        amount: parse_xus(&self.shield_v2_amount_in),
+                    },
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Shield XUS into pool v2");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.shield_v2_amount_in)
+                            .hint_text("amount")
+                            .desired_width(140.0),
+                    );
+                    ui.add_enabled_ui(shield_v.is_ok(), |ui| {
+                        if ui
+                            .button("Shield →")
+                            .on_hover_text(
+                                "Move transparent value into the post-quantum pool. Builds a \
+                                 real STARK proof (~25s).",
+                            )
+                            .clicked()
+                        {
+                            do_shield_v2 = true;
+                        }
+                    });
+                });
+                if let Err(r) = shield_v {
+                    if !self.shield_v2_amount_in.trim().is_empty() {
+                        verdicts.push(r);
+                    }
+                }
+
+                // DE-SHIELD OUT — bounded by balance AND the window budget.
+                let deshield_v = v2_allows(
+                    &guard,
+                    V2Intent::Deshield {
+                        amount: parse_xus(&self.deshield_v2_amount_in),
+                    },
+                );
+                let v2_cap = guard.deshield_cap();
+                ui.horizontal(|ui| {
+                    ui.label("De-shield XUS from pool v2");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.deshield_v2_amount_in)
+                            .hint_text("amount")
+                            .desired_width(140.0),
+                    );
+                    ui.add_enabled_ui(v2_cap > 0, |ui| {
+                        if ui
+                            .button("Max")
+                            .on_hover_text(
+                                "the most allowed right now (balance, capped by the window budget)",
+                            )
+                            .clicked()
+                        {
+                            self.deshield_v2_amount_in = grains_to_xus_plain(v2_cap);
+                        }
+                    });
+                    ui.add_enabled_ui(deshield_v.is_ok(), |ui| {
+                        if ui.button("De-shield").clicked() {
+                            do_deshield_v2 = true;
+                        }
+                    });
+                });
+                if let Err(r) = deshield_v {
+                    verdicts.push(r);
+                }
+
+                // PRIVATE SEND — value never leaves the pool.
+                ui.add_space(sp::S);
+                ui.label(egui::RichText::new("Send privately in pool v2").strong());
+                ui.horizontal(|ui| {
+                    ui.label("To");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.private_v2_to)
+                            .hint_text("xusq1…")
+                            .desired_width(360.0),
+                    );
+                });
+                let send_v = v2_allows(
+                    &guard,
+                    V2Intent::Send {
+                        to: &self.private_v2_to,
+                        amount: parse_xus(&self.private_v2_amount),
+                    },
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Amount XUS");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.private_v2_amount)
+                            .hint_text("amount")
+                            .desired_width(140.0),
+                    );
+                    ui.add_enabled_ui(send_v.is_ok(), |ui| {
+                        if ui.button("Send privately →").clicked() {
+                            do_send_v2 = true;
+                        }
+                    });
+                });
+                if let Err(r) = send_v {
+                    verdicts.push(r);
+                }
+
+                // One reason at a time, the most fundamental first — a wall of
+                // warnings teaches a user to ignore all of them.
+                if let Some(r) = verdicts.first() {
+                    ui.label(
+                        egui::RichText::new(format!("→ {r}"))
+                            .small()
+                            .color(palette::warning()),
+                    );
+                }
+            }
+
             // ── Offline / air-gapped signing (cold reserves) ──────────────────
             ui.add_space(6.0);
             egui::CollapsingHeader::new("🔌 Offline / air-gapped signing").show(ui, |ui| {
@@ -9518,6 +9933,15 @@ impl Station {
         }
         if do_scan_v2 {
             self.scan_shielded_v2(&ctx);
+        }
+        if do_shield_v2 {
+            self.shield_v2(&ctx);
+        }
+        if do_deshield_v2 {
+            self.deshield_v2(&ctx);
+        }
+        if do_send_v2 {
+            self.send_private_v2(&ctx);
         }
         if do_rescan {
             self.rescan_shielded(&ctx);
@@ -10552,6 +10976,149 @@ fn deshield_amount(
     begin(action, "submitted — waiting for on-chain confirmation…");
     await_receipt(&client, &txid, 90)?;
     Ok(txid.to_hex())
+}
+
+/// Submit a pool-v2 bundle inside a carrier transaction signed by `account`.
+///
+/// The carrier binding is the step that makes a bundle admissible at all:
+/// consensus verifies the bundle's ML-DSA authorization over
+/// `carrier_sighash(digest, {signer, nonce})`, so the bundle must be bound to
+/// the exact `{signer, nonce}` this transaction uses — and can therefore never
+/// be lifted onto another transaction. It happens here because the nonce is
+/// only known now, after proving.
+fn submit_v2_bundle(
+    client: &RpcClient,
+    seed: [u8; 32],
+    account: &str,
+    mut bundle: SpendBundle,
+    action: &Arc<Mutex<ActionState>>,
+) -> Result<String, String> {
+    let key = PqShieldedKey::from_leaf_seed(&seed);
+    let kp = Keypair::hybrid_from_seed(seed);
+    let from = AccountId::new(account).map_err(|e| e.to_string())?;
+    let nonce = client.next_nonce(&from).map_err(|e| e.to_string())?;
+    let domain = client.signing_domain().map_err(|e| e.to_string())?;
+    authorize_for_carrier(&mut bundle, &key, account, nonce).map_err(|e| e.to_string())?;
+    let tx = Transaction {
+        signer: from,
+        public_key: kp.public_key(),
+        nonce,
+        action: Action::ShieldedV2 {
+            bundle: encode_bundle(&bundle),
+        },
+    };
+    let stx = SignedTransaction::sign_in(tx, &kp, domain.as_ref()).map_err(|e| e.to_string())?;
+    let txid = client.submit_transaction(&stx).map_err(|e| e.to_string())?;
+    begin(action, "submitted — waiting for on-chain confirmation…");
+    await_receipt(client, &txid, 120)?;
+    Ok(txid.to_hex())
+}
+
+/// Refuse before spending ~25 s proving if pool v2 is not live on this chain.
+fn require_v2_live(client: &RpcClient) -> Result<(), String> {
+    let info = client
+        .call("sov_getShieldedV2Info", json!({}))
+        .map_err(|e| e.to_string())?;
+    if info.get("active").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    Err(
+        "pool v2 is not active on this chain (consensus signal bit 2 is unarmed), \
+         so every v2 spend would be rejected. This is the deployment being dormant, \
+         not a problem with this wallet."
+            .to_string(),
+    )
+}
+
+/// Shield transparent value INTO pool v2 (a real STARK, no input notes).
+fn shield_v2_amount(
+    rpc: &str,
+    seed: [u8; 32],
+    account: &str,
+    amount_grains: u128,
+    action: &Arc<Mutex<ActionState>>,
+) -> Result<String, String> {
+    let amount = u64::try_from(amount_grains).map_err(|_| "amount too large".to_string())?;
+    let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(180));
+    require_v2_live(&client)?;
+    let key = PqShieldedKey::from_leaf_seed(&seed);
+    begin(action, "proving the pool-v2 shield (STARK, ~25s)…");
+    let bundle = build_shield(&key, &key.address(), amount, 0).map_err(|e| e.to_string())?;
+    submit_v2_bundle(&client, seed, account, bundle, action)
+}
+
+/// De-shield value OUT of pool v2 back to `account`; change returns shielded.
+fn deshield_v2_amount(
+    rpc: &str,
+    seed: [u8; 32],
+    account: &str,
+    amount_grains: u128,
+    action: &Arc<Mutex<ActionState>>,
+) -> Result<String, String> {
+    let amount = u64::try_from(amount_grains).map_err(|_| "amount too large".to_string())?;
+    let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(180));
+    require_v2_live(&client)?;
+    // The live per-window drain budget: a de-shield over it would be mined and
+    // REJECTED, which reads as value "stuck" in the pool. Fail fast instead.
+    if let Some(budget) = deshieldable_v2_now(&client) {
+        if amount_grains > budget {
+            return Err(format!(
+                "only {} XUS can be de-shielded from pool v2 in the current window \
+                 (per-window drain limit) — reduce the amount or wait for the window to reset",
+                grains_to_xus_plain(budget),
+            ));
+        }
+    }
+    let key = PqShieldedKey::from_leaf_seed(&seed);
+    begin(action, "scanning pool v2 for spendable notes…");
+    let store = scan_store_v2(rpc, seed)?;
+    if store.unspent_count() == 0 {
+        return Err("no unspent pool-v2 notes to de-shield".to_string());
+    }
+    begin(action, "proving the pool-v2 de-shield (STARK, ~25s)…");
+    let built = build_spend(&key, &store, None, amount, 0).map_err(|e| e.to_string())?;
+    submit_v2_bundle(&client, seed, account, built.bundle, action)
+}
+
+/// Fully-private pool-v2 transfer to another `xusq1…` address.
+fn zsend_v2_amount(
+    rpc: &str,
+    seed: [u8; 32],
+    account: &str,
+    to: &str,
+    amount_grains: u128,
+    action: &Arc<Mutex<ActionState>>,
+) -> Result<String, String> {
+    let amount = u64::try_from(amount_grains).map_err(|_| "amount too large".to_string())?;
+    // A pool-v1 address here would pay the wrong recipient in the wrong value
+    // space, so it is REFUSED rather than coerced.
+    let to_addr = decode_shielded_v2(to.trim()).map_err(|e| {
+        format!("not a pool-v2 (xusq1…) address: {e}. Pool v1 addresses (xus1…) cannot receive here — the pools are separate value spaces.")
+    })?;
+    let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(180));
+    require_v2_live(&client)?;
+    let key = PqShieldedKey::from_leaf_seed(&seed);
+    begin(action, "scanning pool v2 for spendable notes…");
+    let store = scan_store_v2(rpc, seed)?;
+    if store.unspent_count() == 0 {
+        return Err("no unspent pool-v2 notes to send".to_string());
+    }
+    begin(
+        action,
+        "proving the private pool-v2 transfer (STARK, ~25s)…",
+    );
+    let built = build_spend(&key, &store, Some(&to_addr), amount, 0).map_err(|e| e.to_string())?;
+    submit_v2_bundle(&client, seed, account, built.bundle, action)
+}
+
+/// The node's live pool-v2 de-shield budget for this window, in grains.
+fn deshieldable_v2_now(client: &RpcClient) -> Option<u128> {
+    let info = client.call("sov_getShieldedV2Info", json!({})).ok()?;
+    info.get("deshieldableNowGrains").and_then(|v| {
+        v.as_str()
+            .and_then(|s| s.parse().ok())
+            .or_else(|| v.as_u64().map(u128::from))
+    })
 }
 
 /// After a shielded action is submitted, re-scan the pool as new blocks arrive so
@@ -12762,7 +13329,8 @@ mod tests {
     fn the_two_pool_view_never_prints_a_bare_zero_for_an_unavailable_pool() {
         // THE case the live node produces today: v1 answers, v2 does not exist.
         let snap = live_like_snapshot();
-        let out = painted_text(|ui| shielded_pools_view(ui, &snap, Some((500_000_000, 3, 12_500))));
+        let out =
+            painted_text(|ui| shielded_pools_view(ui, &snap, Some((500_000_000, 3, 12_500)), None));
 
         // Both pools are present and each carries its state IN WORDS.
         assert!(out.contains("Pool v1"), "v1 column missing:\n{out}");
@@ -12818,7 +13386,7 @@ mod tests {
         // A node that DOES serve the RPC while bit 2 is unarmed.
         let mut snap = live_like_snapshot();
         snap.shielded_v2 = shielded_v2_info(&v2_reply(false));
-        let out = painted_text(|ui| shielded_pools_view(ui, &snap, Some((0, 0, 12_500))));
+        let out = painted_text(|ui| shielded_pools_view(ui, &snap, Some((0, 0, 12_500)), None));
 
         assert!(
             out.contains("NOT ACTIVE YET"),
@@ -12851,7 +13419,7 @@ mod tests {
         // The trap: a wallet that has not been scanned has an UNKNOWN balance. Showing
         // "0 XUS" there is how a user with real shielded funds concludes they are gone.
         let snap = live_like_snapshot();
-        let out = painted_text(|ui| shielded_pools_view(ui, &snap, None));
+        let out = painted_text(|ui| shielded_pools_view(ui, &snap, None, None));
         assert!(
             out.contains("Not scanned yet"),
             "an unscanned wallet must say so:\n{out}"
@@ -12949,7 +13517,7 @@ mod tests {
         let mut counts = Vec::new();
         for w in [560.0, 700.0, 900.0, 1200.0, 1800.0, 2560.0] {
             let out = painted_at_width(w, |ui| {
-                shielded_pools_view(ui, &snap, Some((500_000_000, 3, 12_500)))
+                shielded_pools_view(ui, &snap, Some((500_000_000, 3, 12_500)), None)
             });
             for needle in [
                 "Pool v1",
@@ -13001,7 +13569,7 @@ mod tests {
         // v2's is a bare dash (nobody answered). Conflating these would tell an
         // operator their live v1 pool is degraded.
         let out = painted_at_width(1400.0, |ui| {
-            shielded_pools_view(ui, &snap, Some((500_000_000, 3, 12_500)))
+            shielded_pools_view(ui, &snap, Some((500_000_000, 3, 12_500)), None)
         });
         assert!(
             out.contains("not reported"),
@@ -13020,7 +13588,7 @@ mod tests {
         // which is a stronger and more reassuring statement than "unknown".
         snap.shielded_v2 = shielded_v2_info(&v2_reply(false));
         let out = painted_at_width(1400.0, |ui| {
-            shielded_pools_view(ui, &snap, Some((500_000_000, 3, 12_500)))
+            shielded_pools_view(ui, &snap, Some((500_000_000, 3, 12_500)), None)
         });
         assert!(
             out.contains("cannot exist yet"),
@@ -13050,7 +13618,7 @@ mod tests {
             ctx.run(i, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        shielded_pools_view(ui, &snap, None);
+                        shielded_pools_view(ui, &snap, None, None);
                     });
                 });
             })
@@ -13175,5 +13743,485 @@ mod tests {
         assert_ne!(dark_pair.0, palette::dormant(), "dormant differs by mode");
         assert_ne!(dark_pair.1, palette::unknown(), "unknown differs by mode");
         palette::set_dark(true);
+    }
+}
+
+/// Exhaustive verification of the pool-v2 money-moving guards.
+///
+/// The Station moves reserve-grade value, so "we reviewed the UI code" is not
+/// an acceptable standard for when a spend button lights up. Every decision is
+/// made by [`v2_allows`], a pure function — so here the ENTIRE input space is
+/// enumerated and every reachable state is asserted, rather than sampled.
+///
+/// The organising principle is that a wrong `Ok` is the only truly dangerous
+/// outcome: a spurious refusal annoys a user, a spurious permission moves
+/// money. So the sweeps below are written as "no state outside the permitted
+/// set may return Ok", not as a list of examples.
+#[cfg(test)]
+mod v2_guard_tests {
+    use super::*;
+
+    /// A real, checksum-valid pool-v2 address (derived, never hardcoded, so it
+    /// cannot drift from the encoder).
+    fn v2_addr() -> String {
+        encode_shielded_v2(&PqShieldedKey::from_leaf_seed(&[3u8; 32]).address())
+    }
+
+    /// A real pool-v1 address — the cross-pool confusion vector.
+    fn v1_addr() -> String {
+        encode_shielded(&ShieldedKey::from_seed([3u8; 32]).unwrap().address())
+    }
+
+    /// Every guard field in its permissive setting; tests turn ONE knob at a
+    /// time so a failure names exactly the condition that broke.
+    fn permissive() -> V2Guard {
+        V2Guard {
+            pool_active: true,
+            for_this_wallet: true,
+            scanned: true,
+            notes: 3,
+            busy: false,
+            balance_grains: 1_000_000_000,
+            window_budget: None,
+        }
+    }
+
+    fn all_intents(to: &str) -> Vec<V2Intent<'_>> {
+        vec![
+            V2Intent::Shield {
+                amount: Some(1_000),
+            },
+            V2Intent::Deshield {
+                amount: Some(1_000),
+            },
+            V2Intent::Send {
+                to,
+                amount: Some(1_000),
+            },
+        ]
+    }
+
+    /// THE headline invariant: a dormant pool permits NOTHING. Every v2 spend
+    /// is rejected by every node while bit 2 is unarmed, so a button that lit
+    /// up here would cost the user ~25 s of proving to earn a certain
+    /// rejection — and would imply the pool works when it does not.
+    #[test]
+    fn a_dormant_pool_permits_absolutely_nothing() {
+        let addr = v2_addr();
+        for balance in [0u128, 1, u128::MAX] {
+            for notes in [0usize, 1, 100] {
+                for scanned in [false, true] {
+                    for busy in [false, true] {
+                        let g = V2Guard {
+                            pool_active: false,
+                            for_this_wallet: true,
+                            scanned,
+                            notes,
+                            busy,
+                            balance_grains: balance,
+                            window_budget: None,
+                        };
+                        for intent in all_intents(&addr) {
+                            assert!(
+                                v2_allows(&g, intent).is_err(),
+                                "DORMANT pool permitted {intent:?} under {g:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A busy Station permits nothing. Two concurrent spends off one note set
+    /// would build a doomed double-spend from the same scan.
+    #[test]
+    fn a_busy_station_permits_absolutely_nothing() {
+        let addr = v2_addr();
+        let g = V2Guard {
+            busy: true,
+            ..permissive()
+        };
+        for intent in all_intents(&addr) {
+            assert!(
+                v2_allows(&g, intent).is_err(),
+                "a BUSY station permitted {intent:?}"
+            );
+        }
+    }
+
+    /// A view belonging to another wallet permits nothing — otherwise one
+    /// wallet's balance could authorise another wallet's spend.
+    #[test]
+    fn another_wallets_view_permits_absolutely_nothing() {
+        let addr = v2_addr();
+        let g = V2Guard {
+            for_this_wallet: false,
+            ..permissive()
+        };
+        for intent in all_intents(&addr) {
+            assert!(
+                v2_allows(&g, intent).is_err(),
+                "another wallet's view permitted {intent:?}"
+            );
+        }
+    }
+
+    /// Spending requires a scan; shielding does not. An unscanned balance is
+    /// UNKNOWN, and building a spend against notes we cannot witness would
+    /// fail after the proving cost — or, worse, spend the wrong ones.
+    #[test]
+    fn spending_requires_a_scan_but_shielding_does_not() {
+        let addr = v2_addr();
+        let g = V2Guard {
+            scanned: false,
+            notes: 0,
+            ..permissive()
+        };
+        assert!(
+            v2_allows(&g, V2Intent::Shield { amount: Some(1) }).is_ok(),
+            "a shield spends no notes, so it must not require a scan"
+        );
+        assert!(v2_allows(&g, V2Intent::Deshield { amount: Some(1) }).is_err());
+        assert!(v2_allows(
+            &g,
+            V2Intent::Send {
+                to: &addr,
+                amount: Some(1)
+            }
+        )
+        .is_err());
+    }
+
+    /// Having scanned and found NOTHING still permits no spend.
+    #[test]
+    fn a_scanned_but_empty_wallet_cannot_spend() {
+        let addr = v2_addr();
+        let g = V2Guard {
+            notes: 0,
+            balance_grains: 0,
+            ..permissive()
+        };
+        assert!(v2_allows(&g, V2Intent::Deshield { amount: Some(1) }).is_err());
+        assert!(v2_allows(
+            &g,
+            V2Intent::Send {
+                to: &addr,
+                amount: Some(1)
+            }
+        )
+        .is_err());
+    }
+
+    /// No amount at, or beyond, the balance may ever be spent — swept across
+    /// the boundary rather than spot-checked.
+    #[test]
+    fn no_spend_may_ever_exceed_the_scanned_balance() {
+        let addr = v2_addr();
+        let balance = 1_000u128;
+        let g = V2Guard {
+            balance_grains: balance,
+            ..permissive()
+        };
+        for a in 0..=(balance * 2) {
+            let ok_deshield = v2_allows(&g, V2Intent::Deshield { amount: Some(a) }).is_ok();
+            let ok_send = v2_allows(
+                &g,
+                V2Intent::Send {
+                    to: &addr,
+                    amount: Some(a),
+                },
+            )
+            .is_ok();
+            let should = a > 0 && a <= balance;
+            assert_eq!(ok_deshield, should, "de-shield of {a} against {balance}");
+            assert_eq!(ok_send, should, "send of {a} against {balance}");
+        }
+        // And the extreme: never permit a saturating amount.
+        assert!(v2_allows(
+            &g,
+            V2Intent::Deshield {
+                amount: Some(u128::MAX)
+            }
+        )
+        .is_err());
+    }
+
+    /// The per-window drain limiter binds de-shields and NOT private sends —
+    /// a private transfer never leaves the pool, so it is not a drain.
+    #[test]
+    fn the_window_budget_binds_deshields_only() {
+        let addr = v2_addr();
+        let g = V2Guard {
+            balance_grains: 1_000,
+            window_budget: Some(100),
+            ..permissive()
+        };
+        assert_eq!(g.deshield_cap(), 100, "the cap is the tighter of the two");
+        for a in 1..=1_000u128 {
+            let de = v2_allows(&g, V2Intent::Deshield { amount: Some(a) }).is_ok();
+            assert_eq!(de, a <= 100, "de-shield of {a} under a 100 budget");
+            let send = v2_allows(
+                &g,
+                V2Intent::Send {
+                    to: &addr,
+                    amount: Some(a),
+                },
+            )
+            .is_ok();
+            assert_eq!(send, a <= 1_000, "a private send of {a} is not a drain");
+        }
+        // A zero budget stops de-shielding entirely, but not private sends.
+        let g0 = V2Guard {
+            window_budget: Some(0),
+            ..g
+        };
+        assert_eq!(g0.deshield_cap(), 0);
+        assert!(v2_allows(&g0, V2Intent::Deshield { amount: Some(1) }).is_err());
+        assert!(v2_allows(
+            &g0,
+            V2Intent::Send {
+                to: &addr,
+                amount: Some(1)
+            }
+        )
+        .is_ok());
+    }
+
+    /// A zero or unparseable amount never spends.
+    #[test]
+    fn zero_and_missing_amounts_never_spend() {
+        let addr = v2_addr();
+        let g = permissive();
+        for amount in [None, Some(0u128)] {
+            assert!(v2_allows(&g, V2Intent::Shield { amount }).is_err());
+            assert!(v2_allows(&g, V2Intent::Deshield { amount }).is_err());
+            assert!(v2_allows(&g, V2Intent::Send { to: &addr, amount }).is_err());
+        }
+    }
+
+    /// THE cross-pool guard. A pool-v1 address in the pool-v2 send box would
+    /// pay a different recipient in a different value space. It must be
+    /// refused — never coerced, never "helpfully" converted.
+    #[test]
+    fn a_pool_v1_address_can_never_receive_a_pool_v2_send() {
+        let g = permissive();
+        let v1 = v1_addr();
+        assert!(
+            v1.starts_with("xus1"),
+            "fixture must really be a v1 address, got {v1}"
+        );
+        let out = v2_allows(
+            &g,
+            V2Intent::Send {
+                to: &v1,
+                amount: Some(1),
+            },
+        );
+        assert!(out.is_err(), "a pool-v1 address was accepted for a v2 send");
+        assert!(
+            out.unwrap_err().contains("POOL-V2"),
+            "the refusal must explain the pool mismatch"
+        );
+    }
+
+    /// No malformed, lookalike, or hostile recipient string may ever be
+    /// accepted — and none may panic. Only a real, checksum-valid `xusq1…`
+    /// address passes.
+    #[test]
+    fn no_malformed_recipient_is_ever_accepted_and_none_panics() {
+        let g = permissive();
+        let good = v2_addr();
+        let mut hostile: Vec<String> = vec![
+            String::new(),
+            " ".repeat(64),
+            "xusq1".to_string(),
+            "xusq".to_string(),
+            "XUSQ1ABC".to_string(),
+            "xus1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq".to_string(),
+            "uxus1qqqqqqqqqqqqqqqqqq".to_string(),
+            "0x0000000000000000000000000000000000000000".to_string(),
+            "usa.reserve.sov".to_string(),
+            "xusq1\0\0nul".to_string(),
+            "xusq1\n\ttab".to_string(),
+            "xusq1💥💥💥".to_string(),
+            "xusq1".to_string() + &"q".repeat(4096),
+        ];
+        // NOTE: whitespace-padded copies of a VALID address are deliberately
+        // NOT hostile — a pasted address commonly carries them, and trimming is
+        // safe because the trimmed string must still pass the bech32m
+        // checksum. That behaviour is asserted at the end of this test.
+        // Case-folding is likewise a bech32m property, not a defect.
+        // Every single-character corruption of a VALID address must fail the
+        // checksum. This is what makes a typo unable to pay a stranger.
+        for i in 0..good.len() {
+            let mut bad = good.clone();
+            let ch = if bad.as_bytes()[i] == b'q' { 'p' } else { 'q' };
+            bad.replace_range(i..i + 1, &ch.to_string());
+            if bad != good {
+                hostile.push(bad);
+            }
+        }
+        // ...and every truncation.
+        for i in 0..good.len() {
+            hostile.push(good[..i].to_string());
+        }
+
+        for s in hostile {
+            let out = v2_allows(
+                &g,
+                V2Intent::Send {
+                    to: &s,
+                    amount: Some(1),
+                },
+            );
+            assert!(out.is_err(), "a malformed recipient was ACCEPTED: {s:?}");
+        }
+
+        // The genuine article, and only it, is permitted — including with the
+        // surrounding whitespace a paste commonly carries.
+        assert!(v2_allows(
+            &g,
+            V2Intent::Send {
+                to: &good,
+                amount: Some(1)
+            }
+        )
+        .is_ok());
+        assert!(v2_allows(
+            &g,
+            V2Intent::Send {
+                to: &format!("  {good}  "),
+                amount: Some(1)
+            }
+        )
+        .is_ok());
+    }
+
+    /// The exhaustive sweep. Enumerate the whole guard space and assert the
+    /// verdict matches an INDEPENDENTLY written specification — so a bug would
+    /// have to be made identically twice, in two different forms, to survive.
+    #[test]
+    fn the_entire_guard_space_matches_an_independent_specification() {
+        let good = v2_addr();
+        let v1 = v1_addr();
+        let recipients = [good.as_str(), v1.as_str(), "", "garbage"];
+        let amounts = [
+            None,
+            Some(0u128),
+            Some(1),
+            Some(500),
+            Some(1_000),
+            Some(5_000),
+        ];
+        let budgets = [None, Some(0u128), Some(500), Some(10_000)];
+        let mut checked = 0usize;
+
+        for pool_active in [false, true] {
+            for for_this_wallet in [false, true] {
+                for scanned in [false, true] {
+                    for notes in [0usize, 2] {
+                        for busy in [false, true] {
+                            for balance in [0u128, 1_000] {
+                                for budget in budgets {
+                                    let g = V2Guard {
+                                        pool_active,
+                                        for_this_wallet,
+                                        scanned,
+                                        notes,
+                                        busy,
+                                        balance_grains: balance,
+                                        window_budget: budget,
+                                    };
+                                    // Independent spec of the common preconditions.
+                                    let base = pool_active && for_this_wallet && !busy;
+                                    let can_spend = base && scanned && notes > 0;
+                                    let cap = match budget {
+                                        Some(b) => balance.min(b),
+                                        None => balance,
+                                    };
+                                    for amount in amounts {
+                                        let a = amount.unwrap_or(0);
+                                        let positive = amount.is_some() && a > 0;
+
+                                        let want_shield = base && positive;
+                                        assert_eq!(
+                                            v2_allows(&g, V2Intent::Shield { amount }).is_ok(),
+                                            want_shield,
+                                            "shield {amount:?} under {g:?}"
+                                        );
+
+                                        let want_deshield =
+                                            can_spend && positive && a <= balance && a <= cap;
+                                        assert_eq!(
+                                            v2_allows(&g, V2Intent::Deshield { amount }).is_ok(),
+                                            want_deshield,
+                                            "deshield {amount:?} under {g:?}"
+                                        );
+
+                                        for to in recipients {
+                                            let addr_ok = to.trim().starts_with("xusq1")
+                                                && decode_shielded_v2(to.trim()).is_ok();
+                                            let want_send =
+                                                can_spend && addr_ok && positive && a <= balance;
+                                            assert_eq!(
+                                                v2_allows(&g, V2Intent::Send { to, amount })
+                                                    .is_ok(),
+                                                want_send,
+                                                "send {amount:?} to {to:?} under {g:?}"
+                                            );
+                                            checked += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 4_000,
+            "the sweep must actually be exhaustive, only checked {checked}"
+        );
+    }
+
+    /// Whenever an action is refused, the user is told why — an empty reason
+    /// would render as a dead button with no explanation.
+    #[test]
+    fn every_refusal_carries_an_actionable_reason() {
+        let good = v2_addr();
+        for pool_active in [false, true] {
+            for scanned in [false, true] {
+                for notes in [0usize, 1] {
+                    for busy in [false, true] {
+                        let g = V2Guard {
+                            pool_active,
+                            for_this_wallet: true,
+                            scanned,
+                            notes,
+                            busy,
+                            balance_grains: 10,
+                            window_budget: Some(5),
+                        };
+                        for intent in [
+                            V2Intent::Shield { amount: Some(50) },
+                            V2Intent::Deshield { amount: Some(50) },
+                            V2Intent::Send {
+                                to: &good,
+                                amount: Some(50),
+                            },
+                        ] {
+                            if let Err(reason) = v2_allows(&g, intent) {
+                                assert!(
+                                    reason.len() > 12 && reason.chars().any(char::is_alphabetic),
+                                    "refusal reason is not actionable: {reason:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

@@ -422,6 +422,75 @@ mod tests {
         }
     }
 
+    /// THE double-spend test. A note whose nullifier is already on-chain must
+    /// be refused — this is the property that makes the pool sound, and it had
+    /// no test at any layer before now.
+    #[test]
+    fn a_note_cannot_be_spent_twice() {
+        let k = key(6);
+        let (shield, _) = shield_bundle(&k, 5, 0);
+
+        // Put the shield's notes into a REAL ledger, so its anchor is known.
+        let mut ledger = Ledger::default();
+        let commitments: Vec<PqDigest> = shield
+            .public_inputs
+            .output_commitments
+            .iter()
+            .zip(shield.public_inputs.output_dummy)
+            .filter_map(|(c, dummy)| (!dummy).then_some(*c))
+            .collect();
+        ledger
+            .apply_shielded_v2(&[], &commitments)
+            .expect("seed the pool");
+        ledger
+            .add_shielded_v2_value(Balance::from_grains(5 * XUS))
+            .expect("seed pool value");
+
+        // Build a spend against that pool.
+        let mut store = sov_shielded_pq::scan::PqNoteStore::new(0);
+        store.ingest_block(&k, 1, [9u8; 32], &[&shield]);
+        let built = build_spend(&k, &store, None, XUS as u64, 0).expect("build spend");
+        let mut spend = built.bundle;
+        authorize_for_carrier(&mut spend, &k, SIGNER, 0).expect("carrier-bind");
+        let bytes = encode_bundle(&spend);
+
+        // First spend verifies.
+        let effects = verify_bundle_for_carrier(
+            &bytes,
+            &ledger,
+            &policy(),
+            1,
+            &signer(),
+            0,
+            Balance::from_grains(10 * XUS),
+        )
+        .expect("the first spend must verify");
+        assert!(
+            !effects.nullifiers.is_empty(),
+            "a spend must publish a nullifier"
+        );
+
+        // Publish its nullifiers, exactly as block execution would.
+        ledger
+            .apply_shielded_v2(&effects.nullifiers, &effects.commitments)
+            .expect("apply the spend");
+
+        // The SAME bundle must now be refused as a double spend.
+        let again = verify_bundle_for_carrier(
+            &bytes,
+            &ledger,
+            &policy(),
+            1,
+            &signer(),
+            0,
+            Balance::from_grains(10 * XUS),
+        );
+        assert!(
+            matches!(again, Err(ShieldedV2Error::NullifierAlreadySpent(_))),
+            "re-spending a note must be refused, got {again:?}"
+        );
+    }
+
     /// Spending a note requires its anchor to be in the ring. A spend proved
     /// against a tree this chain has never seen must be refused.
     #[test]
