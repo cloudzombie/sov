@@ -34,7 +34,7 @@
 //! - The frame ceiling lives in [`crate::wire::MAX_FRAME_BYTES`] and the link's
 //!   own limit, so a declared length can never drive an allocation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,29 +56,43 @@ pub const MAX_INBOX_BYTES: usize = 8 * 1024 * 1024;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Received messages, oldest first, bounded by total plaintext size.
+///
+/// Each entry carries ITS OWN size. An earlier version subtracted the size of
+/// the newly-pushed message when evicting the oldest one, which is only correct
+/// when every message happens to be the same size — so the running total drifted
+/// and the byte bound did not actually bound. Storing the size per entry is what
+/// makes the accounting exact.
 #[derive(Default)]
 struct Inbox {
-    queue: Vec<(SocketAddr, ShareMessage)>,
+    queue: VecDeque<(SocketAddr, ShareMessage, usize)>,
     bytes: usize,
 }
 
 impl Inbox {
     fn push(&mut self, from: SocketAddr, msg: ShareMessage, size: usize) {
-        self.queue.push((from, msg));
+        self.queue.push_back((from, msg, size));
         self.bytes += size;
-        // Bounded in BYTES. A slow consumer costs bounded memory, never the
-        // process — and the sizes here are the plaintext we actually decoded,
-        // not a number the peer told us.
-        while self.bytes > MAX_INBOX_BYTES && !self.queue.is_empty() {
-            self.queue.remove(0);
-            // Recomputed rather than tracked per-entry: exact, and the queue is
-            // bounded so it is cheap.
-            self.bytes = self.bytes.saturating_sub(size);
+        // Bounded in BYTES, not messages: a message count says nothing about
+        // memory. A slow consumer costs bounded memory, never the process — and
+        // these sizes are the plaintext we actually decoded, not a number the
+        // peer told us.
+        while self.bytes > MAX_INBOX_BYTES {
+            match self.queue.pop_front() {
+                Some((_, _, evicted)) => self.bytes -= evicted,
+                None => {
+                    // Nothing left to drop: the total cannot be anything but 0.
+                    self.bytes = 0;
+                    break;
+                }
+            }
         }
     }
     fn drain(&mut self) -> Vec<(SocketAddr, ShareMessage)> {
         self.bytes = 0;
-        std::mem::take(&mut self.queue)
+        self.queue
+            .drain(..)
+            .map(|(addr, msg, _)| (addr, msg))
+            .collect()
     }
 }
 
@@ -303,6 +317,50 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         panic!("timed out waiting for {what}");
+    }
+
+    /// The byte bound must actually bound, with MIXED sizes.
+    ///
+    /// Regression test: the first version subtracted the newly-pushed message's
+    /// size when evicting the oldest, which is only correct when every message
+    /// is the same size. With mixed sizes the total drifted — and it drifted
+    /// DOWNWARD when a small message evicted a large one, so the inbox could
+    /// hold far more than its cap. A uniform-size test would have passed.
+    #[test]
+    fn the_inbox_byte_bound_holds_under_mixed_sizes() {
+        let mut inbox = Inbox::default();
+        let addr: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        // Alternate a very large message with a tiny one, well past the cap.
+        let big = MAX_INBOX_BYTES / 4;
+        for i in 0..40 {
+            let size = if i % 2 == 0 { big } else { 32 };
+            inbox.push(addr, ShareMessage::GetShares { after: None }, size);
+            assert!(
+                inbox.bytes <= MAX_INBOX_BYTES,
+                "inbox exceeded its own bound at push {i}: {} > {}",
+                inbox.bytes,
+                MAX_INBOX_BYTES
+            );
+        }
+        // And the tracked total must equal what is actually queued.
+        let actual: usize = inbox.queue.iter().map(|(_, _, s)| *s).sum();
+        assert_eq!(
+            inbox.bytes, actual,
+            "tracked byte total drifted from the real contents"
+        );
+        assert!(inbox.bytes <= MAX_INBOX_BYTES);
+    }
+
+    /// Draining resets the accounting to a true zero.
+    #[test]
+    fn draining_resets_the_byte_total() {
+        let mut inbox = Inbox::default();
+        let addr: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        inbox.push(addr, ShareMessage::GetShares { after: None }, 4_096);
+        assert_eq!(inbox.bytes, 4_096);
+        assert_eq!(inbox.drain().len(), 1);
+        assert_eq!(inbox.bytes, 0);
+        assert!(inbox.queue.is_empty());
     }
 
     /// The point of the whole crate: two nodes connect over a real encrypted
