@@ -10421,15 +10421,45 @@ fn setup_node_dir(node_dir: &Path, spec_filename: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The `SOV_STATION_DIR` override, if one is set and non-empty.
+///
+/// `station_dir` covers the wallet files. These remaining paths deliberately do NOT
+/// live under `.sov-station` — the node's chain data is in the temp dir, and the
+/// peer/theme/RPC preferences are dotfiles directly in `$HOME` — so they escaped that
+/// helper entirely. They still have to be isolated, for two different reasons:
+///
+///   * the CHAIN DIRECTORY is keyed only by network name, so a dev build and the
+///     installed Station open the SAME `sov-station-node-mainnet` directory. Two
+///     processes on one chain database is a corruption and crash vector, and it is the
+///     most likely way a dev build "dies while syncing";
+///   * the PREFERENCE dotfiles are low-stakes, but a dev build silently overwriting the
+///     operator's saved peer and theme is still reaching into their live install.
+///
+/// The override is applied ONLY when it is set. With it unset every path resolves
+/// exactly where it always did, so an existing install keeps its saved peer, theme and
+/// chain — this isolates dev builds without migrating anybody's settings.
+fn dev_override_dir() -> Option<PathBuf> {
+    std::env::var("SOV_STATION_DIR")
+        .ok()
+        .filter(|d| !d.trim().is_empty())
+        .map(PathBuf::from)
+}
+
 /// The directory the GUI's supervised local node keeps its chain + keystore in.
 fn local_node_dir(net: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("sov-station-node-{net}"))
+    match dev_override_dir() {
+        Some(d) => d.join(format!("node-{net}")),
+        None => std::env::temp_dir().join(format!("sov-station-node-{net}")),
+    }
 }
 
 /// Base directory for network-scoped seed/bootstrap choices. These live outside the
 /// node data dir so a testnet reset does not forget its peer, but MAINNET and TESTNET
 /// must never share one address again. Falls back to the temp dir without a home.
 fn peer_config_base() -> PathBuf {
+    if let Some(d) = dev_override_dir() {
+        return d;
+    }
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
@@ -10466,11 +10496,9 @@ fn save_peer(network: Network, peer: &str) {
 
 /// Where the UI theme choice is persisted (next to the peer file, outside the data dir).
 fn theme_config_path() -> PathBuf {
-    let base = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join(".sov-station-theme")
+    // Via `peer_config_base` so the dev override reaches this too — otherwise a
+    // scratch build rewrites the operator's saved light/dark choice.
+    peer_config_base().join(".sov-station-theme")
 }
 
 /// The saved theme mode — dark unless the operator chose light last time.
@@ -11117,6 +11145,21 @@ fn spawn_poller(snapshot: Arc<Mutex<Snapshot>>, config: Arc<Mutex<Config>>, ctx:
 
 #[cfg(test)]
 mod tests {
+    /// Serialises the tests that mutate `SOV_STATION_DIR`.
+    ///
+    /// Rust runs tests in parallel threads of ONE process, so the environment is
+    /// shared mutable state. Without this lock a test asserting the DEFAULT path can
+    /// observe another test's override and fail intermittently — and an intermittent
+    /// failure in the check that keeps dev builds off the live wallet is worse than
+    /// no check, because it trains people to re-run until green.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the lock, ignoring poisoning: a panic in one env test must not cascade
+    /// into unrelated failures in the others.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// `SOV_STATION_DIR` must actually redirect the data directory.
     ///
     /// This path was hardcoded, so any build run from a working tree opened the
@@ -11125,9 +11168,9 @@ mod tests {
     /// build touches live funds again, so the behaviour is pinned here.
     #[test]
     fn station_dir_is_overridable_for_isolation() {
-        // Serialised via a process-wide lock is overkill for one test; instead
-        // set, assert, and restore, and never assert the DEFAULT here (another
-        // test running concurrently could hold the override).
+        // Serialised against the other env-mutating test: the environment is shared
+        // across test threads, so overlapping set/remove is a flake source.
+        let _g = env_guard();
         let prev = std::env::var("SOV_STATION_DIR").ok();
 
         std::env::set_var("SOV_STATION_DIR", "/tmp/sov-station-isolated");
@@ -11144,6 +11187,61 @@ mod tests {
             station_dir().unwrap().ends_with(".sov-station"),
             "an empty override falls back to the default, never to an empty path"
         );
+
+        match prev {
+            Some(v) => std::env::set_var("SOV_STATION_DIR", v),
+            None => std::env::remove_var("SOV_STATION_DIR"),
+        }
+    }
+
+    /// The override must isolate the CHAIN DIRECTORY and the preference dotfiles too,
+    /// not only the wallet files.
+    ///
+    /// The chain directory is the sharpest of these: it is keyed by network name in the
+    /// temp dir, so without the override a dev build and the installed Station open the
+    /// same `sov-station-node-mainnet` database. Two processes on one chain database is
+    /// how a dev build takes the operator's node down with it.
+    ///
+    /// Equally important is the other direction: with the override UNSET, every path
+    /// must resolve exactly where it always did, or an existing install silently loses
+    /// its saved peer, theme and chain on upgrade.
+    #[test]
+    fn the_override_isolates_the_chain_dir_and_preferences_without_migrating_anyone() {
+        let _g = env_guard();
+        let prev = std::env::var("SOV_STATION_DIR").ok();
+        let scratch = "/tmp/sov-station-scratch-xyz";
+
+        std::env::set_var("SOV_STATION_DIR", scratch);
+        let node = local_node_dir("mainnet");
+        assert!(
+            node.starts_with(scratch),
+            "the chain dir must move under the override, got {node:?}"
+        );
+        assert!(
+            !node.starts_with(std::env::temp_dir().join("sov-station-node-mainnet")),
+            "and must NOT be the shared temp-dir chain the installed Station uses"
+        );
+        for p in [
+            peer_config_path(Network::Mainnet),
+            theme_config_path(),
+            expose_rpc_config_path(),
+        ] {
+            assert!(
+                p.starts_with(scratch),
+                "preference file escaped the override: {p:?}"
+            );
+        }
+
+        // Unset ⇒ historical locations, unchanged. This is the "do not break what
+        // works" half: an operator upgrading must keep their peer, theme and chain.
+        std::env::remove_var("SOV_STATION_DIR");
+        assert_eq!(
+            local_node_dir("mainnet"),
+            std::env::temp_dir().join("sov-station-node-mainnet"),
+            "without the override the chain dir must be exactly where it always was"
+        );
+        assert!(theme_config_path().ends_with(".sov-station-theme"));
+        assert!(peer_config_path(Network::Mainnet).ends_with(".sov-station-peer-mainnet"));
 
         match prev {
             Some(v) => std::env::set_var("SOV_STATION_DIR", v),
