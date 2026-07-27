@@ -4182,6 +4182,7 @@ dependencies = [
  "sov-primitives",
  "sov-runtime",
  "sov-shielded",
+ "sov-shielded-pq",
  "sov-state",
  "sov-types",
  "sov-wallet",
@@ -4261,7 +4262,7 @@ dependencies = [
 
 [[package]]
 name = "sov-station"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chacha20poly1305",
  "eframe",
