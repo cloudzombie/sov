@@ -2,7 +2,7 @@
 //!
 //! # Why this is a separate channel, not a new `NetMessage`
 //!
-//! Shares could have been added to `sov-network`'s [`NetMessage`] enum. They are
+//! Shares could have been added to `sov-network`'s `NetMessage` enum. They are
 //! deliberately not. That enum is decoded by the transport every consensus peer
 //! depends on for block and transaction relay, and putting a second, unrelated
 //! protocol through the same decoder widens the blast radius of a bug here from

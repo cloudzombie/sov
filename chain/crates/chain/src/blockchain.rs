@@ -5420,7 +5420,9 @@ mod assumevalid_ancestry_tests {
         forged.timestamp_ms += 1; // a different genesis
         assert_ne!(forged.hash(), genesis.hash());
         assert!(
-            chain.install_checkpoint_linkage(&[forged]).is_err(),
+            chain
+                .install_checkpoint_linkage(std::slice::from_ref(&forged))
+                .is_err(),
             "a linkage that does not start at OUR genesis must be refused"
         );
         assert!(!chain.is_linked_to_checkpoint(&genesis.hash()));
@@ -5440,7 +5442,7 @@ mod assumevalid_ancestry_tests {
         // Pin something far above what we will supply.
         chain.set_checkpoints([(500, Hash::from_bytes([3u8; 32]))]);
 
-        let out = chain.install_checkpoint_linkage(&[genesis.clone()]);
+        let out = chain.install_checkpoint_linkage(std::slice::from_ref(&genesis));
         assert!(
             out.is_err(),
             "a batch that never reaches the pinned height must be refused, not \
@@ -5461,7 +5463,7 @@ mod assumevalid_ancestry_tests {
         chain.set_checkpoints([(0, Hash::from_bytes([4u8; 32]))]);
         assert!(
             chain
-                .install_checkpoint_linkage(&[genesis.clone()])
+                .install_checkpoint_linkage(std::slice::from_ref(&genesis))
                 .is_err(),
             "the pinned HEIGHT is reached but the HASH differs — refuse"
         );
@@ -5477,7 +5479,7 @@ mod assumevalid_ancestry_tests {
         chain.set_checkpoints([(0, genesis.hash())]);
 
         let n = chain
-            .install_checkpoint_linkage(&[genesis.clone()])
+            .install_checkpoint_linkage(std::slice::from_ref(&genesis))
             .expect("an honest linkage must be accepted");
         assert_eq!(n, 1);
         assert!(
@@ -5497,7 +5499,7 @@ mod assumevalid_ancestry_tests {
         let genesis = chain.block_by_height(0).expect("genesis").header.clone();
         chain.set_checkpoints([(0, genesis.hash())]);
         chain
-            .install_checkpoint_linkage(&[genesis.clone()])
+            .install_checkpoint_linkage(std::slice::from_ref(&genesis))
             .expect("proven");
         assert!(chain.is_linked_to_checkpoint(&genesis.hash()));
 

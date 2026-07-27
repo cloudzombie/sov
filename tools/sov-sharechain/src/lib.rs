@@ -22,7 +22,7 @@
 //! # What is NOT here
 //!
 //! **No consensus surface.** SOV sees ordinary blocks with ordinary
-//! [`Transfer`](sov_primitives)-shaped payouts. Nothing in this crate changes
+//! `Transfer`-shaped payouts. Nothing in this crate changes
 //! block or transaction encoding, the state root, emission, difficulty, or any
 //! KAT vector. Nothing here signs anything: the block producer signs its own
 //! payout transfers with its own key, exactly as it would sign any transaction.
@@ -255,9 +255,9 @@ impl ShareChain {
             *weights.entry(e.share.finder.clone()).or_default() += e.share.work;
             total += e.share.work;
             for u in &e.share.uncles {
-                if let Some(ue) = self.entries.get(u) {
-                    let w = ue.share.work * UNCLE_WEIGHT_PCT / 100;
-                    *weights.entry(ue.share.finder.clone()).or_default() += w;
+                if let Some(uncle) = self.entries.get(u) {
+                    let w = uncle.share.work * UNCLE_WEIGHT_PCT / 100;
+                    *weights.entry(uncle.share.finder.clone()).or_default() += w;
                     total += w;
                 }
             }
@@ -336,8 +336,8 @@ impl ShareChain {
             if *u == share.id || ancestry.contains(u) || !seen_uncles.insert(*u) {
                 return Err(ShareError::BadUncle(*u));
             }
-            let ue = self.entries.get(u).ok_or(ShareError::BadUncle(*u))?;
-            uncle_work += ue.share.work * UNCLE_WEIGHT_PCT / 100;
+            let uncle = self.entries.get(u).ok_or(ShareError::BadUncle(*u))?;
+            uncle_work += uncle.share.work * UNCLE_WEIGHT_PCT / 100;
         }
 
         // THE RULE. A share that carries a real block must pay the window. This
