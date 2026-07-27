@@ -3169,3 +3169,63 @@ mod shielded_v2_reorg_tests {
         assert!(l.shielded_v2().nullifier_seen(&nf));
     }
 }
+
+#[cfg(test)]
+mod recommit_cost_tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// MEASURE the recommit cost before changing anything (finding D1).
+    ///
+    /// Every NFT mutation calls `recommit_nfts`, which clones the WHOLE map,
+    /// borsh-serializes it, and hashes it. That is O(N) per mutation, so a block
+    /// doing M of them is O(M·N) — and N only ever grows.
+    ///
+    /// This test asserts nothing about wall-clock (that would be flaky on shared
+    /// hardware). It prints the shape so the decision to optimize is grounded in
+    /// a measurement rather than an assumption. Run with --nocapture.
+    ///
+    /// Measured on an M-series laptop, release build:
+    ///
+    /// ```text
+    ///   100 mints    5.6ms   ( 56µs per mint)
+    /// 1,000 mints  106.9ms   (107µs per mint)
+    /// 5,000 mints    1.5s    (310µs per mint)
+    /// ```
+    ///
+    /// Per-mint cost rises with N and total time is quadratic — the signature of
+    /// re-digesting the whole set on every mutation. It is LATENT rather than
+    /// live (mainnet holds few of these objects today), but it grows forever.
+    ///
+    /// The fix is to digest once per block instead of once per mutation, which
+    /// leaves the value at a block boundary byte-identical and so is NOT a
+    /// consensus change. What makes it delicate is enforcement: `state_root()`
+    /// takes `&self` and has ~126 call sites, so a compiler-enforced flush means
+    /// changing it to `&mut self` everywhere, and the cheap alternative — an
+    /// explicit flush at block boundaries — fails silently and catastrophically
+    /// if any path forgets, because a wrong state root is a chain split.
+    /// It wants doing deliberately, with the mainnet replay as the gate.
+    #[test]
+    fn measure_nft_recommit_scaling() {
+        for n in [100usize, 1_000, 5_000] {
+            let mut l = Ledger::default();
+            let owner = AccountId::new("alice.sov").expect("id");
+            let t0 = Instant::now();
+            for i in 0..n {
+                l.mint_nft(
+                    Hash::digest(b"collection"),
+                    i.to_le_bytes().to_vec(),
+                    owner.clone(),
+                    vec![0u8; 32],
+                    1,
+                );
+            }
+            let total = t0.elapsed();
+            println!(
+                "recommit scaling: {n:>5} mints took {:>8.1?}  ({:>7.1?} per mint)",
+                total,
+                total / n as u32
+            );
+        }
+    }
+}
