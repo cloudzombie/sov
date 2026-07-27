@@ -4275,6 +4275,7 @@ dependencies = [
  "sov-primitives",
  "sov-rpc",
  "sov-shielded",
+ "sov-shielded-pq",
  "sov-types",
  "sov-wallet",
  "zeroize",
