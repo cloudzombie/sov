@@ -9658,8 +9658,7 @@ fn send_payment(
 /// Path to a wallet's encrypted incremental note cache, keyed by its stable
 /// implicit id (per seed). `<home>/.sov-station/notes/<id>.store`.
 fn note_store_path(store_id: &str) -> Result<PathBuf, String> {
-    Ok(home_dir()?
-        .join(".sov-station")
+    Ok(station_dir()?
         .join("notes")
         .join(format!("{store_id}.store")))
 }
@@ -10160,9 +10159,32 @@ fn home_dir() -> Result<PathBuf, String> {
         .map_err(|_| "no home directory (HOME / USERPROFILE unset)".to_string())
 }
 
+/// Station's data directory — wallets, keystore, device key, note caches.
+///
+/// Defaults to `<home>/.sov-station`, and is overridden by `SOV_STATION_DIR`.
+///
+/// The override exists for a specific safety reason: this path was previously
+/// hardcoded, so ANY build of Station — including a development or test build
+/// run from a working tree — opened the operator's real wallet, keystore and
+/// note caches. Isolating a dev build was impossible, which makes destroying
+/// live wallet state a matter of running the wrong binary. Set
+/// `SOV_STATION_DIR` to a scratch path for any build that is not the one you
+/// actually keep funds in.
+///
+/// Every path helper below routes through here, so there is one place to
+/// isolate rather than five to remember.
+fn station_dir() -> Result<PathBuf, String> {
+    if let Ok(dir) = std::env::var("SOV_STATION_DIR") {
+        if !dir.trim().is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+    Ok(home_dir()?.join(".sov-station"))
+}
+
 /// `<home>/.sov-station/wallets.keystore`.
 fn keystore_path() -> Result<PathBuf, String> {
-    Ok(home_dir()?.join(".sov-station").join("wallets.keystore"))
+    Ok(station_dir()?.join("wallets.keystore"))
 }
 
 fn write_keystore(json: &str) -> Result<String, String> {
@@ -10182,14 +10204,14 @@ fn read_keystore() -> Result<String, String> {
 /// The auto-persist file: wallets are encrypted to this on every change and
 /// reloaded from it on launch (no passphrase). `<home>/.sov-station/wallets.auto`.
 fn autosave_path() -> Result<PathBuf, String> {
-    Ok(home_dir()?.join(".sov-station").join("wallets.auto"))
+    Ok(station_dir()?.join("wallets.auto"))
 }
 
 /// The device key file (owner-only). Holds the random key the auto-persist file
 /// is encrypted under, so auto-load needs no passphrase yet the file is not
 /// plaintext. `<home>/.sov-station/device.key`.
 fn device_key_path() -> Result<PathBuf, String> {
-    Ok(home_dir()?.join(".sov-station").join("device.key"))
+    Ok(station_dir()?.join("device.key"))
 }
 
 /// Restrict a file to owner read/write (0600) on Unix; best-effort elsewhere.
@@ -10517,8 +10539,8 @@ fn add_firewall_rule() {}
 fn ensure_firewall(logs: &Arc<Mutex<Vec<String>>>) {
     #[cfg(windows)]
     {
-        let marker = match home_dir() {
-            Ok(h) => h.join(".sov-station").join("firewall.ok"),
+        let marker = match station_dir() {
+            Ok(d) => d.join("firewall.ok"),
             Err(_) => return,
         };
         if marker.exists() {
@@ -11092,6 +11114,40 @@ fn spawn_poller(snapshot: Arc<Mutex<Snapshot>>, config: Arc<Mutex<Config>>, ctx:
 
 #[cfg(test)]
 mod tests {
+    /// `SOV_STATION_DIR` must actually redirect the data directory.
+    ///
+    /// This path was hardcoded, so any build run from a working tree opened the
+    /// operator's REAL wallet, keystore and note caches — isolating a dev build
+    /// was impossible. If this override ever silently stops working, a test
+    /// build touches live funds again, so the behaviour is pinned here.
+    #[test]
+    fn station_dir_is_overridable_for_isolation() {
+        // Serialised via a process-wide lock is overkill for one test; instead
+        // set, assert, and restore, and never assert the DEFAULT here (another
+        // test running concurrently could hold the override).
+        let prev = std::env::var("SOV_STATION_DIR").ok();
+
+        std::env::set_var("SOV_STATION_DIR", "/tmp/sov-station-isolated");
+        assert_eq!(
+            station_dir().unwrap(),
+            PathBuf::from("/tmp/sov-station-isolated"),
+            "the override must redirect the data directory"
+        );
+
+        // An empty override is ignored rather than resolving to the filesystem
+        // root, which would be a spectacular way to lose a wallet.
+        std::env::set_var("SOV_STATION_DIR", "");
+        assert!(
+            station_dir().unwrap().ends_with(".sov-station"),
+            "an empty override falls back to the default, never to an empty path"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("SOV_STATION_DIR", v),
+            None => std::env::remove_var("SOV_STATION_DIR"),
+        }
+    }
+
     use super::*;
 
     /// The receipt-status filter that gates shielded-note ingestion: only a
