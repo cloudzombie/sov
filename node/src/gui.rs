@@ -1072,7 +1072,6 @@ fn qr_widget(ui: &mut egui::Ui, data: &str, size: f32) {
 ///     stronger and more reassuring fact than "unknown".
 ///   * [`Amount`](Self::Amount)/[`Count`](Self::Count) — a real reading.
 enum Cell {
-    Chip(&'static str, &'static str, egui::Color32),
     Text(String),
     Amount(u128),
     Count(u64),
@@ -1093,7 +1092,6 @@ impl Cell {
 
     fn render(&self, ui: &mut egui::Ui) {
         match self {
-            Cell::Chip(glyph, word, col) => state_chip(ui, glyph, word, *col),
             Cell::Text(t) => {
                 ui.label(
                     egui::RichText::new(t)
@@ -1188,11 +1186,10 @@ fn pool_rows(s: &Snapshot, v1_own: Option<(u128, usize, u64)>) -> Vec<PoolRow> {
     };
 
     vec![
-        PoolRow {
-            label: "status",
-            v1: Cell::Chip(v1_state.glyph(), v1_state.word(), v1_state.color()),
-            v2: Cell::Chip(v2_state.glyph(), v2_state.word(), v2_state.color()),
-        },
+        // NB: there is deliberately no "status" row. The state chip is drawn once per
+        // pool, in the table header. Seeing it rendered three times over (header, a
+        // status row, and again on the prose card) was the layout reading as cluttered
+        // and unfinished — repetition dilutes the one signal that matters most here.
         PoolRow {
             label: "cryptography",
             v1: Cell::Text(Pool::V1.crypto().to_string()),
@@ -1307,16 +1304,15 @@ fn pool_rows(s: &Snapshot, v1_own: Option<(u128, usize, u64)>) -> Vec<PoolRow> {
 fn pool_note(ui: &mut egui::Ui, pool: Pool, state: PoolState, extra: &str) {
     card(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = sp::M;
-            ui.label(
-                egui::RichText::new(pool.name())
-                    .size(ty::SECTION)
-                    .strong()
-                    .color(palette::text()),
-            );
-            state_chip(ui, state.glyph(), state.word(), state.color());
-        });
+        // Name only — the state chip lives in the table header above, and repeating it
+        // a third time here added noise without adding information. The sentence below
+        // is state-specific, so the state is still unambiguous on this card.
+        ui.label(
+            egui::RichText::new(pool.name())
+                .size(ty::SECTION)
+                .strong()
+                .color(palette::text()),
+        );
         ui.add_space(sp::S);
         ui.label(
             egui::RichText::new(state.explanation(pool))
@@ -1364,34 +1360,16 @@ fn pool_note(ui: &mut egui::Ui, pool: Pool, state: PoolState, extra: &str) {
 /// figure like `110,557.53450464 XUS` the table collapses to one pool above the other,
 /// each full width. That threshold is computed from the width the content actually
 /// needs, not guessed.
+///
+/// It is also BOUNDED above. Responsive does not mean "grows forever": past the width
+/// the content needs, further stretching pushes the two pools toward opposite edges of
+/// a large display, and comparing a v1 figure with its v2 counterpart turns into
+/// tracking a row across a void. The whole view therefore stops at a maximum useful
+/// width and sits left-aligned. The empty space to its right on a 27" display is not
+/// wasted — it is what keeps a row readable across.
 fn shielded_pools_view(ui: &mut egui::Ui, s: &Snapshot, v1_own: Option<(u128, usize, u64)>) {
-    let v1_state = PoolState::classify_v1(s.online, s.shielded_v1_available);
-    let v2_state = PoolState::classify_v2(s.online, s.shielded_v2.as_ref());
-    let rows = pool_rows(s, v1_own);
-
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = sp::M;
-        ui.label(
-            egui::RichText::new("SHIELDED POOLS")
-                .size(ty::MICRO)
-                .color(palette::text_dim()),
-        );
-        ui.label(
-            egui::RichText::new(
-                "Two independent pools. Value in one is not value in the other, and \
-                 neither can be spent into the other except through a transparent balance.",
-            )
-            .size(ty::SMALL)
-            .color(palette::text_dim()),
-        );
-    });
-    ui.add_space(sp::M);
-
-    // ── Column sizing, from the content ───────────────────────────────────────
-    //
-    // The widest value any cell holds is a full-precision amount plus its unit
-    // (`110,557.53450464 XUS`), measured in the real font rather than assumed, so the
-    // collapse threshold tracks the actual type scale instead of a magic number.
+    // The widest value any cell holds, measured in the real font rather than assumed,
+    // so every threshold below tracks the actual type scale instead of a magic number.
     let value_w = ui
         .fonts(|f| {
             f.layout_no_wrap(
@@ -1414,6 +1392,45 @@ fn shielded_pools_view(ui: &mut egui::Ui, s: &Snapshot, v1_own: Option<(u128, us
             .x
         })
         .max(100.0);
+    // The whole view — table AND the prose cards under it — is capped together, so
+    // they stay visually one block instead of the prose spanning a width the table no
+    // longer does.
+    let max_content = label_w + 2.0 * (value_w * 2.2) + 5.0 * 18.0;
+    let width = ui.available_width().min(max_content);
+    ui.scope(|ui| {
+        ui.set_max_width(width);
+        shielded_pools_body(ui, s, v1_own, value_w, label_w);
+    });
+}
+
+fn shielded_pools_body(
+    ui: &mut egui::Ui,
+    s: &Snapshot,
+    v1_own: Option<(u128, usize, u64)>,
+    value_w: f32,
+    label_w: f32,
+) {
+    let v1_state = PoolState::classify_v1(s.online, s.shielded_v1_available);
+    let v2_state = PoolState::classify_v2(s.online, s.shielded_v2.as_ref());
+    let rows = pool_rows(s, v1_own);
+
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = sp::M;
+        ui.label(
+            egui::RichText::new("SHIELDED POOLS")
+                .size(ty::MICRO)
+                .color(palette::text_dim()),
+        );
+        ui.label(
+            egui::RichText::new(
+                "Two independent pools. Value in one is not value in the other, and \
+                 neither can be spent into the other except through a transparent balance.",
+            )
+            .size(ty::SMALL)
+            .color(palette::text_dim()),
+        );
+    });
+    ui.add_space(sp::M);
 
     let gap = 18.0;
     let avail = ui.available_width();
@@ -1424,11 +1441,20 @@ fn shielded_pools_view(ui: &mut egui::Ui, s: &Snapshot, v1_own: Option<(u128, us
     let grid = |ui: &mut egui::Ui, headers: Vec<(&str, PoolState)>, pick: usize| {
         // `pick` is 0 for "both", 1 for v1 only, 2 for v2 only (the stacked mode).
         let cols = headers.len() + 1;
+        // Columns divide the available width, but are CAPPED. Letting them grow without
+        // limit was visibly wrong on a wide window: the two pools drifted to opposite
+        // edges of the screen with a void between them, and comparing a v1 figure to
+        // its v2 counterpart meant tracking a row across ~900 px of empty space. A
+        // comparison is only readable while both values stay in one eyeful, so the
+        // table stops widening and simply sits left-aligned once it has the room it
+        // needs. Whitespace at the right of a wide window is not wasted space here —
+        // it is the alternative to an unreadable table.
+        let max_col = value_w * 2.2;
         let col_w = if side_by_side {
             ((ui.available_width() - label_w - cols as f32 * gap) / headers.len() as f32)
-                .max(value_w)
+                .clamp(value_w, max_col)
         } else {
-            (ui.available_width() - label_w - 2.0 * gap).max(value_w)
+            (ui.available_width() - label_w - 2.0 * gap).clamp(value_w, max_col)
         };
         egui::Grid::new(format!("pool-grid-{pick}"))
             .num_columns(cols)
@@ -10791,7 +10817,18 @@ fn lan_ipv4() -> Option<String> {
 fn node_pid_path() -> PathBuf {
     // Legacy sov-rpcd pidfile cleanup — a fixed location (not per-network), since it
     // only reaps a leftover subprocess from older builds.
-    std::env::temp_dir().join("sov-station-node.pid")
+    //
+    // SCOPED BY DATA DIRECTORY, for the same reason the instance guard and the chain
+    // directory are. `stop_tracked_node` reads this file and KILLS the pid in it, and
+    // it runs on every single startup — so while this path was shared, launching any
+    // second Station (a dev build, a release candidate) would terminate the process
+    // recorded by the operator's install. That is the last member of the family of
+    // "a scratch build reaches into the live one" bugs; an override that isolates the
+    // wallet but leaves a kill-on-startup pointing at a shared file is not isolation.
+    match dev_override_dir() {
+        Some(d) => d.join("sov-station-node.pid"),
+        None => std::env::temp_dir().join("sov-station-node.pid"),
+    }
 }
 
 /// The PID recorded in the pidfile, if any.
@@ -11443,11 +11480,12 @@ mod tests {
             peer_config_path(Network::Mainnet),
             theme_config_path(),
             expose_rpc_config_path(),
+            // The pidfile matters most of all: `stop_tracked_node` KILLS the pid it
+            // finds here, on every startup. Shared, it makes launching a dev build
+            // terminate a process belonging to the operator's install.
+            node_pid_path(),
         ] {
-            assert!(
-                p.starts_with(scratch),
-                "preference file escaped the override: {p:?}"
-            );
+            assert!(p.starts_with(scratch), "path escaped the override: {p:?}");
         }
 
         // Unset ⇒ historical locations, unchanged. This is the "do not break what
@@ -11460,6 +11498,11 @@ mod tests {
         );
         assert!(theme_config_path().ends_with(".sov-station-theme"));
         assert!(peer_config_path(Network::Mainnet).ends_with(".sov-station-peer-mainnet"));
+        assert_eq!(
+            node_pid_path(),
+            std::env::temp_dir().join("sov-station-node.pid"),
+            "without the override the pidfile must stay where existing installs write it"
+        );
 
         match prev {
             Some(v) => std::env::set_var("SOV_STATION_DIR", v),
@@ -12551,6 +12594,63 @@ mod tests {
                 "content changed when reflowing: {counts:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_table_stops_widening_so_a_row_stays_readable_across() {
+        // On a wide window the columns must NOT keep spreading. Uncapped, the two
+        // pools drift to opposite edges and comparing a v1 figure with its v2
+        // counterpart means tracking a row across a void — which defeats the only
+        // reason the pools are drawn together.
+        //
+        // Measured as the horizontal distance between the leftmost painted text and
+        // the rightmost, which is the span an eye actually has to cross.
+        fn painted_span(w: f32) -> f32 {
+            let snap = live_like_snapshot();
+            let ctx = egui::Context::default();
+            let input = || egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(w, 2400.0),
+                )),
+                ..Default::default()
+            };
+            let run = |i| {
+                ctx.run(i, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        shielded_pools_view(ui, &snap, Some((500_000_000, 3, 12_500)));
+                    });
+                })
+            };
+            let _ = run(input());
+            let out = run(input());
+            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+            fn walk(shapes: &[egui::Shape], lo: &mut f32, hi: &mut f32) {
+                for s in shapes {
+                    match s {
+                        egui::Shape::Text(t) => {
+                            *lo = lo.min(t.pos.x);
+                            *hi = hi.max(t.pos.x + t.galley.size().x);
+                        }
+                        egui::Shape::Vec(v) => walk(v, lo, hi),
+                        _ => {}
+                    }
+                }
+            }
+            for cs in &out.shapes {
+                walk(std::slice::from_ref(&cs.shape), &mut lo, &mut hi);
+            }
+            hi - lo
+        }
+
+        let at_1200 = painted_span(1200.0);
+        let at_2600 = painted_span(2600.0);
+        assert!(
+            at_2600 <= at_1200 + 40.0,
+            "the table kept stretching with the window: {at_1200} -> {at_2600}"
+        );
+        // And it is genuinely bounded, not accidentally collapsed to nothing.
+        assert!(at_1200 > 300.0, "the table should still be substantial");
     }
 
     #[test]
