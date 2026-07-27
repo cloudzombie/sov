@@ -53,7 +53,8 @@ use sov_crypto::Keypair;
 use sov_primitives::{AccountId, Balance, Hash, GRAINS_PER_SOV};
 use sov_rpc::RpcClient;
 use sov_shielded::{
-    encode_shielded, encode_shielded_v2, shielded_transfer_with_change, unshield_amount_multi,
+    decode_shielded_v2, encode_shielded, encode_shielded_v2, shielded_transfer_with_change,
+    unshield_amount_multi,
     AnyAddress, NoteStore, Receiver, ShieldedBundle, ShieldedKey, ShieldedParams,
 };
 use sov_shielded_pq::bundle::SpendBundle;
@@ -214,7 +215,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         "shield2" => {
             // Transparent ledger -> pool v2. No input notes, so no scan and no
             // witnesses: the value enters through the transparent leg.
-            let usage = "usage: shield2 <seed_hex> <xus> [--fee <xus>] [--ed25519]";
+            let usage =
+                "usage: shield2 <seed_hex> <xus> [--to <xusq1…>] [--fee <xus>] [--ed25519]";
             let seed = seed_arg(&args, 3, usage)?;
             let sov: u128 = args.get(4).ok_or(usage)?.parse()?;
             let amount = Balance::from_sov(sov)?;
@@ -232,8 +234,22 @@ fn run() -> Result<(), Box<dyn Error>> {
             let key = PqShieldedKey::from_leaf_seed(&seed);
             let signer = signer_for(&args, &keypair)?;
             println!("proving the v2 shield (STARK, ~25s)...");
-            let bundle = build_shield(&key, &key.address(), amount_grains, fee_grains)
-                .map_err(|e| e.to_string())?;
+            // `--to` shields into SOMEONE ELSE's pool-v2 address — the v2
+            // equivalent of a v1 `transfer` to an `xus1…` recipient. Absent, the
+            // value shields to this wallet's own address. A pool-v1 address here
+            // would pay a different recipient in a different value space, so it
+            // is refused rather than coerced.
+            let to = match flag_value(&args, "--to") {
+                Some(a) => decode_shielded_v2(a.trim()).map_err(|e| {
+                    format!(
+                        "--to is not a pool-v2 (xusq1…) address: {e}. Pool-v1 xus1… addresses \
+                         cannot receive here — the pools are separate value spaces."
+                    )
+                })?,
+                None => key.address(),
+            };
+            let bundle =
+                build_shield(&key, &to, amount_grains, fee_grains).map_err(|e| e.to_string())?;
             let txid = submit_shielded_v2_bundle(&client, &keypair, &key, &signer, &bundle)?;
             println!("submitted — waiting for on-chain confirmation...");
             await_receipt(&client, &txid, 120)?;

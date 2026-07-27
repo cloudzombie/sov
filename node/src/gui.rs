@@ -2349,7 +2349,10 @@ impl V2Guard {
 #[derive(Clone, Copy, Debug)]
 enum V2Intent<'a> {
     /// Transparent -> pool v2. Spends no notes, so it needs no scan.
-    Shield { amount: Option<u128> },
+    /// `to` empty shields to THIS wallet; otherwise it must be a pool-v2
+    /// address (shielding to a third party, the v2 analogue of a v1 transfer
+    /// to an `xus1…` recipient).
+    Shield { to: &'a str, amount: Option<u128> },
     /// Pool v2 -> transparent. Spends notes; bounded by the window budget.
     Deshield { amount: Option<u128> },
     /// Pool v2 -> pool v2. Spends notes; the recipient must be pool v2.
@@ -2393,7 +2396,22 @@ fn v2_allows(g: &V2Guard, intent: V2Intent<'_>) -> Result<(), &'static str> {
     }
 
     match intent {
-        V2Intent::Shield { amount } => {
+        V2Intent::Shield { to, amount } => {
+            // A blank recipient means "shield to myself". A NON-blank one must
+            // be a real pool-v2 address: a pool-v1 address here would move
+            // value into a pool the named recipient cannot spend from.
+            let to = to.trim();
+            if !to.is_empty() {
+                if !to.starts_with("xusq1") {
+                    return Err(
+                        "the shield recipient must be a POOL-V2 (xusq1…) address, or blank to \
+                         shield to yourself — pool-v1 xus1… addresses are a separate value space",
+                    );
+                }
+                if decode_shielded_v2(to).is_err() {
+                    return Err("that pool-v2 address is not valid (checksum failed)");
+                }
+            }
             let a = amount.ok_or("enter an amount")?;
             if a == 0 {
                 return Err("enter an amount greater than zero");
@@ -2919,6 +2937,7 @@ pub struct Station {
     shielded: Arc<Mutex<ShieldedView>>,
     shielded_v2: Arc<Mutex<ShieldedV2View>>,
     shield_v2_amount_in: String,
+    shield_v2_to: String,
     deshield_v2_amount_in: String,
     private_v2_to: String,
     private_v2_amount: String,
@@ -3192,6 +3211,7 @@ impl Station {
             shielded: Arc::new(Mutex::new(ShieldedView::default())),
             shielded_v2: Arc::new(Mutex::new(ShieldedV2View::default())),
             shield_v2_amount_in: String::new(),
+            shield_v2_to: String::new(),
             deshield_v2_amount_in: String::new(),
             private_v2_to: String::new(),
             private_v2_amount: String::new(),
@@ -3923,6 +3943,7 @@ impl Station {
             finish(&self.action, "enter an amount");
             return;
         };
+        let shield_to = self.shield_v2_to.trim().to_string();
         let to = self.private_v2_to.trim().to_string();
         if matches!(what, V2Action::Send) && to.is_empty() {
             finish(&self.action, "enter a pool-v2 (xusq1…) recipient address");
@@ -3940,7 +3961,9 @@ impl Station {
         begin(&action, what.starting());
         std::thread::spawn(move || {
             let result = match what {
-                V2Action::Shield => shield_v2_amount(&rpc, seed, &account, grains, &action),
+                V2Action::Shield => {
+                    shield_v2_amount(&rpc, seed, &account, &shield_to, grains, &action)
+                }
                 V2Action::Deshield => deshield_v2_amount(&rpc, seed, &account, grains, &action),
                 V2Action::Send => zsend_v2_amount(&rpc, seed, &account, &to, grains, &action),
             };
@@ -9370,6 +9393,7 @@ impl Station {
                 let shield_v = v2_allows(
                     &guard,
                     V2Intent::Shield {
+                        to: &self.shield_v2_to,
                         amount: parse_xus(&self.shield_v2_amount_in),
                     },
                 );
@@ -9392,6 +9416,14 @@ impl Station {
                             do_shield_v2 = true;
                         }
                     });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("  to");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.shield_v2_to)
+                            .hint_text("xusq1… (blank = yourself)")
+                            .desired_width(360.0),
+                    );
                 });
                 if let Err(r) = shield_v {
                     if !self.shield_v2_amount_in.trim().is_empty() {
@@ -11035,6 +11067,7 @@ fn shield_v2_amount(
     rpc: &str,
     seed: [u8; 32],
     account: &str,
+    to: &str,
     amount_grains: u128,
     action: &Arc<Mutex<ActionState>>,
 ) -> Result<String, String> {
@@ -11042,8 +11075,16 @@ fn shield_v2_amount(
     let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(180));
     require_v2_live(&client)?;
     let key = PqShieldedKey::from_leaf_seed(&seed);
+    // Blank means "to myself"; otherwise shield into the named pool-v2
+    // address. Re-checked here, not just in the UI, so no caller can bypass it.
+    let dest = if to.trim().is_empty() {
+        key.address()
+    } else {
+        decode_shielded_v2(to.trim())
+            .map_err(|e| format!("the shield recipient is not a pool-v2 (xusq1…) address: {e}"))?
+    };
     begin(action, "proving the pool-v2 shield (STARK, ~25s)…");
-    let bundle = build_shield(&key, &key.address(), amount, 0).map_err(|e| e.to_string())?;
+    let bundle = build_shield(&key, &dest, amount, 0).map_err(|e| e.to_string())?;
     submit_v2_bundle(&client, seed, account, bundle, action)
 }
 
@@ -13789,6 +13830,7 @@ mod v2_guard_tests {
     fn all_intents(to: &str) -> Vec<V2Intent<'_>> {
         vec![
             V2Intent::Shield {
+                to: "",
                 amount: Some(1_000),
             },
             V2Intent::Deshield {
@@ -13879,7 +13921,14 @@ mod v2_guard_tests {
             ..permissive()
         };
         assert!(
-            v2_allows(&g, V2Intent::Shield { amount: Some(1) }).is_ok(),
+            v2_allows(
+                &g,
+                V2Intent::Shield {
+                    to: "",
+                    amount: Some(1)
+                }
+            )
+            .is_ok(),
             "a shield spends no notes, so it must not require a scan"
         );
         assert!(v2_allows(&g, V2Intent::Deshield { amount: Some(1) }).is_err());
@@ -13994,9 +14043,86 @@ mod v2_guard_tests {
         let addr = v2_addr();
         let g = permissive();
         for amount in [None, Some(0u128)] {
-            assert!(v2_allows(&g, V2Intent::Shield { amount }).is_err());
+            assert!(v2_allows(&g, V2Intent::Shield { to: "", amount }).is_err());
             assert!(v2_allows(&g, V2Intent::Deshield { amount }).is_err());
             assert!(v2_allows(&g, V2Intent::Send { to: &addr, amount }).is_err());
+        }
+    }
+
+    /// A shield may target a third party, but only a REAL pool-v2 address.
+    /// Blank means "to myself". A pool-v1 address here would move value into a
+    /// pool the named recipient cannot spend from — value they can see and
+    /// never touch — so it is refused.
+    #[test]
+    fn a_shield_may_only_target_a_real_pool_v2_address_or_yourself() {
+        let g = permissive();
+        let good = v2_addr();
+        let v1 = v1_addr();
+
+        assert!(
+            v2_allows(
+                &g,
+                V2Intent::Shield {
+                    to: "",
+                    amount: Some(1)
+                }
+            )
+            .is_ok(),
+            "blank must mean shield-to-self"
+        );
+        assert!(
+            v2_allows(
+                &g,
+                V2Intent::Shield {
+                    to: "   ",
+                    amount: Some(1)
+                }
+            )
+            .is_ok(),
+            "whitespace-only must also mean shield-to-self"
+        );
+        assert!(
+            v2_allows(
+                &g,
+                V2Intent::Shield {
+                    to: &good,
+                    amount: Some(1)
+                }
+            )
+            .is_ok(),
+            "a real pool-v2 recipient must be allowed"
+        );
+        for bad in [v1.as_str(), "garbage", "xusq1", "usa.reserve.sov"] {
+            assert!(
+                v2_allows(
+                    &g,
+                    V2Intent::Shield {
+                        to: bad,
+                        amount: Some(1)
+                    }
+                )
+                .is_err(),
+                "a shield was allowed to target {bad:?}"
+            );
+        }
+        // Every single-character corruption of a valid recipient must fail.
+        for i in 0..good.len() {
+            let mut b = good.clone();
+            let ch = if b.as_bytes()[i] == b'q' { 'p' } else { 'q' };
+            b.replace_range(i..i + 1, &ch.to_string());
+            if b != good {
+                assert!(
+                    v2_allows(
+                        &g,
+                        V2Intent::Shield {
+                            to: &b,
+                            amount: Some(1)
+                        }
+                    )
+                    .is_err(),
+                    "a corrupted shield recipient was accepted: {b}"
+                );
+            }
         }
     }
 
@@ -14144,12 +14270,22 @@ mod v2_guard_tests {
                                         let a = amount.unwrap_or(0);
                                         let positive = amount.is_some() && a > 0;
 
-                                        let want_shield = base && positive;
-                                        assert_eq!(
-                                            v2_allows(&g, V2Intent::Shield { amount }).is_ok(),
-                                            want_shield,
-                                            "shield {amount:?} under {g:?}"
-                                        );
+                                        // A shield spends no notes, so it needs
+                                        // no scan — but a NAMED recipient must
+                                        // still be a real pool-v2 address.
+                                        for sto in recipients {
+                                            let sto_ok = sto.trim().is_empty()
+                                                || (sto.trim().starts_with("xusq1")
+                                                    && decode_shielded_v2(sto.trim()).is_ok());
+                                            let want_shield = base && positive && sto_ok;
+                                            assert_eq!(
+                                                v2_allows(&g, V2Intent::Shield { to: sto, amount })
+                                                    .is_ok(),
+                                                want_shield,
+                                                "shield {amount:?} to {sto:?} under {g:?}"
+                                            );
+                                            checked += 1;
+                                        }
 
                                         let want_deshield =
                                             can_spend && positive && a <= balance && a <= cap;
@@ -14205,7 +14341,10 @@ mod v2_guard_tests {
                             window_budget: Some(5),
                         };
                         for intent in [
-                            V2Intent::Shield { amount: Some(50) },
+                            V2Intent::Shield {
+                                to: "",
+                                amount: Some(50),
+                            },
                             V2Intent::Deshield { amount: Some(50) },
                             V2Intent::Send {
                                 to: &good,
