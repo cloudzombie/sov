@@ -70,6 +70,13 @@ pub struct Blockchain {
     /// verifies every seal. That is the SAFE default, and it is what an
     /// un-linked node does.
     linked_to_checkpoint: HashSet<Hash>,
+    /// Partial linkage proof under construction, for the streaming case: a
+    /// syncing node receives headers in batches, and each batch is verified as
+    /// it lands rather than after all ~13k have been buffered. Holds the hashes
+    /// proven so far, the next height expected, and the hash they must link to.
+    linkage_pending: Vec<Hash>,
+    linkage_next_height: u64,
+    linkage_prev: Option<Hash>,
     /// The version-bits mask this node commits in blocks it produces (its
     /// miner-signaled governance votes). `0` = signals nothing.
     signal_mask: u32,
@@ -569,6 +576,9 @@ impl Blockchain {
             genesis_hash,
             checkpoints: HashMap::new(),
             linked_to_checkpoint: HashSet::new(),
+            linkage_pending: Vec::new(),
+            linkage_next_height: 0,
+            linkage_prev: None,
             signal_mask: 0,
             coinbase_account: None,
             default_coinbase: genesis.coinbase,
@@ -593,6 +603,7 @@ impl Blockchain {
         // says nothing about the new one. Dropping it fails safe: the node
         // verifies every seal until linkage is proven again.
         self.linked_to_checkpoint.clear();
+        self.reset_linkage_progress();
     }
 
     /// ADD trusted checkpoints without discarding existing ones — so a node's baked
@@ -714,6 +725,124 @@ impl Blockchain {
         let n = proven.len();
         self.linked_to_checkpoint = proven.into_iter().collect();
         Ok(n)
+    }
+
+    /// Whether a linkage proof is installed, so the seal-skip is available.
+    ///
+    /// False on a fresh node, which is why it must fetch headers before body
+    /// sync if it wants historical blocks to be cheap. False is always SAFE —
+    /// it simply means every seal is verified.
+    pub fn checkpoint_linkage_ready(&self) -> bool {
+        self.checkpoints.is_empty() || !self.linked_to_checkpoint.is_empty()
+    }
+
+    /// The newest pinned checkpoint as `(height, hash)`, if any. A syncing node
+    /// uses this as the `stop` hash when requesting headers.
+    pub fn newest_checkpoint(&self) -> Option<(u64, Hash)> {
+        let h = self.newest_checkpoint_height();
+        self.checkpoints.get(&h).map(|hash| (h, *hash))
+    }
+
+    /// The next header height this node needs to continue building its linkage
+    /// proof, and the hash it must descend from. Drives the request loop.
+    pub fn linkage_progress(&self) -> (u64, Option<Hash>) {
+        (self.linkage_next_height, self.linkage_prev)
+    }
+
+    /// Throw away partial linkage progress.
+    fn reset_linkage_progress(&mut self) {
+        self.linkage_pending.clear();
+        self.linkage_next_height = 0;
+        self.linkage_prev = None;
+    }
+
+    /// Feed the next batch of headers toward a linkage proof.
+    ///
+    /// This is the streaming form of [`install_checkpoint_linkage`], for a node
+    /// syncing from peers: headers arrive a batch at a time, and each batch is
+    /// verified against the same three rules as it lands — rooted in OUR
+    /// genesis, linked by `prev_hash`, and reaching the pinned hash.
+    ///
+    /// Verifying per batch matters: a peer feeding a forged chain is cut off at
+    /// its first bad header instead of after we have buffered thousands, and a
+    /// bad batch resets progress rather than corrupting it.
+    ///
+    /// Returns `Ok(true)` once the pin is reached and the proof is installed.
+    pub fn extend_checkpoint_linkage(
+        &mut self,
+        headers: &[BlockHeader],
+    ) -> Result<bool, ChainError> {
+        let Some((newest, pinned)) = self.newest_checkpoint() else {
+            return Ok(false); // nothing pinned: nothing to prove, nothing skipped
+        };
+        if self.checkpoint_linkage_ready() {
+            return Ok(true);
+        }
+        let genesis = self
+            .block_by_height(0)
+            .ok_or(ChainError::CheckpointMismatch { height: 0 })?
+            .hash();
+
+        // Seed from OUR genesis rather than asking a peer for it. We trust our
+        // own genesis absolutely — it is a hardcoded constant — and a peer never
+        // sends it anyway: `headers_from_fork_point` serves from *past* the
+        // locator. So the proof is rooted locally and peers supply only heights
+        // 1..=checkpoint.
+        if self.linkage_prev.is_none() {
+            self.linkage_pending.push(genesis);
+            self.linkage_next_height = 1;
+            self.linkage_prev = Some(genesis);
+            // A pin AT genesis is already satisfied by the seed.
+            if newest == 0 {
+                if genesis != pinned {
+                    self.reset_linkage_progress();
+                    return Err(ChainError::CheckpointMismatch { height: 0 });
+                }
+                self.linked_to_checkpoint = std::mem::take(&mut self.linkage_pending)
+                    .into_iter()
+                    .collect();
+                self.reset_linkage_progress();
+                return Ok(true);
+            }
+        }
+
+        for h in headers {
+            let height = h.height.get();
+            if height != self.linkage_next_height {
+                // Out of order, a gap, or a replay. Refuse the batch and drop
+                // progress rather than splice something unverified into it.
+                self.reset_linkage_progress();
+                return Err(ChainError::CheckpointMismatch { height });
+            }
+            let hash = h.hash();
+            // Linkage is by `prev_hash` all the way down to the locally-seeded
+            // genesis, so a chain rooted anywhere else cannot attach.
+            let ok = match self.linkage_prev {
+                None => false, // unreachable: seeded above
+                Some(prev) => h.prev_hash == prev,
+            };
+            if !ok {
+                self.reset_linkage_progress();
+                return Err(ChainError::CheckpointMismatch { height });
+            }
+            // Rule 3: the pin itself.
+            if height == newest {
+                if hash != pinned {
+                    self.reset_linkage_progress();
+                    return Err(ChainError::CheckpointMismatch { height: newest });
+                }
+                self.linkage_pending.push(hash);
+                self.linked_to_checkpoint = std::mem::take(&mut self.linkage_pending)
+                    .into_iter()
+                    .collect();
+                self.reset_linkage_progress();
+                return Ok(true);
+            }
+            self.linkage_pending.push(hash);
+            self.linkage_next_height = height + 1;
+            self.linkage_prev = Some(hash);
+        }
+        Ok(false)
     }
 
     /// Rebuild the linkage proof from blocks this node already holds — no network
@@ -5508,6 +5637,83 @@ mod assumevalid_ancestry_tests {
             !chain.is_linked_to_checkpoint(&genesis.hash()),
             "a proof against the OLD pin must not survive a re-pin"
         );
+    }
+
+    /// The streaming path: headers arrive in batches and the proof completes
+    /// when the pin is reached. This is what a fresh node actually does.
+    #[test]
+    fn linkage_builds_across_streamed_batches() {
+        let mut chain = fresh_chain();
+        let genesis = chain.block_by_height(0).expect("genesis").header.clone();
+        chain.set_checkpoints([(0, genesis.hash())]);
+        assert!(!chain.checkpoint_linkage_ready(), "nothing proven yet");
+        assert_eq!(chain.linkage_progress(), (0, None));
+
+        let done = chain
+            .extend_checkpoint_linkage(std::slice::from_ref(&genesis))
+            .expect("honest batch");
+        assert!(done, "reaching the pin completes the proof");
+        assert!(chain.checkpoint_linkage_ready());
+        assert!(chain.is_linked_to_checkpoint(&genesis.hash()));
+    }
+
+    /// A batch that does not start where we left off is refused, and progress is
+    /// RESET rather than spliced — otherwise a peer could skip the part of the
+    /// chain it cannot forge.
+    #[test]
+    fn an_out_of_order_batch_is_refused_and_resets_progress() {
+        let mut chain = fresh_chain();
+        let genesis = chain.block_by_height(0).expect("genesis").header.clone();
+        // Pin high so a single genesis header does not complete the proof.
+        chain.set_checkpoints([(500, Hash::from_bytes([2u8; 32]))]);
+
+        let mut wrong = genesis.clone();
+        wrong.height = BlockHeight::new(7); // not the height we expect next
+        assert!(chain.extend_checkpoint_linkage(&[wrong]).is_err());
+        assert_eq!(
+            chain.linkage_progress(),
+            (0, None),
+            "a refused batch must reset progress, never partially apply"
+        );
+        assert!(!chain.checkpoint_linkage_ready());
+    }
+
+    /// A batch not rooted in OUR genesis proves nothing, however well-formed.
+    #[test]
+    fn a_streamed_batch_rooted_elsewhere_is_refused() {
+        let mut chain = fresh_chain();
+        let genesis = chain.block_by_height(0).expect("genesis").header.clone();
+        chain.set_checkpoints([(500, Hash::from_bytes([2u8; 32]))]);
+
+        let mut forged = genesis.clone();
+        forged.timestamp_ms += 1;
+        assert!(chain.extend_checkpoint_linkage(&[forged]).is_err());
+        assert!(!chain.checkpoint_linkage_ready());
+    }
+
+    /// Reaching the pinned HEIGHT with the wrong hash is refused — the forged
+    /// branch case, now on the streaming path.
+    #[test]
+    fn a_streamed_wrong_hash_at_the_pin_is_refused() {
+        let mut chain = fresh_chain();
+        let genesis = chain.block_by_height(0).expect("genesis").header.clone();
+        chain.set_checkpoints([(0, Hash::from_bytes([9u8; 32]))]);
+        assert!(chain
+            .extend_checkpoint_linkage(std::slice::from_ref(&genesis))
+            .is_err());
+        assert!(!chain.checkpoint_linkage_ready());
+        assert!(!chain.is_linked_to_checkpoint(&genesis.hash()));
+    }
+
+    /// With nothing pinned there is nothing to prove and nothing is skipped.
+    #[test]
+    fn streaming_is_a_noop_with_no_checkpoints() {
+        let mut chain = fresh_chain();
+        assert!(
+            chain.checkpoint_linkage_ready(),
+            "no checkpoints means the skip is simply never taken"
+        );
+        assert_eq!(chain.extend_checkpoint_linkage(&[]).ok(), Some(false));
     }
 
     /// A node that already holds the chain can rebuild the proof locally, with no

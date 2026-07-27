@@ -87,6 +87,15 @@ impl Node {
         &self.chain
     }
 
+    /// The underlying chain, mutably.
+    ///
+    /// Narrow by intent: sync needs to feed verified checkpoint-linkage headers
+    /// in (`extend_checkpoint_linkage`), which is chain state rather than block
+    /// import. Block import keeps going through the node's own methods.
+    pub fn chain_mut(&mut self) -> &mut Blockchain {
+        &mut self.chain
+    }
+
     /// Number of READY (mineable) pooled transactions. Queued future-nonce
     /// entries are reported by [`mempool_queued_len`](Self::mempool_queued_len).
     pub fn mempool_len(&self) -> usize {
