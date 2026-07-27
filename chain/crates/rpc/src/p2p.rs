@@ -2101,39 +2101,38 @@ mod tests {
         let server = TcpNode::bind("127.0.0.1:0").unwrap();
         let client = TcpNode::bind("127.0.0.1:0").unwrap();
         client.connect(&server.local_addr().to_string()).unwrap();
-        let mut connected = false;
-        // Generous ceiling (~30s): under `cargo test --workspace` the CPU-bound
-        // Noise+ML-KEM handshake competes with hundreds of parallel tests, so a tight
-        // wait flaked on CI. The healthy path connects in well under a second.
-        for _ in 0..1500 {
-            if server.peer_count() >= 1 {
-                connected = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert!(connected, "peer connected");
 
+        // ONE loop that sweeps from the very start — deliberately, not for brevity.
+        //
+        // This test used to wait for `peer_count() >= 1` in one loop and only then
+        // begin sweeping in a second. That left a WINDOW between the two: the peer
+        // is silent by construction (the test never sends a Hello), so if it aged
+        // past a reaper during that window it left `connected_peers()` and
+        // `first_seen` could never be populated — the test then failed no matter how
+        // long it waited. That is why raising the timeout did not help: a 180s
+        // budget was exhausted just as reliably as a 10s one.
+        //
+        // The old comment claimed `peer_count()` counts TCP accepts while
+        // `connected_peers()` lists only post-handshake peers. That was simply
+        // wrong: both read `shared.peers` (len vs keys), so they can never disagree.
+        // Sweeping from t=0 stamps `first_seen` on the same observation that would
+        // have satisfied the old first loop, so no window exists to lose.
         let mut state = SyncState::new(None, None);
-        // Poll the sweep until the peer is recorded. `peer_count()` ticks up at the TCP
-        // accept, but `sweep_unauthenticated` reads `connected_peers()`, which only lists
-        // a peer once its Noise+ML-KEM handshake completes — a beat later under CI load.
-        // Retry rather than flake; HELLO_TIMEOUT (30s) is far longer than this wait, so a
-        // freshly-recorded peer is never dropped here.
         let mut recorded = false;
-        // 30s (matching the connect loop above): under the release gate's saturated CPU,
-        // the peer's Noise+ML-KEM (post-quantum) handshake — which is what makes it appear
-        // in connected_peers() and thus get a first_seen stamp — can take well over the
-        // old 10s window. HELLO_TIMEOUT (30s) still guarantees it isn't dropped meanwhile.
-        for _ in 0..1500 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             state.sweep_unauthenticated(&server);
             if state.first_seen.len() == 1 {
                 recorded = true;
                 break;
             }
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(10));
         }
-        assert!(recorded, "the new peer's first-seen time is recorded");
+        assert!(
+            recorded,
+            "the new peer's first-seen time is recorded (swept continuously for 60s; \
+             this test is serialized, so a miss is a real fault, not load)"
+        );
         assert!(
             server.peer_count() >= 1,
             "a just-connected peer is given time to authenticate, not dropped on sight"
