@@ -40,6 +40,8 @@ dashboard/dash2/
 # Root-level dated/scope HTML are personal working artifacts, not repo content.
 # (Product HTML lives in subdirs — explorer/, dashboard/, chain/specs/ — and stays.)
 /july*.html
+# Dated working lists, e.g. 7-27-26.html — same rule, numeric form.
+/[0-9]*.html
 /solanadex.html
 /*-scope.html
 /*-plan.html
