@@ -93,7 +93,7 @@ struct BlockRow {
 
 /// Pool v2 (post-quantum shielded) state, exactly as `sov_getShieldedV2Info` reported
 /// it. Every field is a real number the node supplied; nothing here is derived or
-/// estimated. The struct existing at all means the node ANSWERED — see [`PoolV2State`]
+/// estimated. The struct existing at all means the node ANSWERED — see [`PoolState`]
 /// for what its absence means.
 #[derive(Clone, Default, PartialEq, Eq)]
 struct ShieldedV2Info {
@@ -112,12 +112,51 @@ struct ShieldedV2Info {
     height: u64,
 }
 
-/// The three states a pool-v2 surface can be in. **These must never be collapsed.**
+/// Which shielded pool a surface is describing. The two are NOT interchangeable and
+/// the difference is the entire reason v2 exists, so it is carried in the type rather
+/// than left to whoever writes the label.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Pool {
+    /// Pool v1 — Zcash Orchard / Halo2. Live, and **not** post-quantum: its hiding is
+    /// discrete-log based, so a future quantum adversary who recorded the chain could
+    /// break the privacy of transactions made today ("harvest now, decrypt later").
+    V1,
+    /// Pool v2 — ML-KEM-768 note carriers with a STARK spend proof. Post-quantum, and
+    /// dormant: consensus signal bit 2 is not armed.
+    V2,
+}
+
+impl Pool {
+    fn name(self) -> &'static str {
+        match self {
+            Pool::V1 => "Pool v1",
+            Pool::V2 => "Pool v2",
+        }
+    }
+
+    /// The cryptography, named exactly. Never "quantum-safe" for v1 — the whole point.
+    fn crypto(self) -> &'static str {
+        match self {
+            Pool::V1 => "Orchard / Halo2",
+            Pool::V2 => "ML-KEM-768 / STARK",
+        }
+    }
+
+    /// The post-quantum claim, stated as the plain truth in both directions.
+    fn pq_claim(self) -> &'static str {
+        match self {
+            Pool::V1 => "NOT post-quantum",
+            Pool::V2 => "post-quantum",
+        }
+    }
+}
+
+/// The three states a shielded-pool surface can be in. **These must never be collapsed.**
 ///
 /// The whole reason this enum exists: an operator who reads "not active yet" as "empty"
 /// concludes their funds vanished, and an operator who reads "unavailable" as "empty"
 /// concludes the same. A bare `0` next to the word "balance" is capable of causing that
-/// mistake, so no v2 surface in this app renders one without the state beside it.
+/// mistake, so no pool surface in this app renders one without the state beside it.
 ///
 /// The distinction is not cosmetic — it is three genuinely different facts:
 ///   * [`Unavailable`](Self::Unavailable) — we asked and got nothing. We do not know
@@ -127,33 +166,49 @@ struct ShieldedV2Info {
 ///     been accepted, so no note can exist. Zero is a proof, not a balance.
 ///   * [`Active`](Self::Active)       — we know the value and it is a live balance.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PoolV2State {
+enum PoolState {
     Unavailable,
     Dormant,
     Active,
 }
 
-impl PoolV2State {
-    /// Classify from what the poller actually obtained. `online` is the node's
-    /// reachability; `info` is `Some` only when `sov_getShieldedV2Info` answered.
+impl PoolState {
+    /// Classify pool v2 from what the poller actually obtained. `online` is the node's
+    /// reachability; `info` is `Some` only when `sov_getShieldedV2Info` answered with a
+    /// reply we could read the activation flag out of.
     ///
     /// Note the ordering: an unreachable node is `Unavailable` even if a stale `info`
     /// is still in the snapshot, because a figure we can no longer confirm is not a
     /// figure we may present as current.
-    fn classify(online: bool, info: Option<&ShieldedV2Info>) -> Self {
+    fn classify_v2(online: bool, info: Option<&ShieldedV2Info>) -> Self {
         match (online, info) {
-            (false, _) | (true, None) => PoolV2State::Unavailable,
-            (true, Some(i)) if i.active => PoolV2State::Active,
-            (true, Some(_)) => PoolV2State::Dormant,
+            (false, _) | (true, None) => PoolState::Unavailable,
+            (true, Some(i)) if i.active => PoolState::Active,
+            (true, Some(_)) => PoolState::Dormant,
+        }
+    }
+
+    /// Classify pool v1. v1 has been live since genesis, so it is never `Dormant` — the
+    /// only question is whether this node told us anything. `available` is set by the
+    /// poller when `sov_getShieldedInfo` ANSWERED.
+    ///
+    /// It matters that this returns `Unavailable` rather than showing a zero: a node
+    /// that does not serve the method leaves the v1 figures unknown, and an operator
+    /// with a real shielded balance must not be shown "0".
+    fn classify_v1(online: bool, available: bool) -> Self {
+        if online && available {
+            PoolState::Active
+        } else {
+            PoolState::Unavailable
         }
     }
 
     /// The state as a WORD — always rendered, never replaced by colour alone.
     fn word(self) -> &'static str {
         match self {
-            PoolV2State::Unavailable => "UNAVAILABLE",
-            PoolV2State::Dormant => "NOT ACTIVE YET",
-            PoolV2State::Active => "ACTIVE",
+            PoolState::Unavailable => "UNAVAILABLE",
+            PoolState::Dormant => "NOT ACTIVE YET",
+            PoolState::Active => "ACTIVE",
         }
     }
 
@@ -161,37 +216,53 @@ impl PoolV2State {
     /// any colour-vision deficiency and any monochrome screenshot.
     fn glyph(self) -> &'static str {
         match self {
-            PoolV2State::Unavailable => "?", // we do not know
-            PoolV2State::Dormant => "◌",     // defined, not filled in
-            PoolV2State::Active => "●",      // live
+            PoolState::Unavailable => "?", // we do not know
+            PoolState::Dormant => "◌",     // defined, not filled in
+            PoolState::Active => "●",      // live
         }
     }
 
     fn color(self) -> egui::Color32 {
         match self {
-            PoolV2State::Unavailable => palette::unknown(),
-            PoolV2State::Dormant => palette::dormant(),
-            PoolV2State::Active => palette::success(),
+            PoolState::Unavailable => palette::unknown(),
+            PoolState::Dormant => palette::dormant(),
+            PoolState::Active => palette::success(),
         }
     }
 
-    /// The one-sentence explanation that must accompany any zero on a v2 surface.
+    /// True when figures from this pool are real readings that may be rendered as
+    /// numbers. False means every figure must render as [`num_unknown`] instead — the
+    /// single rule that keeps "we don't know" from ever printing as "0".
+    fn figures_are_real(self) -> bool {
+        !matches!(self, PoolState::Unavailable)
+    }
+
+    /// The one-sentence explanation that must accompany any zero on a pool surface.
     /// Phrased so that each state is unmistakable for the other two.
-    fn explanation(self) -> &'static str {
-        match self {
-            PoolV2State::Unavailable => {
+    fn explanation(self, pool: Pool) -> &'static str {
+        match (self, pool) {
+            (PoolState::Unavailable, Pool::V2) => {
                 "This node did not report pool-v2 state — it is unreachable, or it \
                  predates pool v2. The pool's value is UNKNOWN from here; it is not zero. \
                  Point the station at a node that serves sov_getShieldedV2Info."
             }
-            PoolV2State::Dormant => {
+            (PoolState::Unavailable, Pool::V1) => {
+                "This node did not report pool-v1 state — it is unreachable, or it does \
+                 not serve sov_getShieldedInfo. The pool's value is UNKNOWN from here; it \
+                 is not zero, and it is not a sign that anything is missing."
+            }
+            (PoolState::Dormant, _) => {
                 "Pool v2 is defined in consensus but its activation signal (bit 2) is not \
                  armed, so every v2 spend is rejected by every node. Nothing has ever \
                  entered this pool and nothing can yet — a zero here is the deployment \
                  being dormant, NOT a balance that went missing."
             }
-            PoolV2State::Active => {
+            (PoolState::Active, Pool::V2) => {
                 "Pool v2 is live at this height. The figures below are real balances."
+            }
+            (PoolState::Active, Pool::V1) => {
+                "Pool v1 is live and has been since genesis. The figures below are real \
+                 balances. v1 is NOT post-quantum — it is Orchard/Halo2."
             }
         }
     }
@@ -236,7 +307,7 @@ struct Snapshot {
     shielded_v1_available: bool,
     /// Pool v2 (post-quantum) state from `sov_getShieldedV2Info`. `None` means the
     /// node did not answer — it is offline, or too old to know pool v2 exists. That
-    /// is a THIRD state, distinct from both "dormant" and "empty"; see [`PoolV2State`].
+    /// is a THIRD state, distinct from both "dormant" and "empty"; see [`PoolState`].
     shielded_v2: Option<ShieldedV2Info>,
     error: Option<String>,
     updated_ms: u64,
@@ -987,6 +1058,283 @@ fn qr_widget(ui: &mut egui::Ui, data: &str, size: f32) {
 /// address reaches a counterparty are the clipboard and a file, so the app provides
 /// both rather than pretending a scan is possible.
 ///
+/// A grains figure rendered as XUS, or the explicit unknown dash when the pool's
+/// figures are not real readings. This is the choke point that enforces the honesty
+/// rule for every number on the pools view: `real == false` cannot print a digit.
+fn pool_amount(ui: &mut egui::Ui, label: &str, grains: u128, real: bool, size: f32) {
+    let shown = real.then(|| grains_to_xus_plain(grains));
+    stat(ui, label, shown.as_deref(), "XUS", size);
+}
+
+/// A count rendered in tabular figures, or the explicit unknown dash. Same rule.
+fn pool_count(ui: &mut egui::Ui, label: &str, n: u64, real: bool) {
+    let shown = real.then(|| group_thousands(n as u128));
+    stat(ui, label, shown.as_deref(), "", ty::BODY);
+}
+
+/// One pool's column in the two-pool view: identity, cryptography, state, figures.
+///
+/// The layout is identical for v1 and v2 on purpose. Two pools presented in two
+/// different shapes read as two unrelated features; presented in the same shape they
+/// read as what they are — the same mechanism, twice, with different cryptography and
+/// different activation status. That comparison is the whole point of the view, and it
+/// is what makes "v1 is live and NOT post-quantum, v2 is post-quantum and NOT live"
+/// legible in one glance instead of requiring the operator to hold two panels in mind.
+fn pool_column(
+    ui: &mut egui::Ui,
+    pool: Pool,
+    state: PoolState,
+    // The pool total the node reported, and whether we may print it.
+    pool_grains: u128,
+    // "Your" balance in this pool: `Some` only when a real scan produced it.
+    own: Option<u128>,
+    own_note: &str,
+    body: impl FnOnce(&mut egui::Ui, bool),
+) {
+    let real = state.figures_are_real();
+    card(ui, |ui| {
+        // ── Identity ──────────────────────────────────────────────────────────
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = sp::M;
+            ui.label(
+                egui::RichText::new(pool.name())
+                    .size(ty::SECTION)
+                    .strong()
+                    .color(palette::text()),
+            );
+            state_chip(ui, state.glyph(), state.word(), state.color());
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = sp::S;
+            ui.label(
+                egui::RichText::new(pool.crypto())
+                    .size(ty::MICRO)
+                    .color(palette::text_dim()),
+            );
+            ui.label(
+                egui::RichText::new("·")
+                    .size(ty::MICRO)
+                    .color(palette::text_dim()),
+            );
+            // The post-quantum claim is never implied by adjacency or colour: v1 says
+            // "NOT post-quantum" in words, on its own card, every time it is drawn.
+            ui.label(
+                egui::RichText::new(pool.pq_claim())
+                    .size(ty::MICRO)
+                    .strong()
+                    .color(match pool {
+                        Pool::V1 => palette::text_dim(),
+                        Pool::V2 => palette::dormant(),
+                    }),
+            );
+        });
+
+        ui.add_space(sp::M);
+
+        // ── Your balance — the one figure an operator looks for first ─────────
+        match own {
+            Some(g) => stat(
+                ui,
+                "your balance",
+                Some(&grains_to_xus_plain(g)),
+                "XUS",
+                ty::HERO,
+            ),
+            None => stat(ui, "your balance", None, "XUS", ty::HERO),
+        }
+        if !own_note.is_empty() {
+            ui.label(
+                egui::RichText::new(own_note)
+                    .size(ty::SMALL)
+                    .color(palette::text_dim()),
+            );
+        }
+
+        ui.add_space(sp::M);
+        ui.separator();
+        ui.add_space(sp::M);
+
+        // ── Pool-wide figures ─────────────────────────────────────────────────
+        pool_amount(ui, "pool total", pool_grains, real, ty::TITLE);
+        ui.add_space(sp::S);
+        body(ui, real);
+
+        // ── The explanation that must sit beside any zero ─────────────────────
+        ui.add_space(sp::M);
+        ui.label(
+            egui::RichText::new(state.explanation(pool))
+                .size(ty::SMALL)
+                .color(if real {
+                    palette::text_dim()
+                } else {
+                    palette::text()
+                }),
+        );
+    });
+}
+
+/// **The two-pool view.** SOV has two shielded pools, and the single most dangerous
+/// thing this app can do is let an operator confuse them — or confuse "not active yet"
+/// with "your money is gone".
+///
+/// So they are drawn side by side, in one frame, in one identical layout, with:
+///   * the cryptography NAMED on each (Orchard/Halo2 vs ML-KEM-768/STARK), and the
+///     post-quantum claim spelled out in words on both — including the negative one;
+///   * a three-state chip per pool (glyph + word + colour, never colour alone);
+///   * every figure routed through [`pool_amount`]/[`pool_count`], which physically
+///     cannot print a digit for a pool whose state is `Unavailable`;
+///   * a sentence under each pool that distinguishes its state from the other two.
+///
+/// It stacks to one column below ~720 px so a narrow window degrades to scrolling
+/// rather than to two unreadably-thin columns.
+fn shielded_pools_view(
+    ui: &mut egui::Ui,
+    s: &Snapshot,
+    // The wallet's scanned v1 position: `Some((balance_grains, notes, height))` only
+    // when THIS wallet has actually been scanned. `None` renders as "not scanned",
+    // never as zero — an unscanned wallet has an unknown balance, not an empty one.
+    v1_own: Option<(u128, usize, u64)>,
+) {
+    let v1_state = PoolState::classify_v1(s.online, s.shielded_v1_available);
+    let v2_state = PoolState::classify_v2(s.online, s.shielded_v2.as_ref());
+
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = sp::M;
+        ui.label(
+            egui::RichText::new("SHIELDED POOLS")
+                .size(ty::MICRO)
+                .color(palette::text_dim()),
+        );
+        ui.label(
+            egui::RichText::new(
+                "Two independent pools. Value in one is not value in the other, and \
+                 neither can be spent into the other except through a transparent balance.",
+            )
+            .size(ty::SMALL)
+            .color(palette::text_dim()),
+        );
+    });
+    ui.add_space(sp::S);
+
+    let v1_pool = s.shielded_pool.parse::<u128>().unwrap_or(0);
+    let v1_own_note = match (v1_state, v1_own) {
+        (PoolState::Unavailable, _) => "This node did not report the pool; your balance \
+                                        cannot be confirmed from here."
+            .to_string(),
+        (_, None) => "Not scanned yet — press \"Scan pool\" below. Your balance is unknown \
+                      until then, which is not the same as zero."
+            .to_string(),
+        (_, Some((_, notes, h))) => format!(
+            "{} unspent note(s), scanned to height {}",
+            group_thousands(notes as u128),
+            group_thousands(h as u128)
+        ),
+    };
+    // A v2 balance is not merely unknown, it is IMPOSSIBLE while dormant — consensus
+    // rejects every v2 spend, so no note can exist to be worth anything. That is a
+    // stronger and more reassuring statement than "unknown", and it is the true one.
+    let v2_own_note = match v2_state {
+        PoolState::Unavailable => "This node did not report the pool; nothing about your \
+                                   v2 position can be confirmed from here."
+            .to_string(),
+        PoolState::Dormant => "No v2 note can exist yet: consensus rejects every v2 spend \
+                               while bit 2 is unarmed. This is not a missing balance."
+            .to_string(),
+        PoolState::Active => "Pool v2 is active; this station does not yet scan it.".to_string(),
+    };
+
+    let narrow = ui.available_width() < 720.0;
+    let draw_v1 = |ui: &mut egui::Ui| {
+        pool_column(
+            ui,
+            Pool::V1,
+            v1_state,
+            v1_pool,
+            v1_own.map(|(b, _, _)| b),
+            &v1_own_note,
+            |ui, real| {
+                pool_amount(
+                    ui,
+                    "de-shieldable now",
+                    s.deshieldable_now.unwrap_or(0),
+                    real && s.deshieldable_now.is_some(),
+                    ty::BODY,
+                );
+                ui.add_space(sp::S);
+                pool_amount(
+                    ui,
+                    "de-shield cap / window",
+                    s.deshield_limit.unwrap_or(0),
+                    real && s.deshield_limit.is_some(),
+                    ty::BODY,
+                );
+                ui.add_space(sp::S);
+                let resets = s
+                    .deshield_resets_at
+                    .filter(|_| real)
+                    .map(|h| group_thousands(h as u128));
+                stat(ui, "window resets at block", resets.as_deref(), "", ty::BODY);
+            },
+        )
+    };
+    let draw_v2 = |ui: &mut egui::Ui| {
+        let info = s.shielded_v2.clone().unwrap_or_default();
+        pool_column(
+            ui,
+            Pool::V2,
+            v2_state,
+            info.pool_grains,
+            // Never a number: this station does not scan v2, so it has no reading to
+            // report — and while dormant there is provably nothing to read.
+            None,
+            &v2_own_note,
+            move |ui, real| {
+                pool_count(ui, "notes", info.note_count, real);
+                ui.add_space(sp::S);
+                pool_count(ui, "nullifiers spent", info.nullifier_count, real);
+                ui.add_space(sp::S);
+                pool_amount(
+                    ui,
+                    "de-shieldable now",
+                    info.deshieldable_now,
+                    real,
+                    ty::BODY,
+                );
+                ui.add_space(sp::S);
+                let window = real.then(|| group_thousands(info.deshield_window_blocks as u128));
+                stat(ui, "de-shield window", window.as_deref(), "blocks", ty::BODY);
+                ui.add_space(sp::S);
+                // The anchor is the Merkle root a spend proves membership against.
+                // Elided, because it is a 32-byte hash and only its ends are checkable.
+                ui.label(
+                    egui::RichText::new("ANCHOR")
+                        .size(ty::MICRO)
+                        .color(palette::text_dim()),
+                );
+                if real && !info.anchor.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label(num(short(&info.anchor)).size(ty::SMALL));
+                        copy_glyph(ui, &info.anchor);
+                    });
+                } else {
+                    ui.label(num_unknown().size(ty::BODY));
+                }
+            },
+        )
+    };
+
+    if narrow {
+        draw_v1(ui);
+        ui.add_space(sp::M);
+        draw_v2(ui);
+    } else {
+        ui.columns(2, |c| {
+            draw_v1(&mut c[0]);
+            draw_v2(&mut c[1]);
+        });
+    }
+}
+
 /// The address is PUBLIC key material — a receiving address, not a secret — so it is
 /// written with normal permissions, unlike the keystore.
 fn export_v2_address(addr: &str, owner_tag: &str) -> Result<String, String> {
@@ -1041,7 +1389,7 @@ fn v2_address_block(
     ui: &mut egui::Ui,
     addr: &str,
     owner_tag: &str,
-    state: PoolV2State,
+    state: PoolState,
     did_copy: &mut bool,
 ) {
     ui.add_space(sp::S);
@@ -1057,11 +1405,11 @@ fn v2_address_block(
         });
         ui.add_space(sp::S);
         ui.label(
-            egui::RichText::new(state.explanation())
+            egui::RichText::new(state.explanation(Pool::V2))
                 .size(ty::SMALL)
                 .color(palette::text()),
         );
-        if state != PoolV2State::Active {
+        if state != PoolState::Active {
             ui.add_space(sp::XS);
             ui.label(
                 egui::RichText::new(
@@ -1292,9 +1640,18 @@ fn grains_field(v: &Value, key: &str) -> u128 {
 /// Parse a `sov_getShieldedV2Info` reply. Pure — the unit under test for the wire→UI
 /// mapping, so a field rename on the node side fails a test rather than silently
 /// rendering zeros in a wallet.
-fn shielded_v2_info(v: &Value) -> ShieldedV2Info {
-    ShieldedV2Info {
-        active: v.get("active").and_then(Value::as_bool).unwrap_or(false),
+///
+/// Returns `None` unless the reply is an object carrying a BOOLEAN `active` field.
+/// That guard is load-bearing, not defensive tidiness: `active` is the only thing
+/// that separates [`PoolState::Dormant`] from [`PoolState::Active`], so a reply we
+/// cannot read it from is a reply we cannot classify — and an unclassifiable pool is
+/// UNAVAILABLE, never "dormant with a zero balance". Without this, a node answering
+/// `null`, or a future node that renames the flag, would render a confident
+/// "NOT ACTIVE YET — 0 XUS" that we did not actually learn from anybody.
+fn shielded_v2_info(v: &Value) -> Option<ShieldedV2Info> {
+    let active = v.get("active").and_then(Value::as_bool)?;
+    Some(ShieldedV2Info {
+        active,
         // `poolValue` is a Balance, which serialises as a grains string.
         pool_grains: field(v, "poolValue").parse::<u128>().unwrap_or(0),
         note_count: v.get("noteCount").and_then(Value::as_u64).unwrap_or(0),
@@ -1311,7 +1668,7 @@ fn shielded_v2_info(v: &Value) -> ShieldedV2Info {
             .and_then(Value::as_u64)
             .unwrap_or(0),
         height: v.get("height").and_then(Value::as_u64).unwrap_or(0),
-    }
+    })
 }
 
 /// One full poll of the node into a fresh snapshot.
@@ -1363,7 +1720,7 @@ fn poll(client: &RpcClient, cfg: &Config) -> Snapshot {
     s.shielded_v2 = client
         .call("sov_getShieldedV2Info", json!({}))
         .ok()
-        .map(|v| shielded_v2_info(&v));
+        .and_then(|v| shielded_v2_info(&v));
     if let Ok(v) = client.call("sov_getDifficulty", json!({})) {
         s.difficulty = field(&v, "sha256d");
         s.pow_algo = field(&v, "algo");
@@ -4990,87 +5347,221 @@ fn node_log_panel(ui: &mut egui::Ui, logs: &[String]) {
     });
 }
 
+/// The node's link state, as one value. Extracted from the ad-hoc `if` chain that used
+/// to compute it inline so the STATUS BAND and the rest of the panel cannot disagree
+/// about what the node is doing, and so it is unit-testable.
+///
+/// Each variant carries a DISTINCT GLYPH as well as a distinct colour. The previous
+/// code drew `●` in green for CONNECTED, `●` in red for NOT CONNECTED, and `●` in red
+/// for OFFLINE — three different facts separated by hue alone, which is exactly the
+/// failure mode a red-green colourblind operator cannot recover from. Now the shape
+/// differs too, and the word is always present.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LinkState {
+    /// No node answered at all.
+    Offline,
+    /// Connected to peers but still downloading a heavier chain.
+    Syncing,
+    /// At the tip with peers.
+    Connected,
+    /// The node is up but has no peers — it is not on the network.
+    Isolated,
+}
+
+impl LinkState {
+    fn of(s: &Snapshot) -> Self {
+        if !s.online {
+            return LinkState::Offline;
+        }
+        if s.syncing {
+            return LinkState::Syncing;
+        }
+        if s.peers.unwrap_or(0) > 0 {
+            LinkState::Connected
+        } else {
+            LinkState::Isolated
+        }
+    }
+
+    /// Shape first, so the state survives greyscale and colour-vision deficiency.
+    fn glyph(self) -> &'static str {
+        match self {
+            LinkState::Offline => "✕",
+            LinkState::Syncing => "⟳",
+            LinkState::Connected => "●",
+            LinkState::Isolated => "○",
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            LinkState::Offline => "OFFLINE",
+            LinkState::Syncing => "SYNCING",
+            LinkState::Connected => "CONNECTED",
+            LinkState::Isolated => "NOT CONNECTED",
+        }
+    }
+
+    fn color(self) -> egui::Color32 {
+        match self {
+            LinkState::Offline => palette::error(),
+            LinkState::Syncing => palette::warning(),
+            LinkState::Connected => palette::success(),
+            LinkState::Isolated => palette::error(),
+        }
+    }
+}
+
 fn node_panel(ui: &mut egui::Ui, s: &Snapshot) {
-    ui.heading("Node");
-    ui.add_space(6.0);
-    egui::Grid::new("node-kv")
-        .num_columns(2)
-        .spacing([24.0, 6.0])
-        .show(ui, |ui| {
-            kv(ui, "Chain", &s.chain_id);
-            kv(
-                ui,
-                "Height",
-                &s.height.map(|h| h.to_string()).unwrap_or_default(),
-            );
-            kv_copy(ui, "Head", &s.head_hash);
-            kv_copy(ui, "State root", &s.state_root);
-            kv(
-                ui,
-                "Supply (mined)",
-                &format!("{} XUS", xus(&s.supply_mined)),
-            );
-            kv(
-                ui,
-                "Supply (total)",
-                &format!("{} XUS", xus(&s.supply_total)),
-            );
-            kv(ui, "Difficulty", &s.difficulty);
-            kv(
-                ui,
-                "Mempool",
-                &s.mempool.map(|m| m.to_string()).unwrap_or_default(),
-            );
-            kv(
-                ui,
-                "Peers",
-                &s.peers.map(|p| p.to_string()).unwrap_or_default(),
+    ui.label(egui::RichText::new("Node").size(ty::TITLE).strong());
+    ui.add_space(sp::M);
+
+    // ── STATUS BAND ───────────────────────────────────────────────────────────
+    // The three things an operator checks first — am I connected, how far along, and
+    // how many peers — promoted above the reference data. They used to sit BELOW a
+    // nine-row key/value dump, which put the only actionable facts on the screen last.
+    let link = LinkState::of(s);
+    card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = sp::M;
+            state_chip(ui, link.glyph(), link.word(), link.color());
+            ui.label(
+                egui::RichText::new(match link {
+                    LinkState::Offline => "No node is answering. Start a local node below.",
+                    LinkState::Syncing => "Downloading a heavier chain from peers. Not mining.",
+                    LinkState::Connected => "At the tip, extending the chain.",
+                    LinkState::Isolated => {
+                        "The node is up but has no peers. Set the other machine's \
+                         address in Seed peer below and press Connect."
+                    }
+                })
+                .size(ty::SMALL)
+                .color(palette::text_dim()),
             );
         });
-    ui.add_space(8.0);
-    // Connection/sync status — color-coded and LIVE (the UI repaints continuously),
-    // through the mode-aware palette so it reads correctly in light AND dark:
-    //   green  = solid peer connection(s), at the tip, mining
-    //   amber  = connected but catching up (syncing)
-    //   red    = NOT connected (0 peers) or offline/error
-    let (green, orange, red) = (palette::success(), palette::warning(), palette::error());
-    if s.online {
-        let local_h = s.height.unwrap_or(0);
-        let best = s.best_peer_height.unwrap_or(0);
-        let peers = s.peers.unwrap_or(0);
-        if s.syncing {
-            let behind = best.saturating_sub(local_h);
-            ui.label(
-                egui::RichText::new(format!(
-                    "⟳ SYNCING — {local_h} / {best}  ({behind} behind) — downloading from {peers} peer(s)"
-                ))
-                .color(orange)
-                .strong(),
+        ui.add_space(sp::L);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 32.0;
+            // Height is the number an operator reads most often and the one that ticks,
+            // so it is the hero and it is in tabular figures.
+            stat(
+                ui,
+                "height",
+                s.height.map(|h| group_thousands(h as u128)).as_deref(),
+                "",
+                ty::HERO,
             );
-        } else if peers > 0 {
-            ui.label(
-                egui::RichText::new(format!(
-                    "● CONNECTED — {peers} peer(s), synced at height {local_h}, mining"
-                ))
-                .color(green)
-                .strong(),
+            // Only meaningful while syncing — shown then, absent otherwise, rather
+            // than permanently occupying the band with "0 behind".
+            if link == LinkState::Syncing {
+                let behind = s
+                    .best_peer_height
+                    .zip(s.height)
+                    .map(|(b, h)| group_thousands(b.saturating_sub(h) as u128));
+                stat(ui, "blocks behind", behind.as_deref(), "", ty::HERO);
+            }
+            stat(
+                ui,
+                "peers",
+                s.peers.map(|p| group_thousands(p as u128)).as_deref(),
+                "",
+                ty::HERO,
             );
-        } else {
-            ui.label(
-                egui::RichText::new(format!(
-                    "● NOT CONNECTED — 0 peers (height {local_h}). Set the OTHER machine's address \
-                     in the Seed peer field below and click Connect."
-                ))
-                .color(red)
-                .strong(),
+            stat(
+                ui,
+                "mempool",
+                s.mempool.map(|m| group_thousands(m as u128)).as_deref(),
+                "tx",
+                ty::HERO,
             );
-        }
-    } else {
+        });
+    });
+
+    ui.add_space(sp::L);
+
+    // ── Reference data — stable facts, demoted below the band ─────────────────
+    card(ui, |ui| {
         ui.label(
-            egui::RichText::new("● OFFLINE — no node running. Start a local node above.")
-                .color(red)
-                .strong(),
+            egui::RichText::new("CHAIN")
+                .size(ty::MICRO)
+                .color(palette::text_dim()),
         );
+        ui.add_space(sp::S);
+        egui::Grid::new("node-kv")
+            .num_columns(2)
+            .spacing([24.0, 6.0])
+            .show(ui, |ui| {
+                kv(ui, "Chain", &s.chain_id);
+                kv_copy(ui, "Head", &s.head_hash);
+                kv_copy(ui, "State root", &s.state_root);
+                kv(
+                    ui,
+                    "Supply (mined)",
+                    &format!("{} XUS", xus(&s.supply_mined)),
+                );
+                kv(
+                    ui,
+                    "Supply (total)",
+                    &format!("{} XUS", xus(&s.supply_total)),
+                );
+                kv(ui, "Difficulty", &fmt_difficulty(&s.difficulty));
+            });
+    });
+    // ── Sync progress — drawn ONLY while syncing ──────────────────────────────
+    // A progress bar that is permanently full is noise, so it appears only when it is
+    // reporting something. The numbers are always shown beside it: a bar alone encodes
+    // progress as length and colour, which is not readable as "12,570 of 12,604".
+    if link == LinkState::Syncing {
+        if let (Some(local_h), Some(best)) = (s.height, s.best_peer_height) {
+            ui.add_space(sp::M);
+            card(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("SYNC PROGRESS")
+                        .size(ty::MICRO)
+                        .color(palette::text_dim()),
+                );
+                ui.add_space(sp::S);
+                let frac = if best > 0 {
+                    (local_h as f32 / best as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_height(6.0)
+                        .fill(palette::warning()),
+                );
+                ui.add_space(sp::S);
+                ui.label(
+                    num(format!(
+                        "{} / {}   ({} behind)",
+                        group_thousands(local_h as u128),
+                        group_thousands(best as u128),
+                        group_thousands(best.saturating_sub(local_h) as u128),
+                    ))
+                    .size(ty::SMALL)
+                    .color(palette::text_dim()),
+                );
+            });
+        }
+    }
+}
+
+/// Difficulty as a readable magnitude. The node reports it as a bare float string
+/// (e.g. `"1234567.8901"`), which is neither groupable nor comparable at a glance;
+/// this groups the integer part and drops the fraction, which is below the resolution
+/// anyone reads difficulty at. Empty input stays empty so [`kv`] renders its dash —
+/// a value we did not receive must not become "0".
+fn fmt_difficulty(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    match raw.split('.').next().and_then(|i| i.parse::<u128>().ok()) {
+        Some(n) => group_thousands(n),
+        // Not a number we recognise — show exactly what the node said rather than
+        // silently substituting something prettier and wrong.
+        None => raw.to_string(),
     }
 }
 
@@ -7610,7 +8101,7 @@ impl Station {
                          phrase to see its v2 address.",
                     );
                 } else {
-                    let v2_state = PoolV2State::classify(s.online, s.shielded_v2.as_ref());
+                    let v2_state = PoolState::classify_v2(s.online, s.shielded_v2.as_ref());
                     v2_address_block(ui, &v2_addr, &v2_tag, v2_state, &mut did_copy);
                 }
             } else {
@@ -7768,31 +8259,47 @@ impl Station {
             }
 
             // Shielded pool: private balance (scanned by trial-decryption) + de-shield.
+            ui.add_space(sp::L);
             ui.separator();
-            ui.label(egui::RichText::new("Shielded pool (private)").strong());
+            ui.add_space(sp::M);
             let sv = self.shielded.lock().map(|v| v.clone()).unwrap_or_default();
             let for_this = sv.account == account;
-            ui.horizontal(|ui| {
-                if sv.scanning {
+            let snap = self.snapshot.lock().map(|s| s.clone()).unwrap_or_default();
+
+            // BOTH pools, side by side, before any control that acts on either. An
+            // operator has to be able to see which pool holds what — and which pool is
+            // not live — before touching a button that moves value.
+            //
+            // `v1_own` is `Some` only when THIS wallet has actually been scanned; a
+            // scan that has not run yields `None`, which the view renders as "unknown",
+            // never as a zero balance.
+            let v1_own = (for_this && sv.scanned_height > 0)
+                .then(|| (sv.balance as u128, sv.notes, sv.scanned_height));
+            shielded_pools_view(ui, &snap, v1_own);
+            if sv.scanning {
+                ui.add_space(sp::S);
+                ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("scanning the pool…");
-                } else if for_this && sv.scanned_height > 0 {
-                    ui.label(format!(
-                        "{} XUS  ({} unspent note(s), scanned to height {})",
-                        xus(&sv.balance.to_string()),
-                        sv.notes,
-                        sv.scanned_height
-                    ));
-                } else {
-                    ui.label(egui::RichText::new("not scanned yet").weak());
-                }
-            });
+                    ui.label(
+                        egui::RichText::new("scanning pool v1 by trial-decryption…")
+                            .size(ty::SMALL)
+                            .color(palette::text_dim()),
+                    );
+                });
+            }
+
+            ui.add_space(sp::L);
+            ui.label(
+                egui::RichText::new("Pool v1 — move value")
+                    .size(ty::SECTION)
+                    .strong(),
+            );
+            ui.add_space(sp::S);
             // De-shield a VARIABLE amount: move `amount` from the pool to this
             // account's transparent balance; any remainder stays shielded as change.
             // The amount is bounded by the wallet's shielded balance AND the node's
             // live per-window drain budget, both shown so the limit is never a
             // surprise (the de-shield circuit breaker is visible, not silent).
-            let snap = self.snapshot.lock().map(|s| s.clone()).unwrap_or_default();
             let budget_now = snap.deshieldable_now;
             // The de-shieldable ceiling: the smaller of the scanned shielded balance
             // and the current window budget (a de-shield over budget would be mined
