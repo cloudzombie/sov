@@ -4,6 +4,14 @@
 //! ```text
 //! sov-wallet <rpc_addr> balance  <account>
 //! sov-wallet <rpc_addr> transfer <seed_hex> <from> <to> <sov>
+//! sov-wallet <rpc_addr> shield2 <seed_hex> <xus> [--fee <xus>]
+//!     # transparent ledger -> POOL V2 (post-quantum). No input notes, so no
+//!     # scan: the value enters through the transparent leg.
+//! sov-wallet <rpc_addr> unshield2 <seed_hex> <to_transparent_account> <xus>
+//!     # pool v2 -> transparent; change returns SHIELDED, never burned
+//! sov-wallet <rpc_addr> z2-send <seed_hex> <to: xusq1…> <xus> [--signer <account>]
+//!     # fully-private pool-v2 transfer with shielded change. A pool-v1
+//!     # (xus1…) recipient is REFUSED: the pools are separate value spaces.
 //! sov-wallet <rpc_addr> z2-info
 //!     # POOL V2 (post-quantum) state: whether the deployment is active, pool
 //!     # value, note/nullifier counts, the current anchor, and the live
@@ -51,7 +59,8 @@ use sov_shielded::{
 use sov_shielded_pq::bundle::SpendBundle;
 use sov_shielded_pq::hd::PqShieldedKey;
 use sov_shielded_pq::scan::PqNoteStore;
-use sov_shielded_pq::wire::decode_bundle;
+use sov_shielded_pq::wallet::{build_shield, build_spend};
+use sov_shielded_pq::wire::{decode_bundle, encode_bundle};
 use sov_types::{Action, SignedTransaction, Transaction};
 use sov_wallet::{HdWallet, SOV_COIN_TYPE};
 
@@ -150,11 +159,12 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let addr = args.get(1).ok_or(
         "usage: sov-wallet <rpc_addr> \
-         <balance|transfer|z-balance|unshield|z-send|z2-info|z2-address|z2-balance|keygen> ...",
+         <balance|transfer|z-balance|unshield|z-send\
+         |z2-info|z2-address|z2-balance|shield2|unshield2|z2-send|keygen> ...",
     )?;
     let command = args.get(2).ok_or(
         "expected a command: balance | transfer | z-balance | unshield | z-send \
-             | z2-info | z2-address | z2-balance",
+             | z2-info | z2-address | z2-balance | shield2 | unshield2 | z2-send",
     )?;
     let client = RpcClient::new(addr.clone());
 
@@ -201,6 +211,130 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         // Scan the chain for the seed's shielded notes and report the private
         // balance next to the pool's live drain-limiter state. Read-only.
+        "shield2" => {
+            // Transparent ledger -> pool v2. No input notes, so no scan and no
+            // witnesses: the value enters through the transparent leg.
+            let usage = "usage: shield2 <seed_hex> <xus> [--fee <xus>] [--ed25519]";
+            let seed = seed_arg(&args, 3, usage)?;
+            let sov: u128 = args.get(4).ok_or(usage)?.parse()?;
+            let amount = Balance::from_sov(sov)?;
+            let amount_grains = u64::try_from(amount.grains()).map_err(|_| "amount too large")?;
+            let fee_grains = flag_value(&args, "--fee")
+                .map(|f| f.parse::<u128>().map(Balance::from_sov))
+                .transpose()?
+                .transpose()?
+                .map(|b| u64::try_from(b.grains()).unwrap_or(0))
+                .unwrap_or(0);
+            let keypair = keypair_from(seed, args.iter().any(|a| a == "--ed25519"));
+            let client = RpcClient::new(addr.clone()).with_timeout(Duration::from_secs(120));
+            require_v2_active(&client)?;
+
+            let key = PqShieldedKey::from_leaf_seed(&seed);
+            let signer = signer_for(&args, &keypair)?;
+            println!("proving the v2 shield (STARK, ~25s)...");
+            let bundle = build_shield(&key, &key.address(), amount_grains, fee_grains)
+                .map_err(|e| e.to_string())?;
+            let txid = submit_shielded_v2_bundle(&client, &keypair, &signer, &bundle)?;
+            println!("submitted — waiting for on-chain confirmation...");
+            await_receipt(&client, &txid, 120)?;
+            println!(
+                "shielded {} XUS into pool v2 (tx {})",
+                xus(amount.grains()),
+                txid.to_hex()
+            );
+        }
+        "unshield2" => {
+            // Pool v2 -> transparent. Change returns shielded, so a partial
+            // de-shield never burns the remainder.
+            let usage =
+                "usage: unshield2 <seed_hex> <to_transparent_account> <xus> [--fee <xus>] [--ed25519]";
+            let seed = seed_arg(&args, 3, usage)?;
+            let account = AccountId::new(args.get(4).ok_or(usage)?)?;
+            let sov: u128 = args.get(5).ok_or(usage)?.parse()?;
+            let amount = Balance::from_sov(sov)?;
+            let amount_grains = u64::try_from(amount.grains()).map_err(|_| "amount too large")?;
+            let fee_grains = flag_value(&args, "--fee")
+                .map(|f| f.parse::<u128>().map(Balance::from_sov))
+                .transpose()?
+                .transpose()?
+                .map(|b| u64::try_from(b.grains()).unwrap_or(0))
+                .unwrap_or(0);
+            let keypair = keypair_from(seed, args.iter().any(|a| a == "--ed25519"));
+            let client = RpcClient::new(addr.clone()).with_timeout(Duration::from_secs(120));
+            require_v2_active(&client)?;
+
+            let key = PqShieldedKey::from_leaf_seed(&seed);
+            let store = scan_notes_v2(&client, &key)?;
+            println!("proving the v2 de-shield (STARK, ~25s)...");
+            let built = build_spend(&key, &store, None, amount_grains, fee_grains)
+                .map_err(|e| e.to_string())?;
+            let txid = submit_shielded_v2_bundle(&client, &keypair, &account, &built.bundle)?;
+            println!("submitted — waiting for on-chain confirmation...");
+            await_receipt(&client, &txid, 120)?;
+            println!(
+                "de-shielded {} XUS -> {account} ({} XUS returned as shielded change) (tx {})",
+                xus(amount.grains()),
+                xus(u128::from(built.change_grains)),
+                txid.to_hex()
+            );
+        }
+        "z2-send" => {
+            // Fully-private pool-v2 transfer: sender, recipient and amount all
+            // stay in the pool; only the fee-paying carrier tx is visible.
+            let usage =
+                "usage: z2-send <seed_hex> <to: xusq1…> <xus> [--signer <account>] [--fee <xus>] [--ed25519]";
+            let seed = seed_arg(&args, 3, usage)?;
+            let to = args.get(4).ok_or(usage)?;
+            let sov: u128 = args.get(5).ok_or(usage)?.parse()?;
+            let amount = Balance::from_sov(sov)?;
+            let amount_grains = u64::try_from(amount.grains()).map_err(|_| "amount too large")?;
+            let fee_grains = flag_value(&args, "--fee")
+                .map(|f| f.parse::<u128>().map(Balance::from_sov))
+                .transpose()?
+                .transpose()?
+                .map(|b| u64::try_from(b.grains()).unwrap_or(0))
+                .unwrap_or(0);
+            let keypair = keypair_from(seed, args.iter().any(|a| a == "--ed25519"));
+
+            // The recipient must be a POOL-V2 address. A v1 `xus1…` cannot
+            // receive here — the pools are separate value spaces and a note in
+            // one is not a note in the other, so routing across them silently
+            // would send to an address that can never spend it.
+            let recipient = match AnyAddress::parse(to)
+                .map_err(|e| format!("invalid recipient `{to}`: {e}"))?
+                .receiver()
+            {
+                Receiver::ShieldedV2(a) => *a,
+                Receiver::Shielded(_) => {
+                    return Err("that is a pool-v1 (xus1…) address; use `z-send` for v1. \
+                                Pool v1 and pool v2 are separate value spaces."
+                        .into())
+                }
+                Receiver::Transparent(_) => {
+                    return Err("recipient must be a pool-v2 (xusq1…) address; \
+                                use `transfer` for transparent sends"
+                        .into())
+                }
+            };
+
+            let client = RpcClient::new(addr.clone()).with_timeout(Duration::from_secs(120));
+            require_v2_active(&client)?;
+            let key = PqShieldedKey::from_leaf_seed(&seed);
+            let store = scan_notes_v2(&client, &key)?;
+            let signer = signer_for(&args, &keypair)?;
+            println!("proving the private v2 transfer (STARK, ~25s)...");
+            let built = build_spend(&key, &store, Some(&recipient), amount_grains, fee_grains)
+                .map_err(|e| e.to_string())?;
+            let txid = submit_shielded_v2_bundle(&client, &keypair, &signer, &built.bundle)?;
+            println!("submitted — waiting for on-chain confirmation...");
+            await_receipt(&client, &txid, 120)?;
+            println!(
+                "sent {} XUS privately in pool v2 ({} XUS shielded change) (tx {})",
+                xus(amount.grains()),
+                xus(u128::from(built.change_grains)),
+                txid.to_hex()
+            );
+        }
         "z2-info" => {
             // Pool v2 (post-quantum) state, for a node that serves it. Kept
             // separate from `z2-balance` so an operator can inspect the pool
@@ -692,6 +826,56 @@ fn print_shielded_info(client: &RpcClient) -> Result<(), Box<dyn Error>> {
 /// Wrap a proved shielded `bundle` in a carrier transaction signed by `signer`'s
 /// keypair and submit it: queue-aware next nonce + Phase-2 signing domain (`None`
 /// = dormant/legacy), exactly as SOV Station submits shielded actions.
+/// Submit a pool-v2 bundle as an `Action::ShieldedV2` transaction.
+///
+/// The mirror of [`submit_shielded_bundle`] for v1. The two are deliberately
+/// separate functions over distinct bundle types rather than one generic path:
+/// a v1 bundle and a v2 bundle can then never be submitted under the other's
+/// action, which is the kind of crossing a shared code path invites.
+/// The transparent account that carries (and pays the fee for) a v2 spend.
+/// Defaults to the seed's implicit id, matching the v1 commands.
+fn signer_for(args: &[String], keypair: &Keypair) -> Result<AccountId, Box<dyn Error>> {
+    Ok(match flag_value(args, "--signer") {
+        Some(s) => AccountId::new(&s)?,
+        None => keypair.public_key().implicit_account_id(),
+    })
+}
+
+fn submit_shielded_v2_bundle(
+    client: &RpcClient,
+    keypair: &Keypair,
+    signer: &AccountId,
+    bundle: &SpendBundle,
+) -> Result<Hash, Box<dyn Error>> {
+    let nonce = client.next_nonce(signer)?;
+    let domain = client.signing_domain()?;
+    let tx = Transaction {
+        signer: signer.clone(),
+        public_key: keypair.public_key(),
+        nonce,
+        action: Action::ShieldedV2 {
+            bundle: encode_bundle(bundle),
+        },
+    };
+    let stx = SignedTransaction::sign_in(tx, keypair, domain.as_ref())?;
+    Ok(client.submit_transaction(&stx)?)
+}
+
+/// Refuse early if pool v2 is not active on the connected chain.
+///
+/// Signal bit 2 is unarmed, so consensus rejects every v2 spend. Building one
+/// costs ~25 seconds of proving before the node refuses it; saying so up front
+/// costs nothing and tells the operator the real reason rather than letting
+/// them read a rejection as a broken wallet.
+fn require_v2_active(client: &RpcClient) -> Result<(), Box<dyn Error>> {
+    let info = client.call("sov_getShieldedV2Info", json!({}))?;
+    if info.get("active").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    Err("pool v2 is NOT ACTIVE on this chain: consensus signal bit 2 is unarmed,          so every v2 spend is rejected by every node. This is the deployment          being dormant, not a problem with your wallet."
+        .into())
+}
+
 fn submit_shielded_bundle(
     client: &RpcClient,
     keypair: &Keypair,

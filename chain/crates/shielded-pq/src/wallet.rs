@@ -269,7 +269,13 @@ pub fn build_shield(
     )?;
     let outputs = vec![note];
     let (proof_bytes, public_inputs) = prove_bundle(&[], &outputs, transparent_in, 0, fee_grains)?;
-    finish(key, public_inputs, proof_bytes, &outputs, std::slice::from_ref(to))
+    finish(
+        key,
+        public_inputs,
+        proof_bytes,
+        &outputs,
+        std::slice::from_ref(to),
+    )
 }
 
 /// Encrypt each real output to its recipient and authorize the bundle.
