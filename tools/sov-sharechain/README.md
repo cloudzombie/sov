@@ -89,6 +89,24 @@ attacker-chosen. The tests assert what that is worth: every truncation of every
 message, and every single-bit corruption of a batch, must return rather than
 panic or allocate wildly — a panic in a decoder is a remote crash.
 
-**Still to wire:** the socket loop itself (listener, dial, peer set). The format
-and the ingest rules — the parts hostile bytes actually reach — are done and
-tested.
+The socket loop is in: `GossipNode` binds a listener, dials peers, keeps a peer
+set, and runs a read thread per link. Two nodes complete a real Noise + ML-KEM
+handshake and a share crosses the wire intact — asserted end to end, including
+the receiver validating it with `ShareChain::accept` rather than trusting it
+because it arrived over an encrypted link.
+
+Bounds exist because each is a limit on what a stranger can make the process do:
+`MAX_PEERS` (slots are finite; without a cap one host fills them all and no
+honest peer gets in), and an inbox bounded in **bytes** rather than messages,
+because a message count says nothing about memory.
+
+## Status
+
+Complete: share DAG, heaviest-work fork choice, uncle credit, bounded PPLNS
+window, exact payouts, the block-must-pay-the-window rule, the LWMA share
+retarget, the gossip wire format, and the gossip socket loop. 34 tests.
+
+What remains is operational rather than structural — running it: choosing a
+share target relative to network difficulty, seeding a peer list, and the
+sharechain-across-tx-domain-activation question flagged in
+`notes/activation-pool-mining.md`.

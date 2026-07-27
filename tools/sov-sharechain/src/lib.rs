@@ -43,6 +43,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod gossip;
 pub mod wire;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
