@@ -430,6 +430,162 @@ mod tests {
         }
     }
 
+    /// Build a real de-shield bundle of `xus` XUS, with the pool seeded so its
+    /// anchor is known. Returns (ledger, encoded bundle).
+    fn deshield_fixture(k: &PqShieldedKey, pool_xus: u128, out_xus: u128) -> (Ledger, Vec<u8>) {
+        let (shield, _) = shield_bundle(k, pool_xus, 0);
+        let mut ledger = Ledger::default();
+        let commitments: Vec<PqDigest> = shield
+            .public_inputs
+            .output_commitments
+            .iter()
+            .zip(shield.public_inputs.output_dummy)
+            .filter_map(|(c, dummy)| (!dummy).then_some(*c))
+            .collect();
+        ledger
+            .apply_shielded_v2(&[], &commitments)
+            .expect("seed the pool");
+        ledger
+            .add_shielded_v2_value(Balance::from_grains(pool_xus * XUS))
+            .expect("seed pool value");
+
+        let mut store = sov_shielded_pq::scan::PqNoteStore::new(0);
+        store.ingest_block(k, 1, [9u8; 32], &[&shield]);
+        let out = u64::try_from(out_xus * XUS).expect("fits");
+        let built = build_spend(k, &store, None, out, 0).expect("build de-shield");
+        let mut spend = built.bundle;
+        authorize_for_carrier(&mut spend, k, SIGNER, 0).expect("carrier-bind");
+        (ledger, encode_bundle(&spend))
+    }
+
+    /// The pool-v2 de-shield DRAIN LIMITER must actually bind. It is the
+    /// circuit breaker on how fast value can leave the pool, and it had no
+    /// behavioural test at all — only a replay assertion that its counter
+    /// round-trips.
+    #[test]
+    fn the_drain_limiter_refuses_a_deshield_over_the_window_budget() {
+        let k = key(20);
+        let (ledger, bytes) = deshield_fixture(&k, 5, 2);
+        let mut mining = policy();
+        mining.deshield_window_blocks = 100;
+        // A budget BELOW the 2 XUS leaving the pool.
+        mining.deshield_limit_grains = XUS;
+
+        let out = verify_bundle_for_carrier(
+            &bytes,
+            &ledger,
+            &mining,
+            1,
+            &signer(),
+            0,
+            Balance::from_grains(10 * XUS),
+        );
+        assert!(
+            matches!(out, Err(ShieldedV2Error::DrainLimit)),
+            "a de-shield over the window budget must be refused, got {out:?}"
+        );
+    }
+
+    /// ...and must NOT bind when the de-shield fits, reporting the window
+    /// update the block will persist. A limiter that refuses everything is as
+    /// broken as one that refuses nothing.
+    #[test]
+    fn the_drain_limiter_permits_a_deshield_within_budget_and_meters_it() {
+        let k = key(21);
+        let (ledger, bytes) = deshield_fixture(&k, 5, 2);
+        let mut mining = policy();
+        mining.deshield_window_blocks = 100;
+        mining.deshield_limit_grains = 3 * XUS;
+
+        let effects = verify_bundle_for_carrier(
+            &bytes,
+            &ledger,
+            &mining,
+            50,
+            &signer(),
+            0,
+            Balance::from_grains(10 * XUS),
+        )
+        .expect("a de-shield within budget must verify");
+        assert_eq!(effects.deshield_out.grains(), 2 * XUS);
+        let (start, spent) = effects
+            .window_update
+            .expect("a de-shield must meter the window");
+        assert_eq!(spent.grains(), 2 * XUS, "the GROSS leg is metered");
+        // A fresh ledger's window is (0, 0): it opened at genesis and, at
+        // height 50 with a 100-block window, has NOT elapsed — so the de-shield
+        // joins that open window rather than starting a new one. (The reset
+        // path is asserted by `an_elapsed_window_resets_the_drain_budget`.)
+        assert_eq!(start, 0, "the genesis window is still open at height 50");
+    }
+
+    /// The window RESETS. Value already drained in an elapsed window must not
+    /// keep blocking new de-shields forever.
+    #[test]
+    fn an_elapsed_window_resets_the_drain_budget() {
+        let k = key(22);
+        let (mut ledger, bytes) = deshield_fixture(&k, 5, 2);
+        let mut mining = policy();
+        mining.deshield_window_blocks = 100;
+        mining.deshield_limit_grains = 3 * XUS;
+
+        // A window opened at height 10 that has already spent its budget.
+        ledger.set_deshield_v2_window(10, Balance::from_grains(3 * XUS));
+
+        // Inside that window (height 50), a further 2 XUS is over budget.
+        let inside = verify_bundle_for_carrier(
+            &bytes,
+            &ledger,
+            &mining,
+            50,
+            &signer(),
+            0,
+            Balance::from_grains(10 * XUS),
+        );
+        assert!(
+            matches!(inside, Err(ShieldedV2Error::DrainLimit)),
+            "the spent budget must still bind inside the window, got {inside:?}"
+        );
+
+        // Once the window has elapsed (height 10 + 100), the budget is fresh.
+        let after = verify_bundle_for_carrier(
+            &bytes,
+            &ledger,
+            &mining,
+            110,
+            &signer(),
+            0,
+            Balance::from_grains(10 * XUS),
+        )
+        .expect("an elapsed window must reset the budget");
+        let (start, spent) = after.window_update.expect("metered");
+        assert_eq!(start, 110, "the reset window starts at the current height");
+        assert_eq!(spent.grains(), 2 * XUS, "and counts only this de-shield");
+    }
+
+    /// A disabled limiter (window = 0) meters nothing — the configuration the
+    /// dev/test chains run, which must not silently start rejecting.
+    #[test]
+    fn a_disabled_limiter_meters_nothing() {
+        let k = key(23);
+        let (ledger, bytes) = deshield_fixture(&k, 5, 2);
+        let mut mining = policy();
+        mining.deshield_window_blocks = 0;
+        mining.deshield_limit_grains = 0;
+
+        let effects = verify_bundle_for_carrier(
+            &bytes,
+            &ledger,
+            &mining,
+            1,
+            &signer(),
+            0,
+            Balance::from_grains(10 * XUS),
+        )
+        .expect("a disabled limiter must not refuse");
+        assert!(effects.window_update.is_none(), "nothing to persist");
+    }
+
     /// THE double-spend test. A note whose nullifier is already on-chain must
     /// be refused — this is the property that makes the pool sound, and it had
     /// no test at any layer before now.
