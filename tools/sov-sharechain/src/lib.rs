@@ -45,6 +45,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use sov_mining::Difficulty;
 use sov_primitives::AccountId;
 
 /// A share's identity — the hash of the block candidate it seals.
@@ -80,6 +81,20 @@ pub const PPLNS_WINDOW: usize = 1_000;
 /// Ethereum paid uncles.
 pub const UNCLE_WEIGHT_PCT: u128 = 75;
 
+/// The share interval the retarget aims for, in milliseconds.
+///
+/// ~10s is short enough that a small miner sees frequent credit (the entire
+/// reason to pool) and long enough that share gossip does not swamp the network
+/// or produce orphans faster than peers can reference them as uncles.
+pub const SHARE_TARGET_INTERVAL_MS: u64 = 10_000;
+
+/// How many recent shares the retarget averages over.
+///
+/// The same window length the chain's own LWMA-1 uses. Long enough to be stable
+/// under noise, short enough to follow a real hashrate change within a couple of
+/// minutes at a 10s interval.
+pub const RETARGET_WINDOW: usize = 45;
+
 /// One share: a block candidate that met the share target, plus the sharechain
 /// metadata that makes it accountable.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +113,10 @@ pub struct Share {
     pub work: u128,
     /// Whether this share ALSO met the network target, i.e. it is a real block.
     pub is_block: bool,
+    /// When the share was found, in milliseconds. Feeds the retarget; a share's
+    /// own timestamp is self-reported, which is exactly why the LWMA clamps
+    /// every solve time rather than trusting it.
+    pub timestamp_ms: u64,
 }
 
 /// Why a share was refused.
@@ -358,6 +377,43 @@ impl ShareChain {
         Ok(())
     }
 
+    /// The share difficulty the NEXT share should be mined at.
+    ///
+    /// Delegates to the chain's own `Difficulty::lwma` — the identical LWMA-1
+    /// used for blocks — over the last [`RETARGET_WINDOW`] shares of the best
+    /// branch, aiming at [`SHARE_TARGET_INTERVAL_MS`].
+    ///
+    /// It is deliberately NOT a second implementation. A difficulty rule copied
+    /// into a second crate is a second thing that can drift, and share
+    /// accounting depends on this being exactly right. The LWMA already clamps
+    /// each solve time to `[1, 6·T]`, which matters more here than on the chain:
+    /// share timestamps are self-reported by whoever found them, so a miner who
+    /// lies about timing must not be able to move everyone's difficulty.
+    ///
+    /// Returns [`Difficulty::MIN`] before there is any history to average.
+    pub fn next_share_difficulty(&self) -> Difficulty {
+        // Best branch, newest first — take one extra so N solve times need N+1
+        // timestamps.
+        let branch = self.best_branch();
+        if branch.len() < 2 {
+            return Difficulty::MIN;
+        }
+        let take = (RETARGET_WINDOW + 1).min(branch.len());
+        let recent: Vec<&Share> = branch.into_iter().take(take).collect();
+
+        // LWMA expects OLDEST-first, and weights later entries more heavily.
+        let mut diffs: Vec<u128> = Vec::with_capacity(take - 1);
+        let mut solvetimes: Vec<u64> = Vec::with_capacity(take - 1);
+        for pair in recent.windows(2).rev() {
+            let (newer, older) = (pair[0], pair[1]);
+            diffs.push(newer.work);
+            // Saturating: a non-monotonic timestamp yields 0, which the LWMA
+            // clamps up to 1 rather than underflowing.
+            solvetimes.push(newer.timestamp_ms.saturating_sub(older.timestamp_ms));
+        }
+        Difficulty::lwma(&diffs, &solvetimes, SHARE_TARGET_INTERVAL_MS)
+    }
+
     /// The sharechain height of a known share.
     pub fn height_of(&self, id: &ShareId) -> Option<u64> {
         self.entries.get(id).map(|e| e.height)
@@ -384,6 +440,9 @@ mod tests {
             finder: acct(finder),
             work,
             is_block: false,
+            // Perfectly on-interval by default, so tests that are not about
+            // timing are not accidentally about timing.
+            timestamp_ms: (n as u64) * SHARE_TARGET_INTERVAL_MS,
         }
     }
 
@@ -627,6 +686,7 @@ mod tests {
                     finder: acct("current.sov"),
                     work: 100,
                     is_block: false,
+                    timestamp_ms: (i as u64) * SHARE_TARGET_INTERVAL_MS,
                 },
                 0,
                 &Payouts::new(),
@@ -640,6 +700,120 @@ mod tests {
             "work older than the window must not earn — that is what PPLNS means"
         );
         assert_eq!(p.get(&acct("current.sov")), Some(&1_000_000));
+    }
+
+    /// Build a chain whose shares arrive every `interval_ms`, all at `work`.
+    fn timed_chain(n: u8, work: u128, interval_ms: u64) -> ShareChain {
+        let mut sc = ShareChain::new();
+        let mut prev = None;
+        for i in 0..n {
+            let mut s = share(i, prev, "alice.sov", work);
+            s.timestamp_ms = (i as u64) * interval_ms;
+            sc.accept(s, 0, &Payouts::new()).expect("accept");
+            prev = Some(id(i));
+        }
+        sc
+    }
+
+    /// Shares arriving exactly on the target interval must hold difficulty
+    /// roughly steady — a retarget that drifts while nothing changed would walk
+    /// the interval away from 10s on its own.
+    #[test]
+    fn on_interval_shares_hold_difficulty_steady() {
+        let sc = timed_chain(50, 10_000, SHARE_TARGET_INTERVAL_MS);
+        let next = sc.next_share_difficulty().0;
+        let ratio = next as f64 / 10_000.0;
+        assert!(
+            (0.8..=1.25).contains(&ratio),
+            "steady hashrate must hold difficulty steady, got x{ratio:.3}"
+        );
+    }
+
+    /// Shares arriving FASTER than target mean more hashrate arrived, so the
+    /// next share must be harder — otherwise the interval collapses and share
+    /// gossip swamps the network.
+    #[test]
+    fn faster_shares_raise_the_difficulty() {
+        let steady = timed_chain(50, 10_000, SHARE_TARGET_INTERVAL_MS)
+            .next_share_difficulty()
+            .0;
+        let fast = timed_chain(50, 10_000, SHARE_TARGET_INTERVAL_MS / 4)
+            .next_share_difficulty()
+            .0;
+        assert!(
+            fast > steady,
+            "4x faster shares must raise difficulty: fast {fast} vs steady {steady}"
+        );
+    }
+
+    /// Shares arriving SLOWER mean hashrate left, so the next share must be
+    /// easier — otherwise a shrinking pool stops paying anyone.
+    #[test]
+    fn slower_shares_lower_the_difficulty() {
+        let steady = timed_chain(50, 10_000, SHARE_TARGET_INTERVAL_MS)
+            .next_share_difficulty()
+            .0;
+        let slow = timed_chain(50, 10_000, SHARE_TARGET_INTERVAL_MS * 4)
+            .next_share_difficulty()
+            .0;
+        assert!(
+            slow < steady,
+            "4x slower shares must lower difficulty: slow {slow} vs steady {steady}"
+        );
+    }
+
+    /// A miner who lies about WHEN they found a share must not be able to move
+    /// everyone's difficulty. Share timestamps are self-reported, so the LWMA's
+    /// clamp is load-bearing here in a way it is not on the chain.
+    #[test]
+    fn a_lying_timestamp_cannot_move_the_difficulty_far() {
+        let honest = timed_chain(50, 10_000, SHARE_TARGET_INTERVAL_MS)
+            .next_share_difficulty()
+            .0;
+
+        // One share claims an absurd solve time (a week).
+        let mut sc = ShareChain::new();
+        let mut prev = None;
+        for i in 0..50u8 {
+            let mut s = share(i, prev, "alice.sov", 10_000);
+            s.timestamp_ms = (i as u64) * SHARE_TARGET_INTERVAL_MS;
+            if i == 49 {
+                s.timestamp_ms += 7 * 24 * 60 * 60 * 1_000;
+            }
+            sc.accept(s, 0, &Payouts::new()).expect("accept");
+            prev = Some(id(i));
+        }
+        let lied = sc.next_share_difficulty().0;
+        // The clamp bounds ONE bad sample to 6x the target, so the whole
+        // weighted window can only sag so far.
+        let ratio = lied as f64 / honest as f64;
+        assert!(
+            ratio > 0.5,
+            "one liar must not halve everyone's difficulty, got x{ratio:.3}"
+        );
+    }
+
+    /// A non-monotonic timestamp (a share claiming to precede its parent) must
+    /// not underflow the solve time.
+    #[test]
+    fn a_backwards_timestamp_does_not_underflow() {
+        let mut sc = ShareChain::new();
+        let mut prev = None;
+        for i in 0..10u8 {
+            let mut s = share(i, prev, "alice.sov", 10_000);
+            // Every share claims to be at t=0: solve times are all "negative".
+            s.timestamp_ms = 0;
+            sc.accept(s, 0, &Payouts::new()).expect("accept");
+            prev = Some(id(i));
+        }
+        let d = sc.next_share_difficulty().0;
+        assert!(d >= 1, "difficulty must stay valid, got {d}");
+    }
+
+    /// With no history there is nothing to average.
+    #[test]
+    fn an_empty_chain_has_no_retarget() {
+        assert_eq!(ShareChain::new().next_share_difficulty(), Difficulty::MIN);
     }
 
     #[test]

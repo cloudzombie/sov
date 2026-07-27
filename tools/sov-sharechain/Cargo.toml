@@ -20,6 +20,10 @@ description = "Decentralized (non-custodial) pool sharechain for SOV: PPLNS acco
 
 [dependencies]
 sov-primitives = { path = "../../chain/crates/primitives" }
+# The REAL retarget: `Difficulty::lwma`, the same LWMA-1 the chain uses for blocks.
+# Reused rather than reimplemented — a second copy of a difficulty rule is a second
+# thing that can drift, and share accounting depends on it being exactly right.
+sov-mining = { path = "../../chain/crates/mining" }
 
 [lints.rust]
 unsafe_code = "forbid"

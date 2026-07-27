@@ -52,6 +52,22 @@ The accounting core is built and tested: share DAG, heaviest-work fork choice,
 uncle credit, bounded PPLNS window, exact payout computation, and the
 block-must-pay-the-window rule (including the cheating-finder case).
 
-**Not yet built:** the P2P channel that gossips shares between peers, and the
-LWMA retarget that holds the share interval near 10s. Both are additive and
-neither changes the rules above.
+The **share retarget** is in: `next_share_difficulty()` delegates to the chain's
+own `Difficulty::lwma` — the identical LWMA-1 used for blocks — over the last 45
+shares, aiming at a 10s interval. It is deliberately not a second implementation:
+a difficulty rule copied into another crate is another thing that can drift, and
+share accounting depends on it being exactly right.
+
+The LWMA's clamp on each solve time matters more here than on the chain. Share
+timestamps are **self-reported by whoever found them**, so a miner who lies about
+timing must not be able to move everyone's difficulty — there is a test for
+exactly that, and one for a share claiming to precede its parent.
+
+**Not yet built:** the P2P channel that gossips shares between peers.
+
+That one is left deliberately rather than for lack of time. Shares need their own
+logical channel on `sov-network` — the same crate carrying block and transaction
+relay — so adding a message type there widens the blast radius from "a standalone
+tool" to "the transport consensus peers depend on". A malformed share message
+must not be able to perturb block relay. That wants deliberate design and its own
+adversarial tests, not a tack-on to this commit.
