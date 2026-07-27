@@ -131,11 +131,53 @@ Constraints 84–94 seed the nullifier sponge with `nsk` in the left rate half a
 segment by constraints 12–19 (`m_const_keys`), so the values absorbed here are
 the same ones that produced the commitment in §3.
 
-The nullifier is thus a deterministic function of `(nsk, rho)` — the same pair
-that determines the commitment. Two distinct nullifiers for one note would
-require two distinct `(nsk, rho)` pairs producing the same commitment, i.e. a
-Rescue-Prime collision. The digest at `nf_row(i)` is asserted against
+Constraint 85 additionally binds the note's **Merkle leaf position** into
+capacity element 2, read from the position accumulator (column 31).
+
+### 5.1 Why the position is required
+
+An earlier version of this document argued only that a prover cannot produce
+**two nullifiers for one note**, and called `(nsk, rho)` "the same pair that
+determines the commitment". That was wrong in a way an external audit caught
+(**PQV2-01**): the commitment binds `(value, owner_tag, rho)`, so `(nsk, rho)`
+does *not* determine it. The unexamined direction was the dangerous one —
+**two notes colliding onto one nullifier**:
+
+```text
+Note A = (value = 1,       owner_tag = T, rho = R)   ->  CM_A
+Note B = (value = 1000000, owner_tag = T, rho = R)   ->  CM_B != CM_A
+NF_A == NF_B                                          (both = H(nsk, R))
+```
+
+Both notes are genuinely funded and both fold into the tree, but the moment
+either is spent the other is permanently unspendable. That is not inflation —
+the attacker funds the collision — but it is unrecoverable **loss of value**,
+and a wallet cannot avoid it because the sender chooses `rho`.
+
+Binding the leaf position fixes it, because a leaf position is:
+
+- **unique** — consensus appends each output commitment to its own leaf;
+- **authenticated** — the accumulator is driven by the very path bits that
+  route the Merkle hash of §4, so a prover claiming position `p'` would need
+  an authentication path from its commitment at leaf `p'` to an accepted
+  anchor, i.e. a Rescue-Prime collision;
+- **seeded honestly** — the accumulator is asserted zero at each input
+  segment's first row, so no offset can be smuggled in.
+
+Two distinct nullifiers for one note occurrence therefore still require a
+Rescue-Prime collision, and two note occurrences can no longer share one
+nullifier at all. The digest at `nf_row(i)` is asserted against
 `nullifiers[i]`, so the published value is the computed one.
+
+Note that the *same commitment* may legitimately appear at two leaves (an
+identical note funded twice). Each occurrence now carries its own nullifier
+and is independently spendable, which is the correct accounting: whoever
+created each output paid its value into the pool.
+
+Both directions are covered by adversarial trace-tampering vectors in
+`tests/kat.rs` (`leaf_position_accumulator_seed_rejected`,
+`leaf_position_divorced_from_merkle_path_rejected`), which assert *which*
+constraint rejects, and by wallet-level regression tests in `src/scan.rs`.
 
 Constraint 95–98 selects the capacity domain by the **public** `input_dummy[i]`
 flag: real and dummy nullifiers live in separate domains, so a dummy can never
@@ -315,6 +357,19 @@ queries.** Measured after the change, on the same realistic bundle:
 | proven (unique decoding) | 50 | **74** |
 | proof bytes | 55,054 | **96,586** |
 | verify (median) | 621 us | **970 us** |
+
+The PQV2-01 fix then added one trace column (31 -> 32) for the leaf-position
+accumulator, re-measured on the same machine:
+
+| after PQV2-01 | value |
+|---|---|
+| proof bytes | **98,494** (+1,908, +2.0%) |
+| verify (median) | **1,005 us** (+35 us) |
+| headroom to `MAX_PROOF_LEN` (128 KiB) | 32,578 bytes (25%) |
+
+The security level is unchanged — the FRI parameters did not move — and the
+proof still fits `MAX_PROOF_LEN` and `MAX_SHIELDED_V2_BUNDLE_BYTES` (144 KiB)
+with real margin.
 
 Verification cost rose 621 -> 970 us, which remains far below the block
 interval even for a saturated block, so the liveness budget is unaffected.

@@ -430,7 +430,10 @@ fn wire_kat_publics_header_pinned() {
     let header = &f.encoded[..1 + PUBLICS_LEN];
     assert_eq!(
         hex::encode(blake3::hash(header).as_bytes()),
-        "cb6562850769c8df761d2d73781c5179a442e8b723981ac1659da4546c697b1d",
+        // Re-pinned for the PQV2-01 nullifier fix: nullifiers are public
+        // inputs, so binding the leaf position into them necessarily moves
+        // this header digest. Free only because bit 2 is unarmed.
+        "ab5c6c0690676251ef487a58dd6c701980f41fe17323ea92bb4bce780496da35",
         "v1 wire publics-header KAT drifted"
     );
 }
@@ -450,7 +453,10 @@ fn context_bytes_kat_pinned() {
         // this KAT reads 40 10 10 03 = 64, 16, 16, cubic — previously
         // 2a 08 10 02 = 42, 8, 16, quadratic. A drift here that is NOT an
         // intentional parameter change is a consensus-visible bug.
-        "1f00000a00000801000000ffffffff40101003041f00000101b602",
+        // Re-pinned again for PQV2-01: the trace width went 31 -> 32 (0x1f ->
+        // 0x20) for the leaf-position accumulator column, and the constraint
+        // count rose with the accumulator recurrence.
+        "2000000a00000801000000ffffffff40101003041f00000101ca02",
         "canonical context KAT drifted"
     );
     // And it must literally prefix the honest proof.

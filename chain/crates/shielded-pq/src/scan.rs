@@ -349,7 +349,12 @@ impl PqNoteStore {
             self.stats.rejected_zero_value += 1;
             return false;
         }
-        let nullifier = key.spend_key().nullifier(note.rho).to_bytes();
+        // The nullifier binds this note's leaf POSITION, so two notes that
+        // reuse a `rho` no longer collide (audit PQV2-01) — each occupies its
+        // own leaf and so carries its own nullifier. The duplicate check
+        // stays as defence in depth: a collision here would now imply a
+        // Rescue-Prime collision, not a wallet-visible sender trick.
+        let nullifier = key.spend_key().nullifier(note.rho, position).to_bytes();
         if !self.owned_nullifiers.insert(nullifier) {
             self.stats.rejected_duplicate_nullifier += 1;
             return false;
@@ -742,7 +747,7 @@ mod tests {
         assert!(store.witness(position).is_some(), "witness after reload");
 
         // The chain publishes its nullifier.
-        let nf = alice.spend_key().nullifier(note.rho);
+        let nf = alice.spend_key().nullifier(note.rho, position);
         store.ingest_block(&alice, 2, [2u8; 32], &[&spend_bundle(nf)]);
         assert_eq!(store.balance(), 0, "the spent note leaves the balance");
         assert_eq!(store.unspent_count(), 0);
@@ -799,8 +804,8 @@ mod tests {
         let shield = outputs_bundle(&[(&alice, 60, 0)]);
         let mut store = PqNoteStore::new(0);
         store.ingest_block(&alice, 1, [1u8; 32], &[&shield]);
-        let (note, _) = store.unspent(&alice).into_iter().next().unwrap();
-        let nf = alice.spend_key().nullifier(note.rho);
+        let (note, position) = store.unspent(&alice).into_iter().next().unwrap();
+        let nf = alice.spend_key().nullifier(note.rho, position);
         store.ingest_block(&alice, 2, [2u8; 32], &[&spend_bundle(nf)]);
         assert_eq!(store.balance(), 0);
 
@@ -897,10 +902,61 @@ mod tests {
     }
 
     #[test]
-    fn two_notes_with_the_same_rho_count_once() {
-        // Same rho ⇒ same nullifier ⇒ only ONE of them can ever be spent.
-        // Counting both would inflate the balance by an unspendable amount.
-        let alice = key(14);
+    fn different_values_sharing_one_rho_are_both_spendable() {
+        // Audit PQV2-01 regression. Before the fix the nullifier bound only
+        // (nsk, rho), so two notes for one owner reusing a rho had DIFFERENT
+        // commitments — the commitment binds the value — but ONE nullifier,
+        // and spending either permanently stranded the other. The nullifier
+        // now binds the note's Merkle leaf position, which consensus assigns
+        // uniquely, so a shared rho is harmless.
+        let alice = key(64);
+        let rho = alice.rho(0);
+        let small = Note::new(1, alice.owner_tag(), rho).expect("note");
+        let large = Note::new(1_000_000, alice.owner_tag(), rho).expect("note");
+        assert_ne!(small.commitment(), large.commitment());
+
+        let mut bundle = outputs_bundle(&[]);
+        for (slot, note) in [small, large].iter().enumerate() {
+            bundle.public_inputs.output_commitments[slot] = note.commitment();
+            bundle.public_inputs.output_dummy[slot] = false;
+            bundle.output_ciphertexts[slot] =
+                Some(encrypt_note(alice.address().kem_ek(), note).expect("encrypt"));
+        }
+        let mut store = PqNoteStore::new(0);
+        store.ingest_block(&alice, 1, [1u8; 32], &[&bundle]);
+
+        assert_eq!(store.commitment_count(), 2);
+        assert_eq!(store.unspent_count(), 2, "BOTH notes must survive");
+        assert_eq!(store.balance(), 1_000_001, "nothing is stranded");
+        assert_eq!(store.stats().rejected_duplicate_nullifier, 0);
+
+        // The two occupy distinct leaves, so their nullifiers differ and
+        // spending one leaves the other spendable.
+        let owned = store.unspent(&alice);
+        let nfs: BTreeSet<[u8; 32]> = owned
+            .iter()
+            .map(|(n, pos)| alice.spend_key().nullifier(n.rho, *pos).to_bytes())
+            .collect();
+        assert_eq!(nfs.len(), 2, "one nullifier per note occurrence");
+
+        let (first, first_pos) = owned[0];
+        let nf = alice.spend_key().nullifier(first.rho, first_pos);
+        store.ingest_block(&alice, 2, [2u8; 32], &[&spend_bundle(nf)]);
+        assert_eq!(store.unspent_count(), 1, "only the spent note leaves");
+        assert_eq!(
+            store.balance(),
+            1_000_001 - first.value_grains,
+            "the sibling note keeps its full value"
+        );
+    }
+
+    #[test]
+    fn identical_commitments_at_two_positions_are_both_spendable() {
+        // The second half of PQV2-01: two IDENTICAL notes (same value, tag
+        // and rho) inserted at different leaves. Their commitments collide,
+        // which is legal — the tree is a multiset — but each occurrence must
+        // still carry its own nullifier or one of them is burned.
+        let alice = key(65);
         let note = Note::new(25, alice.owner_tag(), alice.rho(0)).expect("note");
         let mut bundle = outputs_bundle(&[]);
         for slot in 0..2 {
@@ -911,10 +967,10 @@ mod tests {
         }
         let mut store = PqNoteStore::new(0);
         store.ingest_block(&alice, 1, [1u8; 32], &[&bundle]);
-        assert_eq!(store.balance(), 25, "the duplicate must not double-count");
-        assert_eq!(store.unspent_count(), 1);
-        assert_eq!(store.stats().rejected_duplicate_nullifier, 1);
-        assert_eq!(store.commitment_count(), 2, "both commitments still fold");
+        assert_eq!(store.commitment_count(), 2);
+        assert_eq!(store.unspent_count(), 2, "both occurrences are spendable");
+        assert_eq!(store.balance(), 50);
+        assert_eq!(store.stats().rejected_duplicate_nullifier, 0);
     }
 
     #[test]
@@ -977,7 +1033,7 @@ mod tests {
         bundle.public_inputs.output_commitments[0] = note.commitment();
         bundle.output_ciphertexts[0] =
             Some(encrypt_note(alice.address().kem_ek(), &note).expect("encrypt"));
-        bundle.public_inputs.nullifiers[0] = alice.spend_key().nullifier(note.rho);
+        bundle.public_inputs.nullifiers[0] = alice.spend_key().nullifier(note.rho, 0);
         // output_dummy[0] and input_dummy[0] both stay true.
         let mut store = PqNoteStore::new(0);
         store.ingest_block(&alice, 1, [1u8; 32], &[&bundle]);

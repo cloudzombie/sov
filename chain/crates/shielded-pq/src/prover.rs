@@ -2,9 +2,9 @@
 //! circuit ([`crate::air::BundleAir`]).
 
 use crate::air::{
-    input_base, merkle_inject_row, rc_base, BundleAir, BundlePublicInputs, ACTIVE_ROWS, BIT_COL,
-    CAPACITY_SEED, CYCLE_LENGTH, NSK_COL, NUM_SLOTS, OUTPUTS_START_ROW, RC_ACC_COL, RC_BIT_COL,
-    RHO_COL, TRACE_LENGTH, TRACE_WIDTH, VAL_COL,
+    input_base, merkle_inject_row, rc_base, root_row, BundleAir, BundlePublicInputs, ACTIVE_ROWS,
+    BIT_COL, CAPACITY_SEED, CYCLE_LENGTH, NSK_COL, NUM_SLOTS, OUTPUTS_START_ROW, POS_ACC_COL,
+    RC_ACC_COL, RC_BIT_COL, RHO_COL, TRACE_LENGTH, TRACE_WIDTH, VAL_COL,
 };
 use crate::domains::{
     RESCUE_DOMAIN_COMMIT_STAGE1, RESCUE_DOMAIN_COMMIT_STAGE2, RESCUE_DOMAIN_DUMMY_NULLIFIER,
@@ -190,6 +190,14 @@ pub fn build_bundle_columns(
         state[8..12].copy_from_slice(&right);
         state
     };
+    // As `merge_init`, but binding an occurrence scalar into capacity element
+    // 2 — the trace-side twin of `hash::merge_domain_bound`, used only by the
+    // nullifier hash (PQV2-01).
+    let merge_init_bound = |domain: u64, bind: u64, left: [Felt; 4], right: [Felt; 4]| {
+        let mut state = merge_init(domain, left, right);
+        state[2] = Felt::new(bind);
+        state
+    };
     // Non-constant, non-binary filler (see the AIR docs: released register
     // and bit cells carry filler so masked constraint polynomials attain
     // their declared degrees).
@@ -208,6 +216,7 @@ pub fn build_bundle_columns(
     let mut nullifiers = [PqDigest::ZERO; NUM_SLOTS];
     let mut input_dummy = [true; NUM_SLOTS];
     let mut in_values = [0u64; NUM_SLOTS];
+    let mut positions = [0u64; NUM_SLOTS];
 
     for i in 0..NUM_SLOTS {
         let (nsk, rho, value, position, siblings, nf_domain) = match spends.get(i) {
@@ -235,6 +244,7 @@ pub fn build_bundle_columns(
             ),
         };
         in_values[i] = value;
+        positions[i] = position;
         let seg_cycle = i * 24;
         // Cycle 0: owner_tag = merge_d(TAG, nsk, 0).
         let tag = run_cycle(
@@ -275,10 +285,14 @@ pub fn build_bundle_columns(
             debug_assert_eq!(anchors[i], s.path.compute_root(s.note.commitment()));
         }
         // Cycle 23: nf = merge_d(NF or DUMMY_NF, nsk, rho).
-        let nf = run_cycle(&mut cols, seg_cycle + 23, merge_init(nf_domain, nsk, rho));
+        let nf = run_cycle(
+            &mut cols,
+            seg_cycle + 23,
+            merge_init_bound(nf_domain, position, nsk, rho),
+        );
         if let Some(s) = spends.get(i) {
             nullifiers[i] = PqDigest::from_elements(nf);
-            debug_assert_eq!(nullifiers[i], s.key.nullifier(s.note.rho));
+            debug_assert_eq!(nullifiers[i], s.key.nullifier(s.note.rho, s.path.position));
         } else {
             // Dummy: the public nullifier stays ZERO; the in-trace dummy
             // digest is never surfaced.
@@ -379,6 +393,37 @@ pub fn build_bundle_columns(
             cols[RC_ACC_COL][base + t] = Felt::new(acc);
         }
         debug_assert_eq!(acc, v);
+    }
+
+    // Leaf-position accumulator (PQV2-01): zero at each input-segment start,
+    // folds bit·2^level at every Merkle injection row, and holds constant in
+    // between — mirroring the AIR's single step constraint exactly. Beyond
+    // each segment's nullifier seed row the column is unconstrained, so it
+    // carries filler there (which also keeps the constraint polynomial at its
+    // declared degree).
+    for (row, cell) in cols[POS_ACC_COL].iter_mut().enumerate() {
+        *cell = filler(row, 32);
+    }
+    for (i, &position) in positions.iter().enumerate() {
+        let mut acc = 0u64;
+        let mut row = input_base(i);
+        for level in 0..TREE_DEPTH {
+            // Hold the running value up to and including this level's
+            // injection row; the bit folds in on the transition OUT of it.
+            let inject = merkle_inject_row(i, level);
+            while row <= inject {
+                cols[POS_ACC_COL][row] = Felt::new(acc);
+                row += 1;
+            }
+            acc += ((position >> level) & 1) << level;
+        }
+        // Hold the landed position through the nullifier seed row, where the
+        // AIR reads it into sponge capacity element 2.
+        while row <= root_row(i) {
+            cols[POS_ACC_COL][row] = Felt::new(acc);
+            row += 1;
+        }
+        debug_assert_eq!(acc, position, "position accumulator must land exactly");
     }
 
     let pub_inputs = BundlePublicInputs {

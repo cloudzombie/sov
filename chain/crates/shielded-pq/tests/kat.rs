@@ -22,8 +22,8 @@
 //! way [`expect_circuit_reject`] fails the test if the forgery survives.
 
 use sov_shielded_pq::air::{
-    rc_base, BundlePublicInputs, ACTIVE_ROWS, NSK_COL, NUM_SLOTS, RC_ACC_COL, RC_BIT_COL, RHO_COL,
-    VAL_COL,
+    merkle_inject_row, rc_base, BundlePublicInputs, ACTIVE_ROWS, NSK_COL, NUM_SLOTS, POS_ACC_COL,
+    RC_ACC_COL, RC_BIT_COL, RHO_COL, VAL_COL,
 };
 use sov_shielded_pq::auth::AuthKeypair;
 use sov_shielded_pq::bundle::{bundle_digest, verify_bundle, BundleError, SpendBundle};
@@ -107,8 +107,15 @@ fn kat_pinned_digests() {
         "tree root KAT drifted"
     );
     assert_eq!(
-        key.nullifier(notes[0].rho).to_hex(),
-        "399741356fb66da96dcacd36791a5c89c37284dda9ac2245fd372613515a7cad",
+        key.nullifier(notes[0].rho, 1).to_hex(),
+        // Re-pinned when the nullifier gained its leaf-position binding
+        // (audit PQV2-01). The previous value,
+        // 399741356fb66da96dcacd36791a5c89c37284dda9ac2245fd372613515a7cad,
+        // was `merge_d(NF, nsk, rho)` with no occurrence binding. Changing a
+        // consensus digest is free here and ONLY here: pool v2 rides BIP-9
+        // bit 2, which is defined and unarmed, so no chain has ever executed
+        // a v2 spend. Any later change would be a hard fork.
+        "f7b2f5607723662684ea4f7a89a6954067c524b77f365e733d7113560ec8d7ea",
         "nullifier KAT drifted"
     );
     assert_eq!(
@@ -125,8 +132,8 @@ fn kat_bundle_proof_verifies() {
     let key = SpendingKey::from_seed(&KAT_SEED);
     assert_eq!(pub_inputs.anchors[0], tree.root());
     assert_eq!(pub_inputs.anchors[1], tree.root());
-    assert_eq!(pub_inputs.nullifiers[0], key.nullifier(notes[0].rho));
-    assert_eq!(pub_inputs.nullifiers[1], key.nullifier(notes[1].rho));
+    assert_eq!(pub_inputs.nullifiers[0], key.nullifier(notes[0].rho, 1));
+    assert_eq!(pub_inputs.nullifiers[1], key.nullifier(notes[1].rho, 3));
     assert_eq!(pub_inputs.input_dummy, [false, false, true, true]);
     assert_eq!(pub_inputs.output_dummy, [false, false, true, true]);
     // Dummy slots surface only zero digests.
@@ -663,6 +670,49 @@ fn rho_register_non_constant_rejected() {
         &pub_inputs,
         "transition constraint 12",
         "rho-register non-constant",
+    );
+}
+
+#[test]
+fn leaf_position_accumulator_seed_rejected() {
+    // DOUBLE-SPEND vector for audit PQV2-01. The nullifier now binds the
+    // note's Merkle leaf position, taken from the position accumulator. If a
+    // prover could seed that accumulator with an offset it would obtain a
+    // SECOND, distinct nullifier for a note it has already spent — the exact
+    // failure the position binding was introduced to close. The accumulator
+    // is asserted ZERO at each input-segment start, so perturbing the seed is
+    // caught. REJECT.
+    let (spends, outputs, _) = kat_bundle_witness();
+    let (mut cols, pub_inputs) =
+        build_bundle_columns(&spends, &outputs, 0, KAT_T_OUT, KAT_FEE).expect("build");
+    cols[POS_ACC_COL][0] += Felt::new(1);
+    expect_circuit_reject(
+        cols,
+        &pub_inputs,
+        "assertion",
+        "leaf-position accumulator seeded non-zero (double-spend)",
+    );
+}
+
+#[test]
+fn leaf_position_divorced_from_merkle_path_rejected() {
+    // The companion vector: rather than moving the seed, tamper with the
+    // accumulator MID-SEGMENT so the position that reaches the nullifier
+    // sponge is not the one the authenticated Merkle path spells out. The
+    // step constraint ties every increment to the SAME bit register that
+    // routes the hash at that level, so position and membership cannot
+    // disagree. REJECT.
+    let (spends, outputs, _) = kat_bundle_witness();
+    let (mut cols, pub_inputs) =
+        build_bundle_columns(&spends, &outputs, 0, KAT_T_OUT, KAT_FEE).expect("build");
+    // A row inside input 0's Merkle region, after the accumulator has begun.
+    let row = merkle_inject_row(0, 5) + 1;
+    cols[POS_ACC_COL][row] += Felt::new(1 << 5);
+    expect_circuit_reject(
+        cols,
+        &pub_inputs,
+        "transition constraint 129",
+        "leaf position divorced from the authenticated path",
     );
 }
 

@@ -102,7 +102,7 @@ pub fn report_json(
 }
 
 /// Print the human summary to stdout.
-pub fn print_summary(steps: &[StepResult], failed: usize) {
+pub fn print_summary(steps: &[StepResult], failed: usize, skipped: usize, require_complete: bool) {
     println!();
     println!("================ SOV E2E MATRIX SUMMARY ================");
     for s in steps {
@@ -114,9 +114,16 @@ pub fn print_summary(steps: &[StepResult], failed: usize) {
         println!("  [{mark}] {:<34} {}", s.name, s.detail);
     }
     println!("========================================================");
-    if failed == 0 {
-        println!("RESULT: GREEN — no step failed (skips are listed debts).");
-    } else {
-        println!("RESULT: RED — {failed} step(s) FAILED.");
+    match (failed, skipped, require_complete) {
+        (0, 0, _) => println!("RESULT: GREEN — every step ran and passed."),
+        (0, s, true) => println!(
+            "RESULT: RED — 0 failed, but {s} step(s) SKIPPED and --require-complete is set. \
+             A skipped step evidences nothing; this run does NOT qualify as full-green."
+        ),
+        (0, s, false) => println!(
+            "RESULT: AMBER — no step failed, but {s} step(s) were SKIPPED and are UNTESTED debts. \
+             This is NOT a full-green run; re-run with --require-complete for the release gate."
+        ),
+        (f, s, _) => println!("RESULT: RED — {f} step(s) FAILED, {s} skipped."),
     }
 }

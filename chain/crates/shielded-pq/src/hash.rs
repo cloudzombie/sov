@@ -109,6 +109,34 @@ pub fn merge_domain(domain: u64, left: PqDigest, right: PqDigest) -> PqDigest {
     PqDigest::from_elements(state[4..8].try_into().expect("4 elements"))
 }
 
+/// [`merge_domain`], additionally binding a scalar into capacity element 2.
+///
+/// The sponge's capacity is `[RATE, domain, 0, 0]`; elements 2 and 3 are
+/// unused by [`merge_domain`] and are constrained to zero by the AIR. This
+/// variant spends element 2 on an *occurrence* binding, exactly as element 1
+/// is spent on a domain binding — no extra permutation, no extra trace rows.
+///
+/// It exists for the nullifier. `H(nsk, rho)` alone is not occurrence-unique:
+/// two notes owned by one key that reuse a `rho` have distinct commitments but
+/// one nullifier, so spending either strands the other (audit **PQV2-01**).
+/// Binding the note's Merkle leaf position — which consensus assigns, is
+/// unique by construction, and the AIR ties to the same authenticated path
+/// used for the membership proof — makes the nullifier unique per note
+/// occurrence.
+///
+/// `bind` must be a canonical field element; leaf positions are `< 2^20` and
+/// so always are.
+pub fn merge_domain_bound(domain: u64, bind: u64, left: PqDigest, right: PqDigest) -> PqDigest {
+    let mut state = [Felt::ZERO; STATE_WIDTH];
+    state[0] = Felt::new(8); // RATE_WIDTH, per Rp64_256::merge
+    state[1] = Felt::new(domain);
+    state[2] = Felt::new(bind);
+    state[4..8].copy_from_slice(&left.to_elements());
+    state[8..12].copy_from_slice(&right.to_elements());
+    Rp64_256::apply_permutation(&mut state);
+    PqDigest::from_elements(state[4..8].try_into().expect("4 elements"))
+}
+
 /// Map arbitrary bytes to a digest via blake3 + per-limb reduction mod `p`.
 ///
 /// Used only to derive *tags and secrets* (owner tags from KEM public keys,
