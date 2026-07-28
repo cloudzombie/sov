@@ -68,17 +68,22 @@ struct MinerRow {
 // ── External-mining freshness (SHARE-AWARE, with hysteresis) ──────────────────────
 //
 // The only liveness signal the registry gives us is `lastSeenHeight` — the height of the
-// account's LAST WON BLOCK, not a heartbeat. So "how long since a win still counts as
-// mining" cannot be a flat number: a small-share miner legitimately goes many blocks
-// between wins. A home miner at ~1% share wins on average only every ~100 blocks, so a
-// flat 30-block window would read it as idle most of the time and only blip MINING right
-// after each win — the exact bug we are fixing.
+// account's LAST WON BLOCK, not a heartbeat. A recent `lastSeen` proves a PAST win; it
+// NEVER proves the miner is running right now. So MINING is a present-tense claim Station
+// must WITNESS, not infer from a stale height: the light turns on ONLY when an owner
+// account's `blocksMined` rises while THIS session is watching (the delta path). At a cold
+// start there is no prior poll to diff against, so there is nothing witnessed yet and the
+// account reads NOT mining — a miner that won a block shortly before launch and then
+// STOPPED must not be asserted "mining" off its recent `lastSeen` alone (the v0.2.4 bug).
 //
-// Instead the window scales with the account's EXPECTED gap between wins ≈ 1/share blocks
-// (`network_blocks / blocks`). We then apply hysteresis: it takes only a couple of
-// expected gaps of recency to turn MINING on, but several to turn it off, so an active
-// miner stays lit steadily across the luck-driven gaps between its wins and cannot strobe
-// around each win. The `blocksMined`-delta path is the instant confirm on top of this.
+// Recency is then HYSTERESIS-ONLY. Once a witnessed win has lit an account, the last win
+// legitimately falls many blocks behind the head before the next one (a small-share miner
+// wins only every ~1/share blocks), so a flat window would strobe the light off between
+// wins. To HOLD an already-witnessed-active account lit across that gap — and only to hold
+// it, never to enter — we keep it on while its last win is within a window that scales
+// with the account's EXPECTED gap between wins ≈ 1/share blocks (`network_blocks/blocks`),
+// widened by hysteresis. A truly stopped miner's last win eventually falls past that hold
+// window and it goes idle. Recency can only ever KEEP the light on, never turn it on.
 
 /// Floor on the recency window (blocks). Keeps a HIGH-share miner from strobing between
 /// its own fast wins, and bounds how tight the window can get.
@@ -87,12 +92,12 @@ const EXTERNAL_MINING_MIN_WINDOW: u64 = 30;
 /// how long a STOPPED miner can keep reading MINING before it is declared idle — bounds
 /// the widening window of a very-small-share miner so "stopped" is always eventually seen.
 const EXTERNAL_MINING_MAX_WINDOW: u64 = 1_000;
-/// Turn MINING ON when the last win is within this many expected inter-win gaps of the
-/// head (a fresh, in-rhythm miner). Deliberately small so a long-idle miner does not light
-/// up at startup.
+/// Baseline width (in expected inter-win gaps) of the HOLD window for an account that has
+/// just been lit by a witnessed win but is not (yet) in the sticky idle-hysteresis state.
+/// Recency NEVER enters MINING — this only sizes how long a fresh win keeps the light on.
 const EXTERNAL_MINING_ENTRY_GAPS: u64 = 2;
-/// Hysteresis: once MINING, stay lit until the last win is more than this many expected
-/// gaps behind the head. Larger than the entry multiple so the state cannot flap.
+/// Hysteresis: once lit, KEEP an account MINING until its last win is more than this many
+/// expected gaps behind the head. Larger than the baseline multiple so the state cannot flap.
 const EXTERNAL_MINING_IDLE_GAPS: u64 = 6;
 
 /// This account's EXPECTED number of blocks between its own wins ≈ `1 / share`, where
@@ -106,8 +111,10 @@ fn expected_inter_win_gap(blocks: u64, network_blocks: u64) -> u64 {
     (network_blocks / blocks).max(1)
 }
 
-/// The share-aware recency window for one account, in blocks. `sticky` widens it (idle
-/// hysteresis) when the account was already reading MINING on the previous poll.
+/// The share-aware HOLD window for one already-witnessed-active account, in blocks. This
+/// only ever KEEPS a lit account lit across the gap between its wins — it is never consulted
+/// to ENTER the MINING state. `sticky` widens it (idle hysteresis) once the account has been
+/// holding across polls, so the light cannot flap.
 fn external_mining_window(blocks: u64, network_blocks: u64, sticky: bool) -> u64 {
     let gap = expected_inter_win_gap(blocks, network_blocks);
     let gaps = if sticky {
@@ -158,11 +165,15 @@ struct MiningAssessment {
 /// previous poll's `account → blocksMined` (the fresh-win signal), and `prev_active` is
 /// the set that was mining last poll (the hysteresis state).
 ///
-/// "Actively mining now" is decided two ways. First, the DEFINITIVE signal: `blocksMined`
-/// rose since the previous poll ⇒ mining now. Second, a SHARE-AWARE recency window (see
-/// [`external_mining_window`]): the last win is within a window sized to this account's
-/// expected inter-win gap, widened by hysteresis when it was already mining. A row whose
-/// last win sits beyond that window, with no new win, is stale and reads as NOT mining.
+/// "Actively mining now" is ENTERED exactly one way: the WITNESSED signal — `blocksMined`
+/// rose since a previous poll THIS session actually recorded ⇒ mining now. Recency alone
+/// NEVER enters the state, so a cold start (empty `prev_blocks` and `prev_active`) always
+/// reads NOT mining: a recent `lastSeen` proves only a PAST win. Once an account has been
+/// lit by a witnessed win, a SHARE-AWARE recency window (see [`external_mining_window`])
+/// acts as HYSTERESIS ONLY — it keeps that already-active account lit across the expected
+/// gap between its wins, and only for an account that was active last poll (`prev_active`).
+/// A held account whose last win finally falls beyond that window, with no new win, goes
+/// idle. Recency can keep the light on; it can never turn it on.
 fn assess_external_mining(
     miners: &[MinerRow],
     owner: &HashSet<String>,
@@ -190,14 +201,19 @@ fn assess_external_mining(
     for m in &owned {
         facts.blocks_won = facts.blocks_won.saturating_add(m.blocks);
         facts.last_seen = facts.last_seen.max(m.last);
-        // (1) Definitive: this account won a block since the previous poll.
+        // ENTRY — the ONLY way MINING turns on: a WITNESSED fresh win. `blocksMined` rose
+        // since a previous poll THIS session recorded. At a cold start `prev_blocks` is
+        // empty, so this is false for every account — recency can never enter the state.
         let won_more = prev_blocks.get(&m.account).is_some_and(|&p| m.blocks > p);
-        // (2) Share-aware recency, widened by hysteresis if it was mining last poll.
-        // `m.last <= head` guards against a nonsensical row claiming to be ahead of head.
-        let window =
-            external_mining_window(m.blocks, network_blocks, prev_active.contains(&m.account));
+        // HOLD (hysteresis only) — keeps an ALREADY-witnessed-active account (`was_active`)
+        // lit across the gap between its wins, so a modest-share miner does not flicker off.
+        // Gated on `was_active`, so recency alone (a stale `lastSeen`) can NEVER light a
+        // cold or long-idle account. `m.last <= head` guards a row claiming to be ahead of
+        // head; the window widens once the account is holding, so the state cannot flap.
+        let was_active = prev_active.contains(&m.account);
+        let window = external_mining_window(m.blocks, network_blocks, was_active);
         let recent = head > 0 && m.last <= head && head - m.last <= window;
-        if won_more || recent {
+        if won_more || (was_active && recent) {
             active_accounts.insert(m.account.clone());
         }
         // The operator's "main" miner row is the one that has won the most. `>=` with a
@@ -7394,7 +7410,21 @@ fn external_miner_card(ui: &mut egui::Ui, s: &Snapshot, m: &ExternalMinerFacts) 
                 if m.active {
                     state_chip(ui, "⛏", "MINING", palette::mining());
                 } else {
-                    state_chip(ui, "○", "IDLE", palette::text_dim());
+                    // No live win has been WITNESSED this session, so we must not claim
+                    // MINING — nor show a bare "IDLE", which reads as a present-tense claim
+                    // Station cannot back. State the FACT instead: how long since the last
+                    // won block. The gold MINING chip returns only on a witnessed win.
+                    let behind = m.head.saturating_sub(m.last_seen);
+                    let word = if behind == 0 {
+                        "LAST WON AT HEAD".to_string()
+                    } else {
+                        format!(
+                            "LAST WON {} BLOCK{} AGO",
+                            group_thousands(behind as u128),
+                            if behind == 1 { "" } else { "S" }
+                        )
+                    };
+                    state_chip(ui, "○", &word, palette::text_dim());
                 }
             });
         });
@@ -7890,10 +7920,32 @@ impl Station {
                                         .height
                                         .map(|h| format!("#{}", group_thousands(h as u128)))
                                         .unwrap_or_else(|| "#—".into());
-                                    format!(
+                                    let mut sub = format!(
                                         "{h}  ·  {peers} PEER{}",
                                         if peers == 1 { "" } else { "S" }
-                                    )
+                                    );
+                                    // When we are NOT mining but the operator has an owner
+                                    // registry row, state the honest FACT — how long since
+                                    // that account last won — instead of silently implying
+                                    // nothing is theirs. This is the cold-start / restart
+                                    // display: "last won N ago" under a neutral SYNCED/SOLO
+                                    // headline, never the gold MINING claim.
+                                    if !mining {
+                                        if let Some(m) =
+                                            snap.external_miner.as_ref().filter(|m| !m.active)
+                                        {
+                                            let behind = m.head.saturating_sub(m.last_seen);
+                                            sub.push_str(&if behind == 0 {
+                                                "  ·  MINER LAST WON AT HEAD".to_string()
+                                            } else {
+                                                format!(
+                                                    "  ·  MINER LAST WON {} AGO",
+                                                    group_thousands(behind as u128)
+                                                )
+                                            });
+                                        }
+                                    }
+                                    sub
                                 } else {
                                     "LOCAL NODE UNAVAILABLE".to_string()
                                 };
@@ -15489,52 +15541,203 @@ mod tests {
     }
 
     #[test]
-    fn the_min_window_floor_holds_for_a_high_share_miner() {
-        // A lone (100%-share) miner uses the 30-block floor. Inclusive at the edge; one
-        // past it (and no new win) is idle.
+    fn the_min_window_floor_holds_an_already_active_high_share_miner() {
+        // The HOLD window only applies to an account ALREADY lit by a witnessed win, so we
+        // pass `prev_active = {myminer}` (the hysteresis state). A lone (100%-share) miner
+        // uses the 30-block floor. Inclusive at the edge; one past it (no new win) drops out.
         let owner = owner_set(&["myminer"]);
         let head = 13_264u64;
         let mut prev = HashMap::new();
-        prev.insert("myminer".to_string(), 40u64); // no delta this poll
+        prev.insert("myminer".to_string(), 40u64); // no delta this poll — pure hold path
+        let active_prev = owner_set(&["myminer"]); // was mining last poll
 
         let at_edge = vec![miner("myminer", 40, head - EXTERNAL_MINING_MIN_WINDOW)];
         assert!(
-            facts_of(&assess_fresh(&at_edge, &owner, head, &prev)).active,
-            "the window is inclusive at its edge"
+            facts_of(&assess_external_mining(
+                &at_edge,
+                &owner,
+                Some(head),
+                &prev,
+                &active_prev
+            ))
+            .active,
+            "an already-active miner's hold window is inclusive at its edge"
         );
         let past_edge = vec![miner("myminer", 40, head - EXTERNAL_MINING_MIN_WINDOW - 1)];
         assert!(
-            !facts_of(&assess_fresh(&past_edge, &owner, head, &prev)).active,
-            "one block past the window (and no new win) is idle"
+            !facts_of(&assess_external_mining(
+                &past_edge,
+                &owner,
+                Some(head),
+                &prev,
+                &active_prev
+            ))
+            .active,
+            "one block past the hold window (and no new win) goes idle"
+        );
+        // And WITHOUT the prior-active state, the same at-edge row is NOT lit from cold —
+        // recency alone never enters MINING.
+        assert!(
+            !facts_of(&assess_fresh(&at_edge, &owner, head, &prev)).active,
+            "recency at the window edge must NOT enter MINING with no witnessed win"
         );
     }
 
     #[test]
-    fn the_first_poll_falls_back_to_recency_with_no_prior_baseline() {
-        // Cold start: prev_blocks is empty, so the delta signal is unavailable and the
-        // decision MUST come from the recency window alone — the between-wins fallback.
+    fn cold_start_recent_win_but_no_witnessed_delta_is_never_mining() {
+        // THE load-bearing test — the exact bug shipped in v0.2.4. At a COLD START both
+        // `prev_blocks` and `prev_active` are empty, so NOTHING has been witnessed yet. An
+        // owner account that won a block shortly before launch still has a `lastSeen`
+        // comfortably inside every recency window — but a recent `lastSeen` proves only a
+        // PAST win, never present activity. Recency ALONE must NEVER assert MINING.
+        //
+        // This mirrors the reported `a35755d3…` case: it won ~30 blocks (~75 min) before
+        // Station launched and then STOPPED, yet Station showed gold MINING at cold start.
+        // On the pre-fix code this asserted `active == true`; the fix makes it impossible.
+        let owner = owner_set(&["a35755d3"]);
+        let head = 11_260u64;
+        // A LONE row is 100% share ⇒ the 30-block floor window; last win 30 blocks back is
+        // INSIDE it, so the old recency path would (wrongly) have fired.
+        let miners = vec![miner("a35755d3", 8, head - 30)];
+        let empty_blocks: HashMap<String, u64> = HashMap::new();
+        let empty_active: HashSet<String> = HashSet::new();
+
+        let a = assess_external_mining(&miners, &owner, Some(head), &empty_blocks, &empty_active);
+
+        // Liveness FIRST: the feature actually RAN — the owner row was found and assessed,
+        // so a NOT-mining verdict is a real decision, not the code silently declining.
+        assert!(
+            a.facts.is_some(),
+            "the owner's registry row must be present and assessed (feature ran)"
+        );
+        assert_eq!(
+            facts_of(&a).last_seen,
+            head - 30,
+            "the last-won fact is captured"
+        );
+        assert!(
+            facts_of(&a).network_blocks > 0,
+            "a real share denominator was computed"
+        );
+
+        // The fix: no witnessed win ⇒ NOT mining, even though `lastSeen` is inside the window.
+        assert!(
+            !facts_of(&a).active,
+            "a recently-won-then-stopped miner at COLD START must read NOT mining — \
+             recency may never ENTER the MINING state; only a witnessed win can"
+        );
+        assert!(
+            a.active_accounts.is_empty(),
+            "nothing is attributed as active at cold start"
+        );
+    }
+
+    #[test]
+    fn a_stale_miner_is_idle_on_the_first_poll_too() {
+        // A far-behind row with no witnessed delta is idle on the first poll — this was
+        // already true before the fix, and remains true (recency cannot save it either).
         let owner = owner_set(&["myminer"]);
         let head = 13_264u64;
         let empty = HashMap::new();
+        let a = assess_fresh(&[miner("myminer", 40, head - 500)], &owner, head, &empty);
         assert!(
-            facts_of(&assess_fresh(
-                &[miner("myminer", 40, head - 5)],
-                &owner,
-                head,
-                &empty
-            ))
-            .active,
-            "a fresh, recent miner is mining even on the very first poll"
+            a.facts.is_some(),
+            "the owner row is present and assessed (feature ran)"
         );
         assert!(
-            !facts_of(&assess_fresh(
-                &[miner("myminer", 40, head - 500)],
-                &owner,
-                head,
-                &empty
-            ))
-            .active,
-            "a stale miner is idle on the first poll too — no false positive from absence of a baseline"
+            !facts_of(&a).active,
+            "a stale miner is idle on the first poll — no false positive from an absent baseline"
+        );
+    }
+
+    #[test]
+    fn cold_start_surfaces_the_last_won_fact_without_asserting_mining() {
+        // The honest cold-start DISPLAY: an owner row exists but no win is witnessed yet, so
+        // Station shows the FACT — "last won N blocks ago" — under a neutral SYNCED/SOLO
+        // headline, never the gold MINING claim. Here we verify the FACTS that feed that
+        // display: not-active, and a correct "blocks ago" distance the UI renders verbatim.
+        let owner = owner_set(&["home"]);
+        let head = 11_260u64;
+        let last_won = head - 42;
+        let miners = vec![miner("home", 8, last_won), miner("rest", 92, head)];
+        let a = assess_external_mining(
+            &miners,
+            &owner,
+            Some(head),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        let f = facts_of(&a);
+        // Liveness: the row was assessed, so the facts below are a real reading.
+        assert!(
+            !f.active,
+            "cold start with no witnessed win is NOT the MINING assertion"
+        );
+        assert_eq!(f.last_seen, last_won);
+        assert_eq!(f.head, head);
+        // This is exactly the "N blocks ago" the Mining tab and heartbeat chip render.
+        assert_eq!(
+            f.head.saturating_sub(f.last_seen),
+            42,
+            "\"last won 42 blocks ago\""
+        );
+
+        // And the whole-Snapshot verdict the heartbeat reads is neutral, not MINING.
+        let snap = Snapshot {
+            online: true,
+            syncing: false,
+            peers: Some(3),
+            local_hashrate: 0,
+            external_miner: Some(f.clone()),
+            ..Default::default()
+        };
+        assert!(
+            !snap.is_mining(),
+            "an unwitnessed owner row must not read as mining"
+        );
+        assert_eq!(
+            BeatState::of(&snap),
+            BeatState::Synced,
+            "the headline is the neutral SYNCED, never gold MINING, at cold start"
+        );
+    }
+
+    #[test]
+    fn a_station_restart_reverts_to_last_won_until_the_next_witnessed_win() {
+        // Session A witnesses a win and lights MINING; the miner then STOPS. Session B is a
+        // fresh Station (empty prior state) watching the SAME registry: it must revert to
+        // "last won N ago" (not mining), because a restart has witnessed nothing yet. This
+        // is the honest behavior, not a regression — the light returns only on a new win.
+        let owner = owner_set(&["home"]);
+        let won_at = 5_000u64;
+
+        // Session A, poll that witnesses the win (19 → 20): MINING on.
+        let prev_a: HashMap<String, u64> =
+            [("home".to_string(), 19u64), ("rest".to_string(), 80u64)]
+                .into_iter()
+                .collect();
+        let miners_a = vec![miner("home", 20, won_at), miner("rest", 80, won_at)];
+        let a = assess_external_mining(&miners_a, &owner, Some(won_at), &prev_a, &HashSet::new());
+        assert!(facts_of(&a).active, "session A witnessed the win ⇒ MINING");
+
+        // Session B: fresh process, empty prior state, head has moved on with NO new home win.
+        let head_b = won_at + 5;
+        let miners_b = vec![miner("home", 20, won_at), miner("rest", 85, head_b)];
+        let b = assess_external_mining(
+            &miners_b,
+            &owner,
+            Some(head_b),
+            &HashMap::new(), // cold: no witnessed baseline
+            &HashSet::new(), // cold: no prior active state
+        );
+        assert!(
+            !facts_of(&b).active,
+            "after a restart the account reverts to NOT mining until the next witnessed win"
+        );
+        assert_eq!(
+            facts_of(&b).head.saturating_sub(facts_of(&b).last_seen),
+            5,
+            "and it truthfully reads \"last won 5 blocks ago\""
         );
     }
 
@@ -15553,8 +15756,13 @@ mod tests {
         let won_at = 5_000u64;
         let miners = |head: u64| vec![miner("home", 20, won_at), miner("rest", 980, head)];
 
-        // Poll 1: first sighting, right after a win. Turns MINING on (entry window ≈ 100).
-        let mut prev_blocks: HashMap<String, u64> = HashMap::new();
+        // Poll 1: a WITNESSED win turns MINING on — home's blocksMined rises 19 → 20 versus
+        // the previous poll's baseline (recency alone never enters). From here the head
+        // walks forward with NO further win, exercising the pure HOLD path.
+        let mut prev_blocks: HashMap<String, u64> =
+            [("home".to_string(), 19u64), ("rest".to_string(), 980u64)]
+                .into_iter()
+                .collect();
         let mut prev_active: HashSet<String> = HashSet::new();
         let mut lit_every_block = true;
         // Walk the head forward across ~2.4 expected gaps (120 blocks) with NO new win —
@@ -15632,7 +15840,14 @@ mod tests {
     #[test]
     fn mining_is_attributed_only_to_the_operators_own_accounts() {
         let head = 13_264u64;
-        let prev = HashMap::new();
+        // A WITNESSED win for our account (39 → 40) so it legitimately reads MINING; the
+        // stranger's baseline is unchanged. Entry is a witnessed delta, never recency.
+        let prev: HashMap<String, u64> = [
+            ("myminer".to_string(), 39u64),
+            ("stranger".to_string(), 900u64),
+        ]
+        .into_iter()
+        .collect();
         // Two miners at the head: one is ours, one is a stranger's.
         let miners = vec![miner("stranger", 900, head), miner("myminer", 40, head - 3)];
 
@@ -15646,7 +15861,7 @@ mod tests {
 
         // With our account in the set, we detect OUR miner — not the stranger's.
         let a = assess_fresh(&miners, &owner_set(&["myminer"]), head, &prev);
-        assert!(facts_of(&a).active, "our recent miner is mining");
+        assert!(facts_of(&a).active, "our miner just won a block ⇒ mining");
         assert_eq!(
             facts_of(&a).account,
             "myminer",
@@ -15694,9 +15909,12 @@ mod tests {
     #[test]
     fn multiple_owner_accounts_are_summed_and_the_main_miner_is_named() {
         let head = 100u64;
-        let prev = HashMap::new();
-        // `small` (recent) is inside its share-aware window; `big` (last win 40 blocks
-        // back at ~94% share ⇒ 30-block floor) is not — but it has won the most blocks.
+        // `small` just WON (1 → 2) so it reads MINING; `big` (last win 40 blocks back, no
+        // delta, not previously active) does not — but it has won the most blocks, so it is
+        // still named the main miner. Entry is the witnessed win, never recency.
+        let prev: HashMap<String, u64> = [("small".to_string(), 1u64), ("big".to_string(), 30u64)]
+            .into_iter()
+            .collect();
         let miners = vec![miner("small", 2, head - 1), miner("big", 30, head - 40)];
         let owner = owner_set(&["small", "big"]);
         let a = assess_fresh(&miners, &owner, head, &prev);
@@ -15712,7 +15930,7 @@ mod tests {
         );
         assert!(
             facts_of(&a).active,
-            "one owner row (small) is inside its window ⇒ mining"
+            "one owner row (small) just won a block ⇒ mining"
         );
         assert!(a.active_accounts.contains("small") && !a.active_accounts.contains("big"));
     }
