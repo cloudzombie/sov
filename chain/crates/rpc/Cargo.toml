@@ -8,6 +8,13 @@ rust-version.workspace = true
 description = "JSON-RPC server for a SOV node (std-only HTTP) plus a known-answer-test vector generator for the JS/TS SDK."
 
 [dependencies]
+# Graceful shutdown. `unsafe_code = "forbid"` in this crate means a signal
+# handler cannot be written here directly, and a node that can only be killed
+# is a node that leaves work half-finished: an unflushed mempool, and a UPnP
+# mapping the router keeps forwarding to nothing. One small, widely-reviewed
+# crate is a better answer than either relaxing the unsafe policy or shipping
+# an ungraceful daemon.
+ctrlc = { version = "3", features = ["termination"] }
 sov-primitives = { path = "../primitives" }
 sov-crypto = { path = "../crypto" }
 sov-types = { path = "../types" }

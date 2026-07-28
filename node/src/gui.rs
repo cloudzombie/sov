@@ -2697,6 +2697,10 @@ struct EmbeddedNode {
     /// Live sync telemetry, written by the P2P engine and read by the production loop
     /// (to gate mining) and the UI (for a rolling status). Shared by clone with both.
     sync: Arc<SyncShared>,
+    /// The UPnP mapping, if the router accepted one. Owned here so stopping the
+    /// node RELEASES it rather than leaving the router forwarding a port to
+    /// nothing until the lease lapses.
+    port_mapper: Option<(Arc<sov_network::PortMapper>, u16)>,
 }
 
 /// A socket-free, in-process snapshot of the embedded node's CHAIN state — read every
@@ -2729,6 +2733,13 @@ struct SyncView {
 impl EmbeddedNode {
     /// Stop block production, the RPC server, and P2P, joining their threads.
     fn shutdown(self) {
+        // Release the router mapping FIRST. It is the only state that lives
+        // outside this machine, and the only piece another device is actively
+        // relying on — leaving it makes the router forward a port to nothing
+        // until the lease lapses.
+        if let Some((mapper, port)) = self.port_mapper {
+            mapper.shutdown(port);
+        }
         if let Some(p2p) = self.p2p {
             p2p.shutdown();
         }
@@ -11546,6 +11557,14 @@ fn setup_node_dir(node_dir: &Path, spec_filename: &str) -> Result<(), String> {
     std::fs::write(node_dir.join(spec_filename), spec_text)
         .map_err(|e| format!("write spec: {e}"))?;
     let config = NodeConfig {
+        // Ask the router to open the P2P port so this desktop node can accept
+        // INBOUND peers instead of only dialing out. A home machine behind NAT
+        // is exactly the case this exists for — it works either way, but an
+        // unreachable node consumes connectivity without contributing any.
+        //
+        // Best-effort and silent on failure: no IGD router, UPnP disabled, or
+        // carrier-grade NAT all leave the node working exactly as before.
+        upnp: Some(true),
         rpc_addr: "127.0.0.1:8645".to_string(),
         rpc_workers: 4,
         data_dir: "node-1/data".to_string(),
@@ -12152,6 +12171,8 @@ fn build_and_run_node(
             daemon.height()
         ),
     );
+    // Set when the router accepts a mapping; released when the node stops.
+    let mut port_mapper: Option<(Arc<sov_network::PortMapper>, u16)> = None;
     let checkpoints = config
         .checkpoints
         .iter()
@@ -12236,6 +12257,34 @@ fn build_and_run_node(
             }
             daemon = daemon.with_gossip(p2p.tcp());
             push_log(logs, format!("P2P listening on {bound} (peers welcome)"));
+
+            // UPnP: ask the router to let peers IN.
+            //
+            // Station runs the node IN-PROCESS, so it does not inherit the
+            // mapping sov-rpcd sets up — this is the wiring for the desktop
+            // case, which is precisely the machine sitting behind a home router.
+            //
+            // A `PortMapper` rather than a one-shot: a UPnP mapping is a LEASE,
+            // and mapping once then forgetting means going quietly unreachable
+            // an hour later. It renews at half the lease, rediscovers the router
+            // if a renewal fails, and backs off when refused.
+            //
+            // Best-effort throughout: no IGD router, UPnP disabled, or
+            // carrier-grade NAT all leave the node working exactly as before —
+            // able to dial out, just not to be dialled.
+            if config.upnp.unwrap_or(true) {
+                let logs_for_map = logs.clone();
+                port_mapper = Some((
+                    Arc::new(sov_network::PortMapper::start(
+                        bound,
+                        "SOV Station",
+                        move |msg| push_log(&logs_for_map, msg),
+                    )),
+                    bound.port(),
+                ));
+            } else {
+                push_log(logs, "UPnP disabled in config");
+            }
             Some(p2p.start())
         }
         None => {
@@ -12271,6 +12320,7 @@ fn build_and_run_node(
         p2p,
         account: account.to_string(),
         sync,
+        port_mapper,
     })
 }
 

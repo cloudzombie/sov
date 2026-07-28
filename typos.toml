@@ -22,3 +22,5 @@ captable = "captable"  # the removed cap-table crate, referenced in historical d
 Thm = "Thm"            # "Theorem" abbreviation in the proofs
 unparseable = "unparseable"
 clen = "clen"          # content-length local in the framed transport
+Pn = "Pn"              # the "Pn" fragment typos splits out of UPnP (Universal
+                       # Plug and Play), the IGD port-mapping standard

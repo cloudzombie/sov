@@ -54,6 +54,30 @@ fn log(logs: &Logs, msg: impl Into<String>) {
 /// Spawn the stdout drainer: every 200 ms it flushes newly-buffered log lines to stdout in
 /// order. The node's `log_sink` (mining, peers, sync) and this binary's own milestones share
 /// the one buffer, giving a single ordered stream that journald captures verbatim.
+/// Flush any buffered log lines to stdout NOW, synchronously.
+///
+/// The drainer runs on a 200 ms tick, which is invisible during normal
+/// operation and exactly wrong at shutdown: `main` returns in microseconds, so
+/// the last lines — the ones saying what the shutdown actually did — are lost
+/// with the process. An operator then sees a node vanish silently and cannot
+/// tell a clean stop from a crash.
+fn drain_logs_now(logs: &Logs) {
+    use std::io::Write;
+    let batch: Vec<String> = match logs.lock() {
+        Ok(mut v) => std::mem::take(&mut *v),
+        Err(_) => return,
+    };
+    if batch.is_empty() {
+        return;
+    }
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for line in batch {
+        let _ = writeln!(out, "{line}");
+    }
+    let _ = out.flush();
+}
+
 fn spawn_log_drain(logs: Logs) {
     thread::spawn(move || {
         use std::io::Write;
@@ -144,6 +168,9 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
     // transport back to the daemon for OUTBOUND gossip of everything this node produces. Held
     // to the end of `run` (the engine's threads outlive this binding, but keeping it parks
     // shutdown to process exit).
+    // Held so a graceful shutdown can REMOVE the router mapping rather than
+    // leaving it to lapse.
+    let mut port_mapper: Option<(Arc<sov_network::PortMapper>, u16)> = None;
     let _p2p = match config.p2p_addr.as_deref() {
         Some(p2p_addr) => {
             let (account, keypair) = keystore.keys()?.into_iter().next().ok_or_else(|| {
@@ -182,6 +209,52 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
                 &logs,
                 format!("P2P gossip listening on {}", p2p.local_addr()),
             );
+            // UPnP: ask the router to let peers IN.
+            //
+            // A node behind NAT dials out fine — it syncs, relays and mines, and
+            // its blocks reach the network. What it cannot do is ACCEPT inbound
+            // connections, so it is a leaf rather than a participant, and a
+            // network of only leaves has nowhere to connect to.
+            //
+            // A `PortMapper` rather than a one-shot call, because a UPnP mapping
+            // is a LEASE. Mapping once and forgetting means going quietly
+            // unreachable an hour later with nothing in the log to explain it —
+            // worse than never mapping, because the operator was told they were
+            // reachable. The mapper renews at half the lease, rediscovers the
+            // router if a renewal fails, backs off when refused, and removes the
+            // mapping on shutdown so a restarting node does not fill the
+            // router's mapping table.
+            //
+            // Opt-out honoured: some operators are required not to use UPnP, and
+            // a node on a VPS with a public address has no use for it.
+            if config.upnp.unwrap_or(true) {
+                let local = p2p.local_addr();
+                let logs_for_map = Arc::clone(&logs);
+                let mapper = sov_network::PortMapper::start(local, "SOV node", move |msg| {
+                    log(&logs_for_map, msg)
+                });
+                // Publish reachability so `sov_getPeerInfo` can answer "can
+                // anyone reach me?" without the operator reading logs.
+                let mapper = Arc::new(mapper);
+                let sync_for_map = Arc::clone(&sync);
+                let poll_mapper = Arc::clone(&mapper);
+                // Exits with the mapper rather than outliving it: a detached
+                // loop that never stops is a thread nobody owns.
+                std::thread::spawn(move || {
+                    while !poll_mapper.is_stopped() {
+                        sync_for_map.set_reachability(poll_mapper.reachability().as_str());
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
+                    // Final state after shutdown, so the last thing published is
+                    // accurate rather than a stale "mapped".
+                    sync_for_map.set_reachability("stopped");
+                });
+                port_mapper = Some((mapper, local.port()));
+            } else {
+                log(&logs, "UPnP disabled by config (upnp = false)");
+                sync.set_reachability("disabled");
+            }
+
             // Persistent peer discovery: remember reachable peers across restarts so the
             // hard-coded seeds are only ever needed for the FIRST contact. Loads
             // <data_dir>/peers.dat, redials a sample, and re-flushes it periodically.
@@ -247,10 +320,58 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
         ),
     );
 
-    // The daemon's RPC + production threads keep the chain running; park the main
-    // thread to keep the process alive. SIGINT/SIGTERM terminates the process; the
-    // last fsync'd block in blocks.log is the durable head, so restart is clean.
-    loop {
-        thread::park();
+    // GRACEFUL SHUTDOWN.
+    //
+    // The durable head is the last fsync'd block in blocks.log, so an abrupt
+    // kill was already safe for the CHAIN. What it was not safe for is
+    // everything around it: the pending mempool was lost rather than written,
+    // and the router kept forwarding a port to a process that no longer exists
+    // until the UPnP lease happened to expire.
+    //
+    // So the main thread now waits for SIGINT/SIGTERM instead of parking
+    // forever, and unwinds in dependency order.
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    if let Err(e) = ctrlc::set_handler(move || {
+        // Signal-handler context: do nothing but wake the main thread. All the
+        // real work happens below, on a normal thread with normal rules.
+        let _ = tx.send(());
+    }) {
+        // Without a handler we cannot shut down cleanly, and pretending
+        // otherwise would be worse than saying so.
+        log(
+            &logs,
+            format!(
+                "could not install a signal handler ({e}); \
+             shutdown will not be graceful"
+            ),
+        );
     }
+    let _ = rx.recv();
+    log(&logs, "shutdown requested — stopping cleanly".to_string());
+    // Flush after EACH step rather than at the end: if one of them hangs, the
+    // operator can see which, instead of watching a silent process.
+    drain_logs_now(&logs);
+
+    // 1. Release the router mapping FIRST. It is the only piece of state that
+    //    lives outside this machine, and the only one another device is
+    //    actively relying on. The lease would expire eventually; leaving it is
+    //    litter in a table with finite room.
+    if let Some((mapper, port)) = port_mapper.take() {
+        mapper.shutdown(port);
+        log(&logs, "released the UPnP port mapping".to_string());
+        drain_logs_now(&logs);
+    }
+
+    // 2. Stop block production and the RPC server, and WAIT for both. The
+    //    handle's shutdown joins the production thread before returning, so the
+    //    final mempool snapshot cannot race a block being assembled from it.
+    handle.shutdown();
+    log(
+        &logs,
+        "stopped block production and RPC; mempool + snapshot persisted".to_string(),
+    );
+
+    log(&logs, "shutdown complete".to_string());
+    drain_logs_now(&logs);
+    Ok(())
 }
