@@ -212,9 +212,109 @@ hash is untouched. After arming, this binding is part of the hard fork.
   real activation height, ~25 min); the CLI build path it drives is wired and
   compiles.
 
+## PQV2-04 — depth-20 tree exhaustion, resolution (2026-07-28) — **PARTIAL: boundary FIXED, capacity PROTOTYPE (gates arming)**
+
+The finding has two halves. One is a correctness bug and is fixed; the other is
+a capacity/sizing limit that pricing cannot fully solve and that honestly gates
+activation.
+
+**Half 1 — the `root()` / capacity boundary bug — FIXED (already on `main`).**
+The depth-20 frontier is an O(depth) encoding of "one ommer per set bit of
+`size`". At exactly `size == 2^20` every low bit is zero, so the frontier walk
+would return the EMPTY-tree root for a FULL tree — a full-pool anchor colliding
+with the empty-pool anchor. Fixed by capping usable capacity at
+`MAX_V2_NOTES = MAX_TREE_LEAVES = 2^20 − 1` (the final leaf slot is deliberately
+unusable), with a compile-time guard `MAX_V2_NOTES < 2^TREE_DEPTH`. Both mutators
+(`append_commitment`, `apply`) reject the insertion that would reach exact
+capacity with a typed `TreeFull`, mutating nothing. This landed in
+`fix(pool-v2 consensus): the frontier CANNOT hold 2^20 notes` (commit `d999ebd`)
+and is proven — not by an early refusal — by
+`frontier_matches_the_reference_tree_at_full_capacity` (release-only), which
+appends `2^20 − 1` REAL leaves and asserts the frontier root equals the
+reference tree's root at full capacity, is NOT the empty root, and that one more
+append is `TreeFull`. Re-verified this session: **1 passed** in 68 s.
+
+**Half 2 — economic/growth exhaustion — QUANTIFIED; pricing floor pinned; the
+real fix is a deeper tree (out of scope here) and it GATES arming.**
+
+*The number, traced from code (post-activation, mainnet schedule):*
+- Fee model: `fee = gas_for(action) × gas_price`, paid transparently from the
+  carrier (the in-circuit fee leg is pinned to zero in proof_version 1), to the
+  miner (not burned). `gas_price` mainnet = **10 grains/gas**
+  (`MiningPolicy::mainnet_like`). `GRAINS_PER_SOV = 10^8`.
+- `gas_for(ShieldedV2) = INTRINSIC_GAS (21,000) + SHIELDED_V2_VERIFY_GAS
+  (500,000) + bundle.len()·16 (+ hybrid envelope if a PQ carrier)`.
+- Each bundle appends at most `NUM_SLOTS = 4` real output commitments (leaves).
+- Conservative per-bundle floor (fixed terms only, ignoring bundle bytes and a
+  possible V1 carrier's zero envelope): `521,000 gas × 10 = 5,210,000 grains =
+  0.0521 XUS`; per commitment `0.013 XUS`.
+- Filling `2^20 − 1` leaves needs `⌈1,048,575 / 4⌉ = 262,144` bundles ⇒
+  **≥ ~13,657 XUS** in fees at the floor, **~39,000 XUS** counting the ~60 KB of
+  bundle bytes each tx carries.
+- Rate/time floor: block weight bounds a block to
+  `MAX_V2_COMMITMENTS_PER_BLOCK = 160` commitments, so the fill also takes
+  `⌈1,048,575 / 160⌉ = 6,554` consecutive blocks ≈ **11.4 days** the attacker
+  must WIN the blockspace auction against all other traffic.
+
+*Verdict.* The attacker's gain is pure griefing (fees enrich miners; funds are
+never lost — holders can still de-shield out), and the floor is not trivial, so
+the tree is not *cheaply* bricked. But depth-20 is a **prototype** capacity: it
+is exhaustible for a bounded, finite one-time cost (~13.6k–39k XUS + ~11 days),
+AND by honest growth alone (1.05M notes is months-to-a-few-years of real
+adoption). Pricing cannot fix honest exhaustion, and inflating gas to price the
+attack out would distort legitimate use. The robust fix is a **deeper tree**:
+sizing capacity from the issuance/confirmation horizon
+(`MAX_V2_COMMITMENTS_PER_BLOCK × ~20 years of blocks ≈ 6.7×10^8` leaves ⇒ depth
+~30) gives Orchard-parity depth **32** (`HORIZON_SAFE_TREE_DEPTH`), 4.29×10^9
+leaves, >6× headroom.
+
+*Why the depth change is NOT shipped here (reserve-grade honesty).* Raising
+`TREE_DEPTH` is a STARK **spend-circuit** re-derivation, not a constant bump:
+the AIR trace row-map bakes the Merkle path length into fixed literals —
+`INPUT_SEGMENT_ROWS = 24·CYCLE_LENGTH` (24 = 3 setup + 20 levels + 1),
+`root_row` = `input_base + 23·CYCLE_LENGTH − 1`, `nf_row` at `24·…`, and
+`TRACE_LENGTH = 1024`. Depth 32 pushes the input segment to 36 cycles, doubles
+the trace to 2048, and invalidates every proof KAT and the *measured* verify-cost
+basis behind `SHIELDED_V2_VERIFY_WEIGHT`. It is a deliberate, re-audited,
+re-proven change to the trust path (the spend soundness proof). Shipping it
+half-done would be exactly the kind of unproven-crypto-in-the-trust-path move the
+reserve-grade bar forbids, so it is deferred to an audited circuit revision and
+recorded as a **prerequisite for arming bit 2** on any chain that will carry
+sustained v2 traffic.
+
+*What this PR does implement.* (1) Confirms + re-verifies the boundary fix at the
+real depth. (2) Pins the economic floor so a pre-arming retune cannot silently
+cheapen the attack: `pool_v2_exhaustion_has_a_pinned_fee_floor` (runtime, ≥13k
+XUS floor), `filling_the_tree_takes_thousands_of_saturated_blocks` (≥10 days /
+6,554 blocks). (3) Records depth-20 as a documented prototype shortfall with the
+horizon-derived target `HORIZON_SAFE_TREE_DEPTH = 32` and a test,
+`depth_20_is_a_documented_prototype_shortfall_pending_a_circuit_upgrade`, that
+pins `TREE_DEPTH < HORIZON_SAFE_TREE_DEPTH` and `MAX_TREE_LEAVES < horizon_leaves`
+so arming can never quietly ship the prototype depth.
+
+*Why it is safe while dormant.* No new consensus digest, gas value, or capacity
+changes: `SHIELDED_V2_VERIFY_GAS` and `TREE_DEPTH` are untouched, so the only
+additions are a documentation constant (`HORIZON_SAFE_TREE_DEPTH`) and tests.
+Bit 2 is UNARMED on every canonical chain (`shielded_v2_is_dormant_everywhere`
+green), so no v2 action executes and byte-identity holds.
+
+**Status:** boundary FIXED and proven; economics QUANTIFIED and floor-pinned; the
+depth upgrade to `HORIZON_SAFE_TREE_DEPTH` is an OPEN prerequisite for arming
+bit 2, deferred to an audited circuit revision. PQV2-04 is therefore
+**closed for the boundary defect and the pricing floor; the capacity upgrade
+remains a named blocker on the arming bar below.**
+
 ## Bar for arming bit 2
 
 Unchanged and not met: every Medium resolved or explicitly accepted in writing,
 the five-node suite wired as a required job and green with **zero** skips, and
 the external circuit audit (`notes/audit-scope-pq-pool.md`) completed with its
 findings closed. Pool v2 ships DORMANT in v0.2.2 regardless.
+
+Added by PQV2-04: **the note-commitment tree must be deepened to
+`HORIZON_SAFE_TREE_DEPTH` (32) as an audited, re-proven STARK-circuit revision
+before bit 2 is armed on any chain expecting sustained v2 traffic.** Depth-20 is
+a prototype capacity, exhaustible by honest growth and by a ~13.6k–39k XUS /
+~11-day griefing attack; the boundary defect and the fee floor are fixed/pinned,
+but the capacity itself is not production-grade and this is a hard blocker on
+arming, not a pricing knob.

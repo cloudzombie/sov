@@ -966,3 +966,64 @@ mod anchor_horizon_tests {
         }
     }
 }
+
+/// **Audit PQV2-04** — the depth-20 commitment tree's exhaustion economics.
+///
+/// The boundary half of PQV2-04 (a `root()` that returned the empty-tree root
+/// at exactly `2^20`) is fixed by capping usable capacity at [`MAX_V2_NOTES`]
+/// = `2^20 - 1` and is pinned by the boundary tests above (including the
+/// release-only `frontier_matches_the_reference_tree_at_full_capacity`, which
+/// fills the real tree and pins its root against the reference at capacity).
+///
+/// These tests pin the *economic* half: the FLOOR on what filling the tree
+/// costs, in fees and in wall-clock, and the honest record that depth-20 is a
+/// prototype capacity below the lifetime horizon (see
+/// [`HORIZON_SAFE_TREE_DEPTH`](crate::tree::HORIZON_SAFE_TREE_DEPTH)).
+#[cfg(test)]
+mod exhaustion_tests {
+    use super::*;
+    use crate::tree::{HORIZON_SAFE_TREE_DEPTH, MAX_TREE_LEAVES, TREE_DEPTH};
+
+    /// Filling the tree requires sustaining a saturated block for far longer
+    /// than any confirmation horizon — the RATE floor. Block weight caps a
+    /// block at [`MAX_V2_COMMITMENTS_PER_BLOCK`] commitments, so filling the
+    /// `2^20 - 1` usable leaves takes thousands of consecutive blocks the
+    /// attacker must WIN in the blockspace auction against all other traffic.
+    #[test]
+    fn filling_the_tree_takes_thousands_of_saturated_blocks() {
+        let blocks_to_fill = MAX_V2_NOTES.div_ceil(MAX_V2_COMMITMENTS_PER_BLOCK as u64);
+        // ceil(1,048,575 / 160) = 6,554 blocks.
+        assert_eq!(blocks_to_fill, 6_554);
+        // At the 2.5-minute (150 s) target that is ~11.4 days of EVERY block
+        // maxed out with the attacker's bundles.
+        let seconds = blocks_to_fill * 150;
+        assert!(seconds > 10 * 24 * 3600, "at least ten days of saturation");
+        // And orders of magnitude beyond the anchor-retention horizon, so an
+        // attack long enough to fill the tree is not remotely cheap to sustain.
+        assert!(blocks_to_fill > (ANCHOR_HORIZON_BLOCKS as u64) * 40);
+    }
+
+    /// Depth-20 is a documented prototype shortfall: its capacity is below the
+    /// lifetime horizon a horizon-safe tree must cover, and closing the gap is
+    /// a STARK spend-circuit change (raising [`TREE_DEPTH`]), NOT shipped here.
+    /// This pins the gap so arming bit 2 cannot silently ship the prototype
+    /// depth — the horizon-safe depth is strictly larger, by construction.
+    #[test]
+    fn depth_20_is_a_documented_prototype_shortfall_pending_a_circuit_upgrade() {
+        // ~20 years of blocks at the 2.5-minute target.
+        const HORIZON_BLOCKS: u64 = 20 * 365 * 24 * 3600 / 150;
+        let horizon_leaves = (MAX_V2_COMMITMENTS_PER_BLOCK as u64) * HORIZON_BLOCKS;
+        // Depth needed to hold the horizon's worth of leaves.
+        let required_depth = (u64::BITS - (horizon_leaves - 1).leading_zeros()) as usize;
+        // The chosen constant covers the derived requirement with headroom
+        // (Orchard-parity depth 32 vs a ~30 requirement).
+        assert!(required_depth <= HORIZON_SAFE_TREE_DEPTH);
+        // The shipped depth is knowingly below it — this is the prototype limit.
+        const { assert!(TREE_DEPTH < HORIZON_SAFE_TREE_DEPTH) };
+        assert!(
+            (MAX_TREE_LEAVES as u128) < (horizon_leaves as u128),
+            "depth-20 capacity is below the lifetime horizon — a known prototype limit \
+             gating activation until the tree is deepened (a re-audited circuit change)"
+        );
+    }
+}

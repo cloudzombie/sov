@@ -40,6 +40,33 @@ pub const TREE_DEPTH: usize = 20;
 /// is unable to hold.
 pub const MAX_TREE_LEAVES: u64 = (1u64 << TREE_DEPTH) - 1;
 
+/// The tree depth a **production** pool needs so its capacity cannot be
+/// exhausted within the asset's intended lifetime — DERIVED, audit **PQV2-04**.
+///
+/// Capacity must outrun the fastest way leaves are added: a fully-saturated
+/// block. Block weight bounds one block to `MAX_V2_COMMITMENTS_PER_BLOCK` (160)
+/// commitments, so over a horizon of `H` blocks the tree must hold `160·H`
+/// leaves. Sizing `H` at ~20 years of blocks at the 2.5-minute target
+/// (`20·365·24·3600 / 150 ≈ 4.2M` blocks) needs `160 · 4.2M ≈ 6.7×10^8` leaves,
+/// i.e. depth `ceil(log2(6.7×10^8)) = 30`. Rounding up to Orchard's depth **32**
+/// (4.29×10^9 leaves) leaves >6× headroom.
+///
+/// The shipped [`TREE_DEPTH`] = 20 (1.05M leaves) is a **prototype** value: its
+/// capacity is exhaustible both by honest growth and by a bounded griefing
+/// attack (~13.6k XUS in miner fees and ~11 days of sustained block-auction
+/// dominance — see the PQV2-04 resolution in `notes/pq-pool-v2-audit-response.md`
+/// and the cost-floor regression tests). Raising the depth is a STARK
+/// **spend-circuit** change: the AIR trace row-map bakes the Merkle path length
+/// into fixed literals ([`air::root_row`](crate::air::root_row),
+/// [`INPUT_SEGMENT_ROWS`](crate::air::INPUT_SEGMENT_ROWS),
+/// [`TRACE_LENGTH`](crate::air::TRACE_LENGTH) = 1024), and every proof KAT and
+/// the measured verify-cost basis depend on it. It is therefore a deliberate,
+/// re-audited, re-proven circuit revision — deliberately NOT attempted here —
+/// and is a prerequisite for arming signal bit 2 on any chain that will carry
+/// sustained v2 traffic. Bit 2 is dormant on every canonical network today,
+/// which is what keeps the prototype depth safe in the meantime.
+pub const HORIZON_SAFE_TREE_DEPTH: usize = 32;
+
 /// `empty[l]` = digest of an empty subtree of height `l` (level 0 = leaf).
 ///
 /// THE one source of truth for the empty-subtree ladder: the reference tree

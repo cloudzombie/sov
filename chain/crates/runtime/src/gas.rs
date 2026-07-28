@@ -218,6 +218,55 @@ mod tests {
     }
 
     #[test]
+    fn pool_v2_exhaustion_has_a_pinned_fee_floor() {
+        // Audit PQV2-04: "the depth-20 commitment tree can be economically
+        // exhausted." This pins the FLOOR on what exhaustion costs in fees so a
+        // future gas retune (slice S2d may retune BEFORE arming) can never
+        // silently make griefing the pool cheap.
+        //
+        // Threat model: bit 2 is armed and active. An attacker fills the tree's
+        // `MAX_V2_NOTES` = 2^20-1 usable leaves so no further notes can be added
+        // — a permanent pool DoS. Each `ShieldedV2` bundle carries at most
+        // `NUM_SLOTS` real output commitments (leaves).
+        use sov_mining::MiningPolicy;
+        use sov_primitives::GRAINS_PER_SOV;
+        use sov_shielded_pq::{air::NUM_SLOTS, MAX_V2_NOTES};
+
+        // The mainnet fee schedule the attack is priced against.
+        let gas_price = MiningPolicy::mainnet_like().gas_price.grains();
+        assert_eq!(gas_price, 10, "mainnet charges 10 grains per gas unit");
+        assert_eq!(
+            SHIELDED_V2_VERIFY_GAS, 500_000,
+            "verify-gas floor is pinned"
+        );
+
+        // A GUARANTEED per-bundle gas floor, independent of bundle bytes and of
+        // the carrier's signature scheme: intrinsic + the STARK-verify
+        // surcharge. A real bundle also pays for its ~55+ KB proof bytes
+        // (× CALLDATA_GAS_PER_BYTE) and, for a PQ carrier, the hybrid envelope —
+        // all strictly ON TOP of this — so this is a conservative lower bound.
+        let min_gas_per_bundle = INTRINSIC_GAS + SHIELDED_V2_VERIFY_GAS; // 521,000
+        let empty = Action::ShieldedV2 { bundle: vec![] };
+        assert!(
+            gas_for(&empty) >= min_gas_per_bundle,
+            "a v2 bundle always costs at least intrinsic + verify gas"
+        );
+
+        // Cost floor to fill every usable leaf.
+        let bundles_to_fill = MAX_V2_NOTES.div_ceil(NUM_SLOTS as u64); // 262,144
+        let min_fee_grains = (min_gas_per_bundle as u128) * gas_price * (bundles_to_fill as u128);
+        let min_fee_xus = min_fee_grains / GRAINS_PER_SOV;
+        // >= ~13,600 XUS in fees PAID TO MINERS just to grief the pool, with no
+        // financial gain to the attacker (fees are not burned — they enrich the
+        // very miners securing the chain). Counting the ~60 KB of bundle bytes
+        // each transaction must carry raises the realistic figure to ~39k XUS.
+        assert!(
+            min_fee_xus >= 13_000,
+            "filling the tree costs at least ~13,000 XUS in fees, got {min_fee_xus}"
+        );
+    }
+
+    #[test]
     fn wallet_route_intrinsic_gas_is_stable() {
         // These payload-independent sums are what the `sov_estimateFee` RPC reuses for
         // the wallet's three send routes; pin them so the RPC can never drift.
