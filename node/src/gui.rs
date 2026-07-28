@@ -24,9 +24,9 @@ use sov_rpc::{
     P2pHandle, RpcClient, SyncShared,
 };
 use sov_shielded::{
-    decode_shielded_v2, encode_shielded, encode_shielded_v2, shielded_transfer_with_change,
-    unshield_amount_multi, AnyAddress, NoteStore, Receiver, ShieldedBundle, ShieldedKey,
-    ShieldedParams, UnifiedAddress,
+    decode_shielded_v2, encode_shielded, encode_shielded_v2, mint_to_shielded,
+    shielded_transfer_with_change, unshield_amount_multi, AnyAddress, NoteStore, Receiver,
+    ShieldedBundle, ShieldedKey, ShieldedParams, UnifiedAddress,
 };
 use sov_shielded_pq::bundle::SpendBundle;
 use sov_shielded_pq::hd::PqShieldedKey;
@@ -38,6 +38,9 @@ use sov_types::{Action, SignedTransaction, Transaction};
 use sov_wallet::{generate_mnemonic, HdWallet};
 use zeroize::Zeroize;
 
+use crate::auction::{
+    self, Auction, Outlook, Pressure, SendCost, SendState, SentTx, FEE_AUCTION_DEPLOYMENT,
+};
 use crate::vault;
 
 /// Accounts the wallet panel watches by default: the station's own miner and the
@@ -336,6 +339,15 @@ struct Snapshot {
     /// mainnet). Shown in the send-review modal so the spender sees the full cost.
     fee_transfer_grains: u128,
     fee_shielded_grains: u128,
+    /// The node's live gas price (grains per gas unit). Needed to price the tip
+    /// envelope's extra gas, which `sov_estimateFee` cannot express — it takes a
+    /// route, not "route wrapped in a tip envelope".
+    gas_price_grains: u128,
+    /// The live blockspace auction (v0.1.98): the next-block floor, the pooled
+    /// fee-rate distribution, and whether the `fee-auction` deployment is Active.
+    /// Its `available` flag distinguishes "the auction is clear" from "this node
+    /// did not tell us" — see [`Auction`].
+    auction: Auction,
 }
 
 /// UI-editable polling config, shared with the poller thread.
@@ -2033,19 +2045,42 @@ fn poll(client: &RpcClient, cfg: &Config) -> Snapshot {
     // The live per-route network fee, straight from consensus (0 on a fee-free
     // testnet, the real cost on mainnet) — surfaced in the send-review modal. A node
     // without the method just reports no fee (graceful on older peers).
-    let fee_of = |kind: &str| -> u128 {
-        client
-            .call("sov_estimateFee", json!({ "kind": kind }))
-            .ok()
-            .and_then(|v| {
-                v.get("feeGrains")
-                    .and_then(Value::as_str)
-                    .and_then(|g| g.parse::<u128>().ok())
-            })
+    let estimate = |kind: &str| -> Option<Value> {
+        client.call("sov_estimateFee", json!({ "kind": kind })).ok()
+    };
+    let fee_field = |v: &Option<Value>, key: &str| -> u128 {
+        v.as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(Value::as_str)
+            .and_then(|g| g.parse::<u128>().ok())
             .unwrap_or(0)
     };
-    s.fee_transfer_grains = fee_of("transfer");
-    s.fee_shielded_grains = fee_of("shielded");
+    let transfer_estimate = estimate("transfer");
+    let shielded_estimate = estimate("shielded");
+    s.fee_transfer_grains = fee_field(&transfer_estimate, "feeGrains");
+    s.fee_shielded_grains = fee_field(&shielded_estimate, "feeGrains");
+    // The node's live gas price, so Station can price the one thing
+    // `sov_estimateFee` has no parameter for: the extra gas a tip ENVELOPE costs
+    // on top of the bare route (see `auction::route_fee_grains`).
+    s.gas_price_grains = fee_field(&transfer_estimate, "gasPriceGrains");
+    // The live blockspace auction. All three calls are ADDITIVE and optional: a
+    // node too old to serve them errors, and `Auction::from_rpc` then reports
+    // `available = false`, which the send form renders as an explicit UNKNOWN.
+    // Station must keep working against an old node, so nothing here is fatal.
+    let histogram = client.call("sov_getMempoolHistogram", json!({})).ok();
+    let mempool_info = client.call("sov_getMempoolInfo", json!({})).ok();
+    // Tips are only LEGAL once the `fee-auction` deployment is Active — below
+    // that height an `Action::Tipped` is a hard consensus rejection, so a wallet
+    // that tipped anyway would build a transaction that can never be mined.
+    let fee_auction_active = client
+        .call("sov_getDeployments", json!({}))
+        .ok()
+        .is_some_and(|v| auction::deployment_active(&v, FEE_AUCTION_DEPLOYMENT));
+    s.auction = Auction::from_rpc(
+        histogram.as_ref(),
+        mempool_info.as_ref(),
+        fee_auction_active,
+    );
     s.mempool = client.mempool_size().ok();
     if let Ok(r) = client.mint_reward() {
         s.reward = r.grains().to_string();
@@ -2682,6 +2717,13 @@ struct PendingSend {
     /// True for a fully-private spend FROM the shielded pool (sender, recipient,
     /// and amount all hidden) — dispatched via `shielded_send`, not `send`.
     from_pool: bool,
+    /// The exact network fee consensus charges for this route (`sov_estimateFee`),
+    /// captured at review time.
+    fee_grains: u128,
+    /// The blockspace-auction bid this send will carry, captured at review time so
+    /// the modal shows the SAME number that gets signed — not a figure that could
+    /// drift with the pool between review and confirm.
+    tip_grains: u128,
 }
 
 /// The local node, running **in-process** inside sov-station (the Bitcoin Core
@@ -2891,10 +2933,25 @@ pub struct Station {
     reveal_phrase: bool,            // show the active wallet's recovery phrase (export)
     receive_kind: ReceiveKind,      // which address the Receive view shows
     pending_send: Option<PendingSend>, // a send awaiting confirmation (review modal)
-    block_detail: Option<u64>,      // height of the block open in the detail view
-    vault_ui: VaultUi,              // all state for the Vault (multisig) tab; isolated
-    wallets_dirty: bool,            // wallets exist that aren't saved to the keystore
-    confirm_quit: bool,             // quit requested with unsaved wallets — show guard
+    // ── Blockspace auction (v0.1.98) ────────────────────────────────────────
+    // Every send this session, with the nonce and recipient needed to REBUILD it
+    // at the same slot for a replace-by-fee bump. Shared with the poller, which
+    // keeps each entry's pending/confirmed state live.
+    outbox: Arc<Mutex<Vec<SentTx>>>,
+    // The tip to attach to the next send, as typed (XUS). Empty means "use the
+    // suggestion derived from the live pool".
+    send_tip: String,
+    // True once the spender has typed in the tip field. Until then the field
+    // tracks the live suggestion as the pool moves; after, it is THEIRS and
+    // Station never rewrites it under their cursor.
+    send_tip_edited: bool,
+    // A bump awaiting explicit confirmation. The modal exists because "bump"
+    // must never be mistaken for "send again" — see [`Self::bump_send`].
+    pending_bump: Option<SentTx>,
+    block_detail: Option<u64>, // height of the block open in the detail view
+    vault_ui: VaultUi,         // all state for the Vault (multisig) tab; isolated
+    wallets_dirty: bool,       // wallets exist that aren't saved to the keystore
+    confirm_quit: bool,        // quit requested with unsaved wallets — show guard
     gen_name: String,
     import_name: String,
     import_mnemonic: String,
@@ -3140,11 +3197,19 @@ impl Network {
 }
 
 impl Station {
-    fn new(snapshot: Arc<Mutex<Snapshot>>, config: Arc<Mutex<Config>>) -> Self {
+    fn new(
+        snapshot: Arc<Mutex<Snapshot>>,
+        config: Arc<Mutex<Config>>,
+        outbox: Arc<Mutex<Vec<SentTx>>>,
+    ) -> Self {
         let rpc_field = config.lock().map(|c| c.rpc.clone()).unwrap_or_default();
         let mut station = Station {
             snapshot,
             config,
+            outbox,
+            send_tip: String::new(),
+            send_tip_edited: false,
+            pending_bump: None,
             tab: Tab::Node,
             rpc_field,
             node_run: Arc::new(Mutex::new(NodeRun::Stopped)),
@@ -3695,6 +3760,249 @@ impl Station {
 
     /// Send `amount` to `to` (a named account, a `xus1…` shielded address, or a
     /// `uxus1…` unified address). Routing + Halo2 proving happen on a worker.
+    /// The blockspace-auction panel of the send form: what a slot costs right now,
+    /// what this send is bidding, and what that bid is likely to buy. Returns the
+    /// tip (in grains) the send will carry.
+    ///
+    /// The whole tip control is gated on the `fee-auction` deployment being Active,
+    /// because below its activation height an `Action::Tipped` is a hard consensus
+    /// rejection — offering a tip there would not be a worse price, it would be an
+    /// unmineable transaction. When it is dormant the panel still shows the pool,
+    /// and says plainly that tips are not live.
+    fn auction_controls(&mut self, ui: &mut egui::Ui, a: &Auction) -> u128 {
+        ui.add_space(sp::M);
+        card(ui, |ui| {
+            auction_readout(ui, a);
+            // The bid. Kept in sync with the live suggestion until the spender
+            // touches the field — after that it is theirs, and Station never
+            // rewrites a number under their cursor.
+            let suggested = a.suggested_tip_grains();
+            if !self.send_tip_edited {
+                self.send_tip = grains_to_xus_plain(suggested);
+            }
+            if a.fee_auction_active {
+                ui.add_space(sp::M);
+                ui.horizontal(|ui| {
+                    ui.label("Tip XUS");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.send_tip)
+                            .desired_width(140.0)
+                            .hint_text("0"),
+                    );
+                    if r.changed() {
+                        self.send_tip_edited = true;
+                    }
+                    if ui
+                        .add_enabled(self.send_tip_edited, egui::Button::new("Suggested"))
+                        .on_hover_text(
+                            "go back to the tip derived from the live pool, and keep tracking it",
+                        )
+                        .clicked()
+                    {
+                        self.send_tip_edited = false;
+                        self.send_tip = grains_to_xus_plain(suggested);
+                    }
+                });
+                ui.add_space(sp::XS);
+                ui.label(
+                    egui::RichText::new(tip_rationale(a))
+                        .size(ty::SMALL)
+                        .color(palette::text_dim()),
+                );
+            } else {
+                ui.add_space(sp::M);
+                ui.label(
+                    egui::RichText::new(
+                        "the fee auction is not active on this chain — sends carry no tip and \
+                         are included first-come. Nothing to bid.",
+                    )
+                    .size(ty::SMALL)
+                    .color(palette::text_dim()),
+                );
+            }
+            let tip = self.tip_for(a);
+            if self.send_tip_edited && parse_xus(&self.send_tip).is_none() {
+                ui.label(
+                    egui::RichText::new(
+                        "✗ tip must be a number of XUS (e.g. 0.0001) — treating it as 0",
+                    )
+                    .size(ty::SMALL)
+                    .color(palette::error()),
+                );
+            }
+            bid_outlook_view(ui, a, tip);
+            tip
+        })
+    }
+
+    /// The tip a send would carry against auction reading `a`: what the spender
+    /// typed, or the live suggestion while they have not touched the field — and
+    /// unconditionally zero while the `fee-auction` deployment is dormant.
+    fn tip_for(&self, a: &Auction) -> u128 {
+        if !a.fee_auction_active {
+            return 0;
+        }
+        if self.send_tip_edited {
+            parse_xus(&self.send_tip).unwrap_or(0)
+        } else {
+            a.suggested_tip_grains()
+        }
+    }
+
+    /// This session's sends, with a one-click BUMP for anything still pooled.
+    ///
+    /// This is the lever the wallet did not have: a send that lands below the floor
+    /// used to sit in the mempool with nothing the user could do about it.
+    fn pending_sends_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, a: &Auction) {
+        // Only THIS wallet's sends: a bump re-signs with the selected wallet's key,
+        // so showing another wallet's pending transaction here would offer a lever
+        // that cannot work.
+        let Some(me) = self
+            .wallets
+            .get(self.selected)
+            .map(|w| w.effective_account())
+        else {
+            return;
+        };
+        let entries: Vec<SentTx> = self
+            .outbox
+            .lock()
+            .map(|o| o.iter().filter(|t| t.from_account == me).cloned().collect())
+            .unwrap_or_default();
+        if entries.is_empty() {
+            return;
+        }
+        let now = now_ms();
+        let mut bump_target: Option<SentTx> = None;
+        ui.add_space(sp::L);
+        ui.label(egui::RichText::new("This session's sends").strong());
+        ui.add_space(sp::S);
+        card(ui, |ui| {
+            // Newest first — the one you are worried about is the one you just sent.
+            for t in entries.iter().rev() {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = sp::M;
+                    let (glyph, col) = match t.state {
+                        SendState::Pending => ("⏳", palette::warning()),
+                        SendState::Confirmed => ("✓", palette::success()),
+                        SendState::Failed => ("✗", palette::error()),
+                        SendState::Replaced => ("⇄", palette::unknown()),
+                        SendState::Superseded => ("·", palette::unknown()),
+                    };
+                    state_chip(ui, glyph, t.state.label(), col);
+                    ui.label(
+                        num(format!("{} XUS", xus(&t.amount_grains.to_string())))
+                            .size(ty::SMALL)
+                            .color(palette::text()),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("→ {}", short_id(&t.to)))
+                            .size(ty::SMALL)
+                            .color(palette::text_dim()),
+                    );
+                    ui.label(
+                        num(format!("nonce {}", t.nonce))
+                            .size(ty::MICRO)
+                            .color(palette::text_dim()),
+                    );
+                    ui.label(
+                        num(format!("tip {} XUS", xus(&t.tip_grains.to_string())))
+                            .size(ty::MICRO)
+                            .color(palette::text_dim()),
+                    );
+                    if t.state.is_pending() {
+                        ui.label(
+                            num(format!(
+                                "waiting {}s",
+                                now.saturating_sub(t.submitted_ms) / 1000
+                            ))
+                            .size(ty::MICRO)
+                            .color(palette::text_dim()),
+                        );
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if t.bumpable(a) {
+                            if ui
+                                .button("Bump fee →")
+                                .on_hover_text(
+                                    "REPLACE this pending transaction with the same payment at a \
+                                     higher tip. It does not send a second payment.",
+                                )
+                                .clicked()
+                            {
+                                bump_target = Some(t.clone());
+                            }
+                        } else if t.state.is_pending() && !a.fee_auction_active {
+                            ui.label(
+                                egui::RichText::new("no bump — tips dormant on this chain")
+                                    .size(ty::MICRO)
+                                    .color(palette::text_dim()),
+                            );
+                        }
+                    });
+                });
+                if !t.note.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&t.note)
+                            .size(ty::MICRO)
+                            .color(palette::text_dim()),
+                    );
+                }
+            }
+        });
+        if let Some(t) = bump_target {
+            self.pending_bump = Some(t);
+        }
+
+        // ── Bump confirmation ────────────────────────────────────────────────
+        // The single most dangerous misunderstanding available in this whole
+        // feature is "did I just pay twice?". This modal exists to make that
+        // impossible to believe: it names the ONE payment, the ONE nonce slot the
+        // two transactions contest, and states outright that the original can no
+        // longer confirm.
+        let Some(p) = self.pending_bump.clone() else {
+            return;
+        };
+        let new_tip = auction::bump_tip_grains(p.tip_grains, a);
+        let mut do_bump = false;
+        let modal_ctx = ui.ctx().clone();
+        egui::Window::new(egui::RichText::new("Replace this transaction").strong())
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(&modal_ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.add_space(sp::XS);
+                bump_explainer(ui, &p, new_tip);
+                ui.add_space(sp::M);
+                ui.separator();
+                ui.add_space(sp::S);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("⇄ Replace & raise tip")
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(palette::accent()),
+                        )
+                        .clicked()
+                    {
+                        do_bump = true;
+                    }
+                    if ui.button("Keep waiting").clicked() {
+                        self.pending_bump = None;
+                    }
+                });
+            });
+        if do_bump {
+            self.pending_bump = None;
+            self.bump_send(&p, ctx);
+        }
+    }
+
     fn send(&self, ctx: &egui::Context) {
         if !self.require_signing() {
             return;
@@ -3718,18 +4026,148 @@ impl Station {
         let action = self.action.clone();
         let params = self.params.clone();
         let activity = self.activity.clone();
+        let outbox = self.outbox.clone();
+        // The auction bid. Zero unless the `fee-auction` deployment is Active —
+        // below its activation height a tipped transaction is a HARD consensus
+        // rejection, so an unarmed chain must get the bare, legal form.
+        let tip = self.effective_tip_grains();
         let ctx = ctx.clone();
         begin(&action, "sending…");
         std::thread::spawn(move || {
-            let msg = send_payment(&rpc, seed, &from, &to, grains, &params, &action)
-                .map(|id| {
+            let terms = SendTerms {
+                amount_grains: grains,
+                tip_grains: tip,
+                replace_nonce: None,
+            };
+            let msg = send_payment(&rpc, seed, &from, &to, terms, &params, &action)
+                .map(|sent| {
+                    let id = sent.txid.clone();
+                    let bid = if sent.tip_grains > 0 {
+                        format!(" · tip {} XUS", xus(&sent.tip_grains.to_string()))
+                    } else {
+                        String::new()
+                    };
+                    // Record it BEFORE reporting success: the outbox is what makes the
+                    // send bumpable, and a send you can see but cannot rescue is the
+                    // exact failure this slice exists to remove.
+                    if let Ok(mut o) = outbox.lock() {
+                        o.push(sent);
+                    }
                     format!(
-                        "✓ submitted {} XUS → {to} — in the mempool, confirms next block (tx {})",
-                        xus(&grains.to_string()),
-                        &id[..id.len().min(14)]
-                    )
+                    "✓ submitted {} XUS → {to}{bid} — in the mempool, confirms next block (tx {})",
+                    xus(&grains.to_string()),
+                    &id[..id.len().min(14)]
+                )
                 })
                 .unwrap_or_else(|e| format!("✗ send failed: {e}"));
+            finish(&action, &msg);
+            record(&activity, &msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// The tip (grains) the next send will carry: what the spender typed, or the
+    /// live suggestion while they have not touched the field.
+    ///
+    /// Hard-gated on the `fee-auction` deployment being Active. Below that height
+    /// consensus rejects an `Action::Tipped` outright — a wallet that tipped
+    /// anyway would not overpay, it would build a transaction no block can carry.
+    fn effective_tip_grains(&self) -> u128 {
+        let a = self
+            .snapshot
+            .lock()
+            .map(|s| s.auction.clone())
+            .unwrap_or_default();
+        self.tip_for(&a)
+    }
+
+    /// REPLACE a stuck send by re-signing its slot with a higher bid.
+    ///
+    /// This is replace-by-fee, and it is emphatically NOT a second payment: the
+    /// replacement reuses the original's signer and NONCE, so the two are rival
+    /// claims on one slot and the chain can only ever apply one of them. The
+    /// recipient is paid the original amount exactly once.
+    ///
+    /// The bid is [`auction::bump_tip_grains`], which satisfies both the
+    /// mempool's `new_tip >= old_tip + MIN_RBF_BUMP_GRAINS` admission rule and
+    /// the live next-block floor — read from the mempool crate, not restated, so
+    /// it cannot drift out of agreement with the node that judges it.
+    fn bump_send(&mut self, sent: &SentTx, ctx: &egui::Context) {
+        if !self.require_signing() {
+            return;
+        }
+        let Some(w) = self.wallets.get(self.selected) else {
+            return;
+        };
+        let seed = w.seed;
+        // The replacement is signed by the SELECTED wallet's key, so it must be the
+        // key that signed the original. A wallet switch between sending and bumping
+        // would otherwise sign for an account this key does not control — refused
+        // here rather than left for the node to reject after the fact.
+        if w.effective_account() != sent.from_account {
+            return self.set_action(&format!(
+                "that transaction was sent from {} — select that wallet to bump it",
+                short_id(&sent.from_account)
+            ));
+        }
+        let auction = self
+            .snapshot
+            .lock()
+            .map(|s| s.auction.clone())
+            .unwrap_or_default();
+        if !auction.fee_auction_active {
+            return self.set_action(
+                "the fee auction is not active on this chain — a tip would be rejected",
+            );
+        }
+        let new_tip = auction::bump_tip_grains(sent.tip_grains, &auction);
+        let rpc = self
+            .config
+            .lock()
+            .map(|c| c.rpc.clone())
+            .unwrap_or_default();
+        let action = self.action.clone();
+        let params = self.params.clone();
+        let activity = self.activity.clone();
+        let outbox = self.outbox.clone();
+        let old = sent.clone();
+        let ctx = ctx.clone();
+        begin(
+            &action,
+            "replacing the pending transaction with a higher bid…",
+        );
+        std::thread::spawn(move || {
+            let terms = SendTerms {
+                amount_grains: old.amount_grains,
+                tip_grains: new_tip,
+                // THE replacement bit: reuse the original's slot.
+                replace_nonce: Some(old.nonce),
+            };
+            let msg = send_payment(&rpc, seed, &old.from_account, &old.to, terms, &params, &action)
+                .map(|replacement| {
+                let id = replacement.txid.clone();
+                if let Ok(mut o) = outbox.lock() {
+                    // Mark the original REPLACED, then record the replacement. The
+                    // original can no longer confirm: its slot now belongs to the
+                    // higher bid, and the pool swapped them atomically.
+                    for entry in o.iter_mut() {
+                        if entry.txid == old.txid {
+                            entry.state = SendState::Replaced;
+                            entry.note = format!("replaced by {}", &id[..id.len().min(14)]);
+                        }
+                    }
+                    o.push(replacement);
+                }
+                format!(
+                    "✓ replaced tx {} — same nonce {}, tip raised {} → {} XUS (one payment, not two; new tx {})",
+                    &old.txid[..old.txid.len().min(14)],
+                    old.nonce,
+                    xus(&old.tip_grains.to_string()),
+                    xus(&new_tip.to_string()),
+                    &id[..id.len().min(14)]
+                )
+            })
+            .unwrap_or_else(|e| format!("✗ bump failed (the original is untouched): {e}"));
             finish(&action, &msg);
             record(&activity, &msg);
             ctx.request_repaint();
@@ -6323,6 +6761,273 @@ fn avg_block_interval_ms(blocks: &[BlockRow]) -> Option<u64> {
 }
 
 /// A bordered section card (the cohesive container used across the richer panels).
+/// The live auction, read out: pressure chip, the next-block floor, the pool's
+/// ready/queued occupancy, and how long the oldest entry has waited.
+///
+/// The unknown case is rendered as unknown — an em-dash and an explicit sentence,
+/// never a zero. "Blockspace is free" and "we could not ask what blockspace costs"
+/// are opposite pieces of advice, and a wallet that renders them identically is
+/// lying by omission at exactly the moment it matters.
+fn auction_readout(ui: &mut egui::Ui, a: &Auction) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("BLOCKSPACE AUCTION")
+                .size(ty::MICRO)
+                .color(palette::text_dim()),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Shape glyph + word + colour — never colour alone.
+            match a.pressure() {
+                Pressure::Unknown => state_chip(ui, "?", "UNKNOWN", palette::unknown()),
+                Pressure::Clear => state_chip(ui, "○", "CLEAR", palette::success()),
+                Pressure::Contested => state_chip(ui, "▲", "CONTESTED", palette::warning()),
+            }
+            if !a.fee_auction_active {
+                state_chip(ui, "·", "TIPS DORMANT", palette::unknown());
+            }
+        });
+    });
+    ui.add_space(sp::S);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = sp::XL;
+        let floor = a.available.then(|| {
+            if a.next_block_floor_grains == 0 {
+                "0".to_string()
+            } else {
+                xus(&a.next_block_floor_grains.to_string())
+            }
+        });
+        stat(ui, "next-block floor", floor.as_deref(), "XUS", ty::BODY);
+        stat(
+            ui,
+            "ready",
+            a.available
+                .then(|| group_thousands(a.ready_txs as u128))
+                .as_deref(),
+            "tx",
+            ty::BODY,
+        );
+        stat(
+            ui,
+            "queued",
+            a.available
+                .then(|| group_thousands(a.queued_txs as u128))
+                .as_deref(),
+            "tx",
+            ty::BODY,
+        );
+        stat(
+            ui,
+            "oldest wait",
+            a.oldest_pending_age_ms
+                .map(|ms| group_thousands(u128::from(ms / 1000)))
+                .as_deref(),
+            "s",
+            ty::BODY,
+        );
+    });
+    if !a.available {
+        ui.add_space(sp::S);
+        ui.label(
+            egui::RichText::new(
+                "this node did not report mempool state (offline, or too old to serve \
+                 sov_getMempoolInfo) — the floor is unknown, not zero",
+            )
+            .size(ty::SMALL)
+            .color(palette::text_dim()),
+        );
+    }
+}
+
+/// WHY the suggested tip is what it is, in one sentence.
+///
+/// A default the spender cannot account for is a default they cannot judge, and
+/// this one is spending their money. Every branch names the reading it came from.
+fn tip_rationale(a: &Auction) -> String {
+    let suggested = a.suggested_tip_grains();
+    if !a.available {
+        "suggested 0 — no live reading of the pool, so no bid is invented".to_string()
+    } else if suggested == 0 {
+        "suggested 0 — the next block still has room, so a tip buys nothing".to_string()
+    } else {
+        format!(
+            "suggested {} XUS — the live floor ({} XUS) plus the network's minimum bid \
+             increment, the cheapest bid that clears it",
+            xus(&suggested.to_string()),
+            xus(&a.next_block_floor_grains.to_string())
+        )
+    }
+}
+
+/// What the current bid is likely to buy, plus the distribution it is bidding
+/// against. Drawn only where a tip means anything.
+fn bid_outlook_view(ui: &mut egui::Ui, a: &Auction, tip_grains: u128) {
+    if a.fee_auction_active {
+        let (glyph, text, col) = match a.outlook(tip_grains) {
+            Outlook::Unknown => (
+                "?",
+                "no live reading — this send may or may not make the next block".to_string(),
+                palette::unknown(),
+            ),
+            Outlook::NextBlock => (
+                "✓",
+                "this bid clears the floor — expected in the next block".to_string(),
+                palette::success(),
+            ),
+            Outlook::Behind { txs_ahead } => (
+                "⏳",
+                format!(
+                    "outbid — at least {} pooled transaction(s) are ahead of this one; it waits \
+                     until the backlog clears or you raise the tip",
+                    group_thousands(txs_ahead as u128)
+                ),
+                palette::warning(),
+            ),
+        };
+        ui.add_space(sp::S);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(glyph).size(ty::SMALL).color(col));
+            ui.label(egui::RichText::new(text).size(ty::SMALL).color(col));
+        });
+    }
+    if a.available && !a.buckets.is_empty() {
+        ui.add_space(sp::S);
+        ui.label(
+            egui::RichText::new("WHAT YOU ARE BIDDING AGAINST")
+                .size(ty::MICRO)
+                .color(palette::text_dim()),
+        );
+        ui.add_space(sp::XS);
+        fee_histogram(ui, &a.buckets, tip_grains);
+    }
+}
+
+/// The body of the bump confirmation: what a replace-by-fee IS, in the terms a
+/// spender is actually afraid of.
+///
+/// The single most dangerous misunderstanding this whole feature makes available
+/// is "did I just pay twice?". Every line here exists to make that impossible to
+/// believe: one payment, one nonce slot, one of the two versions can ever apply,
+/// and the only new money is the tip increase.
+fn bump_explainer(ui: &mut egui::Ui, p: &SentTx, new_tip_grains: u128) {
+    ui.horizontal(|ui| {
+        state_chip(ui, "⇄", "REPLACE — NOT A SECOND SEND", palette::accent());
+    });
+    ui.add_space(sp::M);
+    ui.label(
+        egui::RichText::new(format!(
+            "{} XUS has already been sent to this recipient once, and is waiting in the mempool. \
+             Raising the tip re-signs THE SAME PAYMENT in THE SAME nonce slot ({}), so the two \
+             versions compete for one slot and the chain can only ever apply one of them.",
+            xus(&p.amount_grains.to_string()),
+            p.nonce
+        ))
+        .color(palette::text()),
+    );
+    ui.add_space(sp::M);
+    egui::Grid::new("bump_grid")
+        .num_columns(2)
+        .spacing([16.0, 8.0])
+        .show(ui, |ui| {
+            kv(ui, "Recipient", &p.to);
+            kv(
+                ui,
+                "Amount",
+                &format!(
+                    "{} XUS — paid ONCE, either way",
+                    xus(&p.amount_grains.to_string())
+                ),
+            );
+            kv(ui, "Nonce slot", &format!("{} (unchanged)", p.nonce));
+            kv(
+                ui,
+                "Tip",
+                &format!(
+                    "{} → {} XUS",
+                    xus(&p.tip_grains.to_string()),
+                    xus(&new_tip_grains.to_string())
+                ),
+            );
+            kv(
+                ui,
+                "Extra cost",
+                &format!(
+                    "{} XUS — only the tip increase; the amount is not spent twice",
+                    xus(&new_tip_grains.saturating_sub(p.tip_grains).to_string())
+                ),
+            );
+            kv(ui, "Replacing tx", &short_id(&p.txid));
+        });
+    ui.add_space(sp::M);
+    ui.colored_label(
+        palette::success(),
+        "✓ The recipient receives the amount exactly once. The original transaction can no longer \
+         confirm — its slot belongs to the replacement.",
+    );
+    if p.shielded_route {
+        ui.add_space(sp::S);
+        ui.colored_label(
+            palette::text_dim(),
+            "This is a shielded route, so the replacement re-proves the bundle (a few seconds). \
+             Still one payment.",
+        );
+    }
+}
+
+/// The pooled fee-rate distribution as a horizontal bar per bucket, highest bid
+/// first — what the spender is bidding against, at a glance.
+///
+/// Bars are scaled by TRANSACTION COUNT, which is the node's own auction key
+/// (`Mempool::select` orders by absolute effective tip, and the floor is the
+/// marginal one), so the picture matches the order inclusion actually uses. A
+/// bucket whose lower edge is above `bid_grains` is drawn in the warning colour:
+/// that is competition already ahead of this send.
+fn fee_histogram(ui: &mut egui::Ui, buckets: &[auction::FeeBucket], bid_grains: u128) {
+    let max = buckets.iter().map(|b| b.tx_count).max().unwrap_or(0).max(1) as f32;
+    // Deep backlogs are bounded by the node at HISTOGRAM_MAX_BUCKETS; show the
+    // most expensive few, which are the ones a bid has to get past.
+    for b in buckets.iter().take(6) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = sp::M;
+            ui.add_sized(
+                [110.0, 14.0],
+                egui::Label::new(
+                    num(format!("≥ {} XUS", xus(&b.min_tip_grains.to_string())))
+                        .size(ty::SMALL)
+                        .color(palette::text_dim()),
+                ),
+            );
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 10.0), egui::Sense::hover());
+            let ahead = b.min_tip_grains > bid_grains;
+            let col = if ahead {
+                palette::warning()
+            } else {
+                palette::success()
+            };
+            let w = (b.tx_count as f32 / max) * rect.width();
+            ui.painter_at(rect).rect_filled(
+                egui::Rect::from_min_size(rect.left_top(), egui::vec2(w.max(2.0), rect.height())),
+                egui::Rounding::same(2.0),
+                col,
+            );
+            ui.label(
+                num(group_thousands(b.tx_count as u128))
+                    .size(ty::SMALL)
+                    .color(palette::text_dim()),
+            );
+            ui.label(
+                egui::RichText::new(if ahead {
+                    "ahead of you"
+                } else {
+                    "below your bid"
+                })
+                .size(ty::MICRO)
+                .color(palette::text_dim()),
+            );
+        });
+    }
+}
+
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::group(ui.style())
         .fill(palette::panel())
@@ -8922,7 +9627,10 @@ impl Station {
             });
             // Live route detection + self-send labelling.
             let route = SendRoute::detect(&self.send_to);
-            let to_trim = self.send_to.trim();
+            // Owned, not a borrow of `self.send_to`: the auction panel below takes
+            // `&mut self` to drive the tip field.
+            let to_trim = self.send_to.trim().to_string();
+            let to_trim = to_trim.as_str();
             let self_send = !to_trim.is_empty()
                 && (to_trim == shielded
                     || to_trim == unified
@@ -8946,16 +9654,27 @@ impl Station {
                         .weak(),
                 );
             }
-            // Amount + Max + live validation. The network fee is RESERVED: a send must
-            // leave room for it (amount + fee ≤ balance), or the tx would fail execution
-            // ("cannot afford fee") and clog the mempool while blocks come up empty.
-            let fee = if route.private() {
+            // Amount + Max + live validation. The network fee AND the auction tip are
+            // RESERVED: a send must leave room for both (amount + fee + tip ≤ balance),
+            // or the tx would fail execution ("cannot afford fee") and clog the mempool
+            // while blocks come up empty.
+            let base_fee = if route.private() {
                 s.fee_shielded_grains
             } else {
                 s.fee_transfer_grains
             };
-            // The most you can send while still covering the fee.
-            let sendable = spendable.saturating_sub(fee);
+            // ── Blockspace auction: the live floor, and this send's bid ──────────
+            // Rendered BEFORE the amount field, because the tip changes what "Max"
+            // means and a spender must see the price of blockspace before they
+            // decide how much of their balance to commit.
+            let tip = self.auction_controls(ui, &s.auction);
+            // A tip is an ENVELOPE, and the envelope costs gas of its own — so the
+            // fee this send is charged is not the bare route's fee once a tip is
+            // attached. Reserving the bare figure would build a send that cannot
+            // pay for itself (a hard `CannotAffordFee` reject).
+            let fee = auction::route_fee_grains(base_fee, s.gas_price_grains, tip);
+            // The most you can send while still covering the fee AND the tip.
+            let sendable = auction::max_sendable_grains(spendable, fee, tip);
             let amount_grains = parse_xus(&self.send_amount);
             let amount_resp = ui
                 .horizontal(|ui| {
@@ -8965,19 +9684,26 @@ impl Station {
                     );
                     if ui
                         .button("Max")
-                        .on_hover_text("send the most that still leaves room for the network fee")
+                        .on_hover_text(
+                            "send the most that still leaves room for the network fee and the tip",
+                        )
                         .clicked()
                     {
                         self.send_amount = grains_to_xus_plain(sendable);
                     }
-                    let note = if fee > 0 {
-                        format!(
+                    let note = match (fee, tip) {
+                        (0, 0) => format!("balance {} XUS", xus(&spendable.to_string())),
+                        (f, 0) => format!(
                             "balance {} XUS · fee ~{} XUS",
                             xus(&spendable.to_string()),
-                            xus(&fee.to_string())
-                        )
-                    } else {
-                        format!("balance {} XUS", xus(&spendable.to_string()))
+                            xus(&f.to_string())
+                        ),
+                        (f, t) => format!(
+                            "balance {} XUS · fee ~{} + tip {} XUS",
+                            xus(&spendable.to_string()),
+                            xus(&f.to_string()),
+                            xus(&t.to_string())
+                        ),
                     };
                     ui.label(egui::RichText::new(note).weak());
                     r
@@ -8990,11 +9716,40 @@ impl Station {
                 Some(0) => Some("amount must be greater than zero".to_string()),
                 Some(g) if g > spendable => Some("amount exceeds your balance".to_string()),
                 Some(g) if g > sendable => Some(format!(
-                    "amount + network fee (~{} XUS) exceeds your balance — lower it or use Max",
-                    xus(&fee.to_string())
+                    "amount + network fee (~{} XUS){} exceeds your balance — lower it, lower the \
+                     tip, or use Max",
+                    xus(&fee.to_string()),
+                    if tip > 0 {
+                        format!(" + tip ({} XUS)", xus(&tip.to_string()))
+                    } else {
+                        String::new()
+                    }
                 )),
                 _ => None,
             };
+            // The full cost, once, in one place: what the recipient gets, what
+            // consensus charges, what the bid costs, and what is left.
+            if let Some(g) = amount_grains.filter(|g| *g > 0) {
+                let cost = SendCost {
+                    amount_grains: g,
+                    fee_grains: fee,
+                    tip_grains: tip,
+                };
+                ui.add_space(sp::XS);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "total {} XUS  ·  balance after {} XUS",
+                        xus(&cost.total_grains().to_string()),
+                        xus(&cost.balance_after(spendable).to_string())
+                    ))
+                    .size(ty::SMALL)
+                    .color(if cost.affordable(spendable) {
+                        palette::text_dim()
+                    } else {
+                        palette::error()
+                    }),
+                );
+            }
             if let Some(e) = &amount_err {
                 ui.label(
                     egui::RichText::new(format!("✗ {e}"))
@@ -9029,6 +9784,8 @@ impl Station {
                         // on-chain in the clear — the privacy downgrade.
                         links_public: !route.private(),
                         from_pool: false,
+                        fee_grains: fee,
+                        tip_grains: tip,
                     });
                 }
             }
@@ -9363,6 +10120,12 @@ impl Station {
                             self_send,
                             links_public: false,
                             from_pool: true,
+                            // A pool spend pays the fee from the transparent
+                            // account that carries it; tips are not wired on this
+                            // route yet, so the bid is honestly zero rather than a
+                            // number the send would not actually carry.
+                            fee_grains: s.fee_shielded_grains,
+                            tip_grains: 0,
                         });
                     }
                 }
@@ -9669,28 +10432,44 @@ impl Station {
                                 "Network",
                                 &format!("{} · {}", network.label(), network.pow_algo()),
                             );
-                            // The EXACT network fee for this route (from consensus via
-                            // `sov_estimateFee`) and the resulting balance after amount +
-                            // fee, so the full cost is visible before broadcast.
-                            let fee = if p.links_public {
-                                s.fee_transfer_grains
-                            } else {
-                                s.fee_shielded_grains
+                            // The EXACT cost, in the three parts a spender must be
+                            // able to tell apart: the network fee consensus charges
+                            // (`sov_estimateFee`), the blockspace bid they chose,
+                            // and the resulting balance. Both were captured when
+                            // Review was clicked, so this modal shows precisely the
+                            // numbers about to be signed.
+                            let cost = SendCost {
+                                amount_grains: p.amount_grains,
+                                fee_grains: p.fee_grains,
+                                tip_grains: p.tip_grains,
                             };
-                            let fee_str = if fee == 0 {
+                            let fee_str = if cost.fee_grains == 0 {
                                 "0 XUS  ·  no network fee".to_string()
                             } else {
-                                format!("{} XUS", xus(&fee.to_string()))
+                                format!("{} XUS", xus(&cost.fee_grains.to_string()))
                             };
                             kv(ui, "Network fee", &fee_str);
-                            let after = p
-                                .from_balance_grains
-                                .saturating_sub(p.amount_grains)
-                                .saturating_sub(fee);
+                            let tip_str = if cost.tip_grains == 0 {
+                                "0 XUS  ·  no bid (blockspace is free right now)".to_string()
+                            } else {
+                                format!(
+                                    "{} XUS  ·  paid to the miner who includes it",
+                                    xus(&cost.tip_grains.to_string())
+                                )
+                            };
+                            kv(ui, "Blockspace tip", &tip_str);
+                            kv(
+                                ui,
+                                "Total cost",
+                                &format!("{} XUS", xus(&cost.total_grains().to_string())),
+                            );
                             kv(
                                 ui,
                                 "Balance after",
-                                &format!("{} XUS", xus(&after.to_string())),
+                                &format!(
+                                    "{} XUS",
+                                    xus(&cost.balance_after(p.from_balance_grains).to_string())
+                                ),
                             );
                         });
                     ui.add_space(8.0);
@@ -9743,6 +10522,11 @@ impl Station {
                     });
                 });
         }
+
+        // This session's sends, each with a BUMP for anything still pooled — the
+        // lever that makes "stuck below the floor" a recoverable state instead of
+        // an indefinite wait.
+        self.pending_sends_view(ui, &ctx, &s.auction);
 
         // Action status — a spinner while broadcasting, then a green (success) or red
         // (failure) banner so the result of a sent transaction is unmistakable.
@@ -10526,18 +11310,47 @@ fn set_swap_view_msg(view: &Arc<Mutex<SwapsView>>, ctx: &egui::Context, msg: &st
     ctx.request_repaint();
 }
 
-/// Sign and submit a payment. `to` may be a named account (transparent), a
-/// `xus1…` shielded address, or a `uxus1…` unified address — `RpcClient::pay`
-/// routes it. A shielded route builds (and caches) the Halo2 prover first.
+/// What a send asks for beyond its recipient: the amount, the blockspace bid, and
+/// — for a replace-by-fee — the nonce slot to reuse.
+#[derive(Clone, Copy, Debug)]
+struct SendTerms {
+    /// What the recipient receives, in grains.
+    amount_grains: u128,
+    /// The auction bid. `0` produces the BARE action (`Transfer` / `Shielded`),
+    /// byte for byte what Station submitted before this feature and the only
+    /// legal form on a chain where the `fee-auction` deployment is dormant: a tip
+    /// is an envelope that is ADDED, never a field that is zeroed.
+    tip_grains: u128,
+    /// `Some(n)` ⇒ REPLACE the pooled transaction in slot `n` instead of taking a
+    /// fresh nonce. That is precisely what makes the result a replacement rather
+    /// than a second payment: same signer, same nonce, higher bid, so the node
+    /// swaps one for the other atomically and exactly one can ever confirm.
+    replace_nonce: Option<u64>,
+}
+
+/// Build, sign, and submit one send. `to` may be a named account (transparent), a
+/// `xus1…` shielded address, or a `uxus1…` unified address; a shielded route
+/// builds (and caches) the Halo2 prover first.
+///
+/// This mirrors `RpcClient::pay` transaction-for-transaction, and is built here
+/// rather than delegated for two reasons the client cannot serve: the tip
+/// envelope, and the NONCE. A wallet that cannot name the slot its transaction
+/// occupies cannot replace it, so it cannot unstick it — and `pay` returns only
+/// a txid.
 fn send_payment(
     rpc: &str,
     seed: [u8; 32],
     from: &str,
     to: &str,
-    grains: u128,
+    terms: SendTerms,
     params_cache: &Arc<Mutex<Option<Arc<ShieldedParams>>>>,
     action: &Arc<Mutex<ActionState>>,
-) -> Result<String, String> {
+) -> Result<SentTx, String> {
+    let SendTerms {
+        amount_grains: grains,
+        tip_grains,
+        replace_nonce,
+    } = terms;
     let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(90));
     let kp = Keypair::hybrid_from_seed(seed);
     let from_id = AccountId::new(from).map_err(|e| e.to_string())?;
@@ -10547,32 +11360,96 @@ fn send_payment(
     // names pass through unchanged, so genesis named accounts still work literally.
     let resolved = resolve_payee(rpc, to);
     let to = resolved.as_str();
-    let shielded = AnyAddress::parse(to)
-        .map(|a| matches!(a.receiver(), Receiver::Shielded(_)))
-        .unwrap_or(false);
-    let params: Option<Arc<ShieldedParams>> = if shielded {
-        let cached = params_cache.lock().ok().and_then(|p| p.clone());
-        Some(match cached {
-            Some(p) => p,
-            None => {
-                begin(action, "building the shielded prover (one-time, ~seconds)…");
-                let p = Arc::new(ShieldedParams::build());
-                if let Ok(mut slot) = params_cache.lock() {
-                    *slot = Some(p.clone());
+    let address = AnyAddress::parse(to).map_err(|e| format!("invalid recipient: {e}"))?;
+    // The route's action. Privacy-first, exactly as `RpcClient::pay` routes it: a
+    // unified address carrying a shielded receiver is paid into the pool, and a
+    // pool-v2 receiver is REFUSED rather than silently downgraded to the
+    // address's transparent receiver (which would pay a different party).
+    let (inner, shielded_route) = match address.receiver() {
+        Receiver::Transparent(account) => (
+            Action::Transfer {
+                to: account,
+                amount,
+            },
+            false,
+        ),
+        Receiver::Shielded(recipient) => {
+            let params = {
+                let cached = params_cache.lock().ok().and_then(|p| p.clone());
+                match cached {
+                    Some(p) => p,
+                    None => {
+                        begin(action, "building the shielded prover (one-time, ~seconds)…");
+                        let p = Arc::new(ShieldedParams::build());
+                        if let Ok(mut slot) = params_cache.lock() {
+                            *slot = Some(p.clone());
+                        }
+                        p
+                    }
                 }
-                p
-            }
-        })
-    } else {
-        None
+            };
+            begin(action, "proving the shielded transfer (real Halo2)…");
+            let units = u64::try_from(amount.grains())
+                .map_err(|_| "amount exceeds u64 grains".to_string())?;
+            let bundle = mint_to_shielded(&params, &recipient, units)
+                .map_err(|e| format!("shield bundle build failed: {e}"))?;
+            (
+                Action::Shielded {
+                    bundle: bundle.to_bytes(),
+                },
+                true,
+            )
+        }
+        Receiver::ShieldedV2(_) => {
+            return Err(
+                "recipient routes to the post-quantum shielded pool (v2), which is not \
+                        active on any chain yet — refusing to send. Paying the address's \
+                        transparent receiver instead would pay a different recipient and \
+                        downgrade privacy without your consent."
+                    .to_string(),
+            )
+        }
     };
-    if shielded {
-        begin(action, "proving the shielded transfer (real Halo2)…");
-    }
-    let txid = client
-        .pay(&kp, &from_id, to, amount, params.as_deref())
-        .map_err(|e| e.to_string())?;
-    Ok(txid.to_hex())
+    // Queue-aware nonce (a send issued while an earlier one is still pending gets
+    // the next free slot instead of colliding) — unless this IS a replacement, in
+    // which case the whole point is to reuse the occupied slot.
+    let nonce = match replace_nonce {
+        Some(n) => n,
+        None => client.next_nonce(&from_id).map_err(|e| e.to_string())?,
+    };
+    // Phase-2 signing domain: binds the signature to {chain_id, genesis} once the
+    // tx-domain fork is active (`None` = dormant/legacy, byte-identical).
+    let domain = client.signing_domain().map_err(|e| e.to_string())?;
+    let tx_action = if tip_grains == 0 {
+        inner
+    } else {
+        Action::Tipped {
+            tip: Balance::from_grains(tip_grains),
+            inner: Box::new(inner),
+        }
+    };
+    let tx = Transaction {
+        signer: from_id,
+        public_key: kp.public_key(),
+        nonce,
+        action: tx_action,
+    };
+    let stx = SignedTransaction::sign_in(tx, &kp, domain.as_ref()).map_err(|e| e.to_string())?;
+    let txid = client.submit_transaction(&stx).map_err(|e| e.to_string())?;
+    Ok(SentTx {
+        txid: txid.to_hex(),
+        from_account: from.to_string(),
+        // The RESOLVED recipient, so a bump can never pay a different party than
+        // the original if a `.sov` name is re-pointed in between.
+        to: to.to_string(),
+        amount_grains: grains,
+        nonce,
+        tip_grains,
+        shielded_route,
+        submitted_ms: now_ms(),
+        state: SendState::Pending,
+        note: String::new(),
+    })
 }
 
 /// Path to a wallet's encrypted incremental note cache, keyed by its stable
@@ -12344,15 +13221,20 @@ pub fn run(rpc: String) -> Result<(), String> {
         ..Default::default()
     };
 
+    // Sends this session, shared with the poller so their pending/confirmed state
+    // stays live without the UI thread ever making an RPC call.
+    let outbox: Arc<Mutex<Vec<SentTx>>> = Arc::new(Mutex::new(Vec::new()));
+
     let poll_snap = snapshot.clone();
     let poll_cfg = config.clone();
+    let poll_outbox = outbox.clone();
     eframe::run_native(
         "SOV Station",
         options,
         Box::new(move |cc| {
             install_theme(&cc.egui_ctx, read_saved_theme());
-            spawn_poller(poll_snap, poll_cfg, cc.egui_ctx.clone());
-            Ok(Box::new(Station::new(snapshot, config)))
+            spawn_poller(poll_snap, poll_cfg, poll_outbox, cc.egui_ctx.clone());
+            Ok(Box::new(Station::new(snapshot, config, outbox)))
         }),
     )
     .map_err(|e| format!("GUI failed: {e}"))
@@ -12360,7 +13242,69 @@ pub fn run(rpc: String) -> Result<(), String> {
 
 /// Background poller: every second, read the node into the shared snapshot and
 /// nudge the UI to repaint. Honors the (UI-editable) RPC endpoint and accounts.
-fn spawn_poller(snapshot: Arc<Mutex<Snapshot>>, config: Arc<Mutex<Config>>, ctx: egui::Context) {
+/// Refresh every still-pending entry in the outbox against the node.
+///
+/// The node exposes no "list my pooled transactions" query, so Station tracks
+/// what it submitted itself. Two signals settle an entry: a receipt for its id
+/// (mined — applied or rejected), or the signer's on-chain nonce moving past its
+/// slot (evicted, or beaten to the slot by something else). Without the second
+/// signal a displaced transaction would read PENDING forever and Station would
+/// keep offering a bump the node could only refuse.
+///
+/// Runs on the poller thread, never the UI thread, and holds the outbox lock only
+/// to read the work list and to write results back — never across an RPC call.
+fn refresh_outbox(client: &RpcClient, outbox: &Arc<Mutex<Vec<SentTx>>>) {
+    let pending: Vec<(String, String, u64)> = match outbox.lock() {
+        Ok(o) => o
+            .iter()
+            .filter(|t| t.state.is_pending())
+            .map(|t| (t.txid.clone(), t.from_account.clone(), t.nonce))
+            .collect(),
+        Err(_) => return,
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let mut settled: Vec<(String, SendState, String)> = Vec::new();
+    for (txid, account, nonce) in pending {
+        let receipt = client.call("sov_getReceipt", json!({ "txId": &txid })).ok();
+        let onchain_nonce = AccountId::new(&account)
+            .ok()
+            .and_then(|id| client.nonce(&id).ok());
+        let state = auction::resolve_state(receipt.as_ref(), onchain_nonce, nonce);
+        if state.is_pending() {
+            continue;
+        }
+        let note = receipt
+            .as_ref()
+            .and_then(auction::receipt_failure_reason)
+            .unwrap_or_default();
+        settled.push((txid, state, note));
+    }
+    if settled.is_empty() {
+        return;
+    }
+    if let Ok(mut o) = outbox.lock() {
+        for entry in o.iter_mut() {
+            if let Some((_, state, note)) = settled.iter().find(|(id, ..)| *id == entry.txid) {
+                // Only ever settle something still pending: a bump may have moved
+                // this entry to REPLACED while the RPCs above were in flight, and
+                // that user-known truth must not be overwritten by a stale read.
+                if entry.state.is_pending() {
+                    entry.state = *state;
+                    entry.note = note.clone();
+                }
+            }
+        }
+    }
+}
+
+fn spawn_poller(
+    snapshot: Arc<Mutex<Snapshot>>,
+    config: Arc<Mutex<Config>>,
+    outbox: Arc<Mutex<Vec<SentTx>>>,
+    ctx: egui::Context,
+) {
     thread::spawn(move || {
         // Count consecutive failed polls so a TRANSIENT timeout — e.g. while the
         // node is busy importing a batch during catch-up — does not flicker the UI
@@ -12377,6 +13321,7 @@ fn spawn_poller(snapshot: Arc<Mutex<Snapshot>>, config: Arc<Mutex<Config>>, ctx:
             let client = RpcClient::new(cfg.rpc.clone()).with_timeout(Duration::from_secs(6));
             let snap = poll(&client, &cfg);
             if snap.online {
+                refresh_outbox(&client, &outbox);
                 consecutive_fail = 0;
                 if let Ok(mut s) = snapshot.lock() {
                     *s = snap;
@@ -13558,6 +14503,207 @@ mod tests {
         let shown = truncate_middle(&addr, 22, 12);
         assert!(shown.starts_with("xusq1"));
         assert!(addr.ends_with(shown.rsplit('…').next().unwrap()));
+    }
+
+    // ── Blockspace auction (v0.1.98) ────────────────────────────────────────
+
+    /// A live, CONTESTED auction — the state every auction UI test below runs
+    /// against, so none of them can pass merely because the feature declined to
+    /// engage (a panel that renders nothing renders no mistakes either).
+    fn contested_auction() -> Auction {
+        let a = Auction::from_rpc(
+            Some(&json!({
+                "txCount": 5u64,
+                "maxBlockTxs": 4u64,
+                "floorGrains": "5000",
+                "poolFloorGrains": "0",
+                "buckets": [
+                    {"feeRateGrains": "900000", "txCount": 2u64, "totalBytes": 500u64},
+                    {"feeRateGrains": "5000",   "txCount": 3u64, "totalBytes": 750u64},
+                ],
+            })),
+            Some(&json!({
+                "txCount": 5u64,
+                "queuedCount": 2u64,
+                "maxBlockTxs": 4u64,
+                "nextBlockFloorGrains": "5000",
+                "poolFloorGrains": "0",
+                "oldestPendingAgeMs": 96_000u64,
+            })),
+            true,
+        );
+        assert!(
+            a.available && a.fee_auction_active && a.next_block_floor_grains == 5_000,
+            "the fixture must be LIVE and CONTESTED, or these tests prove nothing"
+        );
+        a
+    }
+
+    /// "Blockspace is free" and "we could not ask what blockspace costs" are
+    /// opposite advice. They must never paint the same.
+    #[test]
+    fn the_auction_readout_never_renders_unknown_as_free() {
+        // An old / unreachable node: the floor is UNKNOWN.
+        let blind = Auction::from_rpc(None, None, true);
+        let out = painted_at_width(900.0, |ui| auction_readout(ui, &blind));
+        assert!(out.contains("UNKNOWN"), "no pressure word:\n{out}");
+        assert!(
+            out.contains("the floor is unknown, not zero"),
+            "the unknown case must say so in words:\n{out}"
+        );
+        assert!(
+            !out.contains("CLEAR"),
+            "unknown must never read as clear:\n{out}"
+        );
+        assert!(
+            out.contains('—'),
+            "unknown figures render as em-dashes:\n{out}"
+        );
+
+        // A node that ANSWERS with a zero floor really is clear — and says a
+        // different word, with a different figure.
+        let clear = Auction::from_rpc(
+            None,
+            Some(&json!({"txCount": 0u64, "queuedCount": 0u64, "nextBlockFloorGrains": "0"})),
+            true,
+        );
+        let out = painted_at_width(900.0, |ui| auction_readout(ui, &clear));
+        assert!(out.contains("CLEAR"), "{out}");
+        assert!(!out.contains("the floor is unknown"), "{out}");
+
+        // And a contested one names its price and flags the pressure.
+        let out = painted_at_width(900.0, |ui| auction_readout(ui, &contested_auction()));
+        assert!(out.contains("CONTESTED"), "{out}");
+        assert!(out.contains("NEXT-BLOCK FLOOR"), "{out}");
+        assert!(
+            out.contains("0.00005"),
+            "the floor in XUS, not grains:\n{out}"
+        );
+        assert!(out.contains("96"), "oldest wait in seconds:\n{out}");
+
+        // A chain where tips are not legal must SAY so, not silently offer one.
+        let dormant = Auction::from_rpc(
+            None,
+            Some(&json!({"txCount": 9u64, "nextBlockFloorGrains": "5000"})),
+            false,
+        );
+        let out = painted_at_width(900.0, |ui| auction_readout(ui, &dormant));
+        assert!(out.contains("TIPS DORMANT"), "{out}");
+    }
+
+    /// Every suggested tip accounts for itself, in XUS, naming the reading it came
+    /// from. A default the spender cannot audit is a default spending their money
+    /// on their behalf.
+    #[test]
+    fn the_suggested_tip_always_explains_itself() {
+        let a = contested_auction();
+        let why = tip_rationale(&a);
+        assert!(why.contains("0.00006"), "names the bid it suggests: {why}");
+        assert!(
+            why.contains("0.00005"),
+            "and the floor it derives from: {why}"
+        );
+        assert!(
+            !why.contains("grains"),
+            "figures are XUS, not raw grains: {why}"
+        );
+
+        let clear = Auction::from_rpc(None, Some(&json!({"nextBlockFloorGrains": "0"})), true);
+        assert!(
+            tip_rationale(&clear).contains("the next block still has room"),
+            "a zero suggestion must say WHY it is zero"
+        );
+        let blind = Auction::from_rpc(None, None, true);
+        assert!(
+            tip_rationale(&blind).contains("no bid is invented"),
+            "an unknown pool must not be dressed up as a priced one"
+        );
+    }
+
+    /// The outlook and the histogram must show an OUTBID send as outbid — this is
+    /// the readout that turns "my payment vanished" into "my bid is too low".
+    #[test]
+    fn an_outbid_send_is_shown_as_outbid_and_a_winning_one_as_winning() {
+        let a = contested_auction();
+
+        // A zero bid on a contested pool: outbid, with the competition drawn.
+        let out = painted_at_width(900.0, |ui| bid_outlook_view(ui, &a, 0));
+        assert!(out.contains("outbid"), "{out}");
+        assert!(out.contains("ahead of this one"), "{out}");
+        assert!(out.contains("WHAT YOU ARE BIDDING AGAINST"), "{out}");
+        assert!(
+            out.contains("ahead of you"),
+            "the dearer bucket is marked:\n{out}"
+        );
+
+        // The suggested bid clears the floor, and the histogram reclassifies the
+        // bucket it now outbids.
+        let tip = a.suggested_tip_grains();
+        let out = painted_at_width(900.0, |ui| bid_outlook_view(ui, &a, tip));
+        assert!(out.contains("clears the floor"), "{out}");
+        assert!(!out.contains("outbid"), "{out}");
+        assert!(out.contains("below your bid"), "{out}");
+        // The 0.009 XUS bucket is still above the suggestion, so it stays ahead.
+        assert!(out.contains("ahead of you"), "{out}");
+    }
+
+    /// The bump modal must make "did I just pay twice?" impossible to believe.
+    ///
+    /// This is the single most dangerous misunderstanding the whole feature makes
+    /// available, so the words that rule it out are pinned here rather than left
+    /// to survive the next edit by luck.
+    #[test]
+    fn the_bump_modal_makes_double_spend_anxiety_impossible() {
+        let a = contested_auction();
+        let sent = SentTx {
+            txid: "ab".repeat(32),
+            from_account: "usa.reserve.sov".to_string(),
+            to: "ecb.reserve.sov".to_string(),
+            amount_grains: 250_000_000, // 2.5 XUS
+            nonce: 41,
+            tip_grains: 1_000,
+            shielded_route: false,
+            submitted_ms: 0,
+            state: SendState::Pending,
+            note: String::new(),
+        };
+        let new_tip = auction::bump_tip_grains(sent.tip_grains, &a);
+        let out = painted_at_width(700.0, |ui| bump_explainer(ui, &sent, new_tip));
+
+        for needle in [
+            "NOT A SECOND SEND",
+            "THE SAME PAYMENT",
+            "THE SAME nonce slot",
+            "can only ever apply one of them",
+            "paid ONCE, either way",
+            "41 (unchanged)",
+            "only the tip increase; the amount is not spent twice",
+            "receives the amount exactly once",
+            "can no longer confirm",
+        ] {
+            assert!(out.contains(needle), "missing {needle:?} from:\n{out}");
+        }
+        // The EXTRA cost shown is the tip delta — not the amount again.
+        assert!(
+            out.contains(&xus(&new_tip.saturating_sub(sent.tip_grains).to_string())),
+            "the extra cost must be the tip increase:\n{out}"
+        );
+        // And the replacement really is admissible under the pool's own rule.
+        assert!(new_tip >= sent.tip_grains + auction::MIN_RBF_BUMP_GRAINS);
+
+        // A shielded route re-proves its bundle — say so, and still say ONE payment.
+        let out = painted_at_width(700.0, |ui| {
+            bump_explainer(
+                ui,
+                &SentTx {
+                    shielded_route: true,
+                    ..sent.clone()
+                },
+                new_tip,
+            )
+        });
+        assert!(out.contains("re-proves the bundle"), "{out}");
+        assert!(out.contains("Still one payment"), "{out}");
     }
 
     /// Render at an explicit width and return the painted text.

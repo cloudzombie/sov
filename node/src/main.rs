@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use sov_primitives::AccountId;
 use sov_rpc::{RpcClient, RpcClientError};
 
+mod auction;
 mod gui;
 mod vault;
 
