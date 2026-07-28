@@ -322,6 +322,27 @@ pub fn delete_port_mapping(gw: &Gateway, external_port: u16) -> bool {
         if r.starts_with("HTTP/1.1 200") || r.starts_with("HTTP/1.0 200"))
 }
 
+/// How long to wait before the next mapping attempt.
+///
+/// Extracted from the renewal loop so it can be tested. A `while` loop with
+/// sleeps in it is untestable by construction, which is a bad property for the
+/// part of this module that decides how hard we lean on someone else's router.
+///
+/// - Success renews at `renew_every` (half the lease).
+/// - Failure backs off 1, 2, 4 … minutes, doubling, so a router that says no is
+///   asked progressively less often rather than every few seconds.
+/// - The backoff is CAPPED at `renew_every`: waiting longer than a renewal
+///   interval would mean a mapping could lapse while we were still backing off
+///   from an unrelated earlier failure.
+fn next_attempt_delay(failures: u32, renew_every: Duration) -> Duration {
+    if failures == 0 {
+        return renew_every;
+    }
+    // Shift is bounded so this cannot overflow however long a router refuses.
+    let minutes = 1u64 << failures.min(6);
+    Duration::from_secs(minutes * 60).min(renew_every)
+}
+
 /// Whether this node currently believes it is reachable from outside.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Reachability {
@@ -433,10 +454,7 @@ impl PortMapper {
                                 internal_addr.port()
                             ));
                         }
-                        // Back off so a router that refuses is not hammered:
-                        // 1, 2, 4 … minutes, capped at the renewal interval.
-                        let mins = 1u64 << s.failures.min(6);
-                        backoff = Duration::from_secs(mins * 60).min(renew_every);
+                        backoff = next_attempt_delay(s.failures, renew_every);
                     }
                 }
                 // Sleep in short slices so shutdown is prompt rather than waiting
@@ -465,6 +483,12 @@ impl PortMapper {
     /// The router currently holding the mapping, if any.
     pub fn gateway(&self) -> Option<Gateway> {
         self.state.lock().ok().and_then(|s| s.gateway.clone())
+    }
+
+    /// Whether shutdown has been requested. Lets a caller's own polling thread
+    /// exit with the mapper instead of outliving it.
+    pub fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
     }
 
     /// Stop renewing and REMOVE the mapping.
@@ -603,6 +627,48 @@ mod tests {
             .collect();
         assert_eq!(safe, "sovNewPortMappingDescriptionEvilx");
         assert!(!safe.contains('<') && !safe.contains('>') && !safe.contains('/'));
+    }
+
+    /// The renewal cadence — the part that decides how hard we lean on someone
+    /// else's router, and the part a sleep loop would have left untested.
+    #[test]
+    fn the_retry_cadence_backs_off_and_is_capped() {
+        let renew = Duration::from_secs(1800); // half of a 1h lease
+
+        // Success renews on schedule.
+        assert_eq!(next_attempt_delay(0, renew), renew);
+
+        // Failures double: 1, 2, 4, 8 minutes …
+        assert_eq!(next_attempt_delay(1, renew), Duration::from_secs(120));
+        assert_eq!(next_attempt_delay(2, renew), Duration::from_secs(240));
+        assert_eq!(next_attempt_delay(3, renew), Duration::from_secs(480));
+
+        // …and are CAPPED at the renewal interval. Backing off longer than a
+        // renewal would let a live mapping lapse while we waited out an
+        // unrelated earlier failure.
+        assert_eq!(next_attempt_delay(20, renew), renew);
+        assert_eq!(next_attempt_delay(u32::MAX, renew), renew);
+
+        // The delay never decreases as failures mount, and never exceeds the cap.
+        let mut prev = Duration::ZERO;
+        for f in 1..40u32 {
+            let d = next_attempt_delay(f, renew);
+            assert!(d >= prev, "backoff must not shrink at {f} failures");
+            assert!(d <= renew, "backoff must never exceed the renewal interval");
+            prev = d;
+        }
+    }
+
+    /// A short lease must not be out-waited by the backoff.
+    #[test]
+    fn backoff_never_outlives_a_short_renewal_interval() {
+        let renew = Duration::from_secs(30);
+        for f in 0..20u32 {
+            assert!(
+                next_attempt_delay(f, renew) <= renew,
+                "a {f}-failure backoff exceeded a 30s renewal interval"
+            );
+        }
     }
 
     /// Discovery on a machine with no IGD must return cleanly, not hang or

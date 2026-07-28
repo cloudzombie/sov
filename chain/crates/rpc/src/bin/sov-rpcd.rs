@@ -238,9 +238,16 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
                 let mapper = Arc::new(mapper);
                 let sync_for_map = Arc::clone(&sync);
                 let poll_mapper = Arc::clone(&mapper);
-                std::thread::spawn(move || loop {
-                    sync_for_map.set_reachability(poll_mapper.reachability().as_str());
-                    std::thread::sleep(std::time::Duration::from_secs(15));
+                // Exits with the mapper rather than outliving it: a detached
+                // loop that never stops is a thread nobody owns.
+                std::thread::spawn(move || {
+                    while !poll_mapper.is_stopped() {
+                        sync_for_map.set_reachability(poll_mapper.reachability().as_str());
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
+                    // Final state after shutdown, so the last thing published is
+                    // accurate rather than a stale "mapped".
+                    sync_for_map.set_reachability("stopped");
                 });
                 port_mapper = Some((mapper, local.port()));
             } else {

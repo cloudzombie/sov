@@ -11546,6 +11546,14 @@ fn setup_node_dir(node_dir: &Path, spec_filename: &str) -> Result<(), String> {
     std::fs::write(node_dir.join(spec_filename), spec_text)
         .map_err(|e| format!("write spec: {e}"))?;
     let config = NodeConfig {
+        // Ask the router to open the P2P port so this desktop node can accept
+        // INBOUND peers instead of only dialing out. A home machine behind NAT
+        // is exactly the case this exists for — it works either way, but an
+        // unreachable node consumes connectivity without contributing any.
+        //
+        // Best-effort and silent on failure: no IGD router, UPnP disabled, or
+        // carrier-grade NAT all leave the node working exactly as before.
+        upnp: Some(true),
         rpc_addr: "127.0.0.1:8645".to_string(),
         rpc_workers: 4,
         data_dir: "node-1/data".to_string(),
