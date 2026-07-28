@@ -177,9 +177,14 @@ malformed input returns a typed `Err`, never panics, never aborts.
   In-circuit spend auth is a future proof_version (pinned trade-off).
 - **Dummy flags are public**: bundle arity (≤ 4 per side) is visible.
   Values, owners, and linkages are not.
-- **Parameter review to a written 128-bit target** (S1d, pending): current
-  FRI parameters are 42 queries × blowup 8 + 16-bit grinding, quadratic
-  extension — 127 bits conjectured, less under proven FRI bounds.
+- **Parameter review to a written 128-bit target** (S1d, pending): the shipped
+  FRI parameters are 64 queries × blowup 16 + 16-bit grinding, cubic extension,
+  which `tests/security_level.rs` measures at 128 bits *proven* — but note that
+  is a **classical** soundness bound (Johnson/list-decoding), not post-quantum.
+  A quantified post-quantum (QROM) soundness level is separately unestablished
+  and must not be quoted as "128-bit post-quantum" (**PQV2-05**; scoped in
+  `notes/audit-scope-pq-pool.md` §9, and see `pq-shielded-soundness.md` §8
+  item 7 and §10).
 - Global nullifier double-spend tracking, the anchor ring, turnstile, and
   drain limiter are consensus state (W2) — the bundle verifier here takes
   the valid-anchor set as an argument and leaves state to the caller.

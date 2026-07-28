@@ -143,4 +143,78 @@ Timeline, cost, and scheduling to be proposed. We are pre-arming and not under
 release pressure: correctness matters more to us than speed. The pool ships
 dormant regardless of audit timing.
 
+## 9. Post-quantum (QROM) soundness of the proof — PQV2-05
+
+An internal audit finding (PQV2-05) established a claims-accuracy gap that this
+engagement is asked to close, or to bound precisely. The gap is NOT that the
+primitives are curve-based — they are not; the proof uses only Rescue-Prime and
+Blake3, so there is no Shor-breakable assumption anywhere in it. The gap is that
+the security *numbers* the project derives for its FRI parameters
+(`chain/docs/pq-shielded-soundness.md` §10 — currently 128 bits "proven",
+alongside 128 "conjectured") are **classical** soundness bounds. "Proven"
+distinguishes the unconditional Johnson/list-decoding bound from the capacity
+conjecture; it does **not** mean post-quantum. No QROM analysis of this proof
+system at these parameters has been performed, so no "128-bit post-quantum"
+statement is currently warranted, and the project has committed that none may
+gate arming signal bit 2 until this section's deliverables exist.
+
+We are asking for one of two outcomes, whichever the evidence supports: a
+derived post-quantum soundness level with the parameter set that reaches a
+written post-quantum target, OR a precise written statement of why such a level
+cannot yet be asserted and what would be required to assert it.
+
+A post-quantum soundness analysis of the pool-v2 spend proof MUST cover, at
+minimum:
+
+1. **QROM Fiat-Shamir soundness.** The shipped proof is non-interactive: the
+   FRI/STARK verifier's challenges are derived by Fiat-Shamir from a hash
+   (Blake3, via winterfell's `DefaultRandomCoin`). Classical soundness of the
+   interactive protocol does not transfer to the non-interactive proof against
+   a quantum adversary for free. The analysis must state whether the protocol
+   has **round-by-round (state-restoration) soundness** with a bound adequate
+   for a QROM Fiat-Shamir reduction, cite or derive the applicable QROM
+   Fiat-Shamir result for this IOP/FRI construction, and give the resulting
+   post-quantum soundness **in bits at the shipped parameters** (64 FRI queries,
+   blowup 16, 16 bits grinding, cubic extension over Goldilocks), or state
+   plainly that no adequate result applies and why.
+2. **Grover erosion of the grinding proof-of-work.** The 16-bit grinding factor
+   is a hash-based proof-of-work; Grover gives a quadratic speedup, so its
+   contribution to the soundness margin against a quantum adversary is at most
+   ~8 bits, not 16. The analysis must fold this in rather than counting the
+   classical grinding bits.
+3. **Grover/BHT erosion of the hash commitments.** The FRI/trace Merkle
+   commitments and the Rescue-Prime note commitments rest on preimage and
+   collision resistance of 256-bit hashes. Quantum preimage search (Grover) and
+   collision search (BHT) reduce the effective margins; the analysis must state
+   the post-quantum preimage and collision resistance it assumes for `Rp64_256`
+   and Blake3-256 at this output length, and confirm the proof's soundness does
+   not rely on a margin those quantum bounds undercut.
+4. **The binding hash queries.** Confirm no step of the argument silently
+   assumes classical random-oracle behavior where the QROM (quantum queries to
+   the hash) would change the bound — in particular the challenge derivation and
+   any grinding/PoW check.
+5. **A single reconciled figure.** The post-quantum soundness level in bits is
+   the minimum across (1)–(3), stated with its dominant term identified, so a
+   future parameter change can be reasoned about. If it is below the classical
+   128, the parameter set (queries / blowup / grinding / extension degree) that
+   reaches a written post-quantum target must be given, with its proof-size and
+   verify-cost consequences — the same trade the classical analysis in §10 of
+   the soundness doc already makes, redone in the quantum setting.
+
+Deliverable: a written post-quantum soundness statement suitable to stand behind
+a public "post-quantum secure" claim, OR an explicit written finding that the
+claim cannot yet be made, with the blocking gap named. Either way it supersedes
+the classical-only §10 table as the basis for any public security statement and
+for the arming decision.
+
+## 10. Commercial-independent note
+
+The primitives that ARE established post-quantum — the hybrid ML-DSA-65 (FIPS
+204) spend authorization, the hybrid ML-KEM-768 (FIPS 203) note encryption, and
+the reliance on hash functions rather than number theory — are documented in
+`chain/docs/quantum-posture.md` and are not the subject of §9. §9 concerns the
+STARK proof's soundness *argument* specifically. Do not conflate "the pool uses
+post-quantum primitives" (true, established) with "the pool's proof has a proven
+post-quantum soundness level" (open, this engagement).
+
 **Contact:** cloudzombie/sov maintainer.

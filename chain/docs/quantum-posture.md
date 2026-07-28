@@ -39,11 +39,23 @@ elliptic-curve assumptions (Pallas) that a CRQC breaks. Consequences:
    worst steal *within* the pool at a bounded rate, but can never inflate
    SOV or touch transparent balances.
 
-**The long-term fix is a hash-based (STARK-class) shielded pool** — both
-post-quantum sound and post-quantum private. This is a research track:
+**The long-term fix is a hash-based (STARK-class) shielded pool** — designed to
+be both post-quantum sound and post-quantum private. This is a research track:
 no production-audited construction with Orchard's maturity exists today, and
-this project does not ship imitations of one. Until it exists, the honest
-guidance for users is above.
+this project does not ship imitations of one. SOV's own prototype is the
+dormant `shielded-pq` pool v2 (STARK/FRI over Rescue-Prime + Blake3, with
+ML-DSA-65 spend authorization and ML-KEM-768 note encryption). A precise note
+on what "post-quantum sound" does and does not yet mean for it (**PQV2-05**):
+using only hash-based primitives removes any Shor-breakable assumption — a real
+advantage over the curve-based v1 pool — but that alone does **not** establish a
+quantified post-quantum soundness *level*. The bit-security numbers derived for
+its FRI parameters (`chain/docs/pq-shielded-soundness.md` §10) are *classical*
+soundness bounds; the QROM soundness of the Fiat-Shamir-transformed proof, and
+the Grover erosion of its grinding and hash margins, are a separate analysis
+that has not been done. No "128-bit post-quantum" claim is warranted for pool
+v2 until that analysis (scoped in `notes/audit-scope-pq-pool.md` §9) is
+completed, and none may gate arming signal bit 2. Until the audited pool
+exists, the honest guidance for users is above.
 
 ## Implementation caveats (also honest)
 

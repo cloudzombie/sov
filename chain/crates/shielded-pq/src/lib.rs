@@ -42,7 +42,12 @@
 //! - Dummy-slot flags are public: the bundle's real arity (≤ 4 each side)
 //!   is visible. Values, owners, and note linkages are not.
 //! - The written 128-bit parameter review (S1d) is a separate, still
-//!   pending slice. (Deserialization is HARDENED as of S1c: all bundle
+//!   pending slice. The 128 figure is a *classical* FRI soundness bound
+//!   (proven Johnson/list-decoding radius); post-quantum (QROM) soundness of
+//!   the Fiat-Shamir-transformed proof is a distinct, still-pending analysis
+//!   and must not be quoted as "128-bit post-quantum" (PQV2-05; see
+//!   `prover::proof_options` and `notes/audit-scope-pq-pool.md` §9).
+//!   (Deserialization is HARDENED as of S1c: all bundle
 //!   and proof decoding is total — [`wire`], [`proof_frame`],
 //!   [`prover::decode_proof`] — version-gated per D6 and fuzzed; the
 //!   `winterfell::Proof::from_bytes` panic paths of D15 are unreachable

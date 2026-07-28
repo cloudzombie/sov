@@ -76,7 +76,10 @@ Full detail in `pq-pool-v2-audit-response.md`.
 - **C3 / PQV2-05** — "128-bit post-quantum" is a **classical** list-decoding
   bound. Either restate the claim precisely or commission a QROM analysis. This
   is a claims-accuracy issue and must be settled before any public security
-  statement.
+  statement. **RESTATED** across the tree (crate docs/comments +
+  `pq-shielded-soundness.md` + `quantum-posture.md`); the QROM analysis is
+  scoped in `audit-scope-pq-pool.md` §9 and accepted as a pending arming
+  prerequisite. See `pq-pool-v2-audit-response.md` → PQV2-05 resolution.
 - **C4 / PQV2-06** — cross-network replay protection depends on an activation
   ordering consensus does not enforce.
 - **C5 / PQV2-07** — **verified open:** `MAX_BLOCK_WEIGHT` appears only in

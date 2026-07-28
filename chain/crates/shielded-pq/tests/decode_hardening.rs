@@ -188,7 +188,8 @@ fn blowup_byte_offset(pub_inputs: &BundlePublicInputs) -> usize {
     // options run [num_queries, blowup, grinding], DERIVED from
     // `proof_options()` rather than hardcoded — a parameter change must not
     // silently break this locator (it did, when the options moved to a cubic
-    // extension for 128-bit PROVEN security).
+    // extension for 128-bit PROVEN CLASSICAL soundness — not post-quantum;
+    // see prover::proof_options).
     let opts = proof_options();
     let run = [
         opts.num_queries() as u8,
@@ -448,7 +449,8 @@ fn context_bytes_kat_pinned() {
     assert_eq!(
         hex::encode(&ctx),
         // Re-pinned when the proof options moved to 64 queries / blowup 16 /
-        // CUBIC extension for 128-bit PROVEN security (was 42 / 8 / quadratic,
+        // CUBIC extension for 128-bit PROVEN CLASSICAL soundness (not
+        // post-quantum; see prover::proof_options) (was 42 / 8 / quadratic,
         // which was 127 conjectured but only 75 proven). The options run in
         // this KAT reads 40 10 10 03 = 64, 16, 16, cubic — previously
         // 2a 08 10 02 = 42, 8, 16, quadratic. A drift here that is NOT an
