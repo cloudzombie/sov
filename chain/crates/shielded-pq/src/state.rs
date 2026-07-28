@@ -36,11 +36,42 @@ use crate::domains::RESCUE_DOMAIN_MERKLE_NODE;
 use crate::hash::{merge_domain, PqDigest};
 use crate::tree::{empty_levels, MAX_TREE_LEAVES, TREE_DEPTH};
 
+/// Worst-case pool-v2 note commitments a single block can contain.
+///
+/// Derived, not guessed. A block is bounded by `MAX_BLOCK_WEIGHT` (4 MiB). One
+/// v2 bundle costs ~96 KiB on the wire plus `SHIELDED_V2_VERIFY_WEIGHT`
+/// (16 ms x 512 units) = ~106,496 weight, so at most 39 bundles fit; each
+/// carries at most `NUM_SLOTS` = 4 real outputs. 39 x 4 = 156, rounded up to
+/// 160 for headroom against future weight-schedule changes.
+pub const MAX_V2_COMMITMENTS_PER_BLOCK: usize = 160;
+
+/// How many BLOCKS of anchor history a spend may be proven against.
+///
+/// 128 blocks is ~5.3 hours at the 2.5-minute target: far beyond the
+/// 6-confirmation finality depth, and far beyond the ~25 s a wallet spends
+/// generating a STARK plus propagation.
+pub const ANCHOR_HORIZON_BLOCKS: usize = 128;
+
 /// How many recent v2 tree roots (anchors) consensus accepts a spend against
-/// (decision D5 — the same window shape as Orchard's, sized at 128). The ring
-/// holds *at most* this many entries, always the most recent ones; it can
-/// never grow past this bound regardless of input.
-pub const ANCHOR_RING_LEN: usize = 128;
+/// (decision D5 — the same window shape as Orchard's).
+///
+/// # Why this is a derived product, not 128 (audit PQV2-03)
+///
+/// This constant was 128 — with the comment "the same window shape as
+/// Orchard's, sized at 128". But an anchor is pushed **per commitment**, not
+/// per block, and a saturated block can contain 156 commitments. So a SINGLE
+/// block could evict the entire ring, and every spend already in flight —
+/// proven seconds earlier against a then-valid root — would become
+/// unspendable until re-proven. That is not a theoretical corner: it is what
+/// a busy block does.
+///
+/// "128" was the right number against the wrong unit. Sizing it as
+/// `MAX_V2_COMMITMENTS_PER_BLOCK * ANCHOR_HORIZON_BLOCKS` restores the intent:
+/// the ring spans at least 128 BLOCKS no matter how full each one is.
+///
+/// The cost is 20,480 x 32 bytes = 640 KiB of node memory, which is a trivial
+/// price for spends not being invalidated by someone else's traffic.
+pub const ANCHOR_RING_LEN: usize = MAX_V2_COMMITMENTS_PER_BLOCK * ANCHOR_HORIZON_BLOCKS;
 
 /// Maximum notes the depth-[`TREE_DEPTH`] pool tree can hold: `2^20 - 1`
 /// ([`MAX_TREE_LEAVES`]). Appending beyond this is a typed error, never a wrap,
@@ -673,27 +704,36 @@ mod tests {
     }
 
     #[test]
-    fn anchor_ring_holds_exactly_the_last_128_roots() {
+    fn the_anchor_ring_evicts_only_at_its_derived_bound() {
+        // Was `anchor_ring_holds_exactly_the_last_128_roots`, asserting a
+        // hardcoded 128. The bound is now DERIVED
+        // (MAX_V2_COMMITMENTS_PER_BLOCK * ANCHOR_HORIZON_BLOCKS), because 128
+        // anchors was less than one saturated block's worth of commitments —
+        // see `anchor_horizon_tests`. The BEHAVIOUR asserted here is unchanged:
+        // fill to the cap, everything is known; one more evicts exactly the
+        // oldest and nothing else.
         let mut state = ShieldedV2State::new();
         let empty_anchor = state.root();
         let mut roots = vec![empty_anchor];
-        // 127 appends: ring = empty root + 127 roots = 128 entries; all known.
-        for i in 0..127u64 {
+        // Fill to exactly the cap: the seeded empty root plus CAP-1 appends.
+        for i in 0..(ANCHOR_RING_LEN as u64 - 1) {
             state.apply(&[], &[d(i)]).expect("append");
             roots.push(state.root());
         }
         assert_eq!(state.anchors().count(), ANCHOR_RING_LEN);
         for r in &roots {
-            assert!(state.anchor_is_known(r), "all 128 roots known at the cap");
+            assert!(state.anchor_is_known(r), "every root is known at the cap");
         }
-        // One more append crosses the bound: the OLDEST (empty) root is
-        // evicted, everything newer stays, and the ring never exceeds 128.
-        state.apply(&[], &[d(127)]).expect("append");
+        // One more crosses the bound: the OLDEST (empty) root is evicted,
+        // everything newer stays, and the ring never exceeds the cap.
+        state
+            .apply(&[], &[d(ANCHOR_RING_LEN as u64 - 1)])
+            .expect("append");
         roots.push(state.root());
         assert_eq!(state.anchors().count(), ANCHOR_RING_LEN);
         assert!(
             !state.anchor_is_known(&empty_anchor),
-            "the 129th root evicts the oldest anchor"
+            "crossing the bound evicts exactly the oldest anchor"
         );
         for r in &roots[1..] {
             assert!(state.anchor_is_known(r));
@@ -850,5 +890,79 @@ mod tests {
         // Deterministic and distinct.
         assert_eq!(one.commitment(), one.clone().commitment());
         assert_ne!(empty.commitment(), one.commitment());
+    }
+}
+
+#[cfg(test)]
+mod anchor_horizon_tests {
+    use super::*;
+
+    /// **Audit PQV2-03.** A saturated block must not be able to evict the ring.
+    ///
+    /// The ring was 128 entries and an anchor is pushed per COMMITMENT, so one
+    /// block carrying 156 commitments wiped it entirely — invalidating every
+    /// spend already in flight, proven seconds earlier against a then-valid
+    /// root. Sizing the ring in BLOCKS is what fixes that.
+    #[test]
+    fn one_saturated_block_cannot_evict_the_ring() {
+        // Compile-time: a relationship between constants, so the BUILD fails if
+        // anyone ever shrinks the ring below one block's worth again.
+        const {
+            assert!(
+                ANCHOR_RING_LEN > MAX_V2_COMMITMENTS_PER_BLOCK,
+                "one saturated block must not be able to evict the whole ring"
+            )
+        };
+        // And not merely by one: the ring must still span a real horizon after
+        // the busiest possible block.
+        let remaining = ANCHOR_RING_LEN - MAX_V2_COMMITMENTS_PER_BLOCK;
+        assert!(
+            remaining >= MAX_V2_COMMITMENTS_PER_BLOCK * (ANCHOR_HORIZON_BLOCKS - 1),
+            "after one saturated block the ring must still cover the rest of the horizon"
+        );
+    }
+
+    /// The ring spans at least the confirmation horizon under worst-case load —
+    /// the property the constant is supposed to express.
+    #[test]
+    fn the_ring_spans_the_block_horizon_under_saturation() {
+        assert_eq!(
+            ANCHOR_RING_LEN,
+            MAX_V2_COMMITMENTS_PER_BLOCK * ANCHOR_HORIZON_BLOCKS
+        );
+        const {
+            assert!(
+                ANCHOR_HORIZON_BLOCKS >= 6,
+                "the horizon must exceed the 6-confirmation finality depth"
+            )
+        };
+    }
+
+    /// Filling the ring past capacity keeps the NEWEST entries and drops the
+    /// oldest — and never grows without bound.
+    #[test]
+    fn the_ring_is_bounded_and_keeps_the_newest() {
+        let mut st = ShieldedV2State::new();
+        // Push a handful past capacity; each append pushes one anchor.
+        let mut last = None;
+        for i in 0..(ANCHOR_RING_LEN + 50) {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let cm = PqDigest::from_bytes(&b).expect("canonical");
+            if st.apply(&[], &[cm]).is_err() {
+                break;
+            }
+            last = Some(st.root());
+        }
+        assert!(
+            st.anchors().count() <= ANCHOR_RING_LEN,
+            "the ring must never exceed its bound"
+        );
+        if let Some(newest) = last {
+            assert!(
+                st.anchor_is_known(&newest),
+                "the most recent root must always be spendable against"
+            );
+        }
     }
 }
