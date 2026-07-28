@@ -88,18 +88,21 @@ pub const WEIGHT_UNITS_PER_VERIFY_MS: u64 = 512;
 /// 4-in/4-out bundle (the padded worst-case circuit shape) on release-build
 /// Apple-Silicon hardware:
 ///
-/// | quantity | measured |
+/// | quantity | measured (TREE_DEPTH = 32, audit PQV2-04) |
 /// |---|---|
-/// | serialized proof | 55,054 bytes |
-/// | verify, median of 11 | **0.90 ms** |
-/// | verify, slowest sample | 3.24 ms |
+/// | serialized proof | 107,453 bytes |
+/// | verify, median of 11 | **1.60 ms** |
+/// | verify, slowest sample | 1.64 ms |
+///
+/// (At the earlier depth-20 prototype these were 98,494 bytes and ~0.9 ms; the
+/// depth-32 spend circuit doubled the padded trace 1024 -> 2048, so both grew.)
 ///
 /// The proof size is not attacker-controlled: the verifier pins the exact
 /// `proof_options()` via `AcceptableOptions::OptionSet`, so a proof that
-/// verifies at all is ~55 KB — an attacker cannot submit a *small* bundle that
+/// verifies at all is ~105 KB — an attacker cannot submit a *small* bundle that
 /// still costs a full verification.
 ///
-/// The budget charged is **16 ms** — 18× the measured median and ~5× the
+/// The budget charged is **16 ms** — 10× the measured median and ~10× the
 /// slowest observed sample, which covers the fleet's weakest hardware (shared-
 /// vCPU cloud nodes, realistically 3–4× slower than the measurement box) with
 /// margin left over. At [`WEIGHT_UNITS_PER_VERIFY_MS`]:
@@ -110,11 +113,11 @@ pub const WEIGHT_UNITS_PER_VERIFY_MS: u64 = 512;
 ///
 /// # What this bounds
 ///
-/// A realistic v2 carrier transaction is ~66 KB of bytes (bundle ~65.5 KB plus
-/// the transaction envelope), so its weight is ~74 KB and a full 4 MiB block
-/// holds at most `4,194,304 / 74,000 ≈ 56` of them. Verifying that block costs
-/// `56 × 16 ms = 896 ms` against the budget, and `56 × 0.9 ms ≈ 50 ms`
-/// measured — **0.03% of the 150-second block interval**. Bytes, not CPU, are
+/// A realistic v2 carrier transaction is ~113 KB of bytes (bundle ~107.5 KB
+/// plus the transaction envelope), so its weight is ~121 KB and a full 4 MiB
+/// block holds at most `4,194,304 / 121,000 ≈ 34` of them. Verifying that block
+/// costs `34 × 16 ms = 544 ms` against the budget, and `34 × 1.6 ms ≈ 54 ms`
+/// measured — **0.04% of the 150-second block interval**. Bytes, not CPU, are
 /// the binding resource for pool v2 by three orders of magnitude; this term
 /// exists so that remains *structurally* true rather than incidentally true,
 /// and so a future costlier `proof_version` is bounded by construction.

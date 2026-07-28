@@ -219,15 +219,17 @@ mod tests {
 
     #[test]
     fn pool_v2_exhaustion_has_a_pinned_fee_floor() {
-        // Audit PQV2-04: "the depth-20 commitment tree can be economically
-        // exhausted." This pins the FLOOR on what exhaustion costs in fees so a
-        // future gas retune (slice S2d may retune BEFORE arming) can never
-        // silently make griefing the pool cheap.
+        // Audit PQV2-04: filling the commitment tree to exhaust it. With the
+        // tree deepened to the horizon-safe depth 32, this pins the FLOOR on
+        // what exhaustion costs in fees so a future gas retune (slice S2d may
+        // retune BEFORE arming) can never silently make griefing the pool cheap.
         //
         // Threat model: bit 2 is armed and active. An attacker fills the tree's
-        // `MAX_V2_NOTES` = 2^20-1 usable leaves so no further notes can be added
+        // `MAX_V2_NOTES` = 2^32-1 usable leaves so no further notes can be added
         // — a permanent pool DoS. Each `ShieldedV2` bundle carries at most
-        // `NUM_SLOTS` real output commitments (leaves).
+        // `NUM_SLOTS` real output commitments (leaves). At depth 32 the fee
+        // floor to do so exceeds the ENTIRE XUS money supply by a wide margin,
+        // so exhaustion is not merely expensive but economically impossible.
         use sov_mining::MiningPolicy;
         use sov_primitives::GRAINS_PER_SOV;
         use sov_shielded_pq::{air::NUM_SLOTS, MAX_V2_NOTES};
@@ -253,16 +255,20 @@ mod tests {
         );
 
         // Cost floor to fill every usable leaf.
-        let bundles_to_fill = MAX_V2_NOTES.div_ceil(NUM_SLOTS as u64); // 262,144
+        let bundles_to_fill = MAX_V2_NOTES.div_ceil(NUM_SLOTS as u64); // 1,073,741,824
+        assert_eq!(bundles_to_fill, 1_073_741_824);
         let min_fee_grains = (min_gas_per_bundle as u128) * gas_price * (bundles_to_fill as u128);
         let min_fee_xus = min_fee_grains / GRAINS_PER_SOV;
-        // >= ~13,600 XUS in fees PAID TO MINERS just to grief the pool, with no
-        // financial gain to the attacker (fees are not burned — they enrich the
-        // very miners securing the chain). Counting the ~60 KB of bundle bytes
-        // each transaction must carry raises the realistic figure to ~39k XUS.
+        // ~55.9 MILLION XUS in fees PAID TO MINERS just to grief the pool, with
+        // no financial gain to the attacker (fees are not burned — they enrich
+        // the very miners securing the chain). That EXCEEDS the entire ~21M-XUS
+        // money supply by ~2.6x, so at depth 32 the attack cannot be funded at
+        // all — it is economically impossible, not merely expensive. (Proof
+        // bytes are strictly on top of this floor.)
+        assert_eq!(min_fee_xus, 55_941_949);
         assert!(
-            min_fee_xus >= 13_000,
-            "filling the tree costs at least ~13,000 XUS in fees, got {min_fee_xus}"
+            min_fee_xus >= 50_000_000,
+            "filling the depth-32 tree costs tens of millions of XUS in fees, got {min_fee_xus}"
         );
     }
 

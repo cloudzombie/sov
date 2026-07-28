@@ -103,7 +103,12 @@ fn kat_pinned_digests() {
     );
     assert_eq!(
         tree.root().to_hex(),
-        "0fc7b7717c6e446b9eae13e0475689a7ca3b48c2bf8d0d03e68a038736c2e16e",
+        // Re-pinned for the depth-20 -> depth-32 upgrade (audit PQV2-04): the
+        // root of the same leaves now folds 32 empty/internal levels instead of
+        // 20, so the root necessarily moves. The note commitment, owner tag and
+        // nullifier below are UNCHANGED — none of them depend on tree depth,
+        // which is exactly what we expect: only the root changed.
+        "6944acd94c40f5f5404c19b2bbbd7af1ae3267a170c4ea95d2e70cd478282316",
         "tree root KAT drifted"
     );
     assert_eq!(
@@ -160,16 +165,20 @@ fn kat_proof_size_pinned() {
     // parameter or winterfell-version change could move the proof size (and thus
     // the weight/gas derivation) unnoticed. This is that pin.
     //
-    // 98494 bytes = 96.2 KiB, measured for the shipped 64q / blowup 16 / cubic
-    // options. It last moved with the 42q/8/quadratic -> 64q/16/cubic evolution
-    // (audit PQV2-08) and the PQV2-01 trace-width 31 -> 32 change. A drift here
-    // that is NOT a deliberate parameter/witness change is a bug: re-derive the
-    // weight schedule in `sov_types::weight` before re-pinning.
+    // 107453 bytes = 104.9 KiB, measured for the shipped 64q / blowup 16 /
+    // cubic options at TREE_DEPTH = 32. It last moved with the depth-20 ->
+    // depth-32 upgrade (audit PQV2-04): the Merkle segment grew from 20 to 32
+    // cycles per input, so the padded trace doubled 1024 -> 2048 and the FRI/
+    // query openings grew accordingly (was 98494 = 96.2 KiB at depth 20). Still
+    // comfortably inside MAX_PROOF_LEN (128 KiB) and MAX_SHIELDED_V2_BUNDLE_BYTES
+    // (144 KiB). A drift here that is NOT a deliberate parameter/witness/depth
+    // change is a bug: re-derive the weight schedule in `sov_types::weight`
+    // before re-pinning.
     let (proof, _) = kat_prove();
     assert_eq!(
         proof.len(),
-        98_494,
-        "pool-v2 KAT proof size drifted — proof_options() or the witness shape changed"
+        107_453,
+        "pool-v2 KAT proof size drifted — proof_options(), the witness shape, or TREE_DEPTH changed"
     );
     // And it must fit the wire codec with real margin (the weight schedule
     // relies on this).
@@ -353,6 +362,68 @@ fn wrong_merkle_path_rejected() {
         verify_spend(&proof, &forged).is_err(),
         "proof with wrong Merkle path accepted under the true root"
     );
+}
+
+#[test]
+fn spend_circuit_constrains_the_full_32_deep_path() {
+    // Audit PQV2-04. The commitment tree is depth 32; this proves the SPEND
+    // CIRCUIT binds the WHOLE 32-deep authentication path, not a shorter prefix
+    // — i.e. that raising TREE_DEPTH 20 -> 32 actually extended the in-circuit
+    // Merkle chain rather than leaving levels >= 20 unconstrained.
+    use sov_shielded_pq::tree::TREE_DEPTH;
+    assert_eq!(TREE_DEPTH, 32, "this test asserts the horizon-safe depth");
+
+    let (key, notes, tree) = kat_fixture();
+    let (path, anchor) = tree.witness(1).expect("witness");
+    assert_eq!(
+        path.siblings.len(),
+        TREE_DEPTH,
+        "a witness carries one sibling per level, all 32"
+    );
+
+    // (1) An honest 32-deep spend verifies, and the root the prover committed
+    // in-circuit equals the reference depth-32 tree root.
+    let spends = vec![BundleSpend {
+        key: key.clone(),
+        note: notes[0],
+        path: path.clone(),
+    }];
+    let (proof, pi) = prove_bundle(&spends, &[], 0, KAT_VALUE_0, 0).expect("prove");
+    assert_eq!(
+        pi.anchors[0], anchor,
+        "the in-circuit root must equal the reference 32-deep root"
+    );
+    verify_spend(&proof, &pi).expect("an honest 32-deep spend must verify");
+
+    // (2) Tamper a path node at a DEEP level (28) — a level that exists ONLY
+    // because the tree is depth 32. It is load-bearing: the in-circuit Merkle
+    // chain folds all 32 levels, so changing a level-28 sibling MUST move the
+    // anchor (this assert_ne is what catches a circuit that silently ignored
+    // levels >= 20), and a proof built over the tampered deep path cannot pass
+    // under the honest anchor — the root-row boundary assertion binds the
+    // circuit's full 32-level fold to the public anchor.
+    const DEEP_LEVEL: usize = 28;
+    let mut deep = path.clone();
+    deep.siblings[DEEP_LEVEL] = notes[1].commitment(); // any different sibling
+    let spends2 = vec![BundleSpend {
+        key,
+        note: notes[0],
+        path: deep,
+    }];
+    let (proof2, pi2) = prove_bundle(&spends2, &[], 0, KAT_VALUE_0, 0).expect("prove");
+    assert_ne!(
+        pi2.anchors[0], anchor,
+        "a level-28 sibling change must move the depth-32 root"
+    );
+    let mut forged = pi2.clone();
+    forged.anchors[0] = anchor; // claim the honest root for a wrong-position proof
+    assert!(
+        verify_spend(&proof2, &forged).is_err(),
+        "a proof over a tampered level-28 node was accepted under the honest root"
+    );
+    // The tampered-path proof is internally consistent — it just binds a
+    // DIFFERENT tree position, and verifies only under its OWN anchor.
+    verify_spend(&proof2, &pi2).expect("the tampered-path proof binds its own root");
 }
 
 #[test]

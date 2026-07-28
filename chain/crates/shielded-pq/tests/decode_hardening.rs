@@ -431,10 +431,12 @@ fn wire_kat_publics_header_pinned() {
     let header = &f.encoded[..1 + PUBLICS_LEN];
     assert_eq!(
         hex::encode(blake3::hash(header).as_bytes()),
-        // Re-pinned for the PQV2-01 nullifier fix: nullifiers are public
-        // inputs, so binding the leaf position into them necessarily moves
-        // this header digest. Free only because bit 2 is unarmed.
-        "ab5c6c0690676251ef487a58dd6c701980f41fe17323ea92bb4bce780496da35",
+        // Re-pinned for the depth-20 -> depth-32 upgrade (audit PQV2-04): the
+        // public inputs carry the per-input anchors, which are the depth-32 tree
+        // roots — deeper roots than at depth 20 — so this publics-header digest
+        // necessarily moves. (Was re-pinned for the PQV2-01 nullifier fix before
+        // that.) Free only because bit 2 is unarmed.
+        "4bee649a41d541b55c90223bcfd1ca3125596cb0c2ea344b3d897773de2167e2",
         "v1 wire publics-header KAT drifted"
     );
 }
@@ -458,7 +460,12 @@ fn context_bytes_kat_pinned() {
         // Re-pinned again for PQV2-01: the trace width went 31 -> 32 (0x1f ->
         // 0x20) for the leaf-position accumulator column, and the constraint
         // count rose with the accumulator recurrence.
-        "2000000a00000801000000ffffffff40101003041f00000101ca02",
+        // Re-pinned again for PQV2-04 (depth-20 -> depth-32): the trace length
+        // exponent byte moved 0x0a -> 0x0b (2^10 = 1024 -> 2^11 = 2048), the
+        // only change — the trailing constraint-count vint `ca02` is IDENTICAL,
+        // confirming the deeper Merkle path added trace ROWS (masked reuse of
+        // the same constraints) without adding any constraint.
+        "2000000b00000801000000ffffffff40101003041f00000101ca02",
         "canonical context KAT drifted"
     );
     // And it must literally prefix the honest proof.

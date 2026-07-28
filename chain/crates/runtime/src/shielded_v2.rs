@@ -156,7 +156,7 @@ pub struct V2Effects {
 /// 6. **nullifiers**: none already spent on chain (which also covers
 ///    earlier transactions in the same block, since each transaction's
 ///    effect is applied before the next executes);
-/// 7. **capacity**: the outputs fit the depth-20 tree;
+/// 7. **capacity**: the outputs fit the depth-32 tree;
 /// 8. **value balance + turnstile**: the signer funds the shield leg and
 ///    the pool covers the de-shield leg without going negative;
 /// 9. **drain limiter**: the de-shield fits pool v2's own rolling window.
