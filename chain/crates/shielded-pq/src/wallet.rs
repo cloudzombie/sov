@@ -327,10 +327,18 @@ fn finish(
 ///
 /// It is separate from building because the nonce is only known at submit
 /// time, after the ~25 s proving work is already done. Call it last, with the
-/// exact `{signer, nonce}` the carrier transaction will use.
+/// exact `{chain_id, genesis, signer, nonce}` the carrier transaction will use.
+///
+/// `chain_id`/`genesis` are THIS network's identity (PQV2-06): they are folded
+/// into the authorized message so the bundle cannot be replayed onto another
+/// SOV network, independently of the `tx-domain` fork's activation state. Sign
+/// with the domain the connected node reports for its chain (always available,
+/// not the activation-gated signing domain).
 pub fn authorize_for_carrier(
     bundle: &mut SpendBundle,
     key: &PqShieldedKey,
+    chain_id: &str,
+    genesis: &[u8; 32],
     signer: &str,
     nonce: u64,
 ) -> Result<(), SpendBuildError> {
@@ -339,6 +347,8 @@ pub fn authorize_for_carrier(
         &bundle.public_inputs,
         &bundle.output_ciphertexts,
         &CarrierContext {
+            chain_id: chain_id.as_bytes(),
+            genesis,
             signer: signer.as_bytes(),
             nonce,
         },
@@ -366,7 +376,10 @@ mod tests {
     #[test]
     fn a_bundle_must_be_carrier_bound_and_binds_to_exactly_one_carrier() {
         let k = PqShieldedKey::from_leaf_seed(&[7u8; 32]);
+        const GEN: &[u8; 32] = &[0xAA; 32];
         let ctx = |signer: &'static str, nonce: u64| CarrierContext {
+            chain_id: b"sov-mainnet",
+            genesis: GEN,
             signer: signer.as_bytes(),
             nonce,
         };
@@ -377,7 +390,8 @@ mod tests {
             "an UNBOUND bundle must not satisfy consensus carrier auth"
         );
 
-        authorize_for_carrier(&mut b, &k, "usa.reserve.sov", 0).expect("authorize");
+        authorize_for_carrier(&mut b, &k, "sov-mainnet", GEN, "usa.reserve.sov", 0)
+            .expect("authorize");
         assert!(
             verify_carrier_auth(&b, &ctx("usa.reserve.sov", 0)),
             "after binding, its own carrier must verify"
@@ -389,6 +403,20 @@ mod tests {
         assert!(
             !verify_carrier_auth(&b, &ctx("miner.sov", 0)),
             "a different SIGNER must not verify — else the bundle is stealable"
+        );
+        // A different NETWORK (chain id) must not verify — else the bundle
+        // replays cross-network (PQV2-06).
+        assert!(
+            !verify_carrier_auth(
+                &b,
+                &CarrierContext {
+                    chain_id: b"sov-testnet-1",
+                    genesis: GEN,
+                    signer: b"usa.reserve.sov",
+                    nonce: 0,
+                }
+            ),
+            "a different CHAIN ID must not verify — else the bundle replays cross-network"
         );
     }
 

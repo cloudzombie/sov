@@ -86,6 +86,15 @@ pub struct BlockContext<'a> {
     /// limiter ([`crate::shielded_v2`]). Resolved per block height, so
     /// historical (pre-activation) blocks always validate under `false`.
     pub shielded_v2_active: bool,
+    /// This chain's branch-independent identity — `{chain_id, genesis}` — used
+    /// to bind a pool-v2 bundle's authorization to THIS network (audit
+    /// PQV2-06). Unlike [`tx_domain`](Self::tx_domain), this is populated on
+    /// EVERY block regardless of any fork's activation state, because the v2
+    /// cross-network replay guard must not depend on activation ordering: the
+    /// domain is the chain's own `{chain_id, genesis}`, always known. It is
+    /// consumed only by the `shielded-v2` path, which is dormant on every chain
+    /// today, so it never affects any historical or current block's outcome.
+    pub chain_domain: sov_primitives::SigningDomain,
 }
 
 /// Reasons a transaction is *rejected* — not admitted to a block at all. These
@@ -552,6 +561,7 @@ pub fn apply_transaction(
                     ledger,
                     ctx.mining,
                     ctx.height,
+                    &ctx.chain_domain,
                     &tx.signer,
                     tx_nonce,
                     signer.balance,
@@ -2282,6 +2292,10 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            chain_domain: sov_primitives::SigningDomain::new(
+                "sov-test",
+                sov_primitives::Hash::ZERO,
+            ),
         }
     }
     /// A context at a specific height (for staking/vesting tests).
@@ -2296,6 +2310,10 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            chain_domain: sov_primitives::SigningDomain::new(
+                "sov-test",
+                sov_primitives::Hash::ZERO,
+            ),
         }
     }
 
@@ -2339,6 +2357,10 @@ mod tests {
             tx_domain: mode,
             fee_auction_active: false,
             shielded_v2_active: false,
+            chain_domain: sov_primitives::SigningDomain::new(
+                "sov-test",
+                sov_primitives::Hash::ZERO,
+            ),
         }
     }
 
@@ -2672,6 +2694,10 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: true,
             shielded_v2_active: false,
+            chain_domain: sov_primitives::SigningDomain::new(
+                "sov-test",
+                sov_primitives::Hash::ZERO,
+            ),
         }
     }
 
@@ -3557,6 +3583,10 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            chain_domain: sov_primitives::SigningDomain::new(
+                "sov-test",
+                sov_primitives::Hash::ZERO,
+            ),
         };
 
         // Heights 1 & 2 mint 50 each (epoch 0); height 3 halves to 25
@@ -3684,6 +3714,10 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            chain_domain: sov_primitives::SigningDomain::new(
+                "sov-test",
+                sov_primitives::Hash::ZERO,
+            ),
         };
 
         // Deploy from dev.sov.
@@ -3748,6 +3782,10 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            chain_domain: sov_primitives::SigningDomain::new(
+                "sov-test",
+                sov_primitives::Hash::ZERO,
+            ),
         };
         let mut ledger = ledger_with_usa(1_000);
         let stx = transfer([1; 32], "usa.reserve.sov", "ecb.reserve.sov", 1, 0);
@@ -4424,6 +4462,10 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            chain_domain: sov_primitives::SigningDomain::new(
+                "sov-test",
+                sov_primitives::Hash::ZERO,
+            ),
         };
         let mut ledger = ledger_with_usa(100);
         let sov_before = ledger.account(&id("usa.reserve.sov")).balance;
@@ -5722,6 +5764,10 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            chain_domain: sov_primitives::SigningDomain::new(
+                "sov-test",
+                sov_primitives::Hash::ZERO,
+            ),
         }
     }
 
@@ -5944,6 +5990,10 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            chain_domain: sov_primitives::SigningDomain::new(
+                "sov-test",
+                sov_primitives::Hash::ZERO,
+            ),
         };
 
         // A V1 transfer pays exactly the intrinsic gas — no envelope charge.

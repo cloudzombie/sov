@@ -865,13 +865,25 @@ fn submit_shielded_v2_bundle(
 ) -> Result<Hash, Box<dyn Error>> {
     let nonce = client.next_nonce(signer)?;
     let domain = client.signing_domain()?;
-    // Bind the bundle to THIS carrier. Consensus verifies the ML-DSA
-    // authorization over `carrier_sighash(digest, {signer, nonce})`, not over
-    // the bundle digest alone, so this step is what makes the bundle
-    // admissible at all — and what stops it being lifted onto another
-    // transaction. It happens here, after the nonce is known.
+    // Bind the bundle to THIS network AND THIS carrier. Consensus verifies the
+    // ML-DSA authorization over `carrier_sighash({chain_id, genesis}, {signer,
+    // nonce}, digest)`, not over the bundle digest alone: this step is what
+    // makes the bundle admissible at all, what stops it being lifted onto
+    // another transaction, and — via the chain domain — what stops it being
+    // replayed onto another network (PQV2-06). The chain domain is fetched
+    // unconditionally (`sov_getChainDomain`), NOT the activation-gated
+    // `signing_domain`, so the network binding never depends on the `tx-domain`
+    // fork's activation state. It happens here, after the nonce is known.
+    let chain_domain = client.chain_domain()?;
     let mut bundle = bundle.clone();
-    authorize_for_carrier(&mut bundle, pq_key, signer.as_str(), nonce)?;
+    authorize_for_carrier(
+        &mut bundle,
+        pq_key,
+        chain_domain.chain_id(),
+        chain_domain.genesis().as_bytes(),
+        signer.as_str(),
+        nonce,
+    )?;
     let tx = Transaction {
         signer: signer.clone(),
         public_key: keypair.public_key(),

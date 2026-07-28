@@ -389,6 +389,9 @@ fn stf_vector() -> Value {
         // they stay byte-identical across the `fee-auction` deployment.
         fee_auction_active: false,
         shielded_v2_active: false,
+        // Only the (dormant) shielded-v2 path reads this, so it never touches a
+        // KAT vector — a placeholder keeps the vectors byte-identical.
+        chain_domain: sov_primitives::SigningDomain::new("sov-kat", sov_primitives::Hash::ZERO),
     };
     // The full block state transition the node performs: the coinbase mints the
     // scheduled subsidy to the miner FIRST (Bitcoin issuance), then the
