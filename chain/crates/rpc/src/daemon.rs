@@ -921,16 +921,17 @@ struct BakedDeployments {
     /// `None` for a preset that schedules no fee-auction fork.
     fee_auction: Option<sov_governance::Deployment>,
     /// The `shielded-v2` deployment (bit 2): the post-quantum pool.
-    /// `None` on MAINNET — bit 2 is defined and UNARMED there, and stays so
-    /// until the pool has passed external audit. The E2E rehearsal net arms
-    /// it so the harness can drive a REAL pool-v2 lifecycle (audit PQV2-02:
-    /// a release gate must not report green over untested v2 steps).
+    /// ARMED on MAINNET as of 0.2.5 (`Some`), on a schedule with fleet lead time
+    /// (`MAINNET_SHIELDED_V2_START_HEIGHT`). The E2E rehearsal net also arms it
+    /// so the harness can drive a REAL pool-v2 lifecycle (audit PQV2-02: a
+    /// release gate must not report green over untested v2 steps). `None` for
+    /// any preset that schedules no pool-v2 fork.
     shielded_v2: Option<sov_governance::Deployment>,
     /// The tx-domain grace window `G` in blocks — consensus-critical once armed,
     /// baked here so no per-node divergence is possible.
     grace_blocks: u64,
-    /// The version-bits mask this node's mined blocks commit (bits 0 and 1: it
-    /// signals readiness for BOTH deployments).
+    /// The version-bits mask this node's mined blocks commit (mainnet 0.2.5:
+    /// bits 0, 1, and 2 — it signals readiness for all three deployments).
     signal_mask: u32,
 }
 
@@ -974,12 +975,13 @@ const E2E_REHEARSAL_V2_START_HEIGHT: u64 = 512;
 /// (dev/test/testnet-1 get NOTHING — genesis, KATs, and all test behavior
 /// untouched).
 ///
-/// Mainnet: both deployments are DORMANT machinery until miner signaling reaches
-/// the 9/10 threshold over a full 288-block window at/after height 10944 —
-/// pre-activation validation and execution are byte-identical. What DOES change
-/// immediately: a mainnet v0.1.99 node stamps `version_bits = 0b11` in headers it
-/// mines (the intended, non-breaking signaling — old nodes record the bits but do
-/// not enforce them).
+/// Mainnet: every deployment is DORMANT machinery until miner signaling reaches
+/// the 9/10 threshold over a full 288-block window at/after its start height
+/// (bits 0/1 at 10944; bit 2, `shielded-v2`, at
+/// `MAINNET_SHIELDED_V2_START_HEIGHT` as of 0.2.5) — pre-activation validation
+/// and execution are byte-identical. What DOES change immediately: a mainnet
+/// 0.2.5 node stamps `version_bits = 0b111` in headers it mines (the intended,
+/// non-breaking signaling — old nodes record the bits but do not enforce them).
 ///
 /// E2E rehearsal namespace: bit 0 only, period 32, start 384, threshold 9/10,
 /// LOT off, grace `G = 0`. Same code path, same state machine, same threshold
@@ -1000,9 +1002,20 @@ fn baked_deployments(chain_id: &str) -> Option<BakedDeployments> {
     None
 }
 
-/// The release-pinned mainnet activation preset (bits 0 and 1). These values are
-/// consensus-coordinating: two nodes with different heights, thresholds, or grace
-/// `G` would split at activation / at `H_a + G`.
+/// The `shielded-v2` (bit 2) signaling START height on MAINNET — the single knob
+/// the coordinator adjusts to give the fleet lead time before the window opens.
+///
+/// A 288-block window boundary (`52 * 288 = 14_976`) chosen ~1,316 blocks
+/// (~2.3 days at the 2.5-min target) above the ~13,660 mainnet head at the time
+/// 0.2.5 was cut, so every miner can be running the arming release and signaling
+/// bit 2 BEFORE signaling opens. Activation then follows the SAME cadence bits
+/// 0/1 used: `Started` here, `LockedIn` one period later (the min-activation
+/// guard, `start + 288`), `Active` one period after that (`start + 576`).
+const MAINNET_SHIELDED_V2_START_HEIGHT: u64 = 14_976;
+
+/// The release-pinned mainnet activation preset (bits 0, 1, and — as of 0.2.5 —
+/// 2). These values are consensus-coordinating: two nodes with different heights,
+/// thresholds, or grace `G` would split at activation / at `H_a + G`.
 fn mainnet_deployments() -> BakedDeployments {
     // 90% of a 288-block (~12h) window; all heights are exact window boundaries
     // (10944 = 38 * 288, 11808 = 41 * 288, 11232 = 39 * 288).
@@ -1030,15 +1043,37 @@ fn mainnet_deployments() -> BakedDeployments {
         false,
     )
     .expect("baked mainnet deployment is valid");
+    // `shielded-v2` (bit 2): the post-quantum pool. ARMED for MAINNET as of
+    // 0.2.5, on the SAME 288-block window, 9/10 threshold, and non-LOT rule as
+    // bits 0/1. Its min-activation guard and timeout use the identical offsets
+    // bits 0/1 used (`start + 288`, `start + 3 * 288`), so it Locks-in one
+    // period after `start` and goes Active one period after that. Byte-identical
+    // behavior until that activation height: `Action::ShieldedV2` stays a hard
+    // reject and the pool-v2 state stays absent until bit 2 resolves Active over
+    // committed miner signals.
+    let shielded_v2 = sov_governance::Deployment::new(
+        sov_governance::SHIELDED_V2_DEPLOYMENT,
+        2,
+        BlockHeight::new(MAINNET_SHIELDED_V2_START_HEIGHT),
+        BlockHeight::new(MAINNET_SHIELDED_V2_START_HEIGHT + 3 * 288),
+        288,
+        threshold,
+        BlockHeight::new(MAINNET_SHIELDED_V2_START_HEIGHT + 288),
+        false,
+    )
+    .expect("baked mainnet shielded-v2 deployment is valid");
     BakedDeployments {
         tx_domain,
         fee_auction: Some(fee_auction),
-        // Pool v2 is NOT armed on mainnet. Bit 2 stays defined-and-unarmed
-        // until the circuit has passed external audit; `signal_mask` below is
-        // 0b11, so mainnet nodes do not even signal readiness for it.
-        shielded_v2: None,
+        // Pool v2 is ARMED on mainnet as of 0.2.5: bit 2 rides a schedule with
+        // real fleet lead time (`MAINNET_SHIELDED_V2_START_HEIGHT`), and
+        // `signal_mask` below sets bit 2 so mainnet nodes broadcast their
+        // readiness vote. The external circuit audit + QROM analysis remain
+        // accepted-pending per the arming bar; activation is miner-signaled and
+        // requires the fleet running 0.2.5.
+        shielded_v2: Some(shielded_v2),
         grace_blocks: 576,
-        signal_mask: 0b11,
+        signal_mask: 0b111,
     }
 }
 
@@ -2257,19 +2292,43 @@ mod tests {
         assert_eq!(fa.threshold, sov_governance::Threshold::new(9, 10).unwrap());
         assert_eq!(fa.min_activation_height.get(), 11_232);
         assert!(!fa.lockinontimeout);
+        // shielded-v2 (bit 2): ARMED as of 0.2.5, same window/threshold/LOT as
+        // bits 0/1, on a start height with fleet lead time. Its min-activation
+        // and timeout use the identical offsets bits 0/1 used (start + 288,
+        // start + 3*288), so it Locks-in one period after start and activates
+        // one period after that.
+        let v2 = baked
+            .shielded_v2
+            .as_ref()
+            .expect("mainnet arms bit 2 in 0.2.5");
+        assert_eq!(v2.name, sov_governance::SHIELDED_V2_DEPLOYMENT);
+        assert_eq!(v2.bit, 2);
+        assert_eq!(v2.start_height.get(), MAINNET_SHIELDED_V2_START_HEIGHT);
+        assert_eq!(v2.start_height.get(), 14_976);
+        assert_eq!(
+            v2.min_activation_height.get(),
+            MAINNET_SHIELDED_V2_START_HEIGHT + 288
+        );
+        assert_eq!(
+            v2.timeout_height.get(),
+            MAINNET_SHIELDED_V2_START_HEIGHT + 3 * 288
+        );
+        assert_eq!(v2.period, 288);
+        assert_eq!(v2.threshold, sov_governance::Threshold::new(9, 10).unwrap());
+        assert!(!v2.lockinontimeout);
         assert_eq!(baked.grace_blocks, 576);
-        assert_eq!(baked.signal_mask, 0b11, "signals bits 0 AND 1");
+        assert_eq!(baked.signal_mask, 0b111, "signals bits 0, 1 AND 2");
     }
 
     #[test]
-    fn shielded_v2_bit_is_defined_but_not_armed() {
-        // v0.2.0 D13 pin: the `shielded-v2` deployment owns signal bit 2 in
-        // the registry (`sov_governance::BIT_SHIELDED_V2`) but v0.2.0 ARMS
-        // NOTHING — the mainnet preset schedules only bits 0 and 1 and its
-        // signal mask must not set bit 2. If this test ever fails, someone
-        // armed the PQ pool without the arming release + external audit the
-        // program mandates. (The registry also guarantees the bit cannot
-        // collide with the armed ones.)
+    fn shielded_v2_bit_is_defined_and_armed_on_mainnet() {
+        // 0.2.5 arming: the `shielded-v2` deployment owns signal bit 2 in the
+        // registry (`sov_governance::BIT_SHIELDED_V2`), the bit does not collide
+        // with the armed ones, AND the mainnet preset now SCHEDULES it and sets
+        // bit 2 in the signal mask. This is the deliberate arming after the six
+        // audit Mediums + depth-32 upgrade landed. Arming stays byte-identical
+        // until the miner-signaled activation height — `deployment_active_at`
+        // resolves it over committed signals exactly as bits 0/1 resolve.
         assert_eq!(sov_governance::BIT_SHIELDED_V2, 2);
         assert_eq!(sov_governance::SHIELDED_V2_DEPLOYMENT, "shielded-v2");
         assert_ne!(
@@ -2286,15 +2345,15 @@ mod tests {
             baked.fee_auction.as_ref().map(|d| d.bit),
             Some(sov_governance::BIT_FEE_AUCTION)
         );
-        assert_eq!(
+        assert_ne!(
             baked.signal_mask & (1 << sov_governance::BIT_SHIELDED_V2),
             0,
-            "mainnet must NOT signal bit 2 — shielded-v2 is unarmed in v0.2.0"
+            "mainnet 0.2.5 MUST signal bit 2 — shielded-v2 is armed"
         );
-        assert!(
-            baked.shielded_v2.is_none(),
-            "mainnet must schedule NO shielded-v2 deployment — the pool ships \
-             dormant until the circuit passes external audit"
+        assert_eq!(
+            baked.shielded_v2.as_ref().map(|d| d.bit),
+            Some(sov_governance::BIT_SHIELDED_V2),
+            "mainnet 0.2.5 MUST schedule the shielded-v2 deployment on bit 2"
         );
         // The rehearsal namespace DOES arm bit 2 (audit PQV2-02: the release
         // harness must be able to exercise a real v2 lifecycle rather than
@@ -2308,8 +2367,9 @@ mod tests {
             "the rehearsal net must signal bit 2 so activation can be driven"
         );
         assert!(rehearsal.shielded_v2.is_some());
-        // ...and no canonical chain id can ever pick up that preset.
-        for canonical in ["sov-mainnet", "sov-testnet-1", "sov-dev", "sov-test"] {
+        // ...and no NON-mainnet canonical chain id arms shielded-v2 (mainnet is
+        // deliberately armed as of 0.2.5; testnet-1/dev/test get nothing).
+        for canonical in ["sov-testnet-1", "sov-dev", "sov-test"] {
             let armed = baked_deployments(canonical)
                 .map(|b| b.shielded_v2.is_some())
                 .unwrap_or(false);
@@ -2385,7 +2445,7 @@ mod tests {
         // resolves to the frozen mainnet preset (the mainnet arm is tested first).
         let both = baked_deployments("sov-e2e-mainnet").expect("mainnet arm wins");
         assert_eq!(both.tx_domain.period, 288);
-        assert_eq!(both.signal_mask, 0b11);
+        assert_eq!(both.signal_mask, 0b111);
         // And the canonical ids are untouched by the new namespace.
         assert!(baked_deployments("sov-testnet-1").is_none());
     }
@@ -2399,7 +2459,7 @@ mod tests {
         // a preset-less chain cannot replay a post-activation Tipped log is
         // `sov-chain`'s `post_activation_tipped_log_cold_replays_only_with_the_
         // deployment_installed`.) Observable here without mining to height 10944:
-        // the installed signal mask stamps `version_bits = 0b11` on the very first
+        // the installed signal mask stamps `version_bits = 0b111` on the very first
         // produced block, and a non-mainnet chain stays untouched (bits 0).
         let genesis_for = |chain_id: &str| GenesisConfig {
             chain_id: chain_id.into(),
@@ -2417,7 +2477,7 @@ mod tests {
             .expect("mainnet chain builds");
         let block = mainnet.produce_block(vec![], 2_000).unwrap();
         assert_eq!(
-            block.header.version_bits, 0b11,
+            block.header.version_bits, 0b111,
             "the baked signal mask is live on the FIRST produced block — the preset \
              is installed at construction, before any replay could run"
         );

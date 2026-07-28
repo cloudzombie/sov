@@ -3892,6 +3892,150 @@ mod tests {
         assert_eq!(chain.ledger().shielded_v2_value(), Balance::ZERO);
     }
 
+    #[test]
+    fn miner_signaled_shielded_v2_activates_and_a_bundle_executes() {
+        use sov_governance::{Deployment, Threshold};
+        use sov_shielded_pq::hd::PqShieldedKey;
+        use sov_shielded_pq::wallet::{authorize_for_carrier, build_shield};
+        use sov_shielded_pq::wire::encode_bundle;
+
+        // The exact mirror of `miner_signaled_fee_auction_activates_...`, but for
+        // bit 2. Same window math: signaling opens at height 4, window length 4,
+        // 3-of-4 threshold — [4,8) signals 4/4 -> LockedIn at boundary 8 ->
+        // Active at boundary 12. The per-branch resolution
+        // (`branch_shielded_v2_active` / `shielded_v2_active_with`) is the SAME
+        // `deployment_active_at` walk fee-auction uses, so this proves the armed
+        // path end to end.
+        let mut chain = fresh_chain();
+        chain.set_shielded_v2_deployment(
+            Deployment::new(
+                sov_governance::SHIELDED_V2_DEPLOYMENT,
+                2,
+                BlockHeight::new(4),
+                BlockHeight::new(400),
+                4,
+                Threshold::new(3, 4).unwrap(),
+                BlockHeight::new(0),
+                true,
+            )
+            .unwrap(),
+        );
+        chain.set_signal_mask(1 << 2);
+
+        // This chain's identity, captured so bundle construction never borrows
+        // `chain` while it is being mined into.
+        let chain_id = chain.chain_id().to_string();
+        let genesis = chain.chain_domain().genesis();
+        let seed = [7u8; 32];
+        let pqk = PqShieldedKey::from_leaf_seed(&seed);
+        // usa.reserve.sov's genesis key (seed [2]) — the carrier that pays for
+        // and authorizes the bundle. It is funded with 1_000 SOV in `fresh_chain`.
+        let kp = Keypair::from_seed([2; 32]);
+        let make_shield = |nonce: u64| -> SignedTransaction {
+            let grains =
+                u64::try_from(Balance::from_sov(5).unwrap().grains()).expect("5 SOV fits u64");
+            let mut bundle = build_shield(&pqk, &pqk.address(), grains, 0).expect("build shield");
+            authorize_for_carrier(
+                &mut bundle,
+                &pqk,
+                &chain_id,
+                genesis.as_bytes(),
+                "usa.reserve.sov",
+                nonce,
+            )
+            .expect("carrier-bind to this chain");
+            let tx = Transaction {
+                signer: id("usa.reserve.sov"),
+                public_key: kp.public_key(),
+                nonce,
+                action: Action::ShieldedV2 {
+                    bundle: encode_bundle(&bundle),
+                },
+            };
+            SignedTransaction::sign(tx, &kp).unwrap()
+        };
+
+        // (c) DORMANT before activation: at the tip (height 0, next block 1) the
+        // deployment has not even Started, so a `ShieldedV2` action is a hard,
+        // block-invalidating `FeatureInactive` reject. The bundle is bound to THIS
+        // chain and is otherwise valid, so dormancy is the ONLY thing keeping it
+        // out — the producer excludes it, and a block that smuggles one in fails
+        // to import. Neither candidate is committed, so the tip stays at height 0
+        // and nonce 0 stays unused for the Active spend below.
+        let ts0 = 2_000u64;
+        let v2 = make_shield(0);
+        let excluded = chain.produce_block(vec![v2.clone()], ts0).unwrap();
+        assert!(
+            !chain.shielded_v2_active(1),
+            "not active for the next (height 1) block"
+        );
+        assert!(
+            excluded.transactions.is_empty(),
+            "producer must exclude a ShieldedV2 tx while dormant"
+        );
+        let smuggled = Block::assemble(
+            excluded.header.height,
+            excluded.header.prev_hash,
+            excluded.header.state_root,
+            excluded.header.receipts_root,
+            excluded.header.timestamp_ms,
+            excluded.header.proposer.clone(),
+            vec![v2],
+        );
+        assert!(
+            chain.import_block(smuggled).is_err(),
+            "a dormant ShieldedV2 tx must invalidate any block carrying it"
+        );
+
+        // (a) The node SIGNALS bit 2 in every block it produces. Mine the
+        // signaling window [1, 11]; [4,8) signals 4/4 -> LockedIn at 8.
+        let mut ts = ts0;
+        for _ in 1..=11 {
+            let block = chain.produce_block(vec![], ts).unwrap();
+            assert_eq!(block.header.version_bits, 1 << 2, "blocks signal bit 2");
+            chain.import_block(block).unwrap();
+            ts += 1_000;
+        }
+
+        // (b) ACTIVE at height 12 — the first Active height, resolved purely from
+        // committed header signals — and a real, carrier-bound shield now EXECUTES:
+        // included by the producer, imported through the full consensus gate
+        // (check_transition / check_ledger run on import), moving value into the
+        // pool while total supply changes by EXACTLY the coinbase.
+        assert!(!chain.shielded_v2_active(11), "still dormant at height 11");
+        assert!(chain.shielded_v2_active(12), "active for the block at 12");
+        assert!(chain.shielded_v2_active(13), "and stays active (terminal)");
+        let pool_before = chain.ledger().shielded_v2_value();
+        let supply_before = chain.ledger().total_supply().unwrap();
+        let reward = chain.mint_reward();
+
+        let shield = make_shield(0);
+        let block = chain.produce_block(vec![shield], ts).unwrap();
+        assert_eq!(
+            block.transactions.len(),
+            1,
+            "the shield is INCLUDED once bit 2 is Active"
+        );
+        chain.import_block(block).unwrap();
+
+        let shielded = Balance::from_sov(5).unwrap();
+        assert_eq!(
+            chain.ledger().shielded_v2_value(),
+            pool_before.checked_add(shielded).unwrap(),
+            "the shielded value entered the pool-v2 turnstile"
+        );
+        assert!(
+            !chain.ledger().shielded_v2().is_empty(),
+            "the note commitment is now in the pool-v2 state"
+        );
+        assert_eq!(
+            chain.ledger().total_supply().unwrap(),
+            supply_before.checked_add(reward).unwrap(),
+            "supply moved by exactly the coinbase — a shield is an internal \
+             transparent -> pool transfer that conserves total supply"
+        );
+    }
+
     /// A signed `Tipped{tip, Transfer{to, amount}}` from `usa.reserve.sov`.
     fn usa_tipped_transfer(tip_sov: u128, to: &str, sov: u128, nonce: u64) -> SignedTransaction {
         let kp = Keypair::from_seed([2; 32]);

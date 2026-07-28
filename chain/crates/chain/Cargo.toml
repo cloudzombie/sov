@@ -21,6 +21,11 @@ thiserror.workspace = true
 
 [dev-dependencies]
 sov-mempool = { path = "../mempool" }
+# Test-only: build a REAL, carrier-bound pool-v2 bundle so the shielded-v2
+# activation test can prove a `ShieldedV2` action EXECUTES once bit 2 is Active
+# (not just that the discriminant decodes). Not a runtime dependency of the
+# chain crate — execution reaches the verifier through `sov-runtime`.
+sov-shielded-pq = { path = "../shielded-pq" }
 
 [lints.rust]
 unsafe_code = "forbid"
