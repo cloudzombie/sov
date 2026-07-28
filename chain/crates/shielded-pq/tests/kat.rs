@@ -22,8 +22,8 @@
 //! way [`expect_circuit_reject`] fails the test if the forgery survives.
 
 use sov_shielded_pq::air::{
-    merkle_inject_row, rc_base, BundlePublicInputs, ACTIVE_ROWS, NSK_COL, NUM_SLOTS, POS_ACC_COL,
-    RC_ACC_COL, RC_BIT_COL, RHO_COL, VAL_COL,
+    merkle_inject_row, rc_base, BundlePublicInputs, ACTIVE_ROWS, INPUT_SEGMENT_CYCLES, NSK_COL,
+    NUM_SLOTS, POS_ACC_COL, RC_ACC_COL, RC_BIT_COL, RHO_COL, VAL_COL,
 };
 use sov_shielded_pq::auth::AuthKeypair;
 use sov_shielded_pq::bundle::{bundle_digest, verify_bundle, BundleError, SpendBundle};
@@ -588,12 +588,19 @@ fn range_check_landing_must_match_value_register() {
     let out_note = Note::new(MAX_NOTE_VALUE, key.owner_tag(), derive_rho(&seed, 1)).expect("note");
     let (mut cols, mut pub_inputs) =
         build_bundle_columns(&spends, &[out_note], 0, 0, 0).expect("build");
-    // Rebuild output 0's segment (cycles 96/97) for value 2^61.
+    // Rebuild output 0's segment for value 2^61. Output j's two commitment
+    // cycles start at `NUM_SLOTS * INPUT_SEGMENT_CYCLES + 2*j` — DERIVED from
+    // TREE_DEPTH via INPUT_SEGMENT_CYCLES (= 3+TREE_DEPTH+1 = 36 at depth 32),
+    // so output 0 is cycles 144/145 (was the depth-20 96/97 these literals used
+    // to be). Writing to the wrong cycles would leave output 0's real segment
+    // honest and corrupt an INPUT segment instead — so this derivation is
+    // load-bearing for the tamper landing where it is meant to.
+    let out0_cycle = NUM_SLOTS * INPUT_SEGMENT_CYCLES;
     let too_big = Felt::new(1u64 << VALUE_BITS);
     let vpad = [too_big, Felt::ZERO, Felt::ZERO, Felt::ZERO];
     let d1 = fill_hash_cycle(
         &mut cols,
-        96,
+        out0_cycle,
         sponge_init(
             RESCUE_DOMAIN_COMMIT_STAGE1,
             vpad,
@@ -602,7 +609,7 @@ fn range_check_landing_must_match_value_register() {
     );
     let cm = fill_hash_cycle(
         &mut cols,
-        97,
+        out0_cycle + 1,
         sponge_init(RESCUE_DOMAIN_COMMIT_STAGE2, d1, out_note.rho.to_elements()),
     );
     pub_inputs.output_commitments[0] = PqDigest::from_elements(cm);
@@ -614,7 +621,13 @@ fn range_check_landing_must_match_value_register() {
     expect_circuit_reject(
         cols,
         &pub_inputs,
-        "transition constraint 124", // the range-check landing for output 0
+        // Range-check landing for output 0 = `result[120 + m]` with
+        // m = NUM_SLOTS + 0 = 4, i.e. transition constraint 124 — depth-
+        // INDEPENDENT (constraint indices do not move with TREE_DEPTH; only the
+        // trace ROWS the tamper targets did). This is the constraint that
+        // enforces value < 2^61 by tying the range-check accumulator to the
+        // value register.
+        "transition constraint 124",
         "out-of-range value register",
     );
 }
@@ -634,8 +647,11 @@ fn dummy_with_nonzero_value_rejected() {
 
     // Re-run the dummy slot's hash segment with value = 5 (nsk = rho = 0,
     // zero path, dummy nullifier domain), exactly as the builder would for
-    // a real value-5 witness.
-    let seg_cycle = 2 * 24;
+    // a real value-5 witness. Slot 2's segment starts at cycle
+    // `2 * INPUT_SEGMENT_CYCLES` — DERIVED from TREE_DEPTH (= 72 at depth 32,
+    // was 48 at the depth-20 `2*24`); writing to the wrong cycles would corrupt
+    // a REAL input's segment instead, so this must track the row-map.
+    let seg_cycle = 2 * INPUT_SEGMENT_CYCLES;
     let run_cycle = fill_hash_cycle;
     let init = sponge_init;
     use sov_shielded_pq::domains::{
@@ -659,16 +675,18 @@ fn dummy_with_nonzero_value_rejected() {
         seg_cycle + 2,
         init(RESCUE_DOMAIN_COMMIT_STAGE2, d1, zero4),
     );
-    for level in 0..20 {
+    for level in 0..sov_shielded_pq::tree::TREE_DEPTH {
         acc = run_cycle(
             &mut cols,
             seg_cycle + 3 + level,
             init(RESCUE_DOMAIN_MERKLE_NODE, acc, zero4),
         );
     }
+    // The nullifier cycle sits at `3 + TREE_DEPTH` within the segment (was the
+    // depth-20 literal 23); it is the last cycle of the input segment.
     run_cycle(
         &mut cols,
-        seg_cycle + 23,
+        seg_cycle + 3 + sov_shielded_pq::tree::TREE_DEPTH,
         init(RESCUE_DOMAIN_DUMMY_NULLIFIER, zero4, zero4),
     );
     // Value register + range check for the smuggled value.
@@ -679,7 +697,12 @@ fn dummy_with_nonzero_value_rejected() {
     expect_circuit_reject(
         cols,
         &pub_inputs,
-        "assertion main_trace(23, 0)", // the dummy value-zero assertion, VAL_COL + 2
+        // The dummy value-zero boundary assertion on column VAL_COL+2 = 23 at
+        // ROW 0 — depth-INDEPENDENT (the assertion is `single(VAL_COL+i, 0, 0)`),
+        // so the identifier is unchanged by the depth-20 -> depth-32 row-map
+        // move; only WHERE the tamper is written (seg_cycle above) moved. This
+        // is the constraint that keeps a dummy slot from smuggling real value.
+        "assertion main_trace(23, 0)",
         "dummy with nonzero value",
     );
 }
