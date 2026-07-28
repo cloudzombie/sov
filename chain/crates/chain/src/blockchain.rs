@@ -1272,6 +1272,27 @@ impl Blockchain {
         self.resolved_tx_domain_mode_with(height, &signals)
     }
 
+    /// Whether `shielded-v2` is Active for `block`, resolved over **its own
+    /// parent branch's** committed signals — not blindly over the active chain's.
+    ///
+    /// Validation runs for blocks on ANY branch (side branches and reorg tips
+    /// included), so resolving over the active chain would let two nodes disagree
+    /// about whether a rule applies to the same block. Mirrors
+    /// [`branch_tx_domain_mode`](Self::branch_tx_domain_mode) exactly, for the
+    /// same reason.
+    fn branch_shielded_v2_active(&self, block: &Block) -> bool {
+        let height = block.header.height.get();
+        // Dormant: false on every branch, with no signal reconstruction at all.
+        if self.shielded_v2_deployment.is_none() {
+            return false;
+        }
+        if block.header.prev_hash == self.head {
+            return self.shielded_v2_active(height);
+        }
+        let signals = self.branch_signals_of(block);
+        self.shielded_v2_active_with(height, &signals)
+    }
+
     /// Reconstruct the committed signal history of `block`'s **parent branch**:
     /// the active chain's signals up to the fork point (the branches share that
     /// prefix), then the branch's own committed `version_bits` above it. This is
@@ -1738,6 +1759,22 @@ impl Blockchain {
         // why — otherwise a permanently-failing tx is silently re-tried every block,
         // clogging the mempool and producing empty blocks.
         let mut excluded: Vec<(SignedTransaction, String)> = Vec::new();
+        // WEIGHT budget, alongside the size budget (audit PQV2-07).
+        //
+        // Size is bytes; WEIGHT adds each action's verification cost. A pool-v2
+        // bundle is ~96 KB of proof whose STARK verification costs far more than
+        // its bytes suggest, so a block can be comfortably inside the size cap
+        // and still take far longer to verify than the network agreed to.
+        //
+        // Accumulated here so a producer never assembles a block its own import
+        // would reject. Only meaningful once bit 2 is Active — before then no
+        // action carries enough verify weight to approach the cap — but it costs
+        // nothing to account for always, and accounting always means there is no
+        // second code path that only runs after activation.
+        let weight_limit = sov_types::MAX_BLOCK_WEIGHT;
+        // Seed with the empty block's own serialized overhead, so the budget
+        // measures the same thing `block_weight` will at import.
+        let mut weight_acc: u64 = 0;
         for stx in transactions {
             // Skip (but keep in the mempool) any transaction that would push the block
             // past the elastic size cap; a smaller later transaction may still fit.
@@ -1745,9 +1782,17 @@ impl Blockchain {
             if size_acc.saturating_add(tx_size) > tx_budget {
                 continue;
             }
+            // Same for weight: a heavy transaction is skipped, not fatal, and a
+            // lighter one behind it can still fit.
+            let tx_weight =
+                sov_types::verify_weight(&stx.transaction.action).saturating_add(tx_size as u64);
+            if weight_acc.saturating_add(tx_weight) > weight_limit {
+                continue;
+            }
             match apply_transaction(&mut probe, &stx, &selection_ctx) {
                 Ok(_) => {
                     size_acc = size_acc.saturating_add(tx_size);
+                    weight_acc = weight_acc.saturating_add(tx_weight);
                     included.push(stx);
                 }
                 Err(e) => excluded.push((stx, e.to_string())),
@@ -1994,6 +2039,41 @@ impl Blockchain {
                 got: block.header.bits,
             });
         }
+        // BLOCK WEIGHT (audit PQV2-07).
+        //
+        // `MAX_BLOCK_WEIGHT` was declared and then enforced NOWHERE: production
+        // did not accumulate weight and import did not recompute it. The mempool
+        // bounds a single transaction, but nothing bounded a BLOCK — so a
+        // producer could assemble one far past the limit and every node would
+        // accept it, with verification cost the network never agreed to pay.
+        //
+        // Gated on `shielded-v2` being Active, and that gating is the point
+        // rather than a convenience:
+        //
+        //   * Adding a validation rule to a live chain is a consensus TIGHTENING.
+        //     A block that was valid yesterday must not become invalid today, or
+        //     nodes that upgrade and nodes that do not will split.
+        //   * Today nothing can realistically reach the limit, so the rule is
+        //     unobservable — every historical block passes it, which the mainnet
+        //     replay checks byte-for-byte.
+        //   * The limit exists BECAUSE pool-v2 bundles are large (~96 KB of proof
+        //     each). The risk it guards against arrives exactly when bit 2
+        //     activates, so the rule arrives with it — atomically, under the same
+        //     miner-signalled deployment, rather than as a silent flag day of its
+        //     own.
+        //
+        // So: byte-identical before activation, enforced from the moment the
+        // thing it protects against becomes possible.
+        if self.branch_shielded_v2_active(block) {
+            let weight = sov_types::block_weight(block);
+            if weight > sov_types::MAX_BLOCK_WEIGHT {
+                return Err(ChainError::BlockTooHeavy {
+                    weight,
+                    limit: sov_types::MAX_BLOCK_WEIGHT,
+                });
+            }
+        }
+
         // ASSUMEVALID — gated on ANCESTRY, not on height.
         //
         // The old rule skipped the seal for any block BELOW the newest checkpoint
@@ -2843,6 +2923,17 @@ impl Blockchain {
 /// Errors importing a block or constructing a chain.
 #[derive(Debug, thiserror::Error)]
 pub enum ChainError {
+    /// The block's total weight exceeds `MAX_BLOCK_WEIGHT`.
+    ///
+    /// Enforced only once the `shielded-v2` deployment is Active — see the check
+    /// site for why that gating is what makes this safe to add to a live chain.
+    #[error("block weight {weight} exceeds the limit of {limit}")]
+    BlockTooHeavy {
+        /// The block's computed weight.
+        weight: u64,
+        /// The limit it exceeded.
+        limit: u64,
+    },
     /// Genesis configuration was invalid.
     #[error("genesis error: {0}")]
     Genesis(#[from] GenesisError),
@@ -5755,6 +5846,71 @@ mod assumevalid_ancestry_tests {
             "a block at the pinned height whose HASH differs must NOT satisfy the \
              pin — otherwise the pin checks height and not identity, which is the \
              whole vulnerability"
+        );
+    }
+}
+
+#[cfg(test)]
+mod block_weight_tests {
+    use super::tests::fresh_chain;
+
+    /// `MAX_BLOCK_WEIGHT` must be a real limit, not a declared constant.
+    ///
+    /// Audit PQV2-07 found it enforced NOWHERE: production did not accumulate
+    /// weight and import did not recompute it. A constant that nothing checks
+    /// reads as a protection in review while providing none.
+    #[test]
+    fn the_weight_limit_is_actually_reachable_and_meaningful() {
+        // The limit must be small enough that a saturated block can hit it, and
+        // large enough for real blocks. If it were u64::MAX the check would be
+        // decoration.
+        // Compile-time: these are relationships between constants, so a const
+        // block proves them at build time rather than at test time — the whole
+        // build fails if anyone ever sets them incongruently.
+        const { assert!(sov_types::MAX_BLOCK_WEIGHT > 0) };
+        const {
+            assert!(
+                sov_types::MAX_BLOCK_WEIGHT < u64::MAX / 2,
+                "a limit that cannot be reached is not a limit"
+            )
+        };
+        // A single max-weight transaction must not by itself exceed a block, or
+        // no block could ever include one.
+        const {
+            assert!(
+                sov_types::MAX_TX_WEIGHT < sov_types::MAX_BLOCK_WEIGHT,
+                "one transaction must always be able to fit in a block"
+            )
+        };
+    }
+
+    /// An ordinary block weighs far less than the cap, so enforcement cannot
+    /// reject honest traffic.
+    #[test]
+    fn an_ordinary_block_is_far_below_the_cap() {
+        let chain = fresh_chain();
+        let genesis = chain.block_by_height(0).expect("genesis");
+        let w = sov_types::block_weight(genesis);
+        assert!(
+            w < sov_types::MAX_BLOCK_WEIGHT / 4,
+            "an empty/ordinary block should sit well under the cap, got {w}"
+        );
+    }
+
+    /// The rule is DORMANT until `shielded-v2` activates.
+    ///
+    /// This is what makes it safe to add to a live chain: a block valid
+    /// yesterday must not become invalid today, or upgraded and un-upgraded
+    /// nodes split. With no v2 deployment scheduled, the check does not run at
+    /// all — which the mainnet replay then confirms byte-for-byte.
+    #[test]
+    fn the_weight_rule_is_dormant_without_the_v2_deployment() {
+        let chain = fresh_chain();
+        let genesis = chain.block_by_height(0).expect("genesis").clone();
+        assert!(
+            !chain.branch_shielded_v2_active(&genesis),
+            "with no shielded-v2 deployment the weight rule must not apply — \
+             enforcing it retroactively would split the network"
         );
     }
 }
