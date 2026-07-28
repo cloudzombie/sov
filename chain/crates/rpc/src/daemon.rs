@@ -326,6 +326,12 @@ pub struct NodeConfig {
     /// peer with anyone.
     #[serde(default)]
     pub p2p_addr: Option<String>,
+    /// Ask the router to forward the P2P port via UPnP IGD (default: on).
+    ///
+    /// Set `false` where UPnP is forbidden by policy, or on a host that already
+    /// has a public address and needs no mapping. Disabling it never affects
+    /// whether the node WORKS — only whether it can accept inbound peers.
+    pub upnp: Option<bool>,
     /// Bootstrap peers to dial on startup (`host:port`), typically the seed
     /// node's P2P address. Discovery then spreads the rest of the network
     /// gossip-style, so one good link is enough to join.

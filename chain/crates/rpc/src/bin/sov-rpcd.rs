@@ -182,6 +182,49 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
                 &logs,
                 format!("P2P gossip listening on {}", p2p.local_addr()),
             );
+            // UPnP: ask the router to let peers IN.
+            //
+            // A node behind NAT dials out fine — it syncs, relays and mines, and
+            // its blocks reach the network. What it cannot do is ACCEPT inbound
+            // connections, so it is a leaf rather than a participant, and a
+            // network of only leaves has nowhere to connect to.
+            //
+            // A `PortMapper` rather than a one-shot call, because a UPnP mapping
+            // is a LEASE. Mapping once and forgetting means going quietly
+            // unreachable an hour later with nothing in the log to explain it —
+            // worse than never mapping, because the operator was told they were
+            // reachable. The mapper renews at half the lease, rediscovers the
+            // router if a renewal fails, backs off when refused, and removes the
+            // mapping on shutdown so a restarting node does not fill the
+            // router's mapping table.
+            //
+            // Opt-out honoured: some operators are required not to use UPnP, and
+            // a node on a VPS with a public address has no use for it.
+            if config.upnp.unwrap_or(true) {
+                let local = p2p.local_addr();
+                let logs_for_map = Arc::clone(&logs);
+                let mapper = sov_network::PortMapper::start(local, "SOV node", move |msg| {
+                    log(&logs_for_map, msg)
+                });
+                // Publish reachability so `sov_getPeerInfo` can answer "can
+                // anyone reach me?" without the operator reading logs.
+                //
+                // The mapper is MOVED into this thread and lives for the process
+                // lifetime, which is deliberate: sov-rpcd parks until SIGTERM and
+                // has no graceful shutdown, so `PortMapper::shutdown` would never
+                // run here. The LEASE is the real cleanup — it expires on its own
+                // and works even after `kill -9`, which no shutdown hook can.
+                // `shutdown()` exists for callers that DO have a graceful path.
+                let sync_for_map = Arc::clone(&sync);
+                std::thread::spawn(move || loop {
+                    sync_for_map.set_reachability(mapper.reachability().as_str());
+                    std::thread::sleep(std::time::Duration::from_secs(15));
+                });
+            } else {
+                log(&logs, "UPnP disabled by config (upnp = false)");
+                sync.set_reachability("disabled");
+            }
+
             // Persistent peer discovery: remember reachable peers across restarts so the
             // hard-coded seeds are only ever needed for the FIRST contact. Loads
             // <data_dir>/peers.dat, redials a sample, and re-flushes it periodically.

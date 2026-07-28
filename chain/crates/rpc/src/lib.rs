@@ -1267,6 +1267,15 @@ fn call(
                 .as_ref()
                 .map(|s| (s.authed_peers(), s.best_peer_height(), s.behind_blocks()))
                 .unwrap_or((0, 0, 0));
+            // Can anyone reach US? An operator should be able to answer that
+            // without reading logs. "unmapped" is not an error — the node works
+            // either way — but it is the difference between contributing
+            // connectivity to the network and only consuming it.
+            let reachability = ctx
+                .sync
+                .as_ref()
+                .map(|s| s.reachability())
+                .unwrap_or_else(|| "unknown".to_string());
             // Real per-peer software versions (v0.1.86 Version handshake): the network is
             // now version-aware, so an operator sees exactly what each peer is running.
             let peer_versions: Vec<serde_json::Value> = ctx
@@ -1298,6 +1307,9 @@ fn call(
                 "connectedPeers": connected,
                 "peerVersions": peer_versions,
                 "protocolVersion": sov_network::PROTOCOL_VERSION,
+                // "mapped" = a router forwards our P2P port, so peers can dial
+                // in. "unmapped" = outbound-only: fully functional, but a leaf.
+                "reachability": reachability,
                 "bestPeerHeight": best,
                 "behindBlocks": behind,
                 "syncing": behind > 0,

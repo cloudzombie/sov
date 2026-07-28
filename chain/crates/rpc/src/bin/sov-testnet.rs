@@ -413,6 +413,9 @@ fn cmd_gen(flags: &Flags) -> Result<(), Box<dyn Error>> {
         let node_dir = out.join(dir);
         fs::create_dir_all(&node_dir)?;
         let config = NodeConfig {
+            // Loopback test nodes: no router to ask, so do not spend startup
+            // waiting on SSDP replies that will never come.
+            upnp: Some(false),
             rpc_addr: node_entries[idx].rpc_addr.clone(),
             rpc_workers: 4,
             data_dir: format!("{dir}/data"),
@@ -534,6 +537,8 @@ fn cmd_join(flags: &Flags) -> Result<(), Box<dyn Error>> {
     let node_dir = out.join(&dir);
     fs::create_dir_all(node_dir.join("data"))?;
     let config = NodeConfig {
+        // Loopback: no router to ask.
+        upnp: Some(false),
         rpc_addr: rpc_addr.clone(),
         rpc_workers: 4,
         data_dir: format!("{dir}/data"),

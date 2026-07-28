@@ -15,6 +15,7 @@
 
 pub mod link;
 pub mod message;
+pub mod portmap;
 pub mod pq;
 pub mod tcp;
 pub mod transport;
@@ -23,6 +24,7 @@ pub use link::{LinkRead, SealedLink};
 pub use message::{
     handshake_bytes, NetMessage, NetworkError, MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION,
 };
+pub use portmap::{try_map_port, Gateway, PortMapper, Reachability};
 pub use pq::PqChannel;
 pub use tcp::TcpNode;
 pub use transport::{InMemoryNetwork, PeerId};

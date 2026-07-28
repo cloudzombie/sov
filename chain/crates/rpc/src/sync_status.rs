@@ -64,6 +64,9 @@ pub struct SyncShared {
     /// pre-v0.1.86 peer that advertises nothing simply isn't listed here). Not lock-free
     /// (it is a small snapshot refreshed once per poll), but read only by the RPC.
     peer_agents: std::sync::Mutex<Vec<(String, u32, String)>>,
+    /// Whether the router has accepted a UPnP port mapping — i.e. whether this
+    /// node can be DIALED, as opposed to only dialing out.
+    reachability: std::sync::Mutex<String>,
 }
 
 impl SyncShared {
@@ -84,6 +87,27 @@ impl SyncShared {
     /// protocol_version, agent) for `sov_getPeerInfo`.
     pub fn set_peer_agents(&self, agents: Vec<(String, u32, String)>) {
         *self.peer_agents.lock().unwrap() = agents;
+    }
+
+    /// **(writer — UPnP mapper.)** Record whether the router has accepted a
+    /// port mapping.
+    ///
+    /// Surfaced through `sov_getPeerInfo` so an operator can answer "can anyone
+    /// reach me?" without reading logs. Unreachable is not an error — the node
+    /// works either way — but it is the difference between contributing
+    /// connectivity to the network and only consuming it.
+    pub fn set_reachability(&self, state: &str) {
+        if let Ok(mut r) = self.reachability.lock() {
+            *r = state.to_string();
+        }
+    }
+
+    /// **(reader — RPC.)** The last known reachability state.
+    pub fn reachability(&self) -> String {
+        self.reachability
+            .lock()
+            .map(|r| r.clone())
+            .unwrap_or_else(|_| "unknown".to_string())
     }
 
     /// **(reader — RPC.)** The advertised versions of the currently-known peers.
