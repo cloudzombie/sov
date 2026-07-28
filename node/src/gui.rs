@@ -4003,7 +4003,12 @@ impl Station {
         }
     }
 
-    fn send(&self, ctx: &egui::Context) {
+    /// Broadcast the send the spender just confirmed, at exactly `tip_grains` —
+    /// the bid captured when they clicked Review, NOT a fresh read of the live
+    /// suggestion. The pool moves every second; signing a different number than
+    /// the one on the confirmation screen would be the wallet spending money the
+    /// user did not approve.
+    fn send(&self, ctx: &egui::Context, tip_grains: u128) {
         if !self.require_signing() {
             return;
         }
@@ -4027,10 +4032,15 @@ impl Station {
         let params = self.params.clone();
         let activity = self.activity.clone();
         let outbox = self.outbox.clone();
-        // The auction bid. Zero unless the `fee-auction` deployment is Active —
-        // below its activation height a tipped transaction is a HARD consensus
-        // rejection, so an unarmed chain must get the bare, legal form.
-        let tip = self.effective_tip_grains();
+        // The bid the spender confirmed. Re-gated on the deployment here as well
+        // as at capture: below its activation height a tipped transaction is a HARD
+        // consensus rejection, so an unarmed chain must get the bare, legal form
+        // even if a stale tip somehow reached this point.
+        let tip = if self.fee_auction_active() {
+            tip_grains
+        } else {
+            0
+        };
         let ctx = ctx.clone();
         begin(&action, "sending…");
         std::thread::spawn(move || {
@@ -4066,19 +4076,17 @@ impl Station {
         });
     }
 
-    /// The tip (grains) the next send will carry: what the spender typed, or the
-    /// live suggestion while they have not touched the field.
+    /// Whether a tip is LEGAL on this chain right now (the `fee-auction`
+    /// deployment is Active).
     ///
-    /// Hard-gated on the `fee-auction` deployment being Active. Below that height
-    /// consensus rejects an `Action::Tipped` outright — a wallet that tipped
-    /// anyway would not overpay, it would build a transaction no block can carry.
-    fn effective_tip_grains(&self) -> u128 {
-        let a = self
-            .snapshot
+    /// Below its activation height consensus rejects an `Action::Tipped`
+    /// outright — a wallet that tipped anyway would not overpay, it would build a
+    /// transaction no block can carry.
+    fn fee_auction_active(&self) -> bool {
+        self.snapshot
             .lock()
-            .map(|s| s.auction.clone())
-            .unwrap_or_default();
-        self.tip_for(&a)
+            .map(|s| s.auction.fee_auction_active)
+            .unwrap_or(false)
     }
 
     /// REPLACE a stuck send by re-signing its slot with a higher bid.
@@ -9277,6 +9285,10 @@ impl Station {
         let mut new_pending: Option<PendingSend> = None;
         let mut did_copy = false;
         let mut do_send = false;
+        // The tip the spender CONFIRMED, carried from the review modal to the
+        // dispatch below. Re-reading the live suggestion at send time would sign a
+        // different bid than the one they approved — the pool moves every second.
+        let mut confirmed_tip_grains = 0u128;
         let mut do_private_send = false;
         let mut do_scan = false;
         let mut do_scan_v2 = false;
@@ -10513,6 +10525,7 @@ impl Station {
                                 do_private_send = true;
                             } else {
                                 do_send = true;
+                                confirmed_tip_grains = p.tip_grains;
                             }
                             self.pending_send = None;
                         }
@@ -10750,7 +10763,7 @@ impl Station {
             }
         }
         if do_send {
-            self.send(&ctx);
+            self.send(&ctx, confirmed_tip_grains);
         }
         if do_private_send {
             self.send_private(&ctx);
