@@ -21,6 +21,17 @@ sov-shielded-pq = { path = "../chain/crates/shielded-pq" }
 # router for a mapping itself rather than inheriting one from sov-rpcd.
 sov-network = { path = "../chain/crates/network" }
 sov-types = { path = "../chain/crates/types" }
+# The blockspace auction's rules — `MIN_RBF_BUMP_GRAINS` and `effective_tip` — are
+# READ from the mempool that enforces them rather than restated here, so a wallet
+# can never compute a replacement price the network refuses. Already in this
+# binary's graph (sov-rpc → sov-chain → sov-mempool); this only makes the
+# dependency the code actually has an explicit one.
+sov-mempool = { path = "../chain/crates/mempool" }
+# The gas schedule, for the one figure `sov_estimateFee` cannot express: the extra
+# gas a `Tipped` envelope costs on top of the bare route. Read from the schedule
+# consensus charges, not guessed. Already in this binary's graph (sov-rpc →
+# sov-runtime).
+sov-runtime = { path = "../chain/crates/runtime" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Native GUI: the `sov-station` desktop window (cross-platform — macOS, Windows,
