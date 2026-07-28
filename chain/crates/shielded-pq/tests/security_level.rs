@@ -82,16 +82,36 @@ fn report_conjectured_and_proven_security_bits() {
     let conjectured = proof.conjectured_security::<Blake3_256<BaseElement>>();
     let proven = proof.proven_security::<Blake3_256<BaseElement>>();
 
-    println!("--- pool-v2 proof security (42 queries, blowup 8, 16 grinding, quadratic ext)");
+    // These are the SHIPPED options (`prover::proof_options`): 64 queries,
+    // blowup 16, 16 grinding bits, cubic extension. The label previously read
+    // "42 queries, blowup 8, quadratic" — the OLD set — while the code below
+    // measured the new one (audit PQV2-08: the label had drifted off the
+    // parameters actually shipped).
+    println!("--- pool-v2 proof security (64 queries, blowup 16, 16 grinding, cubic ext)");
     println!("conjectured        : {} bits", conjectured.bits());
     println!("proven (Johnson/ldr): {} bits", proven.ldr_bits());
     println!("proven (unique dec) : {} bits", proven.udr_bits());
 
-    // No assertion on the numbers themselves: this test exists to REPORT them
-    // honestly, and the derived figures are written down in
-    // `chain/docs/pq-shielded-soundness.md`. Asserting a target here would let
-    // a parameter change silently move the goalposts instead of failing the
-    // documented claim.
+    // Regression FLOOR (audit PQV2-08). The whole reason the parameters moved
+    // 42q/8/quadratic -> 64q/16/cubic was to raise PROVEN security 75 -> 128
+    // bits. Previously this test asserted NOTHING, so a silent revert of the
+    // options would drop proven security to 75 with no failing test. A floor
+    // (>=, not ==) does not "move the goalposts": it can only catch a
+    // downward regression, never bless a change. Measured today: conjectured
+    // 128, proven (ldr) 128. The build-time `const _` guards in `prover.rs`
+    // pin the parameters themselves; this pins the security level they buy.
+    assert!(
+        conjectured.bits() >= 128,
+        "conjectured security regressed below 128 bits: {} — did proof_options() change?",
+        conjectured.bits()
+    );
+    assert!(
+        proven.ldr_bits() >= 128,
+        "PROVEN (Johnson/ldr) security regressed below 128 bits: {} — the 64q/16/cubic \
+         parameter set exists specifically to reach 128 proven; a drop means proof_options() \
+         regressed toward the old 42q/8/quadratic set (75 proven)",
+        proven.ldr_bits()
+    );
 }
 
 /// What parameter set reaches a PROVEN target?
