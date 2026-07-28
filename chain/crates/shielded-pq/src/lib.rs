@@ -73,7 +73,9 @@ pub mod wire;
 pub use air::BundlePublicInputs;
 pub use auth::AuthKeypair;
 pub use bundle::{bundle_digest, check_structure, verify_bundle, BundleError, SpendBundle};
-pub use carrier::{carrier_sighash, verify_carrier_auth, CarrierContext, SCHEME_SIGNER_NONCE};
+pub use carrier::{
+    carrier_sighash, verify_carrier_auth, CarrierContext, SCHEME_DOMAIN_SIGNER_NONCE,
+};
 pub use encrypt::{encrypt_note, EncryptionKeypair, NoteCiphertext};
 pub use hash::PqDigest;
 pub use hd::{pq_hd_path, PqAddress, PqShieldedKey, PQ_ADDRESS_LEN, PQ_HD_PATH_TEMPLATE};

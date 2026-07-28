@@ -12371,7 +12371,21 @@ fn submit_v2_bundle(
     let from = AccountId::new(account).map_err(|e| e.to_string())?;
     let nonce = client.next_nonce(&from).map_err(|e| e.to_string())?;
     let domain = client.signing_domain().map_err(|e| e.to_string())?;
-    authorize_for_carrier(&mut bundle, &key, account, nonce).map_err(|e| e.to_string())?;
+    // The bundle's ML-DSA carrier authorization binds this chain's {chain_id,
+    // genesis} (PQV2-06 cross-network replay protection) in addition to the
+    // carrier {signer, nonce}. The domain is the chain's own identity, sourced
+    // from the node (not the tx-domain deployment state), so the binding holds
+    // regardless of activation ordering.
+    let chain_domain = client.chain_domain().map_err(|e| e.to_string())?;
+    authorize_for_carrier(
+        &mut bundle,
+        &key,
+        chain_domain.chain_id(),
+        chain_domain.genesis().as_bytes(),
+        account,
+        nonce,
+    )
+    .map_err(|e| e.to_string())?;
     let tx = Transaction {
         signer: from,
         public_key: kp.public_key(),

@@ -210,6 +210,26 @@ impl RpcClient {
         Ok(Some(SigningDomain::new(chain_id, genesis)))
     }
 
+    /// This chain's branch-independent identity — `{chain_id, genesis}` — as a
+    /// [`SigningDomain`], ALWAYS available regardless of any fork's activation
+    /// (unlike [`signing_domain`](Self::signing_domain)). A pool-v2 wallet binds
+    /// a bundle's carrier authorization to this domain so it cannot be replayed
+    /// onto another SOV network, independently of activation order (PQV2-06).
+    pub fn chain_domain(&self) -> Result<SigningDomain, RpcClientError> {
+        let result = self.call("sov_getChainDomain", json!({}))?;
+        let chain_id = result
+            .get("chainId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcClientError::Malformed("chain domain missing chainId".into()))?;
+        let genesis_hex = result
+            .get("genesis")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcClientError::Malformed("chain domain missing genesis".into()))?;
+        let genesis = Hash::from_hex(genesis_hex)
+            .map_err(|e| RpcClientError::Malformed(format!("bad genesis in chain domain: {e}")))?;
+        Ok(SigningDomain::new(chain_id, genesis))
+    }
+
     /// The full account record, or `None` if it has never been funded.
     pub fn account(&self, account: &AccountId) -> Result<Option<Account>, RpcClientError> {
         self.call_typed("sov_getAccount", json!({ "account": account.as_str() }))

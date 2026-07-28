@@ -27,7 +27,7 @@
 //! from the bundle. All arithmetic is checked.
 
 use sov_mining::MiningPolicy;
-use sov_primitives::{AccountId, Balance};
+use sov_primitives::{AccountId, Balance, SigningDomain};
 use sov_shielded_pq::air::NUM_SLOTS;
 use sov_shielded_pq::carrier::{verify_carrier_auth, CarrierContext};
 use sov_shielded_pq::{
@@ -146,7 +146,11 @@ pub struct V2Effects {
 ///    in-bundle nullifier uniqueness, non-emptiness, zero fee leg;
 /// 3. **carrier authorization**: ML-DSA-65 over the carrier-bound sighash
 ///    (~0.1 ms; runs before the proof so a bundle lifted out of another
-///    transaction never costs a STARK verification);
+///    transaction never costs a STARK verification). The sighash binds this
+///    chain's `{chain_id, genesis}` (from `domain`) alongside the carrier's
+///    `{signer, nonce}`, so a bundle authorized for one network is refused
+///    here on any other — cross-network replay is closed INTRINSICALLY, not
+///    by assuming the `tx-domain` fork activated first (audit PQV2-06);
 /// 4. **STARK proof** against the bundle's public inputs (~0.7 ms);
 /// 5. **anchors**: every real input's anchor is in the 128-entry ring;
 /// 6. **nullifiers**: none already spent on chain (which also covers
@@ -162,6 +166,7 @@ pub fn verify_bundle_for_carrier(
     ledger: &Ledger,
     mining: &MiningPolicy,
     height: u64,
+    domain: &SigningDomain,
     signer: &AccountId,
     nonce: u64,
     signer_balance: Balance,
@@ -188,8 +193,16 @@ pub fn verify_bundle_for_carrier(
         return Err(ShieldedV2Error::NoEffect);
     }
 
-    // ── 3. Carrier authorization (binds the bundle to THIS transaction) ─
+    // ── 3. Carrier authorization (binds the bundle to THIS network AND
+    // THIS transaction) ─────────────────────────────────────────────────
+    // The network binding (`{chain_id, genesis}`) makes cross-network replay
+    // impossible on the v2 path regardless of `tx-domain` activation order
+    // (PQV2-06); the carrier binding (`{signer, nonce}`) makes the bundle
+    // unliftable out of its transaction.
+    let genesis = domain.genesis();
     let carrier = CarrierContext {
+        chain_id: domain.chain_id().as_bytes(),
+        genesis: genesis.as_bytes(),
         signer: signer.as_str().as_bytes(),
         nonce,
     };
@@ -286,6 +299,8 @@ mod tests {
 
     const SIGNER: &str = "usa.reserve.sov";
     const XUS: u128 = 100_000_000;
+    const CHAIN_ID: &str = "sov-mainnet";
+    const GENESIS: [u8; 32] = [0xA1; 32];
 
     fn key(byte: u8) -> PqShieldedKey {
         PqShieldedKey::from_leaf_seed(&[byte; 32])
@@ -299,11 +314,16 @@ mod tests {
         AccountId::new(SIGNER).expect("valid account id")
     }
 
+    fn domain() -> SigningDomain {
+        SigningDomain::new(CHAIN_ID, sov_primitives::Hash::from_bytes(GENESIS))
+    }
+
     /// A carrier-bound, encoded shield of `xus` XUS into pool v2.
     fn shield_bundle(k: &PqShieldedKey, xus: u128, nonce: u64) -> (SpendBundle, Vec<u8>) {
         let grains = u64::try_from(xus * XUS).expect("fits");
         let mut bundle = build_shield(k, &k.address(), grains, 0).expect("build shield");
-        authorize_for_carrier(&mut bundle, k, SIGNER, nonce).expect("carrier-bind");
+        authorize_for_carrier(&mut bundle, k, CHAIN_ID, &GENESIS, SIGNER, nonce)
+            .expect("carrier-bind");
         let bytes = encode_bundle(&bundle);
         (bundle, bytes)
     }
@@ -319,6 +339,7 @@ mod tests {
             &ledger,
             &policy(),
             1,
+            &domain(),
             &signer(),
             0,
             Balance::from_grains(10 * XUS),
@@ -358,6 +379,7 @@ mod tests {
                 &ledger,
                 &policy(),
                 1,
+                &domain(),
                 &AccountId::new(who).expect("id"),
                 nonce,
                 Balance::from_grains(10 * XUS),
@@ -374,6 +396,68 @@ mod tests {
         );
     }
 
+    /// PQV2-06 — THE cross-network replay test at the CONSENSUS layer. A bundle
+    /// authorized for network A (its `{chain_id, genesis}`) must be REJECTED
+    /// when the identical bytes are imported under network B's domain, even
+    /// though `{signer, nonce, balance, proof, anchors}` are all identical. The
+    /// protection is intrinsic to the bundle's authorized message and does NOT
+    /// depend on the `tx-domain` fork's activation state.
+    ///
+    /// Before this fix the bundle bound only `{signer, nonce}`, so this same
+    /// call verified on network B — the replay — and the assertion below would
+    /// fail. It now hard-rejects with `CarrierAuth`.
+    #[test]
+    fn a_bundle_valid_on_network_a_is_refused_on_network_b() {
+        let k = key(9);
+        // Authorized for CHAIN_ID / GENESIS — i.e. network A.
+        let (_, bytes) = shield_bundle(&k, 5, 0);
+        let ledger = Ledger::default();
+        let balance = Balance::from_grains(10 * XUS);
+
+        // Control: on its own network it verifies.
+        assert!(
+            verify_bundle_for_carrier(
+                &bytes,
+                &ledger,
+                &policy(),
+                1,
+                &domain(),
+                &signer(),
+                0,
+                balance
+            )
+            .is_ok(),
+            "the bundle must verify on its own network A"
+        );
+
+        // A DIFFERENT chain id (a sibling network), everything else identical.
+        let network_b =
+            SigningDomain::new("sov-testnet-1", sov_primitives::Hash::from_bytes(GENESIS));
+        let replay_b = verify_bundle_for_carrier(
+            &bytes,
+            &ledger,
+            &policy(),
+            1,
+            &network_b,
+            &signer(),
+            0,
+            balance,
+        );
+        assert!(
+            matches!(replay_b, Err(ShieldedV2Error::CarrierAuth)),
+            "a bundle authorized for network A must be refused on a sibling network, got {replay_b:?}"
+        );
+
+        // A DIFFERENT genesis under the SAME chain id (a hard fork of A).
+        let fork = SigningDomain::new(CHAIN_ID, sov_primitives::Hash::from_bytes([0xB2; 32]));
+        let replay_fork =
+            verify_bundle_for_carrier(&bytes, &ledger, &policy(), 1, &fork, &signer(), 0, balance);
+        assert!(
+            matches!(replay_fork, Err(ShieldedV2Error::CarrierAuth)),
+            "a bundle authorized for A must be refused on a fork with a different genesis, got {replay_fork:?}"
+        );
+    }
+
     /// A shield for more than the signer holds must be refused BEFORE any
     /// state is touched — the pool must never be credited value the
     /// transparent ledger cannot pay.
@@ -387,6 +471,7 @@ mod tests {
             &ledger,
             &policy(),
             1,
+            &domain(),
             &signer(),
             0,
             Balance::from_grains(XUS), // only 1 XUS, shielding 5
@@ -419,6 +504,7 @@ mod tests {
                 &ledger,
                 &policy(),
                 1,
+                &domain(),
                 &signer(),
                 0,
                 Balance::from_grains(10 * XUS),
@@ -454,7 +540,7 @@ mod tests {
         let out = u64::try_from(out_xus * XUS).expect("fits");
         let built = build_spend(k, &store, None, out, 0).expect("build de-shield");
         let mut spend = built.bundle;
-        authorize_for_carrier(&mut spend, k, SIGNER, 0).expect("carrier-bind");
+        authorize_for_carrier(&mut spend, k, CHAIN_ID, &GENESIS, SIGNER, 0).expect("carrier-bind");
         (ledger, encode_bundle(&spend))
     }
 
@@ -476,6 +562,7 @@ mod tests {
             &ledger,
             &mining,
             1,
+            &domain(),
             &signer(),
             0,
             Balance::from_grains(10 * XUS),
@@ -502,6 +589,7 @@ mod tests {
             &ledger,
             &mining,
             50,
+            &domain(),
             &signer(),
             0,
             Balance::from_grains(10 * XUS),
@@ -538,6 +626,7 @@ mod tests {
             &ledger,
             &mining,
             50,
+            &domain(),
             &signer(),
             0,
             Balance::from_grains(10 * XUS),
@@ -553,6 +642,7 @@ mod tests {
             &ledger,
             &mining,
             110,
+            &domain(),
             &signer(),
             0,
             Balance::from_grains(10 * XUS),
@@ -578,6 +668,7 @@ mod tests {
             &ledger,
             &mining,
             1,
+            &domain(),
             &signer(),
             0,
             Balance::from_grains(10 * XUS),
@@ -615,7 +706,7 @@ mod tests {
         store.ingest_block(&k, 1, [9u8; 32], &[&shield]);
         let built = build_spend(&k, &store, None, XUS as u64, 0).expect("build spend");
         let mut spend = built.bundle;
-        authorize_for_carrier(&mut spend, &k, SIGNER, 0).expect("carrier-bind");
+        authorize_for_carrier(&mut spend, &k, CHAIN_ID, &GENESIS, SIGNER, 0).expect("carrier-bind");
         let bytes = encode_bundle(&spend);
 
         // First spend verifies.
@@ -624,6 +715,7 @@ mod tests {
             &ledger,
             &policy(),
             1,
+            &domain(),
             &signer(),
             0,
             Balance::from_grains(10 * XUS),
@@ -645,6 +737,7 @@ mod tests {
             &ledger,
             &policy(),
             1,
+            &domain(),
             &signer(),
             0,
             Balance::from_grains(10 * XUS),
@@ -668,7 +761,7 @@ mod tests {
 
         let built = build_spend(&k, &store, None, XUS as u64, 0).expect("build spend");
         let mut spend = built.bundle;
-        authorize_for_carrier(&mut spend, &k, SIGNER, 0).expect("carrier-bind");
+        authorize_for_carrier(&mut spend, &k, CHAIN_ID, &GENESIS, SIGNER, 0).expect("carrier-bind");
         let bytes = encode_bundle(&spend);
 
         // The consensus ledger never saw that tree, so its anchor is unknown.
@@ -678,6 +771,7 @@ mod tests {
             &ledger,
             &policy(),
             1,
+            &domain(),
             &signer(),
             0,
             Balance::from_grains(10 * XUS),

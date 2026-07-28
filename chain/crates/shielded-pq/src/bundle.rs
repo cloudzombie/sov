@@ -81,13 +81,14 @@ pub enum BundleError {
 /// a signature — the signature attests "THIS key authorized THIS bundle",
 /// not mere well-formedness.
 ///
-/// **CARRIER SEAM (D4) — CLOSED in S2c, exactly as this note specified:**
-/// the authorization consensus verifies is NOT a signature over this digest
+/// **CARRIER SEAM (D4) — CLOSED in S2c, extended for PQV2-06:** the
+/// authorization consensus verifies is NOT a signature over this digest
 /// alone. [`crate::carrier`] wraps it in a second, domain-separated digest
 /// over `(bundle_digest, carrier_context)` with the carrier context pinned
-/// to the transaction's `{signer, nonce}` (scheme byte 1), so a bundle
-/// cannot be lifted out of one transaction and replayed in another. This
-/// function, its bytes, and its KATs stayed frozen: the binding is additive.
+/// to this chain's `{chain_id, genesis}` AND the transaction's
+/// `{signer, nonce}` (scheme byte 2), so a bundle cannot be lifted out of one
+/// transaction, nor replayed onto another network. This function, its bytes,
+/// and its KATs stayed frozen: the binding is additive.
 /// The carrier transaction id was rejected as the context because it is
 /// circular — the id hashes the full Borsh transaction, whose action embeds
 /// these very bundle bytes *including `auth_sig`*.

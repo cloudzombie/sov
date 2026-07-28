@@ -1150,6 +1150,17 @@ impl Blockchain {
         self.resolved_tx_domain_with(height, &self.signals)
     }
 
+    /// This chain's branch-independent identity — `{chain_id, genesis}` — as a
+    /// [`SigningDomain`], ALWAYS available regardless of any fork's activation
+    /// state (unlike [`resolved_tx_domain`](Self::resolved_tx_domain), which is
+    /// gated on the `tx-domain` fork). The pool-v2 carrier binding (audit
+    /// PQV2-06) uses this to bind a bundle's authorization to THIS network, so
+    /// cross-network replay is closed intrinsically without depending on
+    /// activation ordering.
+    pub fn chain_domain(&self) -> SigningDomain {
+        SigningDomain::new(self.chain_id.clone(), self.genesis_hash)
+    }
+
     /// As [`resolved_tx_domain`](Self::resolved_tx_domain), but resolved against an
     /// explicit signal history — so fork-choice replay of a competing branch
     /// evaluates activation over *that branch's* signals, exactly as
@@ -1750,6 +1761,7 @@ impl Blockchain {
             tx_domain: self.resolved_tx_domain_mode(next_height),
             fee_auction_active: self.fee_auction_active(next_height),
             shielded_v2_active: self.shielded_v2_active(next_height),
+            chain_domain: self.chain_domain(),
         };
         apply_coinbase(&mut probe, &selection_ctx)?;
         let mut included = Vec::new();
@@ -1812,6 +1824,7 @@ impl Blockchain {
             tx_domain: self.resolved_tx_domain_mode(next_height),
             fee_auction_active: self.fee_auction_active(next_height),
             shielded_v2_active: self.shielded_v2_active(next_height),
+            chain_domain: self.chain_domain(),
         };
         apply_coinbase(&mut scratch, &ctx)?;
         let receipts = apply_transactions(&mut scratch, &included, &ctx)?;
@@ -2533,6 +2546,7 @@ impl Blockchain {
             tx_domain: self.resolved_tx_domain_mode_with(height, signals),
             fee_auction_active: self.fee_auction_active_with(height, signals),
             shielded_v2_active: self.shielded_v2_active_with(height, signals),
+            chain_domain: self.chain_domain(),
         };
         apply_coinbase(ledger, &ctx)?;
         Ok(apply_transactions(ledger, &block.transactions, &ctx)?)

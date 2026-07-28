@@ -1393,6 +1393,18 @@ fn call(
                 })),
             }
         }
+        "sov_getChainDomain" => {
+            // This chain's branch-independent identity `{chainId, genesis}`,
+            // ALWAYS available (unlike `sov_getSigningDomain`, which is gated on
+            // the `tx-domain` fork). A pool-v2 wallet binds a bundle's carrier
+            // authorization to this so it cannot be replayed onto another
+            // network, independently of any fork's activation order (PQV2-06).
+            let domain = node.chain().chain_domain();
+            Ok(json!({
+                "chainId": domain.chain_id(),
+                "genesis": domain.genesis().to_hex(),
+            }))
+        }
         "sov_submitTransaction" => {
             let stx: SignedTransaction = serde_json::from_value(params.clone())
                 .map_err(|e| RpcError::invalid_params(format!("invalid SignedTransaction: {e}")))?;
