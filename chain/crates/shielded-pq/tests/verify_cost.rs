@@ -95,8 +95,10 @@ fn measure_v2_proof_size_and_verify_cost() {
     println!("v2 verify samples (us)    = {samples_us:?}");
 
     // The weight derivation relies on the proof fitting the wire codec's
-    // 128 KiB `MAX_PROOF_LEN`, with real margin. Assert the bound, not the
-    // exact size (the exact size is pinned by the KAT suite).
+    // 128 KiB `MAX_PROOF_LEN`, with real margin. Assert the bound here; the
+    // exact size is pinned byte-for-byte by `kat.rs::kat_proof_size_pinned`
+    // (that KAT was added in audit PQV2-08 — this comment used to claim a pin
+    // that did not exist).
     assert!(
         proof.len() <= sov_shielded_pq::MAX_PROOF_LEN,
         "proof {} exceeds MAX_PROOF_LEN {}",

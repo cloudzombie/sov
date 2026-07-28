@@ -151,6 +151,32 @@ fn kat_bundle_proof_verifies() {
 }
 
 #[test]
+fn kat_proof_size_pinned() {
+    // PROOF-SIZE KAT (audit PQV2-08). A STARK proof is deterministic given the
+    // proof options + witness (Fiat-Shamir, fixed Blake3 hasher, no RNG), so
+    // the serialized length of the KAT bundle's proof is a stable known answer,
+    // NOT a machine- or run-dependent number. `verify_cost.rs` long claimed the
+    // exact size was "pinned by the KAT suite" — but no such pin existed, so a
+    // parameter or winterfell-version change could move the proof size (and thus
+    // the weight/gas derivation) unnoticed. This is that pin.
+    //
+    // 98494 bytes = 96.2 KiB, measured for the shipped 64q / blowup 16 / cubic
+    // options. It last moved with the 42q/8/quadratic -> 64q/16/cubic evolution
+    // (audit PQV2-08) and the PQV2-01 trace-width 31 -> 32 change. A drift here
+    // that is NOT a deliberate parameter/witness change is a bug: re-derive the
+    // weight schedule in `sov_types::weight` before re-pinning.
+    let (proof, _) = kat_prove();
+    assert_eq!(
+        proof.len(),
+        98_494,
+        "pool-v2 KAT proof size drifted — proof_options() or the witness shape changed"
+    );
+    // And it must fit the wire codec with real margin (the weight schedule
+    // relies on this).
+    assert!(proof.len() <= sov_shielded_pq::MAX_PROOF_LEN);
+}
+
+#[test]
 fn full_4in_4out_with_distinct_anchors_verifies() {
     // D5: inputs in ONE bundle may be witnessed against DIFFERENT anchors.
     let key = SpendingKey::from_seed(&[0x21; 32]);

@@ -57,6 +57,40 @@ pub enum SpendProofError {
     Verification(String),
 }
 
+/// FRI query count. 64 (not the previous 42) is load-bearing: with the cubic
+/// extension it is what reaches **128 proven** bits (see the table below).
+pub const FRI_NUM_QUERIES: usize = 64;
+/// LDE blowup factor. 16 (not the previous 8); must stay a power of two.
+pub const FRI_BLOWUP_FACTOR: usize = 16;
+/// Proof-of-work grinding bits folded into the FRI transcript.
+pub const FRI_GRINDING_BITS: u32 = 16;
+/// Degree of the extension field the constraints are checked over. **3 —
+/// cubic**, not the previous quadratic (2): over 64-bit Goldilocks the proven
+/// figure saturates at ~86 bits under a quadratic extension no matter the
+/// query budget, so the cubic degree is what lifts the ceiling to 128.
+pub const FRI_EXTENSION_DEGREE: u32 = 3;
+
+// --- Build-time regression guards (audit PQV2-08). ---------------------------
+// These are the security-critical proof parameters. A silent edit to any of
+// them would move the proven security level (128 -> as low as 75) with NO
+// consensus-visible signal while the pool is dormant. Pinning each to a
+// *separately stated* expectation makes a one-line change fail the BUILD, not
+// just a test nobody ran — the same structural-guard discipline as the
+// PQV2-03 anchor-ring floor in `state.rs`. If you intend to change one, change
+// its pin here too and re-run `tests/security_level.rs` to re-derive the
+// proven bits before trusting the new number.
+const _: () = assert!(FRI_NUM_QUERIES == 64, "FRI query count moved off 64");
+const _: () = assert!(FRI_BLOWUP_FACTOR == 16, "FRI blowup moved off 16");
+const _: () = assert!(
+    FRI_BLOWUP_FACTOR.is_power_of_two(),
+    "winterfell requires a power-of-two blowup"
+);
+const _: () = assert!(FRI_GRINDING_BITS == 16, "grinding bits moved off 16");
+const _: () = assert!(
+    FRI_EXTENSION_DEGREE == 3,
+    "extension degree moved off cubic — proven security regresses to <=86 bits"
+);
+
 /// Standard proof options: 64 FRI queries, blowup 16, 16 bits of grinding,
 /// **cubic** extension field.
 ///
@@ -69,8 +103,13 @@ pub enum SpendProofError {
 ///
 /// | parameters | conjectured (classical) | proven (classical) | proof |
 /// |---|---|---|---|
-/// | 42q / blowup 8 / quadratic (previous) | 127 | **75** | 53.8 KB |
-/// | 64q / blowup 16 / cubic (these) | 128 | **128** | 94.3 KB |
+/// | 42q / blowup 8 / quadratic (previous) | 127 | **75** | 54.3 KB |
+/// | 64q / blowup 16 / cubic (these) | 128 | **128** | 96.2 KB |
+///
+/// (The 96.2 KB = 98494-byte figure for the current set is the one
+/// `tests/verify_cost.rs` measures and `tests/kat.rs::kat_proof_size_pinned`
+/// pins byte-exactly; it is deterministic given these options + the KAT
+/// witness.)
 ///
 /// The previous set quoted 127 bits, but that was the *capacity-conjecture*
 /// figure; unconditionally it was 75 bits (50 under the unique-decoding
@@ -84,8 +123,8 @@ pub enum SpendProofError {
 /// field, not the number of queries. Goldilocks is a 64-bit base field, and a
 /// cubic extension is what lifts the ceiling.
 ///
-/// The cost is honest and bounded: 1.75x proof size (53.8 KB -> 94.3 KB, a
-/// full bundle ~62 KB -> ~101 KB) for 75 -> 128 proven bits. That stays well
+/// The cost is honest and bounded: ~1.75x proof size (54.3 KB -> 96.2 KB, a
+/// full bundle ~62 KB -> ~103 KB) for 75 -> 128 proven bits. That stays well
 /// inside `MAX_SHIELDED_V2_BUNDLE_BYTES` (144 KiB), which the weight schedule
 /// is already sized against.
 ///
@@ -114,11 +153,15 @@ pub enum SpendProofError {
 /// a quantified post-quantum soundness level; the QROM caveat above stands
 /// until an external analysis closes it.
 pub fn proof_options() -> ProofOptions {
+    // The extension enum is not const-constructible; assert it matches the
+    // pinned degree so the const guards above actually govern the shipped call.
+    let ext = FieldExtension::Cubic;
+    debug_assert_eq!(ext.degree(), FRI_EXTENSION_DEGREE);
     ProofOptions::new(
-        64,
-        16,
-        16,
-        FieldExtension::Cubic,
+        FRI_NUM_QUERIES,
+        FRI_BLOWUP_FACTOR,
+        FRI_GRINDING_BITS,
+        ext,
         4,
         31,
         BatchingMethod::Linear,

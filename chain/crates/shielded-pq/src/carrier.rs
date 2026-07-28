@@ -311,4 +311,29 @@ mod tests {
         d2[0] ^= 1;
         assert_ne!(carrier_sighash(&d, &a), carrier_sighash(&d2, &a));
     }
+
+    #[test]
+    fn carrier_sighash_byte_kat_pinned() {
+        // BYTE-EXACT KAT (audit PQV2-08). Every other carrier test re-derives
+        // the sighash through this same code, so they are self-consistent: a
+        // silent change to the preimage layout, the scheme byte, or the
+        // `B3_CARRIER_BINDING` domain separator would keep them ALL green while
+        // changing the actual authorized message. This pins the known answer
+        // for a fully-fixed input, so any such change screams here.
+        //
+        // The scheme byte is part of the preimage, so its value is pinned too:
+        assert_eq!(SCHEME_DOMAIN_SIGNER_NONCE, 2, "carrier scheme byte moved");
+        let digest = [0x11u8; 32];
+        let ctx = CarrierContext {
+            chain_id: b"sov-mainnet",
+            genesis: &[0xAA; 32],
+            signer: b"usa.reserve.sov",
+            nonce: 4,
+        };
+        assert_eq!(
+            hex::encode(carrier_sighash(&digest, &ctx)),
+            "22eba1d2409986def8fdc3f32fb4a2b848626948638447cd72043f749d2ef042",
+            "carrier sighash KAT drifted — the network/carrier binding preimage changed"
+        );
+    }
 }

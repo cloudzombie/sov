@@ -392,6 +392,67 @@ reproduce unchanged. Bit 2 is UNARMED on every canonical chain.
 **Verification (real output).** `cargo build --workspace` green (documentation/
 comment-only changes; see the PR body / agent report for the tail). `cargo fmt
 --check` clean on the touched crate.
+## PQV2-08 — regression checks have drifted, resolution (2026-07-28) — **FIXED**
+
+*The finding.* The pool-v2 security/performance regression guards had drifted off
+the parameters actually shipped, and several security-critical surfaces had no
+regression pin at all. A silent parameter change could therefore regress proven
+security (128 → as low as 75 bits) or the proof size / weight derivation with **no
+failing test** while the pool is dormant.
+
+*Drift inventory and evidence (each verified by running the tests, not guessed):*
+
+1. **Mislabeled security report** (`tests/security_level.rs`). The report line read
+   `"42 queries, blowup 8, 16 grinding, quadratic ext"` while the code below it
+   measured the SHIPPED options via `proof_options()`. Evidence: the measured
+   output is `conjectured 128 / proven(ldr) 128`, which is the **64q / blowup 16 /
+   cubic** row of the sweep — the quadratic/8/42 set measures 127/75. The label
+   described the OLD set. → relabeled to the real parameters.
+
+2. **No floor pin on the security level** (`security_level.rs`). The reporting test
+   asserted *nothing* ("asserting a target would move the goalposts"). That reasoning
+   is wrong for a *floor*: the entire 42q→64q / quadratic→cubic evolution existed to
+   raise **proven** security 75→128. A silent revert would drop proven security to 75
+   with every test still green. → added `assert!(conjectured.bits() >= 128)` and
+   `assert!(proven.ldr_bits() >= 128)` (measured today: 128 / 128). A `>=` floor can
+   only catch a downward regression, never bless a change.
+
+3. **Proof parameters not build-time-guarded** (`src/prover.rs`). `proof_options()`
+   inlined `64, 16, 16, Cubic` as bare literals — a runtime-only fact. → extracted
+   `FRI_NUM_QUERIES=64`, `FRI_BLOWUP_FACTOR=16`, `FRI_GRINDING_BITS=16`,
+   `FRI_EXTENSION_DEGREE=3` with `const _: () = assert!(…)` build-time guards (same
+   structural discipline as the PQV2-03 anchor-ring floor). Proven by experiment: a
+   one-line edit to `42` fails the BUILD with `evaluation panicked: FRI query count
+   moved off 64` — not a test nobody ran.
+
+4. **Claimed-but-absent proof-size pin** (`tests/verify_cost.rs` + `tests/kat.rs`).
+   `verify_cost.rs` stated the exact proof size "is pinned by the KAT suite" — but
+   **no such pin existed**; only the loose `<= MAX_PROOF_LEN` bound was checked, so a
+   parameter/winterfell change could move the size (and the weight/gas derivation)
+   unnoticed. → added `kat_proof_size_pinned` pinning the deterministic proof length
+   to **98494 bytes** (measured; STARK proofs are Fiat-Shamir-deterministic, so this
+   is a true known-answer, not a machine-dependent number), and corrected the stale
+   `verify_cost.rs` reference. Also corrected the `prover.rs` doc table (it claimed
+   94.3 KB; the shipped `prove_bundle` output is 96.2 KB / 98494 B — a stale figure
+   from before the PQV2-01 width 31→32 growth).
+
+5. **No byte-KAT on the carrier network binding** (`src/carrier.rs`, PQV2-06). Every
+   carrier test re-derived the sighash through the same code, so they were mutually
+   self-consistent: a silent change to the preimage layout, the scheme byte, or the
+   `B3_CARRIER_BINDING` domain would keep them ALL green while changing the authorized
+   message. → added `carrier_sighash_byte_kat_pinned`, pinning the exact sighash for a
+   fixed input and asserting `SCHEME_DOMAIN_SIGNER_NONCE == 2`.
+
+*Already-covered surfaces (left as-is):* the note-commitment / tree-root / nullifier /
+owner-tag digest KATs (`kat.rs`), the canonical proof-context KAT already carrying the
+`40 10 10 03` = 64/16/16/cubic option bytes with justification (`decode_hardening.rs`),
+the PQV2-01 leaf-position double-spend vectors, and the PQV2-03 tree-exhaustion const
+floor (`state.rs`) all already pin their respective invariants.
+
+*No KAT/security constant was re-blessed to make a test pass.* The one changed constant
+is the corrected report LABEL (drift 1); every added pin was captured from a freshly
+measured, deterministic value and justified above. No consensus behavior, gas, digest,
+or activation state changed — only the guards around them. Bit 2 remains UNARMED.
 
 ## Bar for arming bit 2
 
