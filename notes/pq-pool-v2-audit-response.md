@@ -120,7 +120,8 @@ None of these are fixed. They are stated here so they are not lost.
 - **PQV2-05** — 128-bit *end-to-end post-quantum* security is not established.
   The 128 figure is a classical list-decoding bound. Either restate the claim
   precisely or commission a QROM analysis. This is a claims-accuracy issue and
-  should be settled before any public security statement.
+  should be settled before any public security statement. **RESTATED +
+  QROM-SCOPED — see the resolution below.**
 - **PQV2-06** — cross-network replay protection depends on an activation
   ordering consensus does not enforce. **FIXED** — see the resolution below.
 - **PQV2-07** — the declared proof-verification block weight is not enforced by
@@ -304,6 +305,94 @@ bit 2, deferred to an audited circuit revision. PQV2-04 is therefore
 **closed for the boundary defect and the pricing floor; the capacity upgrade
 remains a named blocker on the arming bar below.**
 
+## PQV2-05 — "128-bit post-quantum" claim, resolution (2026-07-28) — **RESTATED; QROM analysis SCOPED-AND-PENDING (accepted in writing)**
+
+The finding is a claims-accuracy issue, and this is the claims-accuracy fix. No
+crypto was changed, no QROM proof was fabricated. `proof_options()` and the FRI
+parameters are byte-for-byte unchanged; this is documentation and comment text
+plus one relabeled table, no behavior/consensus/digest change.
+
+**The overstatement, precisely.** The tree derives 128 "proven" soundness bits
+for the shipped parameters (64 FRI queries, blowup 16, 16 bits grinding, cubic
+extension over Goldilocks). "Proven" there meant *proven vs conjectured* FRI
+soundness — the unconditional Johnson/list-decoding bound rather than the
+capacity conjecture. Both are **classical** bounds. Nowhere did the tree
+distinguish that classical soundness figure from a post-quantum (QROM) one, so
+"128-bit PROVEN" read as if it were an established post-quantum guarantee. It is
+not.
+
+**What is genuinely established PQ (NOT downgraded).** Kept exactly as true:
+the hybrid ML-DSA-65 (FIPS 204) spend authorization and hybrid ML-KEM-768
+(FIPS 203) note encryption (`chain/docs/quantum-posture.md`), and the fact that
+the proof rests on hashes only (Rescue-Prime + Blake3) with **no Shor-breakable
+number-theoretic assumption** — a real advantage over the curve-based v1 pool.
+That removes the catastrophic total break.
+
+**What was overstated and is now precise.** Using only hash primitives does not
+by itself yield a *quantified* post-quantum soundness level. Two gaps, neither
+assigned a number (the finding explicitly warned against asserting one we cannot
+back): (1) the QROM soundness of the Fiat-Shamir-transformed FRI/STARK at these
+parameters has not been analyzed; (2) a quantum adversary gets Grover-type
+speedups against the 16-bit grinding (→ at most ~8 bits) and against the
+hash-based commitments (Grover preimage / BHT collision), eroding margins by an
+amount we do not quantify here.
+
+**Where it was restated (every occurrence found and corrected):**
+- `chain/crates/shielded-pq/src/prover.rs` — `proof_options()` docstring: table
+  columns relabeled "conjectured (classical)" / "proven (classical)"; the
+  headline is now "128 bits of proven CLASSICAL soundness"; the old one-liner
+  "Soundness rests on hashes only: no number-theoretic assumption a quantum
+  adversary could break" is expanded into an explicit "what 128 is and is NOT"
+  block naming the QROM gap and the Grover erosion, and keeping the genuine
+  no-Shor-target advantage.
+- `chain/crates/shielded-pq/src/lib.rs` — the "128-bit parameter review (S1d)"
+  bullet now states the 128 is a classical FRI bound and QROM soundness is a
+  separate pending analysis.
+- `chain/docs/pq-shielded-soundness.md` — §10 opens with a "every number here is
+  a CLASSICAL bound" note; §8 gains item 8.7 (post-quantum soundness NOT
+  established, with the two gaps).
+- `chain/docs/quantum-posture.md` — the STARK-pool paragraph now names pool v2
+  and states plainly that hash-only primitives remove the Shor break but do not
+  establish a post-quantum soundness *level*; no "128-bit post-quantum" claim is
+  warranted until the QROM analysis is done.
+- test comments (`tests/security_level.rs`, `tests/decode_hardening.rs`) that
+  said "128-bit PROVEN security" now say "PROVEN CLASSICAL soundness (not
+  post-quantum)".
+
+No user-facing surface (Station GUI, CLI help, explorer, release notes, README)
+was found to make a "128-bit post-quantum" claim about pool v2 — the release
+notes correctly describe the pool only as "dormant and incomplete". So the
+claim lived entirely in the crate docs/comments and the two design docs, all
+corrected above.
+
+**The QROM analysis is scoped, not done.** `notes/audit-scope-pq-pool.md` §9
+now specifies exactly what a post-quantum soundness analysis of the spend proof
+must cover before any public "post-quantum secure" claim or before arming bit 2:
+QROM Fiat-Shamir soundness (round-by-round / state-restoration) at the shipped
+parameters, Grover erosion of grinding, Grover/BHT erosion of the hash
+commitments, the QROM query model for challenge derivation, and a single
+reconciled bit figure with the parameter set that reaches a written
+post-quantum target (or a precise statement of why one cannot yet be asserted).
+
+**Disposition (explicit written acceptance — one of the two allowed ways to
+clear a Medium per this doc).** PQV2-05 is cleared as a *claims-accuracy* Medium:
+the overstated claims are restated conservatively and correctly across the tree.
+The underlying **QROM analysis is ACCEPTED as scoped-and-pending** and is added
+to the arming bar below: no public "post-quantum secure" statement about pool v2,
+and no arming of bit 2, until `audit-scope-pq-pool.md` §9 is completed with a
+derived post-quantum soundness level (or an explicit finding that it cannot be
+asserted, with the gap named). The classical parameter review (S1d) remains a
+separate pending slice; this finding does not close it and does not claim to.
+
+**Why it is safe while dormant.** Docs, comments, and one relabeled table only —
+no code path, constant, FRI parameter, gas value, or digest changed.
+`proof_options()` is byte-identical, so every proof KAT and the consensus KATs
+reproduce unchanged. Bit 2 is UNARMED on every canonical chain.
+
+**Verification (real output).** `cargo build --workspace` green (documentation/
+comment-only changes; see the PR body / agent report for the tail). `cargo fmt
+--check` clean on the touched crate.
+
 ## Bar for arming bit 2
 
 Unchanged and not met: every Medium resolved or explicitly accepted in writing,
@@ -318,3 +407,10 @@ a prototype capacity, exhaustible by honest growth and by a ~13.6k–39k XUS /
 ~11-day griefing attack; the boundary defect and the fee floor are fixed/pinned,
 but the capacity itself is not production-grade and this is a hard blocker on
 arming, not a pricing knob.
+
+Added by PQV2-05: **no public "post-quantum secure" statement about pool v2, and
+no arming of bit 2, until the QROM / post-quantum soundness analysis scoped in
+`notes/audit-scope-pq-pool.md` §9 is completed** — a derived post-quantum
+soundness level (with the parameter set reaching a written PQ target), or an
+explicit written finding that it cannot yet be asserted with the blocking gap
+named. The classical 128-bit figure alone does not satisfy this bar.

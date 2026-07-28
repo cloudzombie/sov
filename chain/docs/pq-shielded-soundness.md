@@ -275,6 +275,18 @@ Stated plainly, because a soundness argument that overclaims is worse than none:
    present are sufficient for the five claims in §0. It cannot prove that no
    *additional* freedom exists — that is precisely what an external audit with
    under-constraint tooling is for.
+7. **Post-quantum soundness of the proof (PQV2-05).** The bit-security figures
+   in §10 are *classical* soundness bounds. They establish that the proof
+   uses no number-theoretic assumption a quantum adversary could break with
+   Shor (there is no discrete-log or factoring target — a genuine and
+   important advantage over the Orchard/Halo2 v1 pool). They do **not**
+   establish a quantified post-quantum soundness *level* for the argument. Two
+   gaps remain, and neither is a number this document is entitled to assert:
+   the QROM soundness of the Fiat-Shamir-transformed FRI/STARK at these
+   parameters, and the Grover-type erosion of the 16-bit grinding and the
+   hash-based commitment margins. Until an external QROM analysis closes this
+   (scoped in `notes/audit-scope-pq-pool.md` §9), no public "128-bit
+   post-quantum" claim is warranted and none may gate arming bit 2.
 
 ---
 
@@ -296,6 +308,20 @@ In our own order of concern:
 ---
 
 ## 10. Concrete security level — measured, not conjectured
+
+**Read this first (PQV2-05): every number in this section is a CLASSICAL
+soundness bound.** "Conjectured" and "proven" here distinguish the capacity
+conjecture from the unconditional Johnson/list-decoding bound — a classical-vs-
+classical distinction. Neither is a post-quantum (QROM) security level. The
+128-bit target this section adopts is therefore "128-bit *classical* proven
+soundness", and it must not be restated in public as "128-bit post-quantum".
+What is genuinely post-quantum about this proof — no Shor-breakable
+assumption — and what is still unestablished — a quantified QROM soundness
+level and the Grover erosion of grinding/hash margins — is stated in §8 item 7.
+The
+QROM analysis that would let a post-quantum figure be quoted is scoped in
+`notes/audit-scope-pq-pool.md` §9 and is a prerequisite for any public
+post-quantum security statement.
 
 Winterfell computes both figures from a real proof. `tests/security_level.rs`
 does exactly that, on a realistic 2-in/2-out bundle at the shipped parameters

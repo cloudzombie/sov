@@ -60,11 +60,14 @@ pub enum SpendProofError {
 /// Standard proof options: 64 FRI queries, blowup 16, 16 bits of grinding,
 /// **cubic** extension field.
 ///
-/// **128 bits PROVEN, not conjectured** — and that distinction is the whole
-/// reason for these values. Measured by `tests/security_level.rs`, which reads
-/// both figures off a real proof:
+/// **128 bits of proven CLASSICAL soundness, not the weaker conjectured
+/// figure** — and that distinction is the whole reason for these values.
+/// Measured by `tests/security_level.rs`, which reads both figures off a real
+/// proof. Both columns are *classical* soundness bounds (see the post-quantum
+/// caveat below): "conjectured" is the capacity conjecture, "proven" is the
+/// unconditional Johnson/list-decoding-radius bound.
 ///
-/// | parameters | conjectured | proven | proof |
+/// | parameters | conjectured (classical) | proven (classical) | proof |
 /// |---|---|---|---|
 /// | 42q / blowup 8 / quadratic (previous) | 127 | **75** | 53.8 KB |
 /// | 64q / blowup 16 / cubic (these) | 128 | **128** | 94.3 KB |
@@ -91,8 +94,25 @@ pub enum SpendProofError {
 /// exactly these options. Changing them while the pool is dormant costs
 /// nothing but a re-benchmark — which is why it is done now.
 ///
-/// Soundness rests on hashes only: no number-theoretic assumption a quantum
-/// adversary could break.
+/// **What "128" is — and is NOT (PQV2-05).** These are *classical* soundness
+/// bits: the proven Johnson/list-decoding-radius bound winterfell derives for
+/// the FRI protocol at these parameters. It is NOT an established post-quantum
+/// (QROM) security level and MUST NOT be quoted as "128-bit post-quantum".
+/// Two things separate this classical bound from a quantum one, neither
+/// quantified here: (1) the soundness of the Fiat-Shamir-transformed FRI/STARK
+/// against a quantum adversary requires a QROM analysis this project has not
+/// performed (scoped in `notes/audit-scope-pq-pool.md` §9, PQV2-05); (2) a
+/// quantum adversary gets Grover-type speedups against the 16 bits of grinding
+/// and against the hash-based commitments, lowering the effective margin by an
+/// amount this crate does not assert a number for.
+///
+/// What IS post-quantum here, and is genuinely stronger than a curve-based
+/// proof system: soundness rests on hashes only (Rescue-Prime + Blake3), with
+/// no number-theoretic assumption a quantum adversary could break with Shor —
+/// there is no discrete-log or factoring target anywhere in the proof. That
+/// removes the catastrophic (total) break, but it does not by itself establish
+/// a quantified post-quantum soundness level; the QROM caveat above stands
+/// until an external analysis closes it.
 pub fn proof_options() -> ProofOptions {
     ProofOptions::new(
         64,

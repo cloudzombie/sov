@@ -12,6 +12,11 @@
 //!   eprint 2024/1553. Winterfell's own docs note provable security typically
 //!   needs 2-3x the queries of conjectured security at the same level.
 //!
+//! BOTH figures are *classical* soundness bounds. Neither is a post-quantum
+//! (QROM) security level: quoting either as "128-bit post-quantum" overstates
+//! it (PQV2-05; see `prover::proof_options` and `notes/audit-scope-pq-pool.md`
+//! §9).
+//!
 //! Run with:
 //! `cargo test -p sov-shielded-pq --release --test security_level -- --nocapture`
 
