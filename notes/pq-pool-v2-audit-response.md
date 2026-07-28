@@ -213,11 +213,36 @@ hash is untouched. After arming, this binding is part of the hard fork.
   real activation height, ~25 min); the CLI build path it drives is wired and
   compiles.
 
-## PQV2-04 — depth-20 tree exhaustion, resolution (2026-07-28) — **PARTIAL: boundary FIXED, capacity PROTOTYPE (gates arming)**
+## PQV2-04 — depth-20 tree exhaustion, resolution (2026-07-28) — **boundary FIXED; capacity UPGRADED to depth 32 (code-complete, pending external audit)**
 
-The finding has two halves. One is a correctness bug and is fixed; the other is
-a capacity/sizing limit that pricing cannot fully solve and that honestly gates
-activation.
+The finding has two halves. One is a correctness bug and is fixed; the other was
+a capacity/sizing limit that pricing could not solve. As of this session BOTH
+are resolved in code: the tree is deepened to the horizon-safe depth 32 in a
+re-derived, re-proven STARK spend circuit. The depth upgrade is code-complete and
+carries the same "pending the external audit that gates arming" caveat as the
+rest of pool v2 — it is no longer an open prerequisite blocking the circuit work,
+only the audit.
+
+**Update (depth-32 upgrade, 2026-07-28).** `TREE_DEPTH` is now
+`HORIZON_SAFE_TREE_DEPTH` = **32** (asserted equal at compile time). The spend
+circuit was re-derived so the Merkle-verify segment proves a full 32-deep
+authentication path: `INPUT_SEGMENT_ROWS`, `root_row`, `nf_row` and
+`TRACE_LENGTH` are now DERIVED symbolically from `TREE_DEPTH` (no depth literals;
+compile-time guards pin the geometry), the trace grew 1024 → **2048** rows, and
+every proof/param KAT was regenerated from freshly MEASURED values. The circuit
+is proven to actually CONSTRAIN the deep path by a negative test
+(`spend_circuit_constrains_the_full_32_deep_path`): a proof over a tampered
+level-28 node — a level that exists only because depth is 32 — does not verify
+under the honest anchor, while an honest 32-deep spend does. Measured deltas
+(release, Apple Silicon): proof **98,494 → 107,453 bytes**; verify median
+**~0.9 → 1.60 ms** (16 ms weight budget still ~10× over); prove ~68 ms; proven
+classical soundness unchanged at **128 bits** (`>=128` floor green). All KAT
+changes are explained by the depth increase and nothing else (see the per-KAT
+justifications in code); the trailing constraint-count vint in the canonical
+context byte-string is IDENTICAL, confirming the deeper path added trace ROWS via
+masked reuse of the same constraints, not any new constraint. Everything remains
+DORMANT: bit 2 UNARMED, no v2 action executes, the non-v2 consensus KAT
+(`sov-verify`) stays green.
 
 **Half 1 — the `root()` / capacity boundary bug — FIXED (already on `main`).**
 The depth-20 frontier is an O(depth) encoding of "one ommer per set bit of
@@ -269,41 +294,48 @@ sizing capacity from the issuance/confirmation horizon
 ~30) gives Orchard-parity depth **32** (`HORIZON_SAFE_TREE_DEPTH`), 4.29×10^9
 leaves, >6× headroom.
 
-*Why the depth change is NOT shipped here (reserve-grade honesty).* Raising
-`TREE_DEPTH` is a STARK **spend-circuit** re-derivation, not a constant bump:
-the AIR trace row-map bakes the Merkle path length into fixed literals —
-`INPUT_SEGMENT_ROWS = 24·CYCLE_LENGTH` (24 = 3 setup + 20 levels + 1),
-`root_row` = `input_base + 23·CYCLE_LENGTH − 1`, `nf_row` at `24·…`, and
-`TRACE_LENGTH = 1024`. Depth 32 pushes the input segment to 36 cycles, doubles
-the trace to 2048, and invalidates every proof KAT and the *measured* verify-cost
-basis behind `SHIELDED_V2_VERIFY_WEIGHT`. It is a deliberate, re-audited,
-re-proven change to the trust path (the spend soundness proof). Shipping it
-half-done would be exactly the kind of unproven-crypto-in-the-trust-path move the
-reserve-grade bar forbids, so it is deferred to an audited circuit revision and
-recorded as a **prerequisite for arming bit 2** on any chain that will carry
-sustained v2 traffic.
+*The depth change, now SHIPPED (reserve-grade).* Raising `TREE_DEPTH` was a STARK
+**spend-circuit** re-derivation, not a constant bump: the AIR trace row-map used
+to bake the Merkle path length into fixed literals. That is now gone — the row
+map is derived from `TREE_DEPTH` symbolically:
+`INPUT_SEGMENT_ROWS = (3 + TREE_DEPTH + 1)·CYCLE_LENGTH`,
+`root_row = input_base + (3 + TREE_DEPTH)·CYCLE_LENGTH − 1`,
+`nf_row` at `(4 + TREE_DEPTH)·…`, and `TRACE_LENGTH = ACTIVE_ROWS.next_power_of_two()`,
+each pinned by a `const _: () = assert!(…)` so no literal can silently assume the
+old depth again. Depth 32 pushed the input segment 24 → 36 cycles and doubled the
+trace 1024 → 2048; every proof KAT and the *measured* verify-cost basis behind
+`SHIELDED_V2_VERIFY_WEIGHT` were regenerated from real measurements. Soundness of
+the extended path is not assumed but tested (the level-28 tamper negative test).
+This is a deliberate, re-proven change to the trust path; it still awaits the
+same **external audit** as the rest of pool v2 before bit 2 is armed.
 
-*What this PR does implement.* (1) Confirms + re-verifies the boundary fix at the
-real depth. (2) Pins the economic floor so a pre-arming retune cannot silently
-cheapen the attack: `pool_v2_exhaustion_has_a_pinned_fee_floor` (runtime, ≥13k
-XUS floor), `filling_the_tree_takes_thousands_of_saturated_blocks` (≥10 days /
-6,554 blocks). (3) Records depth-20 as a documented prototype shortfall with the
-horizon-derived target `HORIZON_SAFE_TREE_DEPTH = 32` and a test,
-`depth_20_is_a_documented_prototype_shortfall_pending_a_circuit_upgrade`, that
-pins `TREE_DEPTH < HORIZON_SAFE_TREE_DEPTH` and `MAX_TREE_LEAVES < horizon_leaves`
-so arming can never quietly ship the prototype depth.
+*What this PR implements.* (1) `TREE_DEPTH` 20 → 32 with the whole AIR/prover
+row-map re-derived symbolically and guarded. (2) The economic floor re-pinned at
+the new depth: `pool_v2_exhaustion_has_a_pinned_fee_floor` now shows filling the
+tree costs ~55.9M XUS — **more than the entire ~21M-XUS money supply (~2.6×)**, so
+exhaustion is economically impossible, not merely expensive; and
+`filling_the_tree_takes_decades_of_saturated_blocks` shows ~26.8M blocks ≈ **127
+years** of sustained saturation (was 6,554 blocks / ~11 days at depth 20). (3)
+The boundary is proven algebraically (a literal 2^32 fill is infeasible):
+`capacity_boundary_is_exact_for_real_appends_at_the_real_depth` and
+`a_state_at_full_capacity_never_reports_the_empty_root` (real append at a faked
+`MAX_V2_NOTES − 1` plus the `size == 2^depth` collision argument), plus the
+exhaustive small-depth frontier↔reference equivalence and a many-thousand-append
+deep-prefix pin at the real depth. (4) `TREE_DEPTH == HORIZON_SAFE_TREE_DEPTH`
+asserted at compile time — the "prototype depth" era is over.
 
-*Why it is safe while dormant.* No new consensus digest, gas value, or capacity
-changes: `SHIELDED_V2_VERIFY_GAS` and `TREE_DEPTH` are untouched, so the only
-additions are a documentation constant (`HORIZON_SAFE_TREE_DEPTH`) and tests.
-Bit 2 is UNARMED on every canonical chain (`shielded_v2_is_dormant_everywhere`
-green), so no v2 action executes and byte-identity holds.
+*Why it is safe while dormant.* Bit 2 is UNARMED on every canonical chain
+(`shielded_v2_is_dormant_everywhere` green), so no v2 action executes and no
+`Action::ShieldedV2` has ever been accepted — there is no historical v2 proof to
+preserve, so re-deriving every v2 KAT is free. The non-v2 consensus KAT
+(`sov-verify::kat_vectors_are_reproduced_byte_for_byte`) is untouched and green:
+genesis and the transparent path are unaffected.
 
-**Status:** boundary FIXED and proven; economics QUANTIFIED and floor-pinned; the
-depth upgrade to `HORIZON_SAFE_TREE_DEPTH` is an OPEN prerequisite for arming
-bit 2, deferred to an audited circuit revision. PQV2-04 is therefore
-**closed for the boundary defect and the pricing floor; the capacity upgrade
-remains a named blocker on the arming bar below.**
+**Status:** boundary FIXED and proven; economics now horizon-safe; the depth
+upgrade to `HORIZON_SAFE_TREE_DEPTH` = 32 is **code-complete and re-proven**,
+pending the same external audit as the rest of pool v2. PQV2-04 is therefore
+**resolved in code** — no longer a circuit-work blocker on the arming bar, only
+the audit remains.
 
 ## PQV2-05 — "128-bit post-quantum" claim, resolution (2026-07-28) — **RESTATED; QROM analysis SCOPED-AND-PENDING (accepted in writing)**
 
@@ -461,13 +493,16 @@ the five-node suite wired as a required job and green with **zero** skips, and
 the external circuit audit (`notes/audit-scope-pq-pool.md`) completed with its
 findings closed. Pool v2 ships DORMANT in v0.2.2 regardless.
 
-Added by PQV2-04: **the note-commitment tree must be deepened to
-`HORIZON_SAFE_TREE_DEPTH` (32) as an audited, re-proven STARK-circuit revision
-before bit 2 is armed on any chain expecting sustained v2 traffic.** Depth-20 is
-a prototype capacity, exhaustible by honest growth and by a ~13.6k–39k XUS /
-~11-day griefing attack; the boundary defect and the fee floor are fixed/pinned,
-but the capacity itself is not production-grade and this is a hard blocker on
-arming, not a pricing knob.
+PQV2-04 (depth) — **RESOLVED IN CODE (2026-07-28), audit-pending.** The
+note-commitment tree is now the horizon-safe depth 32
+(`TREE_DEPTH == HORIZON_SAFE_TREE_DEPTH`), a re-derived and re-proven STARK
+spend circuit (trace 1024 → 2048, all row-map constants derived from
+`TREE_DEPTH`, all KATs regenerated from measured values, the deep path proven
+constrained by a negative test). Filling the tree now costs more than the entire
+money supply and would take ~127 years of saturation, so honest-growth and
+griefing exhaustion are both off the table. This is no longer a circuit-work
+blocker on arming — it folds into the SAME external circuit audit already
+required above; bit 2 stays UNARMED until that audit closes.
 
 Added by PQV2-05: **no public "post-quantum secure" statement about pool v2, and
 no arming of bit 2, until the QROM / post-quantum soundness analysis scoped in

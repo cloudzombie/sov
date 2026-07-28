@@ -3,8 +3,9 @@
 
 use crate::air::{
     input_base, merkle_inject_row, rc_base, root_row, BundleAir, BundlePublicInputs, ACTIVE_ROWS,
-    BIT_COL, CAPACITY_SEED, CYCLE_LENGTH, NSK_COL, NUM_SLOTS, OUTPUTS_START_ROW, POS_ACC_COL,
-    RC_ACC_COL, RC_BIT_COL, RHO_COL, TRACE_LENGTH, TRACE_WIDTH, VAL_COL,
+    BIT_COL, CAPACITY_SEED, CYCLE_LENGTH, INPUT_SEGMENT_CYCLES, NSK_COL, NUM_SLOTS,
+    OUTPUTS_START_ROW, POS_ACC_COL, RC_ACC_COL, RC_BIT_COL, RHO_COL, TRACE_LENGTH, TRACE_WIDTH,
+    VAL_COL,
 };
 use crate::domains::{
     RESCUE_DOMAIN_COMMIT_STAGE1, RESCUE_DOMAIN_COMMIT_STAGE2, RESCUE_DOMAIN_DUMMY_NULLIFIER,
@@ -180,7 +181,8 @@ pub struct BundleSpend {
     pub path: MerklePath,
 }
 
-/// Build the 31×1024 execution trace COLUMNS for one bundle, plus the
+/// Build the 32×[`TRACE_LENGTH`] (32×2048 at [`TREE_DEPTH`] = 32) execution
+/// trace COLUMNS for one bundle, plus the
 /// public inputs they commit to. Up to [`NUM_SLOTS`] real spends and
 /// outputs; remaining slots are filled with in-circuit dummies (zero value,
 /// domain-separated dummy nullifier, unconstrained junk chain).
@@ -308,7 +310,7 @@ pub fn build_bundle_columns(
         };
         in_values[i] = value;
         positions[i] = position;
-        let seg_cycle = i * 24;
+        let seg_cycle = i * INPUT_SEGMENT_CYCLES;
         // Cycle 0: owner_tag = merge_d(TAG, nsk, 0).
         let tag = run_cycle(
             &mut cols,
@@ -331,7 +333,7 @@ pub fn build_bundle_columns(
         if let Some(s) = spends.get(i) {
             debug_assert_eq!(PqDigest::from_elements(acc), s.note.commitment());
         }
-        // Cycles 3..23: the Merkle path, leaf level first.
+        // Cycles 3..3+TREE_DEPTH: the Merkle path, leaf level first.
         for level in 0..TREE_DEPTH {
             let bit = (position >> level) & 1;
             let sib = siblings[level].to_elements();
@@ -347,10 +349,10 @@ pub fn build_bundle_columns(
         if let Some(s) = spends.get(i) {
             debug_assert_eq!(anchors[i], s.path.compute_root(s.note.commitment()));
         }
-        // Cycle 23: nf = merge_d(NF or DUMMY_NF, nsk, rho).
+        // Cycle 3+TREE_DEPTH: nf = merge_d(NF or DUMMY_NF, nsk, rho).
         let nf = run_cycle(
             &mut cols,
-            seg_cycle + 23,
+            seg_cycle + 3 + TREE_DEPTH,
             merge_init_bound(nf_domain, position, nsk, rho),
         );
         if let Some(s) = spends.get(i) {
@@ -385,7 +387,7 @@ pub fn build_bundle_columns(
             None => (0u64, zero4, zero4),
         };
         out_values[j] = value;
-        let seg_cycle = NUM_SLOTS * 24 + j * 2;
+        let seg_cycle = NUM_SLOTS * INPUT_SEGMENT_CYCLES + j * 2;
         let value_pad = [Felt::new(value), Felt::ZERO, Felt::ZERO, Felt::ZERO];
         let d1 = run_cycle(
             &mut cols,

@@ -22,8 +22,8 @@
 //! way [`expect_circuit_reject`] fails the test if the forgery survives.
 
 use sov_shielded_pq::air::{
-    merkle_inject_row, rc_base, BundlePublicInputs, ACTIVE_ROWS, NSK_COL, NUM_SLOTS, POS_ACC_COL,
-    RC_ACC_COL, RC_BIT_COL, RHO_COL, VAL_COL,
+    merkle_inject_row, rc_base, BundlePublicInputs, ACTIVE_ROWS, INPUT_SEGMENT_CYCLES, NSK_COL,
+    NUM_SLOTS, POS_ACC_COL, RC_ACC_COL, RC_BIT_COL, RHO_COL, VAL_COL,
 };
 use sov_shielded_pq::auth::AuthKeypair;
 use sov_shielded_pq::bundle::{bundle_digest, verify_bundle, BundleError, SpendBundle};
@@ -103,7 +103,12 @@ fn kat_pinned_digests() {
     );
     assert_eq!(
         tree.root().to_hex(),
-        "0fc7b7717c6e446b9eae13e0475689a7ca3b48c2bf8d0d03e68a038736c2e16e",
+        // Re-pinned for the depth-20 -> depth-32 upgrade (audit PQV2-04): the
+        // root of the same leaves now folds 32 empty/internal levels instead of
+        // 20, so the root necessarily moves. The note commitment, owner tag and
+        // nullifier below are UNCHANGED — none of them depend on tree depth,
+        // which is exactly what we expect: only the root changed.
+        "6944acd94c40f5f5404c19b2bbbd7af1ae3267a170c4ea95d2e70cd478282316",
         "tree root KAT drifted"
     );
     assert_eq!(
@@ -160,16 +165,20 @@ fn kat_proof_size_pinned() {
     // parameter or winterfell-version change could move the proof size (and thus
     // the weight/gas derivation) unnoticed. This is that pin.
     //
-    // 98494 bytes = 96.2 KiB, measured for the shipped 64q / blowup 16 / cubic
-    // options. It last moved with the 42q/8/quadratic -> 64q/16/cubic evolution
-    // (audit PQV2-08) and the PQV2-01 trace-width 31 -> 32 change. A drift here
-    // that is NOT a deliberate parameter/witness change is a bug: re-derive the
-    // weight schedule in `sov_types::weight` before re-pinning.
+    // 107453 bytes = 104.9 KiB, measured for the shipped 64q / blowup 16 /
+    // cubic options at TREE_DEPTH = 32. It last moved with the depth-20 ->
+    // depth-32 upgrade (audit PQV2-04): the Merkle segment grew from 20 to 32
+    // cycles per input, so the padded trace doubled 1024 -> 2048 and the FRI/
+    // query openings grew accordingly (was 98494 = 96.2 KiB at depth 20). Still
+    // comfortably inside MAX_PROOF_LEN (128 KiB) and MAX_SHIELDED_V2_BUNDLE_BYTES
+    // (144 KiB). A drift here that is NOT a deliberate parameter/witness/depth
+    // change is a bug: re-derive the weight schedule in `sov_types::weight`
+    // before re-pinning.
     let (proof, _) = kat_prove();
     assert_eq!(
         proof.len(),
-        98_494,
-        "pool-v2 KAT proof size drifted — proof_options() or the witness shape changed"
+        107_453,
+        "pool-v2 KAT proof size drifted — proof_options(), the witness shape, or TREE_DEPTH changed"
     );
     // And it must fit the wire codec with real margin (the weight schedule
     // relies on this).
@@ -356,6 +365,68 @@ fn wrong_merkle_path_rejected() {
 }
 
 #[test]
+fn spend_circuit_constrains_the_full_32_deep_path() {
+    // Audit PQV2-04. The commitment tree is depth 32; this proves the SPEND
+    // CIRCUIT binds the WHOLE 32-deep authentication path, not a shorter prefix
+    // — i.e. that raising TREE_DEPTH 20 -> 32 actually extended the in-circuit
+    // Merkle chain rather than leaving levels >= 20 unconstrained.
+    use sov_shielded_pq::tree::TREE_DEPTH;
+    assert_eq!(TREE_DEPTH, 32, "this test asserts the horizon-safe depth");
+
+    let (key, notes, tree) = kat_fixture();
+    let (path, anchor) = tree.witness(1).expect("witness");
+    assert_eq!(
+        path.siblings.len(),
+        TREE_DEPTH,
+        "a witness carries one sibling per level, all 32"
+    );
+
+    // (1) An honest 32-deep spend verifies, and the root the prover committed
+    // in-circuit equals the reference depth-32 tree root.
+    let spends = vec![BundleSpend {
+        key: key.clone(),
+        note: notes[0],
+        path: path.clone(),
+    }];
+    let (proof, pi) = prove_bundle(&spends, &[], 0, KAT_VALUE_0, 0).expect("prove");
+    assert_eq!(
+        pi.anchors[0], anchor,
+        "the in-circuit root must equal the reference 32-deep root"
+    );
+    verify_spend(&proof, &pi).expect("an honest 32-deep spend must verify");
+
+    // (2) Tamper a path node at a DEEP level (28) — a level that exists ONLY
+    // because the tree is depth 32. It is load-bearing: the in-circuit Merkle
+    // chain folds all 32 levels, so changing a level-28 sibling MUST move the
+    // anchor (this assert_ne is what catches a circuit that silently ignored
+    // levels >= 20), and a proof built over the tampered deep path cannot pass
+    // under the honest anchor — the root-row boundary assertion binds the
+    // circuit's full 32-level fold to the public anchor.
+    const DEEP_LEVEL: usize = 28;
+    let mut deep = path.clone();
+    deep.siblings[DEEP_LEVEL] = notes[1].commitment(); // any different sibling
+    let spends2 = vec![BundleSpend {
+        key,
+        note: notes[0],
+        path: deep,
+    }];
+    let (proof2, pi2) = prove_bundle(&spends2, &[], 0, KAT_VALUE_0, 0).expect("prove");
+    assert_ne!(
+        pi2.anchors[0], anchor,
+        "a level-28 sibling change must move the depth-32 root"
+    );
+    let mut forged = pi2.clone();
+    forged.anchors[0] = anchor; // claim the honest root for a wrong-position proof
+    assert!(
+        verify_spend(&proof2, &forged).is_err(),
+        "a proof over a tampered level-28 node was accepted under the honest root"
+    );
+    // The tampered-path proof is internally consistent — it just binds a
+    // DIFFERENT tree position, and verifies only under its OWN anchor.
+    verify_spend(&proof2, &pi2).expect("the tampered-path proof binds its own root");
+}
+
+#[test]
 fn foreign_note_cannot_be_spent() {
     // The sender knows the recipient's full note opening but not nsk.
     let (_, notes, tree) = kat_fixture();
@@ -517,12 +588,19 @@ fn range_check_landing_must_match_value_register() {
     let out_note = Note::new(MAX_NOTE_VALUE, key.owner_tag(), derive_rho(&seed, 1)).expect("note");
     let (mut cols, mut pub_inputs) =
         build_bundle_columns(&spends, &[out_note], 0, 0, 0).expect("build");
-    // Rebuild output 0's segment (cycles 96/97) for value 2^61.
+    // Rebuild output 0's segment for value 2^61. Output j's two commitment
+    // cycles start at `NUM_SLOTS * INPUT_SEGMENT_CYCLES + 2*j` — DERIVED from
+    // TREE_DEPTH via INPUT_SEGMENT_CYCLES (= 3+TREE_DEPTH+1 = 36 at depth 32),
+    // so output 0 is cycles 144/145 (was the depth-20 96/97 these literals used
+    // to be). Writing to the wrong cycles would leave output 0's real segment
+    // honest and corrupt an INPUT segment instead — so this derivation is
+    // load-bearing for the tamper landing where it is meant to.
+    let out0_cycle = NUM_SLOTS * INPUT_SEGMENT_CYCLES;
     let too_big = Felt::new(1u64 << VALUE_BITS);
     let vpad = [too_big, Felt::ZERO, Felt::ZERO, Felt::ZERO];
     let d1 = fill_hash_cycle(
         &mut cols,
-        96,
+        out0_cycle,
         sponge_init(
             RESCUE_DOMAIN_COMMIT_STAGE1,
             vpad,
@@ -531,7 +609,7 @@ fn range_check_landing_must_match_value_register() {
     );
     let cm = fill_hash_cycle(
         &mut cols,
-        97,
+        out0_cycle + 1,
         sponge_init(RESCUE_DOMAIN_COMMIT_STAGE2, d1, out_note.rho.to_elements()),
     );
     pub_inputs.output_commitments[0] = PqDigest::from_elements(cm);
@@ -543,7 +621,13 @@ fn range_check_landing_must_match_value_register() {
     expect_circuit_reject(
         cols,
         &pub_inputs,
-        "transition constraint 124", // the range-check landing for output 0
+        // Range-check landing for output 0 = `result[120 + m]` with
+        // m = NUM_SLOTS + 0 = 4, i.e. transition constraint 124 — depth-
+        // INDEPENDENT (constraint indices do not move with TREE_DEPTH; only the
+        // trace ROWS the tamper targets did). This is the constraint that
+        // enforces value < 2^61 by tying the range-check accumulator to the
+        // value register.
+        "transition constraint 124",
         "out-of-range value register",
     );
 }
@@ -563,8 +647,11 @@ fn dummy_with_nonzero_value_rejected() {
 
     // Re-run the dummy slot's hash segment with value = 5 (nsk = rho = 0,
     // zero path, dummy nullifier domain), exactly as the builder would for
-    // a real value-5 witness.
-    let seg_cycle = 2 * 24;
+    // a real value-5 witness. Slot 2's segment starts at cycle
+    // `2 * INPUT_SEGMENT_CYCLES` — DERIVED from TREE_DEPTH (= 72 at depth 32,
+    // was 48 at the depth-20 `2*24`); writing to the wrong cycles would corrupt
+    // a REAL input's segment instead, so this must track the row-map.
+    let seg_cycle = 2 * INPUT_SEGMENT_CYCLES;
     let run_cycle = fill_hash_cycle;
     let init = sponge_init;
     use sov_shielded_pq::domains::{
@@ -588,16 +675,18 @@ fn dummy_with_nonzero_value_rejected() {
         seg_cycle + 2,
         init(RESCUE_DOMAIN_COMMIT_STAGE2, d1, zero4),
     );
-    for level in 0..20 {
+    for level in 0..sov_shielded_pq::tree::TREE_DEPTH {
         acc = run_cycle(
             &mut cols,
             seg_cycle + 3 + level,
             init(RESCUE_DOMAIN_MERKLE_NODE, acc, zero4),
         );
     }
+    // The nullifier cycle sits at `3 + TREE_DEPTH` within the segment (was the
+    // depth-20 literal 23); it is the last cycle of the input segment.
     run_cycle(
         &mut cols,
-        seg_cycle + 23,
+        seg_cycle + 3 + sov_shielded_pq::tree::TREE_DEPTH,
         init(RESCUE_DOMAIN_DUMMY_NULLIFIER, zero4, zero4),
     );
     // Value register + range check for the smuggled value.
@@ -608,7 +697,12 @@ fn dummy_with_nonzero_value_rejected() {
     expect_circuit_reject(
         cols,
         &pub_inputs,
-        "assertion main_trace(23, 0)", // the dummy value-zero assertion, VAL_COL + 2
+        // The dummy value-zero boundary assertion on column VAL_COL+2 = 23 at
+        // ROW 0 — depth-INDEPENDENT (the assertion is `single(VAL_COL+i, 0, 0)`),
+        // so the identifier is unchanged by the depth-20 -> depth-32 row-map
+        // move; only WHERE the tamper is written (seg_cycle above) moved. This
+        // is the constraint that keeps a dummy slot from smuggling real value.
+        "assertion main_trace(23, 0)",
         "dummy with nonzero value",
     );
 }

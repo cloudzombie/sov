@@ -13,7 +13,7 @@
 //! 1. `tag_i = merge_d(TAG, nsk_i, 0)`                       (ownership)
 //! 2. `cm_i = merge_d(C2, merge_d(C1, [v_i,0,0,0], tag_i), rho_i)`
 //!    (commitment opening — `v_i` is a WITNESS, never public)
-//! 3. `cm_i` is a depth-20 Merkle leaf under `anchors[i]` (membership; each
+//! 3. `cm_i` is a depth-32 Merkle leaf under `anchors[i]` (membership; each
 //!    input may use a DIFFERENT public anchor — D5's anchor-ring acceptance
 //!    is the native verifier's job)
 //! 4. `nullifiers[i] = merge_d(NF, nsk_i, rho_i; pos_i)`     (nullifier),
@@ -71,8 +71,9 @@
 //!
 //! # Trace layout
 //!
-//! 32 columns × 1024 rows, in 8-row hash cycles (7 Rescue rounds + 1
-//! injection row):
+//! 32 columns × 2048 rows (at [`TREE_DEPTH`] = 32), in 8-row hash cycles (7
+//! Rescue rounds + 1 injection row). Every row count below is DERIVED from
+//! [`TREE_DEPTH`] — the figures in parentheses are the depth-32 instantiation:
 //!
 //! - Columns 0..12: the Rescue-Prime sponge state.
 //! - Columns 12..16 / 16..20: `rho` / `nsk` witness registers, constant
@@ -84,12 +85,15 @@
 //! - Column 31: Merkle leaf-position accumulator (`Σ bit_l·2^l`), zero at
 //!   each input-segment start and read into the nullifier sponge's capacity.
 //!
-//! Row map: input `i` occupies rows `192·i .. 192·i+191` (cycle 0 = owner
-//! tag, 1–2 = commitment, 3..22 = Merkle ×20 with the root on row
-//! `192·i+183`, 23 = nullifier on row `192·i+191`). Output `j` occupies
-//! rows `768+16·j .. 768+16·j+15` (2 commitment cycles, commitment on row
-//! `768+16·j+15`). Rows 832..1024 are padding (hash rounds only). The
-//! range check for value `m ∈ 0..8` runs in columns 29–30 over rows
+//! Row map: input `i` occupies rows
+//! `INPUT_SEGMENT_ROWS·i .. INPUT_SEGMENT_ROWS·i + INPUT_SEGMENT_ROWS-1`
+//! (288 rows each at depth 32): cycle 0 = owner tag, 1–2 = commitment,
+//! `3..3+TREE_DEPTH` = Merkle ×[`TREE_DEPTH`] with the root on
+//! [`root_row`]`(i)` (`i·288+279`), then the nullifier on [`nf_row`]`(i)`
+//! (`i·288+287`). Output `j` occupies rows
+//! `OUTPUTS_START_ROW+16·j ..` (2 commitment cycles). Rows
+//! `ACTIVE_ROWS..TRACE_LENGTH` (1216..2048) are padding (hash rounds only).
+//! The range check for value `m ∈ 0..8` runs in columns 29–30 over rows
 //! `64·m .. 64·m+61`, in parallel with the hash columns.
 //!
 //! Injection rows stamp each phase's DOMAIN into capacity element 1; the
@@ -116,8 +120,15 @@ use winterfell::{
 
 /// Rows per hash invocation (7 rounds + 1 injection row).
 pub const CYCLE_LENGTH: usize = 8;
-/// Total trace length: 104 active cycles padded to a power of two.
-pub const TRACE_LENGTH: usize = 1024;
+/// Total trace length: [`ACTIVE_ROWS`] padded up to a power of two.
+///
+/// DERIVED from the depth-dependent trace layout, never a magic literal: at
+/// [`TREE_DEPTH`] = 32 the active region is [`ACTIVE_ROWS`] = 1216 rows, so
+/// this is 2048 (was 1024 at the depth-20 prototype). The const guards below
+/// pin the invariants winterfell needs (power of two, a multiple of
+/// [`CYCLE_LENGTH`] so the padding loop is whole, and wide enough for both the
+/// input/output region and every range-check segment).
+pub const TRACE_LENGTH: usize = ACTIVE_ROWS.next_power_of_two();
 /// Trace width: 12 sponge + 4 rho + 4 nsk + 1 path bit + 8 values + 2 rc
 /// + 1 Merkle leaf-position accumulator.
 pub const TRACE_WIDTH: usize = 32;
@@ -147,8 +158,12 @@ pub const RC_ACC_COL: usize = 30;
 /// and a position from another.
 pub const POS_ACC_COL: usize = 31;
 
-/// Rows per input segment (24 cycles).
-pub const INPUT_SEGMENT_ROWS: usize = 24 * CYCLE_LENGTH;
+/// Cycles per input segment, DERIVED from [`TREE_DEPTH`]: owner-tag (1) +
+/// commitment (2) + Merkle path ([`TREE_DEPTH`]) + nullifier (1). At depth 32
+/// that is 36 cycles (was 24 at depth 20).
+pub const INPUT_SEGMENT_CYCLES: usize = 3 + TREE_DEPTH + 1;
+/// Rows per input segment ([`INPUT_SEGMENT_CYCLES`] cycles).
+pub const INPUT_SEGMENT_ROWS: usize = INPUT_SEGMENT_CYCLES * CYCLE_LENGTH;
 /// Rows per output segment (2 cycles).
 pub const OUTPUT_SEGMENT_ROWS: usize = 2 * CYCLE_LENGTH;
 /// First row of the output region.
@@ -157,6 +172,31 @@ pub const OUTPUTS_START_ROW: usize = NUM_SLOTS * INPUT_SEGMENT_ROWS;
 pub const ACTIVE_ROWS: usize = OUTPUTS_START_ROW + NUM_SLOTS * OUTPUT_SEGMENT_ROWS;
 /// Rows allocated per range-check segment (61 used + 3 slack).
 pub const RC_SEGMENT_ROWS: usize = 64;
+
+// Trace-length invariants the prover and winterfell both rely on. These make a
+// depth change fail the BUILD unless the trace still frames correctly, rather
+// than miscomputing a proof at runtime.
+const _: () = assert!(
+    TRACE_LENGTH.is_power_of_two(),
+    "winterfell needs a pow2 trace"
+);
+const _: () = assert!(
+    TRACE_LENGTH >= ACTIVE_ROWS,
+    "trace must cover the active region"
+);
+const _: () = assert!(
+    ACTIVE_ROWS % CYCLE_LENGTH == 0,
+    "the padding loop advances whole hash cycles"
+);
+// The 2·NUM_SLOTS range-check segments live in columns 29/30, laid out from row
+// 0; they must also fit inside the trace.
+const _: () = assert!(
+    TRACE_LENGTH >= 2 * NUM_SLOTS * RC_SEGMENT_ROWS,
+    "every range-check segment must fit the trace"
+);
+// Pin the depth-32 layout so a silent regression to the prototype geometry
+// fails the build (documents the intended numbers, not just their relations).
+const _: () = assert!(INPUT_SEGMENT_ROWS == (3 + TREE_DEPTH + 1) * CYCLE_LENGTH);
 
 /// Sponge capacity seed for a 2-to-1 merge (`Rp64_256` sets `capacity[0]` to
 /// the rate width, 8).
@@ -180,13 +220,26 @@ pub const fn merkle_inject_row(i: usize, level: usize) -> usize {
 }
 /// Row where input `i`'s Merkle chain output (the root) sits; the same row
 /// injects the nullifier hash.
+///
+/// The Merkle chain occupies cycles `3..3+TREE_DEPTH`; its final merge lands in
+/// cycle `3+TREE_DEPTH-1`, so the root sits on that cycle's last row —
+/// `(3 + TREE_DEPTH) * CYCLE_LENGTH - 1`, DERIVED from the depth (was `23·…` at
+/// depth 20; is `35·…` at depth 32).
 pub const fn root_row(i: usize) -> usize {
-    input_base(i) + 23 * CYCLE_LENGTH - 1
+    input_base(i) + (3 + TREE_DEPTH) * CYCLE_LENGTH - 1
 }
-/// Row where input `i`'s nullifier digest sits.
+/// Row where input `i`'s nullifier digest sits — the cycle after the root,
+/// `(4 + TREE_DEPTH) * CYCLE_LENGTH - 1`, and the last row of the input
+/// segment (was `24·…` at depth 20; is `36·…` at depth 32).
 pub const fn nf_row(i: usize) -> usize {
-    input_base(i) + 24 * CYCLE_LENGTH - 1
+    input_base(i) + (4 + TREE_DEPTH) * CYCLE_LENGTH - 1
 }
+// The nullifier row is the final row of an input segment, and the root row is
+// exactly one cycle before it — both derived from the same depth. Pin it so the
+// row-map can never drift out of step with INPUT_SEGMENT_ROWS.
+const _: () = assert!(nf_row(0) == INPUT_SEGMENT_ROWS - 1);
+const _: () = assert!(nf_row(0) == root_row(0) + CYCLE_LENGTH);
+
 /// First row of output `j`'s segment.
 pub const fn output_base(j: usize) -> usize {
     OUTPUTS_START_ROW + j * OUTPUT_SEGMENT_ROWS

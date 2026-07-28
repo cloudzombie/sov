@@ -14,8 +14,16 @@ use std::sync::OnceLock;
 use crate::domains::RESCUE_DOMAIN_MERKLE_NODE;
 use crate::hash::{merge_domain, PqDigest};
 
-/// Merkle tree depth — a 2^20-slot (~1M) leaf space.
-pub const TREE_DEPTH: usize = 20;
+/// Merkle tree depth — a 2^32-slot (~4.29 billion) leaf space.
+///
+/// This is the **horizon-safe** depth ([`HORIZON_SAFE_TREE_DEPTH`]): sized so
+/// the tree cannot be exhausted within the asset's intended lifetime, even
+/// under sustained worst-case growth. See [`HORIZON_SAFE_TREE_DEPTH`] for the
+/// capacity derivation. Raising the depth from the earlier depth-20 prototype
+/// to 32 was audit **PQV2-04** — a re-derived, re-proven STARK spend-circuit
+/// revision (the Merkle-verify segment of the AIR trace grows from 20 to 32
+/// path steps; see [`crate::air`]).
+pub const TREE_DEPTH: usize = 32;
 
 /// **Usable** leaf capacity of the depth-[`TREE_DEPTH`] tree: `2^TREE_DEPTH - 1`,
 /// one slot short of the leaf space.
@@ -30,8 +38,8 @@ pub const TREE_DEPTH: usize = 20;
 /// total, injective encoding of tree contents at every reachable size, which
 /// is the invariant the anchor ring and the STARK's membership proofs stand
 /// on. The alternative (a 21st ommer slot holding the completed root, special
-/// -cased in `root()`) buys one note out of 1,048,576 and pays for it with a
-/// state field that is only ever meaningful in one unreachable-in-practice
+/// -cased in `root()`) buys one note out of 4,294,967,296 and pays for it with
+/// a state field that is only ever meaningful in one unreachable-in-practice
 /// configuration; capping is strictly simpler to reason about and strictly
 /// safer for the executor that consumes this next.
 ///
@@ -51,21 +59,24 @@ pub const MAX_TREE_LEAVES: u64 = (1u64 << TREE_DEPTH) - 1;
 /// i.e. depth `ceil(log2(6.7×10^8)) = 30`. Rounding up to Orchard's depth **32**
 /// (4.29×10^9 leaves) leaves >6× headroom.
 ///
-/// The shipped [`TREE_DEPTH`] = 20 (1.05M leaves) is a **prototype** value: its
-/// capacity is exhaustible both by honest growth and by a bounded griefing
-/// attack (~13.6k XUS in miner fees and ~11 days of sustained block-auction
-/// dominance — see the PQV2-04 resolution in `notes/pq-pool-v2-audit-response.md`
-/// and the cost-floor regression tests). Raising the depth is a STARK
-/// **spend-circuit** change: the AIR trace row-map bakes the Merkle path length
-/// into fixed literals ([`air::root_row`](crate::air::root_row),
+/// As of audit **PQV2-04** the shipped [`TREE_DEPTH`] **is** this depth: the
+/// two are equal (asserted below), and the earlier depth-20 prototype — whose
+/// capacity was exhaustible by a bounded griefing attack in ~11 days — is gone.
+/// Deepening the tree was a STARK **spend-circuit** revision: the AIR trace
+/// row-map derives the Merkle path length from [`TREE_DEPTH`]
+/// ([`air::root_row`](crate::air::root_row),
 /// [`INPUT_SEGMENT_ROWS`](crate::air::INPUT_SEGMENT_ROWS),
-/// [`TRACE_LENGTH`](crate::air::TRACE_LENGTH) = 1024), and every proof KAT and
-/// the measured verify-cost basis depend on it. It is therefore a deliberate,
-/// re-audited, re-proven circuit revision — deliberately NOT attempted here —
-/// and is a prerequisite for arming signal bit 2 on any chain that will carry
-/// sustained v2 traffic. Bit 2 is dormant on every canonical network today,
-/// which is what keeps the prototype depth safe in the meantime.
+/// [`TRACE_LENGTH`](crate::air::TRACE_LENGTH), now 2048), and every proof KAT
+/// and the measured verify-cost basis were re-derived and re-measured with it.
+/// The circuit was re-proven to CONSTRAIN a full 32-deep authentication path
+/// (a spend whose path is shorter, longer, or tampered fails verification —
+/// see `tests/kat.rs`). This remains gated behind signal bit 2, which is
+/// dormant on every canonical network today.
 pub const HORIZON_SAFE_TREE_DEPTH: usize = 32;
+
+/// The shipped tree is now the horizon-safe depth (audit PQV2-04). This build
+/// fails if the two ever diverge again — the "prototype depth" era is over.
+const _: () = assert!(TREE_DEPTH == HORIZON_SAFE_TREE_DEPTH);
 
 /// `empty[l]` = digest of an empty subtree of height `l` (level 0 = leaf).
 ///

@@ -55,8 +55,10 @@ use winter_utils::{ByteWriter, Serializable};
 use winterfell::{Air, TraceInfo};
 
 /// Hard cap on accepted serialized proof size. An honest proof for this
-/// circuit is ~35.5 KB; the cap leaves headroom without letting a peer
-/// make us buffer megabytes. (Re-check if [`proof_options`] change.)
+/// circuit is ~105 KB (TREE_DEPTH = 32); the cap leaves headroom without
+/// letting a peer make us buffer megabytes. (Re-check if [`proof_options`]
+/// or `TREE_DEPTH` change — the depth-32 proof is 107,453 bytes, comfortably
+/// inside this 128 KiB cap.)
 pub const MAX_PROOF_LEN: usize = 128 * 1024;
 
 /// Typed rejection reasons for a malformed proof frame. Every variant is a
@@ -172,7 +174,7 @@ impl<'a> Cursor<'a> {
 }
 
 /// The exact context bytes an honest prover emits for this circuit with
-/// the given public-input shape: `TraceInfo` (31×1024, no aux segment),
+/// the given public-input shape: `TraceInfo` (32×2048, no aux segment),
 /// the f64 field modulus, the standard [`proof_options`], and the
 /// constraint count (which depends only on the public dummy pattern).
 /// Built with winterfell's OWN `Serializable` impls, mirroring the

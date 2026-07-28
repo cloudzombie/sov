@@ -124,8 +124,8 @@ pub fn merge_domain(domain: u64, left: PqDigest, right: PqDigest) -> PqDigest {
 /// used for the membership proof — makes the nullifier unique per note
 /// occurrence.
 ///
-/// `bind` must be a canonical field element; leaf positions are `< 2^20` and
-/// so always are.
+/// `bind` must be a canonical field element; leaf positions are `< 2^32` and
+/// so always are (far below the Goldilocks modulus).
 pub fn merge_domain_bound(domain: u64, bind: u64, left: PqDigest, right: PqDigest) -> PqDigest {
     let mut state = [Felt::ZERO; STATE_WIDTH];
     state[0] = Felt::new(8); // RATE_WIDTH, per Rp64_256::merge

@@ -280,7 +280,7 @@ impl PqNoteStore {
                 }
                 let cm = pi.output_commitments[slot];
                 let Some(position) = self.tree.append(cm) else {
-                    // The depth-20 tree is full; consensus refuses further
+                    // The depth-32 tree is full; consensus refuses further
                     // appends too (`ShieldedV2StateError::TreeFull`), so the
                     // store simply stops growing rather than desyncing.
                     continue;
@@ -432,8 +432,8 @@ impl PqNoteStore {
     /// The wallet's unspent pool-v2 balance in grains.
     ///
     /// Saturating: the sum of note values cannot overflow in practice
-    /// (every note is `< 2^61` and the tree holds `< 2^20` notes, so the
-    /// true sum is `< 2^81`… which *would* overflow a `u64` if a chain
+    /// (every note is `< 2^61` and the tree holds `< 2^32` notes, so the
+    /// true sum is `< 2^93`… which *would* overflow a `u64` if a chain
     /// somehow carried that much value). Saturation makes the impossible
     /// case a visibly wrong balance rather than a wrapped one.
     pub fn balance(&self) -> u64 {
@@ -1097,7 +1097,7 @@ mod tests {
         data.owned[0].rho[..8].copy_from_slice(&0xffff_ffff_0000_0001u64.to_le_bytes());
         assert!(PqNoteStore::from_bytes(&borsh::to_vec(&data).unwrap()).is_none());
 
-        // A commitment count beyond what the depth-20 tree can hold is
+        // A commitment count beyond what the depth-32 tree can hold is
         // rejected by the explicit bound, without allocating a tree for it.
         let mut data = store.data.clone();
         data.commitments = vec![[0u8; 32]; 4];

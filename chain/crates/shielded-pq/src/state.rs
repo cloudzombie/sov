@@ -73,11 +73,11 @@ pub const ANCHOR_HORIZON_BLOCKS: usize = 128;
 /// price for spends not being invalidated by someone else's traffic.
 pub const ANCHOR_RING_LEN: usize = MAX_V2_COMMITMENTS_PER_BLOCK * ANCHOR_HORIZON_BLOCKS;
 
-/// Maximum notes the depth-[`TREE_DEPTH`] pool tree can hold: `2^20 - 1`
+/// Maximum notes the depth-[`TREE_DEPTH`] pool tree can hold: `2^32 - 1`
 /// ([`MAX_TREE_LEAVES`]). Appending beyond this is a typed error, never a wrap,
 /// a panic, or a silent divergence.
 ///
-/// The final leaf slot of the `2^20`-slot leaf space is **deliberately
+/// The final leaf slot of the `2^32`-slot leaf space is **deliberately
 /// unusable**: an O(depth) frontier stores one ommer per set bit of `size`, so
 /// a depth-`D` frontier represents `0..2^D` faithfully and cannot represent
 /// `2^D` at all (every low bit is zero there — the encoding collides with the
@@ -398,7 +398,7 @@ impl ShieldedV2State {
 
     /// Test-only: a state that CLAIMS `size` leaves (frontier/ring contents
     /// are not meaningful) so capacity boundaries can be exercised without
-    /// paying 2^20 real appends.
+    /// paying 2^32 real appends (which is infeasible at the real depth).
     #[cfg(test)]
     fn with_claimed_size(size: u64) -> Self {
         let mut s = ShieldedV2State::new();
@@ -431,7 +431,7 @@ mod tests {
     /// [`CommitmentTree::root`] uses (the tree the STARK's witnesses are built
     /// against), lifted to an arbitrary depth so the frontier can be pinned
     /// against it at capacity boundaries that are unreachable in a test at
-    /// depth 20. `reference_root_agrees_with_the_stark_reference_tree` proves
+    /// depth 32. `reference_root_agrees_with_the_stark_reference_tree` proves
     /// this really is that algorithm.
     fn reference_root(leaves: &[PqDigest], depth: usize) -> PqDigest {
         fn subtree(leaves: &[PqDigest], empty: &[PqDigest], level: usize, index: u64) -> PqDigest {
@@ -484,7 +484,7 @@ mod tests {
     fn reference_root_agrees_with_the_stark_reference_tree() {
         // The depth-parameterized reference used by the boundary tests below
         // is the SAME function tree.rs computes — pinned at the real depth so
-        // small-depth conclusions transfer to depth 20.
+        // small-depth conclusions transfer to depth 32.
         let mut reference = CommitmentTree::new();
         let mut leaves = Vec::new();
         assert_eq!(reference_root(&leaves, TREE_DEPTH), reference.root());
@@ -503,7 +503,7 @@ mod tests {
     #[test]
     fn frontier_is_exact_below_capacity_and_cannot_represent_a_full_tree() {
         // THE BUG THIS FILE ONCE HAD, pinned structurally at every small depth
-        // (the same algorithms production runs at depth 20, driven directly so
+        // (the same algorithms production runs at depth 32, driven directly so
         // the whole leaf space is affordable):
         //
         //   * for every size in 0..2^depth the frontier root EQUALS the
@@ -610,7 +610,7 @@ mod tests {
     #[test]
     fn capacity_boundary_is_exact_for_real_appends_at_the_real_depth() {
         // One below / at / one above capacity, for BOTH mutators, with a real
-        // leaf appended at the boundary (the size is faked to make 2^20
+        // leaf appended at the boundary (the size is faked to make 2^32
         // affordable; the append, the frontier update and the root are real).
         for size in [MAX_V2_NOTES - 1, MAX_V2_NOTES] {
             // append_commitment
@@ -672,35 +672,47 @@ mod tests {
         const { assert!((1u64 << TREE_DEPTH) > MAX_V2_NOTES) };
     }
 
-    /// Release-only (~2 minutes): fill the REAL depth-20 tree to capacity with
-    /// real appends and pin the frontier root against the reference tree there.
+    /// Release-only: pin the frontier root against the reference tree over a
+    /// **representative deep prefix** of the real depth-32 tree.
+    ///
+    /// A literal fill to `MAX_V2_NOTES` = `2^32 - 1` is INFEASIBLE here — 4.3
+    /// billion real Rescue-Prime appends would take days even in release, so
+    /// unlike the depth-20 prototype this test cannot exhaust the tree. It does
+    /// the next-strongest honest thing: it drives many thousands of real
+    /// appends at the *real* depth (crossing enough carry boundaries that fresh
+    /// ommer levels are exercised) and pins the O(depth) frontier root against
+    /// the O(n·depth) reference tree the STARK's witnesses are built against, at
+    /// every step. The exact `2^32` capacity boundary itself is proven
+    /// *algebraically* — without touching 2^32 leaves — by the always-run
+    /// `capacity_boundary_is_exact_for_real_appends_at_the_real_depth` and
+    /// `a_state_at_full_capacity_never_reports_the_empty_root` (a real append at
+    /// a faked `MAX_V2_NOTES - 1`, plus the `size == 2^depth` collision
+    /// argument), and the frontier↔reference equivalence is proven EXHAUSTIVELY
+    /// over the whole leaf space at every small depth by
+    /// `frontier_is_exact_below_capacity_and_cannot_represent_a_full_tree`.
     /// Run with:
-    /// `cargo test -p sov-shielded-pq --release -- --ignored full_capacity`
+    /// `cargo test -p sov-shielded-pq --release -- --ignored deep_prefix`
     #[test]
-    #[ignore = "fills the real 2^20 tree; ~2 min in release, far longer in debug"]
-    fn frontier_matches_the_reference_tree_at_full_capacity() {
+    #[ignore = "drives many thousands of real depth-32 appends; release-only"]
+    fn frontier_matches_the_reference_tree_over_a_deep_prefix() {
+        // Enough appends to cross several ommer-level carries (well past 2^12)
+        // while staying feasible; every step pins frontier == reference.
+        const PREFIX: u64 = 20_000;
+        const {
+            assert!(
+                PREFIX < MAX_V2_NOTES,
+                "prefix stays inside the real capacity"
+            )
+        };
         let mut state = ShieldedV2State::new();
         let mut reference = CommitmentTree::new();
-        for i in 0..MAX_V2_NOTES {
+        for i in 0..PREFIX {
             state.apply(&[], &[d(i)]).expect("append");
             reference.append(d(i)).expect("append");
+            assert_eq!(state.root(), reference.root(), "size {}", i + 1);
         }
-        assert_eq!(state.note_count(), MAX_V2_NOTES);
-        assert_eq!(reference.len() as u64, MAX_V2_NOTES);
-        assert_eq!(
-            state.root(),
-            reference.root(),
-            "frontier and reference agree at FULL capacity"
-        );
+        assert_eq!(state.note_count(), PREFIX);
         assert_ne!(state.root(), ShieldedV2State::new().root());
-        assert_eq!(
-            state.apply(&[], &[d(0)]),
-            Err(ShieldedV2StateError::TreeFull)
-        );
-        assert!(
-            reference.append(d(0)).is_none(),
-            "reference caps identically"
-        );
     }
 
     #[test]
@@ -879,13 +891,20 @@ mod tests {
         let empty = ShieldedV2State::new();
         assert_eq!(
             hex::encode(empty.commitment()),
-            "a9a49bfab47ef7521b59bb2a921fdef5b085f960d6839a427a5f1045b49d809f",
+            // Re-pinned for the depth-20 -> depth-32 upgrade (audit PQV2-04):
+            // the empty-tree root folded into this commitment now hashes over 32
+            // empty levels instead of 20, so the state commitment necessarily
+            // moves. Free to change only because bit 2 is unarmed and no chain
+            // has ever executed a v2 state transition.
+            "7aaa64dc7e9f367e2f83f3f6cd97ea0eef17901db6d98150dc042965952ff7ba",
         );
         let mut one = ShieldedV2State::new();
         one.apply(&[d(1)], &[d(2)]).expect("apply");
         assert_eq!(
             hex::encode(one.commitment()),
-            "934a9a2a06aae8ca1dece468472d990c918a7bbe787704e0683666687b2849e5",
+            // Re-pinned for the depth-32 upgrade (audit PQV2-04): same reason as
+            // the empty commitment above — the folded root depends on the depth.
+            "31d48bcbe2eebb3a23664f77e4899a974ef8ed9d8aa9ec1573e3b3c00d77dbb1",
         );
         // Deterministic and distinct.
         assert_eq!(one.commitment(), one.clone().commitment());
@@ -967,63 +986,68 @@ mod anchor_horizon_tests {
     }
 }
 
-/// **Audit PQV2-04** — the depth-20 commitment tree's exhaustion economics.
+/// **Audit PQV2-04** — the depth-32 commitment tree's exhaustion economics.
 ///
 /// The boundary half of PQV2-04 (a `root()` that returned the empty-tree root
-/// at exactly `2^20`) is fixed by capping usable capacity at [`MAX_V2_NOTES`]
-/// = `2^20 - 1` and is pinned by the boundary tests above (including the
-/// release-only `frontier_matches_the_reference_tree_at_full_capacity`, which
-/// fills the real tree and pins its root against the reference at capacity).
+/// at exactly `2^depth`) is fixed by capping usable capacity at [`MAX_V2_NOTES`]
+/// = `2^32 - 1` and is pinned by the boundary tests above (the always-run
+/// `capacity_boundary_is_exact_for_real_appends_at_the_real_depth` and
+/// `a_state_at_full_capacity_never_reports_the_empty_root`, which prove the
+/// boundary algebraically since a literal `2^32` fill is infeasible, plus the
+/// exhaustive small-depth `frontier_is_exact_below_capacity_…`).
 ///
-/// These tests pin the *economic* half: the FLOOR on what filling the tree
-/// costs, in fees and in wall-clock, and the honest record that depth-20 is a
-/// prototype capacity below the lifetime horizon (see
-/// [`HORIZON_SAFE_TREE_DEPTH`](crate::tree::HORIZON_SAFE_TREE_DEPTH)).
+/// The capacity half of PQV2-04 — depth-20's exhaustibility — is now CLOSED:
+/// the tree is the horizon-safe depth 32
+/// ([`HORIZON_SAFE_TREE_DEPTH`](crate::tree::HORIZON_SAFE_TREE_DEPTH)). These
+/// tests pin the new economics: filling the tree now takes *decades* of
+/// sustained blockspace dominance, and the shipped depth meets the derived
+/// lifetime requirement rather than falling short of it.
 #[cfg(test)]
 mod exhaustion_tests {
     use super::*;
     use crate::tree::{HORIZON_SAFE_TREE_DEPTH, MAX_TREE_LEAVES, TREE_DEPTH};
 
-    /// Filling the tree requires sustaining a saturated block for far longer
-    /// than any confirmation horizon — the RATE floor. Block weight caps a
-    /// block at [`MAX_V2_COMMITMENTS_PER_BLOCK`] commitments, so filling the
-    /// `2^20 - 1` usable leaves takes thousands of consecutive blocks the
-    /// attacker must WIN in the blockspace auction against all other traffic.
+    /// Filling the depth-32 tree requires sustaining saturated blocks for
+    /// DECADES — the RATE floor, now horizon-safe. Block weight caps a block at
+    /// [`MAX_V2_COMMITMENTS_PER_BLOCK`] commitments, so filling the `2^32 - 1`
+    /// usable leaves takes tens of millions of consecutive blocks the attacker
+    /// must WIN in the blockspace auction against all other traffic.
     #[test]
-    fn filling_the_tree_takes_thousands_of_saturated_blocks() {
+    fn filling_the_tree_takes_decades_of_saturated_blocks() {
         let blocks_to_fill = MAX_V2_NOTES.div_ceil(MAX_V2_COMMITMENTS_PER_BLOCK as u64);
-        // ceil(1,048,575 / 160) = 6,554 blocks.
-        assert_eq!(blocks_to_fill, 6_554);
-        // At the 2.5-minute (150 s) target that is ~11.4 days of EVERY block
-        // maxed out with the attacker's bundles.
+        // ceil((2^32 - 1) / 160) = 26,843,546 blocks.
+        assert_eq!(blocks_to_fill, 26_843_546);
+        // At the 2.5-minute (150 s) target that is ~127 years of EVERY block
+        // maxed out with the attacker's bundles — beyond any practical horizon.
         let seconds = blocks_to_fill * 150;
-        assert!(seconds > 10 * 24 * 3600, "at least ten days of saturation");
-        // And orders of magnitude beyond the anchor-retention horizon, so an
-        // attack long enough to fill the tree is not remotely cheap to sustain.
+        assert!(
+            seconds > 100 * 365 * 24 * 3600,
+            "at least a century of saturation"
+        );
+        // And orders of magnitude beyond the anchor-retention horizon.
         assert!(blocks_to_fill > (ANCHOR_HORIZON_BLOCKS as u64) * 40);
     }
 
-    /// Depth-20 is a documented prototype shortfall: its capacity is below the
-    /// lifetime horizon a horizon-safe tree must cover, and closing the gap is
-    /// a STARK spend-circuit change (raising [`TREE_DEPTH`]), NOT shipped here.
-    /// This pins the gap so arming bit 2 cannot silently ship the prototype
-    /// depth — the horizon-safe depth is strictly larger, by construction.
+    /// The shipped depth IS the horizon-safe depth (audit PQV2-04 resolved):
+    /// capacity meets or exceeds the ~20-year lifetime requirement, so the tree
+    /// cannot be exhausted within the asset's intended lifetime. The former
+    /// "prototype shortfall" (depth 20, exhaustible in ~11 days) is gone.
     #[test]
-    fn depth_20_is_a_documented_prototype_shortfall_pending_a_circuit_upgrade() {
+    fn depth_meets_the_lifetime_horizon_requirement() {
         // ~20 years of blocks at the 2.5-minute target.
         const HORIZON_BLOCKS: u64 = 20 * 365 * 24 * 3600 / 150;
         let horizon_leaves = (MAX_V2_COMMITMENTS_PER_BLOCK as u64) * HORIZON_BLOCKS;
         // Depth needed to hold the horizon's worth of leaves.
         let required_depth = (u64::BITS - (horizon_leaves - 1).leading_zeros()) as usize;
-        // The chosen constant covers the derived requirement with headroom
-        // (Orchard-parity depth 32 vs a ~30 requirement).
-        assert!(required_depth <= HORIZON_SAFE_TREE_DEPTH);
-        // The shipped depth is knowingly below it — this is the prototype limit.
-        const { assert!(TREE_DEPTH < HORIZON_SAFE_TREE_DEPTH) };
+        // The shipped depth covers the derived requirement with headroom
+        // (depth 32 = 4.29e9 leaves vs a ~30-bit / 6.7e8-leaf requirement).
+        assert!(required_depth <= TREE_DEPTH);
+        // The shipped depth IS the horizon-safe depth — no gap remains.
+        const { assert!(TREE_DEPTH == HORIZON_SAFE_TREE_DEPTH) };
         assert!(
-            (MAX_TREE_LEAVES as u128) < (horizon_leaves as u128),
-            "depth-20 capacity is below the lifetime horizon — a known prototype limit \
-             gating activation until the tree is deepened (a re-audited circuit change)"
+            (MAX_TREE_LEAVES as u128) >= (horizon_leaves as u128),
+            "depth-32 capacity meets or exceeds the lifetime horizon — the tree \
+             cannot be exhausted within the asset's intended lifetime"
         );
     }
 }
