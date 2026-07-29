@@ -2233,6 +2233,14 @@ impl Blockchain {
     /// the final state root ONCE via `replayed_state_matches_head`. This is for local
     /// replay only — network blocks always go through the fully-verified `import_block`.
     pub fn extend_trusted(&mut self, block: Block) -> Result<(), ChainError> {
+        self.extend_trusted_inner(block, true)
+    }
+
+    /// Trusted replay implementation. Historical blocks older than the bounded reorg
+    /// window do not need an undo journal: recording one only to evict it immediately
+    /// creates substantial allocator churn on a long chain. Snapshot gaps and the final
+    /// [`REORG_UNDO_WINDOW`] blocks pass `capture_undo = true`.
+    fn extend_trusted_inner(&mut self, block: Block, capture_undo: bool) -> Result<(), ChainError> {
         if block.header.prev_hash != self.head {
             return Err(ChainError::PrevHashMismatch); // not a sequential extend
         }
@@ -2256,17 +2264,24 @@ impl Blockchain {
         // apply, then retain that undo log for shallow reorgs after trusted replay.
         // (Borrow-safe — `self` is only read while `self.ledger` is a local.)
         let mut ledger = std::mem::take(&mut self.ledger);
-        ledger.begin_undo();
+        if capture_undo {
+            ledger.begin_undo();
+        }
         let receipts = match self.execute_block_on(&mut ledger, &block, sha_target, &self.signals) {
             Ok(r) => r,
             Err(e) => {
-                let undo = ledger.take_undo();
-                ledger.apply_undo(undo);
-                self.ledger = ledger; // restore before bailing
+                if capture_undo {
+                    let undo = ledger.take_undo();
+                    ledger.apply_undo(undo);
+                }
+                // Put the ledger back before bailing. The public path captured undo and
+                // restored it; an old unjournaled replay prefix is discarded by its
+                // caller on error together with the failed replay chain.
+                self.ledger = ledger;
                 return Err(e);
             }
         };
-        let undo = ledger.take_undo();
+        let undo = capture_undo.then(|| ledger.take_undo());
         self.ledger = ledger;
 
         let cand = Candidate {
@@ -2278,7 +2293,9 @@ impl Blockchain {
             .record(block.header.height, block.header.version_bits);
         self.blocks.push(block.clone());
         self.head = block_hash;
-        self.remember_undo(height, block_hash, undo);
+        if let Some(undo) = undo {
+            self.remember_undo(height, block_hash, undo);
+        }
         self.index_block_receipts(height, &receipts);
         self.insert_entry(block, &cand);
         self.sync_active_difficulty();
@@ -2311,9 +2328,10 @@ impl Blockchain {
         }
         let chain = self.heaviest_chain(blocks);
         let total = chain.len() as u64;
+        let undo_start = total.saturating_sub(REORG_UNDO_WINDOW as u64);
         progress(0, total);
         for (i, block) in chain.into_iter().enumerate() {
-            self.extend_trusted(block)?;
+            self.extend_trusted_inner(block, i as u64 >= undo_start)?;
             let done = i as u64 + 1;
             if done % 128 == 0 || done == total {
                 progress(done, total);
