@@ -1186,11 +1186,12 @@ const SNAPSHOT_EVERY_BLOCKS: u64 = 50;
 /// with a different version, a bad checksum, or any decode error is simply IGNORED —
 /// the node falls back to replaying the (authoritative) block log — so this never
 /// blocks a boot or risks mis-loading state.
-const SNAPSHOT_VERSION: u32 = 1;
+const SNAPSHOT_VERSION: u32 = 2;
 
 /// Serialize a chainstate snapshot of `chain` to a checksummed byte blob:
 /// `[checksum: 32-byte BLAKE3 of payload][payload]`, where the payload is Borsh
-/// `(version, head_hash, head_height, head_state_root, ledger_bytes, active_receipts)`.
+/// `(version, head_hash, head_height, head_state_root, ledger_bytes, active_receipts,
+/// recent_undo_logs)`.
 /// Cheap (no I/O) so it can be produced under a brief node lock; pair with
 /// [`write_snapshot_bytes`], which does the (off-lock) durable write.
 fn snapshot_bytes(chain: &Blockchain) -> Vec<u8> {
@@ -1202,6 +1203,7 @@ fn snapshot_bytes(chain: &Blockchain) -> Vec<u8> {
         head.header.state_root,
         chain.ledger().to_snapshot_bytes(),
         chain.active_receipts_snapshot(),
+        chain.undo_snapshot(),
     ))
     .expect("snapshot serialization is infallible");
     let checksum = Hash::digest(&payload);
@@ -1226,11 +1228,19 @@ fn write_snapshot_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Read + integrity-check a snapshot written by [`snapshot_bytes`], returning the
-/// resume inputs `(ledger, active_receipts, head_hash, head_height)`. `None` on
+/// resume inputs `(ledger, active_receipts, undo_logs, head_hash, head_height)`. `None` on
 /// absence, a short file, a bad checksum, a version mismatch, or any decode error —
 /// the caller then replays the log.
 #[allow(clippy::type_complexity)]
-fn load_snapshot(path: &Path) -> Option<(Ledger, Vec<(u64, Vec<Receipt>)>, Hash, u64)> {
+fn load_snapshot(
+    path: &Path,
+) -> Option<(
+    Ledger,
+    Vec<(u64, Vec<Receipt>)>,
+    Vec<(u64, Hash, sov_state::UndoLog)>,
+    Hash,
+    u64,
+)> {
     let bytes = fs::read(path).ok()?;
     if bytes.len() < Hash::LEN {
         return None;
@@ -1239,19 +1249,20 @@ fn load_snapshot(path: &Path) -> Option<(Ledger, Vec<(u64, Vec<Receipt>)>, Hash,
     if Hash::digest(payload).as_bytes() != checksum {
         return None; // corrupt / torn snapshot — ignore, replay the log
     }
-    let (version, head_hash, head_height, _state_root, ledger_bytes, active_receipts): (
+    let (version, head_hash, head_height, _state_root, ledger_bytes, active_receipts, undo_logs): (
         u32,
         Hash,
         u64,
         Hash,
         Vec<u8>,
         Vec<(u64, Vec<Receipt>)>,
+        Vec<(u64, Hash, sov_state::UndoLog)>,
     ) = borsh::from_slice(payload).ok()?;
     if version != SNAPSHOT_VERSION {
         return None;
     }
     let ledger = Ledger::from_snapshot_bytes(&ledger_bytes).ok()?;
-    Some((ledger, active_receipts, head_hash, head_height))
+    Some((ledger, active_receipts, undo_logs, head_hash, head_height))
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -1541,8 +1552,8 @@ impl Daemon {
         // the daemon could never boot from its own log.
         let mut chain = genesis_chain_with_baked_preset(genesis)?;
         let resumed_fast = match load_snapshot(&snap_path) {
-            Some((ledger, receipts, head, height)) => chain
-                .resume_from_snapshot(ledger, receipts, head, height, &persisted)
+            Some((ledger, receipts, undo_logs, head, height)) => chain
+                .resume_from_snapshot(ledger, receipts, undo_logs, head, height, &persisted)
                 .unwrap_or(false),
             None => false,
         };
@@ -3398,9 +3409,11 @@ mod tests {
 
         let path = tmp_path("snap");
         write_snapshot_bytes(&path, &snapshot_bytes(&chain)).unwrap();
-        let (_ledger, _receipts, head, height) = load_snapshot(&path).expect("snapshot loads");
+        let (_ledger, _receipts, undo_logs, head, height) =
+            load_snapshot(&path).expect("snapshot loads");
         assert_eq!(head, chain.head().hash());
         assert_eq!(height, chain.height());
+        assert_eq!(undo_logs.len(), chain.height() as usize);
 
         // Flip a byte in the payload — the checksum must reject it.
         let mut raw = fs::read(&path).unwrap();

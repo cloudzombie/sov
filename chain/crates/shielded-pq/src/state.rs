@@ -31,10 +31,12 @@
 //! pure function of the state.
 
 use std::collections::{BTreeSet, VecDeque};
+use std::io;
 
 use crate::domains::RESCUE_DOMAIN_MERKLE_NODE;
 use crate::hash::{merge_domain, PqDigest};
 use crate::tree::{empty_levels, MAX_TREE_LEAVES, TREE_DEPTH};
+use borsh::{BorshDeserialize, BorshSerialize};
 
 /// Worst-case pool-v2 note commitments a single block can contain.
 ///
@@ -181,6 +183,24 @@ pub struct ShieldedV2State {
     /// exposes only the root), which `sov-state` persistence relies on. Same
     /// pattern as pool v1.
     commitments: Vec<[u8; 32]>,
+}
+
+// Operational encoding used when this state appears inside a node's recent-block
+// undo journal. Persist the compact canonical snapshot and rebuild the derived
+// frontier/anchor ring on decode. Blocks and consensus commitments never use this.
+impl BorshSerialize for ShieldedV2State {
+    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        BorshSerialize::serialize(&self.snapshot(), writer)
+    }
+}
+
+impl BorshDeserialize for ShieldedV2State {
+    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+        let (commitments, nullifiers) =
+            <(Vec<[u8; 32]>, Vec<[u8; 32]>)>::deserialize_reader(reader)?;
+        Self::restore(&commitments, &nullifiers)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
 }
 
 impl Default for ShieldedV2State {
@@ -416,6 +436,16 @@ mod tests {
     /// A distinct, canonical, nonzero digest per index.
     fn d(n: u64) -> PqDigest {
         digest_from_bytes(crate::domains::B3_TEST, &n.to_le_bytes())
+    }
+
+    #[test]
+    fn operational_borsh_encoding_round_trips() {
+        let mut state = ShieldedV2State::new();
+        state.append_commitment(d(1)).unwrap();
+        let bytes = borsh::to_vec(&state).unwrap();
+        let decoded: ShieldedV2State = borsh::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, state);
+        assert_eq!(decoded.commitment(), state.commitment());
     }
 
     /// Empty-subtree digests for an arbitrary depth (level 0 = leaf).

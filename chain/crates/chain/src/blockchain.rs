@@ -148,8 +148,10 @@ pub struct Blockchain {
     /// newest at the back). A reorg DISCONNECTS through these in O(reorg depth) instead
     /// of replaying the chain from genesis; a reorg whose fork point is older than the
     /// window (an extraordinarily deep partition heal) falls back to the full genesis
-    /// replay. In-memory, transient, and derived from execution — it changes no block
-    /// hash, state root, or wire encoding, so the genesis KAT is unaffected.
+    /// replay. Operational and derived from execution; persisted only in the node's
+    /// checksummed chainstate snapshot so a restarted node keeps shallow-reorg
+    /// capability. It changes no block hash, state root, or wire encoding, so the
+    /// genesis KAT is unaffected.
     undo_ring: VecDeque<(u64, Hash, UndoLog)>,
 }
 
@@ -2231,6 +2233,14 @@ impl Blockchain {
     /// the final state root ONCE via `replayed_state_matches_head`. This is for local
     /// replay only — network blocks always go through the fully-verified `import_block`.
     pub fn extend_trusted(&mut self, block: Block) -> Result<(), ChainError> {
+        self.extend_trusted_inner(block, true)
+    }
+
+    /// Trusted replay implementation. Historical blocks older than the bounded reorg
+    /// window do not need an undo journal: recording one only to evict it immediately
+    /// creates substantial allocator churn on a long chain. Snapshot gaps and the final
+    /// [`REORG_UNDO_WINDOW`] blocks pass `capture_undo = true`.
+    fn extend_trusted_inner(&mut self, block: Block, capture_undo: bool) -> Result<(), ChainError> {
         if block.header.prev_hash != self.head {
             return Err(ChainError::PrevHashMismatch); // not a sequential extend
         }
@@ -2250,16 +2260,28 @@ impl Blockchain {
             .chain_work;
         let new_work = parent_work.saturating_add(Work::of_target(&sha_target));
 
-        // Execute on the live ledger with no clone: move it out, apply, move back.
+        // Execute on the live ledger with no clone: move it out, journal every write,
+        // apply, then retain that undo log for shallow reorgs after trusted replay.
         // (Borrow-safe — `self` is only read while `self.ledger` is a local.)
         let mut ledger = std::mem::take(&mut self.ledger);
+        if capture_undo {
+            ledger.begin_undo();
+        }
         let receipts = match self.execute_block_on(&mut ledger, &block, sha_target, &self.signals) {
             Ok(r) => r,
             Err(e) => {
-                self.ledger = ledger; // restore before bailing
+                if capture_undo {
+                    let undo = ledger.take_undo();
+                    ledger.apply_undo(undo);
+                }
+                // Put the ledger back before bailing. The public path captured undo and
+                // restored it; an old unjournaled replay prefix is discarded by its
+                // caller on error together with the failed replay chain.
+                self.ledger = ledger;
                 return Err(e);
             }
         };
+        let undo = capture_undo.then(|| ledger.take_undo());
         self.ledger = ledger;
 
         let cand = Candidate {
@@ -2271,6 +2293,9 @@ impl Blockchain {
             .record(block.header.height, block.header.version_bits);
         self.blocks.push(block.clone());
         self.head = block_hash;
+        if let Some(undo) = undo {
+            self.remember_undo(height, block_hash, undo);
+        }
         self.index_block_receipts(height, &receipts);
         self.insert_entry(block, &cand);
         self.sync_active_difficulty();
@@ -2303,9 +2328,10 @@ impl Blockchain {
         }
         let chain = self.heaviest_chain(blocks);
         let total = chain.len() as u64;
+        let undo_start = total.saturating_sub(REORG_UNDO_WINDOW as u64);
         progress(0, total);
         for (i, block) in chain.into_iter().enumerate() {
-            self.extend_trusted(block)?;
+            self.extend_trusted_inner(block, i as u64 >= undo_start)?;
             let done = i as u64 + 1;
             if done % 128 == 0 || done == total {
                 progress(done, total);
@@ -2350,6 +2376,13 @@ impl Blockchain {
             .collect()
     }
 
+    /// The recent active-chain undo window for the node's operational chainstate
+    /// snapshot. This is not consensus data; it lets a fast-resumed node immediately
+    /// handle a shallow competing fork without replaying from genesis.
+    pub fn undo_snapshot(&self) -> Vec<(u64, Hash, UndoLog)> {
+        self.undo_ring.iter().cloned().collect()
+    }
+
     /// **Fast-resume from a trusted local chainstate snapshot** instead of replaying
     /// every block. The snapshot is the ledger + active receipt index at some height
     /// `snapshot_height` (identified by `snapshot_head`) on the chain. This:
@@ -2374,6 +2407,7 @@ impl Blockchain {
         &mut self,
         ledger: Ledger,
         active_receipts: Vec<(u64, Vec<Receipt>)>,
+        undo_logs: Vec<(u64, Hash, UndoLog)>,
         snapshot_head: Hash,
         snapshot_height: u64,
         log: &[Block],
@@ -2426,6 +2460,33 @@ impl Blockchain {
         if !self.replayed_state_matches_head() {
             return Ok(false);
         }
+        // Restore and independently validate the complete recent undo window. The
+        // snapshot checksum detects torn/corrupt writes; walking the logs backward and
+        // matching every committed state root proves the operational journal actually
+        // describes this active chain. Missing history is rejected so a restart never
+        // silently loses its shallow-reorg capability.
+        let expected_undo_len = usize::try_from(snapshot_height)
+            .unwrap_or(usize::MAX)
+            .min(REORG_UNDO_WINDOW);
+        if undo_logs.len() != expected_undo_len {
+            return Ok(false);
+        }
+        let first_undo_height = snapshot_height - expected_undo_len as u64 + 1;
+        for (offset, (height, hash, _)) in undo_logs.iter().enumerate() {
+            let expected_height = first_undo_height + offset as u64;
+            if *height != expected_height || self.blocks[*height as usize].hash() != *hash {
+                return Ok(false);
+            }
+        }
+        let mut before_snapshot = self.ledger.clone();
+        for (height, _, undo) in undo_logs.iter().rev() {
+            before_snapshot.apply_undo(undo.clone());
+            let parent = &self.blocks[(*height - 1) as usize];
+            if before_snapshot.state_root() != parent.header.state_root {
+                return Ok(false);
+            }
+        }
+        self.undo_ring = undo_logs.into();
         // Phase 2 — trusted replay (with execution) of any blocks after the snapshot
         // up to the heaviest tip. Bounded by how far the snapshot lags, not by length.
         for block in chain.into_iter().skip(snapshot_height as usize) {
@@ -2511,6 +2572,7 @@ impl Blockchain {
     /// Defense in depth behind the state-root check: even an execution bug that
     /// produced a self-consistent-but-wrong root cannot make the math diverge,
     /// because the chain refuses to commit such a block.
+    #[cfg(test)]
     fn verify_invariants(
         &self,
         before: &Ledger,
@@ -2802,7 +2864,7 @@ impl Blockchain {
         for b in ancestors {
             let entry = self.index.get(&b.hash()).expect("ancestor is indexed");
             let sha_target = entry.sha_target;
-            let before = ledger.clone();
+            let pre = sov_verify::TransitionPre::capture(&ledger)?;
             let receipts = self.execute_block_on(&mut ledger, b, sha_target, &signals)?;
             if ledger.state_root() != b.header.state_root {
                 return Err(ChainError::StateRootMismatch);
@@ -2810,14 +2872,15 @@ impl Blockchain {
             if receipts_root(&receipts) != b.header.receipts_root {
                 return Err(ChainError::ReceiptsRootMismatch);
             }
-            self.verify_invariants(&before, &ledger, sha_target)?;
+            sov_verify::check_transition_pre(&pre, &ledger)?;
+            sov_verify::check_ledger(&ledger, &self.policy_with(sha_target))?;
             signals.record(b.header.height, b.header.version_bits);
             branch_receipts.push((b.header.height.get(), receipts));
             active_blocks.push(b.clone());
         }
 
         // Finally the tip itself, with its freshly-derived target.
-        let before_tip = ledger.clone();
+        let pre_tip = sov_verify::TransitionPre::capture(&ledger)?;
         let tip_receipts = self.execute_block_on(&mut ledger, tip, cand.sha_target, &signals)?;
         if ledger.state_root() != tip.header.state_root {
             return Err(ChainError::StateRootMismatch);
@@ -2825,7 +2888,8 @@ impl Blockchain {
         if receipts_root(&tip_receipts) != tip.header.receipts_root {
             return Err(ChainError::ReceiptsRootMismatch);
         }
-        self.verify_invariants(&before_tip, &ledger, cand.sha_target)?;
+        sov_verify::check_transition_pre(&pre_tip, &ledger)?;
+        sov_verify::check_ledger(&ledger, &self.policy_with(cand.sha_target))?;
         signals.record(tip.header.height, tip.header.version_bits);
         branch_receipts.push((tip.header.height.get(), tip_receipts.clone()));
         active_blocks.push(tip.clone());
@@ -5666,10 +5730,18 @@ mod tests {
 
         let ledger = Ledger::from_snapshot_bytes(&chain.ledger().to_snapshot_bytes()).unwrap();
         let receipts = chain.active_receipts_snapshot();
+        let undos = chain.undo_snapshot();
 
         let mut resumed = fresh_chain();
         let ok = resumed
-            .resume_from_snapshot(ledger, receipts, tip.hash(), tip.header.height.get(), &log)
+            .resume_from_snapshot(
+                ledger,
+                receipts,
+                undos,
+                tip.hash(),
+                tip.header.height.get(),
+                &log,
+            )
             .unwrap();
         assert!(ok, "snapshot resume verified against the committed head");
         assert_eq!(resumed.height(), chain.height());
@@ -5694,6 +5766,7 @@ mod tests {
         let snap_height = chain.height();
         let snap_ledger = Ledger::from_snapshot_bytes(&chain.ledger().to_snapshot_bytes()).unwrap();
         let snap_receipts = chain.active_receipts_snapshot();
+        let snap_undos = chain.undo_snapshot();
         // ...then mine 5 more (the gap the resume must replay).
         mine_blocks(&mut chain, 5);
         assert_eq!(chain.height(), 9);
@@ -5701,7 +5774,14 @@ mod tests {
 
         let mut resumed = fresh_chain();
         let ok = resumed
-            .resume_from_snapshot(snap_ledger, snap_receipts, snap_head, snap_height, &log)
+            .resume_from_snapshot(
+                snap_ledger,
+                snap_receipts,
+                snap_undos,
+                snap_head,
+                snap_height,
+                &log,
+            )
             .unwrap();
         assert!(ok);
         assert_eq!(resumed.height(), 9);
@@ -5718,13 +5798,14 @@ mod tests {
         mine_blocks(&mut chain, 5);
         let ledger = Ledger::from_snapshot_bytes(&chain.ledger().to_snapshot_bytes()).unwrap();
         let receipts = chain.active_receipts_snapshot();
+        let undos = chain.undo_snapshot();
         let snap_head = chain.head().hash();
 
         // Present only the first 3 blocks of the log, but claim a height-5 snapshot.
         let short_log: Vec<Block> = active_log(&chain).into_iter().take(3).collect();
         let mut resumed = fresh_chain();
         let ok = resumed
-            .resume_from_snapshot(ledger, receipts, snap_head, 5, &short_log)
+            .resume_from_snapshot(ledger, receipts, undos, snap_head, 5, &short_log)
             .unwrap();
         assert!(
             !ok,
@@ -5740,13 +5821,109 @@ mod tests {
         mine_blocks(&mut chain, 5);
         let ledger = Ledger::from_snapshot_bytes(&chain.ledger().to_snapshot_bytes()).unwrap();
         let receipts = chain.active_receipts_snapshot();
+        let undos = chain.undo_snapshot();
         let log = active_log(&chain);
 
         let mut resumed = fresh_chain();
         let ok = resumed
-            .resume_from_snapshot(ledger, receipts, Hash::digest(b"wrong head"), 5, &log)
+            .resume_from_snapshot(
+                ledger,
+                receipts,
+                undos,
+                Hash::digest(b"wrong head"),
+                5,
+                &log,
+            )
             .unwrap();
         assert!(!ok, "a snapshot head off the heaviest chain is rejected");
+    }
+
+    #[test]
+    fn snapshot_resume_rejects_missing_undo_history() {
+        let mut chain = fresh_chain();
+        mine_blocks(&mut chain, 5);
+        let ledger = Ledger::from_snapshot_bytes(&chain.ledger().to_snapshot_bytes()).unwrap();
+        let receipts = chain.active_receipts_snapshot();
+        let log = active_log(&chain);
+
+        let mut resumed = fresh_chain();
+        let ok = resumed
+            .resume_from_snapshot(
+                ledger,
+                receipts,
+                Vec::new(),
+                chain.head().hash(),
+                chain.height(),
+                &log,
+            )
+            .unwrap();
+        assert!(
+            !ok,
+            "a snapshot without the required undo window falls back to trusted replay"
+        );
+    }
+
+    #[test]
+    fn trusted_replay_rebuilds_the_undo_window() {
+        let mut chain = fresh_chain();
+        mine_blocks(&mut chain, 6);
+        let log = active_log(&chain);
+
+        let mut replayed = fresh_chain();
+        assert!(replayed.replay_log_trusted(&log, &mut |_, _| {}).unwrap());
+        assert_eq!(replayed.undo_ring.len(), 6);
+        assert_eq!(
+            replayed
+                .undo_ring
+                .back()
+                .map(|(height, hash, _)| (*height, *hash)),
+            Some((chain.height(), chain.head().hash()))
+        );
+    }
+
+    #[test]
+    fn snapshot_resumed_chain_handles_a_shallow_reorg() {
+        // Reproduce the production failure mode: resume A from a tip snapshot, then
+        // learn about a competing B branch one block behind. A valid restored undo
+        // window must let the node disconnect A5 and adopt B5-B6 incrementally.
+        let mut branch_a = fresh_chain();
+        mine_blocks(&mut branch_a, 4);
+        let shared = active_log(&branch_a);
+
+        let mut branch_b = fresh_chain();
+        for block in &shared {
+            branch_b.import_block(block.clone()).unwrap();
+        }
+
+        let a5 = branch_a.produce_block(vec![], 7_000).unwrap();
+        branch_a.import_block(a5).unwrap();
+        let a_log = active_log(&branch_a);
+        let ledger = Ledger::from_snapshot_bytes(&branch_a.ledger().to_snapshot_bytes()).unwrap();
+
+        let mut resumed = fresh_chain();
+        assert!(resumed
+            .resume_from_snapshot(
+                ledger,
+                branch_a.active_receipts_snapshot(),
+                branch_a.undo_snapshot(),
+                branch_a.head().hash(),
+                branch_a.height(),
+                &a_log,
+            )
+            .unwrap());
+
+        let b5 = branch_b.produce_block(vec![], 7_500).unwrap();
+        branch_b.import_block(b5.clone()).unwrap();
+        let b6 = branch_b.produce_block(vec![], 8_500).unwrap();
+        branch_b.import_block(b6.clone()).unwrap();
+
+        resumed.import_block(b5).unwrap();
+        resumed.import_block(b6).unwrap();
+        assert_eq!(resumed.head().hash(), branch_b.head().hash());
+        assert_eq!(
+            resumed.ledger().state_root(),
+            branch_b.ledger().state_root()
+        );
     }
 }
 
