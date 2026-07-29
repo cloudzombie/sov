@@ -18,7 +18,9 @@
 //! reads the root, which is all [`Frontier`] provides.
 
 use std::collections::BTreeSet;
+use std::io;
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use incrementalmerkletree::frontier::Frontier;
 use orchard::note::{ExtractedNoteCommitment, Nullifier};
 use orchard::tree::{Anchor, MerkleHashOrchard};
@@ -45,6 +47,25 @@ pub struct ShieldedState {
     /// faithfully reconstructed (the `Frontier` exposes only the root, not its
     /// leaves), which `Ledger` persistence relies on.
     commitments: Vec<[u8; 32]>,
+}
+
+// Operational encoding used when this state appears inside a node's recent-block
+// undo journal. The authoritative representation is the same compact snapshot the
+// ledger already persists; the Merkle frontier and anchor history are deterministically
+// rebuilt on decode. This encoding is not used by blocks or the consensus state root.
+impl BorshSerialize for ShieldedState {
+    fn serialize<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        BorshSerialize::serialize(&self.snapshot(), writer)
+    }
+}
+
+impl BorshDeserialize for ShieldedState {
+    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+        let (commitments, nullifiers) =
+            <(Vec<[u8; 32]>, Vec<[u8; 32]>)>::deserialize_reader(reader)?;
+        Self::restore(&commitments, &nullifiers)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
 }
 
 impl Default for ShieldedState {
@@ -210,6 +231,16 @@ mod tests {
         bytes[0] = 1;
         bytes[1] = n;
         Option::from(ExtractedNoteCommitment::from_bytes(&bytes)).expect("valid field element")
+    }
+
+    #[test]
+    fn operational_borsh_encoding_round_trips() {
+        let mut state = ShieldedState::new();
+        state.add_commitment(&cmx(1)).unwrap();
+        let bytes = borsh::to_vec(&state).unwrap();
+        let decoded: ShieldedState = borsh::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.snapshot(), state.snapshot());
+        assert_eq!(decoded.commitment(), state.commitment());
     }
 
     fn nf(n: u8) -> Nullifier {

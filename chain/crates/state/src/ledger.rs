@@ -259,9 +259,10 @@ pub struct Htlc {
 /// field write — enough to restore that field exactly. Applying a block's ops in
 /// reverse order returns the ledger to its pre-block state bit-for-bit (same
 /// `state_root`), which is what lets a reorg DISCONNECT blocks in O(reorg depth)
-/// instead of replaying the whole chain from genesis. The log is in-memory and
-/// transient (never serialized, never part of the state root).
-#[derive(Clone)]
+/// instead of replaying the whole chain from genesis. The log is operational
+/// chainstate: it is serialized only into the node's checksummed fast-start
+/// snapshot and is never part of the consensus state root or block encoding.
+#[derive(Clone, BorshSerialize, BorshDeserialize)]
 enum UndoOp {
     // `Account` is boxed because it carries the ~2 KB hybrid post-quantum public key;
     // keeping it off the inline enum keeps every journal entry small.
@@ -302,7 +303,7 @@ enum UndoOp {
 
 /// A captured undo log for one block — replay it with [`Ledger::apply_undo`] to
 /// disconnect that block. Ordered as the writes happened; applied in reverse.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, BorshSerialize, BorshDeserialize)]
 pub struct UndoLog(Vec<UndoOp>);
 
 impl UndoLog {
@@ -730,8 +731,8 @@ impl Ledger {
 
     /// Start recording an undo log for the block about to be applied: every state
     /// write now captures its pre-image. Pair with [`take_undo`](Ledger::take_undo)
-    /// once the block has executed. Off by default, so boot replay and query-only
-    /// ledgers pay nothing.
+    /// once the block has executed. Off by default, so query-only ledgers pay
+    /// nothing; trusted replay enables it only for the bounded recent reorg window.
     pub fn begin_undo(&mut self) {
         self.undo = Some(Vec::new());
     }
