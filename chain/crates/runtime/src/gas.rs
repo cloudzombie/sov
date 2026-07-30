@@ -137,6 +137,22 @@ pub fn gas_for(action: &Action) -> u64 {
             };
             g.saturating_add(BOOKKEEPING_GAS)
         }
+        // A bounded creation-time envelope: the inner action's own gas plus one
+        // bookkeeping unit for the extra 8 declared bytes and the two bound
+        // comparisons. Recurse at MOST one level — mirroring the `Tipped` and
+        // `MultisigExec` guards above — so a maliciously deep-nested
+        // `Timestamped{Timestamped{…}}` can never blow the stack during gas
+        // estimation (which runs before the execution-layer reject). Nesting is
+        // rejected at execution anyway; here we only need a bounded, non-crashing
+        // price. Not free, so wrapping is never a way to buy blockspace cheaply.
+        Action::Timestamped { inner, .. } => {
+            let g = if matches!(**inner, Action::Timestamped { .. }) {
+                INTRINSIC_GAS
+            } else {
+                gas_for(inner)
+            };
+            g.saturating_add(BOOKKEEPING_GAS)
+        }
         // Pool v2 (post-quantum shielded): pays for STARK proof verification
         // plus its (large, ~40-62 KB) bundle bytes priced like calldata. NOT
         // yet consensus-live: execution hard-rejects `ShieldedV2` as

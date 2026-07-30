@@ -47,7 +47,11 @@
 //! `sov_getSupply` also reports shielded value + shielded % of supply.
 //! Receipts (the recorded outcome of a transaction, incl. the exact failure
 //! reason for an included-but-rejected tx): `sov_getReceipt` (by `txId`),
-//! `sov_getBlockReceipts` (by `height`). Shielded pool + de-shield drain-limiter
+//! `sov_getBlockReceipts` (by `height`), and `sov_getReceiptProof` (by `txId`,
+//! or by `height` + `index`) — a receipt plus its Merkle inclusion proof against
+//! the block's `receiptsRoot`, so a light client can verify a receipt (including
+//! its committed creation time) against a block header WITHOUT trusting the node
+//! that served it. Shielded pool + de-shield drain-limiter
 //! state: `sov_getShieldedInfo`; pool-v2 (post-quantum) state:
 //! `sov_getShieldedV2Info`, `sov_getShieldedV2Anchors`,
 //! `sov_shieldedV2NullifierSeen` — served even while the deployment is dormant,
@@ -988,6 +992,92 @@ fn call(
                 .map_or(Value::Null, |rs| {
                     json!(rs.iter().map(to_value).collect::<Vec<_>>())
                 }))
+        }
+        "sov_getReceiptProof" => {
+            // A receipt PLUS a Merkle inclusion proof against the containing
+            // block's `receiptsRoot` — the endpoint that makes a receipt
+            // checkable WITHOUT trusting this node.
+            //
+            // A light client that has the block header (from any source it
+            // trusts — a checkpoint, a header chain it verified the PoW of)
+            // feeds `receipt` and `siblings` to
+            // `sov_types::verify_receipt_proof` and learns for itself that this
+            // node neither invented nor altered the receipt. Together with the
+            // committed `timing.created_at_ms` that yields a self-contained
+            // statement: "this transaction declared creation at T and was
+            // confirmed in a block timestamped T + waitedMs".
+            //
+            // Addressed either by `txId` (the common case) or by `height` +
+            // `index`. `null` when the transaction is not on the active chain,
+            // or the height/index does not exist — mirroring `sov_getReceipt`.
+            let (height, index) = match params.get("txId") {
+                Some(_) => {
+                    let tx_id = param_tx_id(params)?;
+                    match node.chain().receipt(&tx_id) {
+                        None => return Ok(Value::Null),
+                        Some((h, _)) => {
+                            // Position within the block, which is what the
+                            // Merkle path is built over.
+                            let idx = node
+                                .chain()
+                                .receipts_at_height(h)
+                                .and_then(|rs| rs.iter().position(|r| r.tx_id == tx_id));
+                            match idx {
+                                None => return Ok(Value::Null),
+                                Some(i) => (h, i),
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let h = params
+                        .get("height")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            RpcError::invalid_params(
+                            "missing string param `txId`, or integer params `height` and `index`",
+                        )
+                        })?;
+                    let i = params
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| RpcError::invalid_params("missing integer param `index`"))?;
+                    (h, i as usize)
+                }
+            };
+            let chain = node.chain();
+            let (Some(receipts), Some(block)) = (
+                chain.receipts_at_height(height),
+                chain.block_by_height(height),
+            ) else {
+                return Ok(Value::Null);
+            };
+            let (Some(receipt), Some(proof)) = (
+                receipts.get(index),
+                sov_types::receipt_proof(receipts, index),
+            ) else {
+                return Ok(Value::Null);
+            };
+            // `waitedMs` is DERIVED here purely as a convenience — it is
+            // `header.timestamp_ms - created_at_ms`, which any holder of the
+            // proof recomputes for itself. It is deliberately NOT committed:
+            // committing a pure function of two already-committed values would
+            // only add a second thing that could disagree. `null` for a receipt
+            // with no committed timing (every receipt below the `tx-timestamp`
+            // activation height).
+            let waited_ms = receipt
+                .timing
+                .map(|t| block.header.timestamp_ms.saturating_sub(t.created_at_ms));
+            Ok(json!({
+                "height": height,
+                "index": proof.index,
+                "receipt": to_value(receipt),
+                "siblings": to_value(&proof.siblings),
+                "receiptsRoot": to_value(block.header.receipts_root),
+                "blockHash": block.hash().to_hex(),
+                "timestampMs": block.header.timestamp_ms,
+                "waitedMs": waited_ms,
+            }))
         }
         "sov_getShieldedInfo" => {
             // The shielded pool's value plus the live de-shield drain-limiter state,

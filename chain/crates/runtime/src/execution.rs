@@ -38,6 +38,20 @@ pub struct BlockContext<'a> {
     pub height: u64,
     /// Hash of the parent block — the head this block extends.
     pub prev_hash: Hash,
+    /// The block's own header timestamp (Unix millis) — the producer's declared
+    /// wall clock, and the ONLY time reference the state transition may use.
+    ///
+    /// Consensus anchors the `tx-timestamp` bound check on this value rather
+    /// than on the executing node's clock, because the state transition must be
+    /// deterministic and replayable: a historical block must re-validate today
+    /// exactly as it did when it was mined. The producer sets it before
+    /// selection (`build_candidate_for`), and the importer reads it straight off
+    /// the header, so both evaluate the identical bound.
+    ///
+    /// It affects nothing until the `tx-timestamp` deployment is Active — no
+    /// other rule consults it — so adding it leaves every existing block, the
+    /// genesis hash, and every KAT vector unchanged.
+    pub block_time_ms: u64,
     /// The chain's mining difficulty and emission policy.
     pub mining: &'a MiningPolicy,
     /// Price charged per unit of gas, in grains (mirrors `mining.gas_price`).
@@ -86,6 +100,20 @@ pub struct BlockContext<'a> {
     /// limiter ([`crate::shielded_v2`]). Resolved per block height, so
     /// historical (pre-activation) blocks always validate under `false`.
     pub shielded_v2_active: bool,
+    /// Whether the miner-signaled `tx-timestamp` deployment (signal bit 3) is
+    /// `Active` at this block's height.
+    ///
+    /// While `false` (the pre-activation default), [`Action::Timestamped`] is a
+    /// HARD, block-invalidating [`ExecutionError::FeatureInactive`] wherever it
+    /// appears — top level or inside any carrier — so behavior is byte-identical
+    /// to a build without the envelope. When `true`, the envelope's declared
+    /// `created_at_ms` must fall inside the window
+    /// `[block_time_ms - TX_TIMESTAMP_MAX_AGE_MS,
+    ///   block_time_ms + TX_TIMESTAMP_FUTURE_TOLERANCE_MS]`
+    /// or the transaction is a hard reject, and its `inner` action then
+    /// executes. Resolved per block height, so historical (pre-activation)
+    /// blocks always validate under `false`.
+    pub tx_timestamp_active: bool,
     /// This chain's branch-independent identity — `{chain_id, genesis}` — used
     /// to bind a pool-v2 bundle's authorization to THIS network (audit
     /// PQV2-06). Unlike [`tx_domain`](Self::tx_domain), this is populated on
@@ -175,6 +203,49 @@ pub enum ExecutionError {
     /// invalid, so an illegal envelope can never be mined.
     #[error("fee-auction envelope: inner action may not be MultisigExec or RotateKey")]
     TipInnerNotAllowed,
+    /// A creation-time envelope appeared somewhere other than the OUTERMOST
+    /// position of the action tree (including nested inside another one). The
+    /// declared time describes the whole transaction, so exactly one may exist
+    /// and it must be on the outside; anything else is a hard, block-invalidating
+    /// error rather than a mineable `Failed` receipt.
+    #[error("creation-time envelopes may appear only as the outermost action, and never nested")]
+    MisplacedTimestamp,
+    /// A creation-time envelope wrapped an action whose authorization is
+    /// resolved from the TOP-LEVEL action (`MultisigExec` / `RotateKey`), which
+    /// wrapping would silently change. Mirrors the fee-auction envelope's guard,
+    /// and for the same reason: HARD, so an illegal envelope can never be mined.
+    #[error("creation-time envelope: inner action may not be MultisigExec or RotateKey")]
+    TimestampInnerNotAllowed,
+    /// The declared creation time is further ahead of the including block's
+    /// `timestamp_ms` than [`sov_types::TX_TIMESTAMP_FUTURE_TOLERANCE_MS`] — a
+    /// future-dated transaction. Hard reject: no partial effect, no receipt.
+    #[error(
+        "transaction declares creation time {created_at_ms} ms, more than {tolerance_ms} ms after \
+         the block's {block_time_ms} ms"
+    )]
+    TxTimestampInFuture {
+        /// The sender's declared creation time (Unix millis).
+        created_at_ms: u64,
+        /// The including block's header timestamp (Unix millis).
+        block_time_ms: u64,
+        /// The permitted forward tolerance.
+        tolerance_ms: u64,
+    },
+    /// The declared creation time is further BEHIND the including block's
+    /// `timestamp_ms` than [`sov_types::TX_TIMESTAMP_MAX_AGE_MS`] — the
+    /// transaction has EXPIRED (or is back-dated). Hard reject.
+    #[error(
+        "transaction declares creation time {created_at_ms} ms, more than {max_age_ms} ms before \
+         the block's {block_time_ms} ms (expired)"
+    )]
+    TxTimestampExpired {
+        /// The sender's declared creation time (Unix millis).
+        created_at_ms: u64,
+        /// The including block's header timestamp (Unix millis).
+        block_time_ms: u64,
+        /// The maximum permitted age — the transaction's lifetime.
+        max_age_ms: u64,
+    },
     /// A pool-v2 ([`Action::ShieldedV2`]) bundle was refused. **Every** v2
     /// failure lands here as a hard, block-invalidating reject — the pool-v2
     /// surface has no mineable failure mode by design (see
@@ -204,17 +275,21 @@ fn dormant_feature(action: &Action, ctx: &BlockContext) -> Option<&'static str> 
         // like `fee-auction`, so once a schedule IS baked, blocks below the
         // activation height keep re-validating as dormant.
         Action::ShieldedV2 { .. } if !ctx.shielded_v2_active => Some("shielded-v2"),
+        // `tx-timestamp` (signal bit 3). Dormant until miners activate bit 3;
+        // resolved per block height exactly like the two above, so blocks below
+        // the activation height keep re-validating as dormant forever.
+        Action::Timestamped { .. } if !ctx.tx_timestamp_active => Some("tx-timestamp"),
         _ => None,
     }
 }
 
 /// The first dormant feature anywhere in `action`'s carrier chain, or `None`.
 ///
-/// [`Action`] is recursive through exactly three `Box<Action>` carriers
-/// (`MultisigExec.action`, `ProposeMultisig.action`, `Tipped.inner`), each with
-/// at most one action child — so the walk is a simple loop rather than
-/// recursion, and cannot grow the stack regardless of how deeply an in-memory
-/// action was constructed.
+/// [`Action`] is recursive through exactly four `Box<Action>` carriers
+/// (`MultisigExec.action`, `ProposeMultisig.action`, `Tipped.inner`,
+/// `Timestamped.inner`), each with at most one action child — so the walk is a
+/// simple loop rather than recursion, and cannot grow the stack regardless of
+/// how deeply an in-memory action was constructed.
 fn find_inactive_feature(action: &Action, ctx: &BlockContext) -> Option<&'static str> {
     let mut node = action;
     loop {
@@ -223,8 +298,35 @@ fn find_inactive_feature(action: &Action, ctx: &BlockContext) -> Option<&'static
         }
         node = match node {
             Action::MultisigExec { action, .. } | Action::ProposeMultisig { action, .. } => action,
-            Action::Tipped { inner, .. } => inner,
+            Action::Tipped { inner, .. } | Action::Timestamped { inner, .. } => inner,
             _ => return None,
+        };
+    }
+}
+
+/// Whether an [`Action::Timestamped`] appears anywhere BELOW the top level of
+/// `action`'s carrier chain — nested inside another envelope, smuggled into a
+/// multisig proposal, or wrapped by a tip.
+///
+/// A creation-time envelope describes the whole transaction, so exactly one may
+/// exist and it must be outermost. Walks the same bounded carrier chain as
+/// [`find_inactive_feature`] (a loop, never recursion), starting one level in.
+fn has_nested_timestamp(action: &Action) -> bool {
+    let mut node = match action {
+        Action::MultisigExec { action, .. } | Action::ProposeMultisig { action, .. } => {
+            action.as_ref()
+        }
+        Action::Tipped { inner, .. } | Action::Timestamped { inner, .. } => inner.as_ref(),
+        _ => return false,
+    };
+    loop {
+        if matches!(node, Action::Timestamped { .. }) {
+            return true;
+        }
+        node = match node {
+            Action::MultisigExec { action, .. } | Action::ProposeMultisig { action, .. } => action,
+            Action::Tipped { inner, .. } => inner,
+            _ => return false,
         };
     }
 }
@@ -355,10 +457,98 @@ pub fn apply_transaction(
         return Err(ExecutionError::FeatureInactive { feature });
     }
 
+    // ── Bounded creation time (`tx-timestamp`, signal bit 3) ────────────────
+    //
+    // A creation-time envelope is the OUTERMOST carrier and is unwrapped here,
+    // before every rule below, so the rest of execution sees exactly the action
+    // it would have seen without the envelope. Three hard checks, all
+    // block-invalidating (never a mineable `Failed` receipt, so a malformed
+    // envelope can never be mined into the chain):
+    //
+    //  1. Placement — exactly one envelope, outermost. `has_nested_timestamp`
+    //     rejects one buried under a tip, a multisig carrier, or another
+    //     envelope, so `created_at_ms` can never be ambiguous.
+    //  2. Inner legality — mirrors the fee-auction guard: `MultisigExec` and
+    //     `RotateKey` resolve their authorization from the TOP-LEVEL action
+    //     (see the authorization block above), which wrapping would silently
+    //     change. Refusing them keeps that reasoning intact.
+    //  3. The BOUND — the declared time must sit inside
+    //     `[block_time_ms - MAX_AGE, block_time_ms + FUTURE_TOLERANCE]`.
+    //     Anchored on the BLOCK's header timestamp, never on this node's wall
+    //     clock, so the check is deterministic and a historical block
+    //     re-validates today exactly as it did when it was mined. The upper
+    //     bound stops future-dating; the lower bound stops back-dating AND is
+    //     the transaction's expiry — past it, no future block can ever include
+    //     it, because every later block's timestamp is only larger.
+    //
+    // The dormant gate above already hard-rejected the envelope entirely while
+    // bit 3 is inactive, so none of this is reachable pre-activation and
+    // execution stays byte-identical.
+    if has_nested_timestamp(&tx.action) {
+        return Err(ExecutionError::MisplacedTimestamp);
+    }
+    // `receipt_timing` is what this transaction COMMITS about its own timing:
+    // `Some` exactly when a bound-checked envelope ran, `None` otherwise — and
+    // `None` keeps the receipt's consensus preimage byte-identical to every
+    // receipt the chain has produced to date (`Receipt::consensus_bytes`).
+    let (timestamped_inner, receipt_timing): (&Action, Option<sov_types::ReceiptTiming>) =
+        match &tx.action {
+            Action::Timestamped {
+                created_at_ms,
+                inner,
+            } => {
+                let inner = inner.as_ref();
+                if matches!(
+                    inner,
+                    Action::MultisigExec { .. } | Action::RotateKey { .. }
+                ) {
+                    return Err(ExecutionError::TimestampInnerNotAllowed);
+                }
+                if *created_at_ms
+                    > ctx
+                        .block_time_ms
+                        .saturating_add(sov_types::TX_TIMESTAMP_FUTURE_TOLERANCE_MS)
+                {
+                    return Err(ExecutionError::TxTimestampInFuture {
+                        created_at_ms: *created_at_ms,
+                        block_time_ms: ctx.block_time_ms,
+                        tolerance_ms: sov_types::TX_TIMESTAMP_FUTURE_TOLERANCE_MS,
+                    });
+                }
+                if *created_at_ms
+                    < ctx
+                        .block_time_ms
+                        .saturating_sub(sov_types::TX_TIMESTAMP_MAX_AGE_MS)
+                {
+                    return Err(ExecutionError::TxTimestampExpired {
+                        created_at_ms: *created_at_ms,
+                        block_time_ms: ctx.block_time_ms,
+                        max_age_ms: sov_types::TX_TIMESTAMP_MAX_AGE_MS,
+                    });
+                }
+                // The `ctx.tx_timestamp_active` conjunct is DELIBERATELY redundant:
+                // the dormant-feature gate above already hard-rejected the envelope
+                // while bit 3 is inactive, so this arm is unreachable then. It is
+                // written anyway because the invariant it protects is a consensus
+                // one — no receipt may EVER carry committed timing at a height where
+                // the deployment is not Active, since that would move
+                // `receipts_root` on a chain that never voted for it. Belt and
+                // braces on the field itself means no future refactor of the gate
+                // above can silently break that invariant.
+                let timing = ctx.tx_timestamp_active.then_some(sov_types::ReceiptTiming {
+                    created_at_ms: *created_at_ms,
+                });
+                (inner, timing)
+            }
+            other => (other, None),
+        };
+
     // BIP-110: cap the arbitrary data a transaction may carry (contract code on
     // Deploy, calldata on Call), keeping block space reserved for monetary use
-    // rather than data storage.
-    let data_len = match &tx.action {
+    // rather than data storage. Read through the creation-time envelope
+    // (`timestamped_inner`) so wrapping a transaction can never be a way to
+    // smuggle oversized data past the cap.
+    let data_len = match timestamped_inner {
         Action::Deploy { code } => Some(code.len()),
         Action::Call { calldata, .. } => Some(calldata.len()),
         _ => None,
@@ -433,7 +623,7 @@ pub fn apply_transaction(
     let mut tip_paid = Balance::ZERO;
     let mut ms_error: Option<String> = None;
     let effective_action: &Action =
-        match &tx.action {
+        match timestamped_inner {
             Action::Tipped { tip, inner } if ctx.fee_auction_active => {
                 let inner = inner.as_ref();
                 // Tips do not nest: a tipped tip is a HARD error (block-invalid),
@@ -523,6 +713,22 @@ pub fn apply_transaction(
                 } else {
                     ExecutionError::FeatureInactive {
                         feature: "fee-auction",
+                    }
+                });
+            }
+            // Creation-time envelope — UNREACHABLE by construction: an
+            // outermost envelope was unwrapped during action resolution above,
+            // and one anywhere else was already rejected as
+            // `MisplacedTimestamp`. Kept as defense in depth so that if a
+            // future carrier ever forgets to walk it, the outcome is a HARD,
+            // block-invalidating error on every node — never a mineable `Failed`
+            // receipt whose bytes older nodes cannot even decode.
+            Action::Timestamped { .. } => {
+                return Err(if ctx.tx_timestamp_active {
+                    ExecutionError::MisplacedTimestamp
+                } else {
+                    ExecutionError::FeatureInactive {
+                        feature: "tx-timestamp",
                     }
                 });
             }
@@ -1731,6 +1937,13 @@ pub fn apply_transaction(
         gas_used,
         return_data,
         events,
+        // Committed timing — `Some` only for a bound-checked creation-time
+        // envelope under an Active `tx-timestamp` deployment. Note this is set
+        // on SUCCESS and on `Failed` receipts alike: a transaction that was
+        // created at `T`, mined, and then failed still has a provable creation
+        // time, and hiding it on failure would make the commitment depend on
+        // the outcome.
+        timing: receipt_timing,
     })
 }
 
@@ -2270,6 +2483,10 @@ mod tests {
     use sov_state::Account;
     use sov_types::Transaction;
 
+    /// Fixed block clock for test contexts — never the wall clock, so a test
+    /// that exercises the `tx-timestamp` bound is reproducible forever.
+    const TEST_BLOCK_TIME_MS: u64 = 1_700_000_000_000;
+
     fn id(s: &str) -> AccountId {
         AccountId::new(s).unwrap()
     }
@@ -2292,6 +2509,8 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            tx_timestamp_active: false,
+            block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
                 "sov-test",
                 sov_primitives::Hash::ZERO,
@@ -2310,6 +2529,8 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            tx_timestamp_active: false,
+            block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
                 "sov-test",
                 sov_primitives::Hash::ZERO,
@@ -2357,6 +2578,8 @@ mod tests {
             tx_domain: mode,
             fee_auction_active: false,
             shielded_v2_active: false,
+            tx_timestamp_active: false,
+            block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
                 "sov-test",
                 sov_primitives::Hash::ZERO,
@@ -2694,6 +2917,8 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: true,
             shielded_v2_active: false,
+            tx_timestamp_active: false,
+            block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
                 "sov-test",
                 sov_primitives::Hash::ZERO,
@@ -3583,6 +3808,8 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            tx_timestamp_active: false,
+            block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
                 "sov-test",
                 sov_primitives::Hash::ZERO,
@@ -3714,6 +3941,8 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            tx_timestamp_active: false,
+            block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
                 "sov-test",
                 sov_primitives::Hash::ZERO,
@@ -3782,6 +4011,8 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            tx_timestamp_active: false,
+            block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
                 "sov-test",
                 sov_primitives::Hash::ZERO,
@@ -4462,6 +4693,8 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            tx_timestamp_active: false,
+            block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
                 "sov-test",
                 sov_primitives::Hash::ZERO,
@@ -5764,6 +5997,8 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            tx_timestamp_active: false,
+            block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
                 "sov-test",
                 sov_primitives::Hash::ZERO,
@@ -5990,6 +6225,8 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            tx_timestamp_active: false,
+            block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
                 "sov-test",
                 sov_primitives::Hash::ZERO,
@@ -6891,5 +7128,439 @@ mod tests {
             ledger.account(&id("usa.reserve.sov")).balance,
             Balance::from_sov(100).unwrap()
         );
+    }
+
+    // ---- `tx-timestamp` (signal bit 3): the bounded creation-time envelope ----
+
+    /// A context with the `tx-timestamp` deployment ACTIVE, at block clock
+    /// [`TEST_BLOCK_TIME_MS`] — the post-activation execution environment.
+    fn ts_ctx(p: &MiningPolicy) -> BlockContext<'_> {
+        BlockContext {
+            tx_timestamp_active: true,
+            ..ctx(p)
+        }
+    }
+
+    /// A `Timestamped { created_at_ms, inner: Transfer }` from `usa.reserve.sov`.
+    fn timestamped_transfer(created_at_ms: u64, nonce: u64) -> SignedTransaction {
+        signed(
+            [1; 32],
+            "usa.reserve.sov",
+            nonce,
+            Action::Timestamped {
+                created_at_ms,
+                inner: Box::new(Action::Transfer {
+                    to: id("ecb.reserve.sov"),
+                    amount: Balance::from_sov(1).unwrap(),
+                }),
+            },
+        )
+    }
+
+    /// THE BOUND, at its exact upper edge: `block_time + TOLERANCE` is accepted,
+    /// `+ 1` beyond it is a HARD reject (an `Err`, not a mineable `Failed`
+    /// receipt), and the rejected one leaves the ledger untouched — no nonce
+    /// burned, no fee charged. An off-by-one here is a consensus split.
+    #[test]
+    fn tx_timestamp_future_bound_is_exact_at_both_sides_of_the_edge() {
+        let p = policy();
+        let edge = TEST_BLOCK_TIME_MS + sov_types::TX_TIMESTAMP_FUTURE_TOLERANCE_MS;
+
+        let mut ledger = ledger_with_usa(100);
+        let r = apply_transaction(&mut ledger, &timestamped_transfer(edge, 0), &ts_ctx(&p))
+            .expect("exactly at the tolerance is INSIDE the window");
+        assert!(r.succeeded());
+
+        let mut ledger = ledger_with_usa(100);
+        let root0 = ledger.state_root();
+        let err = apply_transaction(&mut ledger, &timestamped_transfer(edge + 1, 0), &ts_ctx(&p))
+            .expect_err("one millisecond past the tolerance is a HARD reject");
+        assert!(matches!(
+            err,
+            ExecutionError::TxTimestampInFuture {
+                created_at_ms,
+                block_time_ms,
+                tolerance_ms,
+            } if created_at_ms == edge + 1
+                && block_time_ms == TEST_BLOCK_TIME_MS
+                && tolerance_ms == sov_types::TX_TIMESTAMP_FUTURE_TOLERANCE_MS
+        ));
+        assert_eq!(
+            ledger.state_root(),
+            root0,
+            "a hard reject commits nothing: no nonce, no fee, no partial effect"
+        );
+    }
+
+    /// THE BOUND, at its exact lower (expiry) edge: `block_time - MAX_AGE` is
+    /// accepted, one millisecond older is a HARD reject. This edge IS the
+    /// transaction-expiry rule, so its exactness is what makes expiry a
+    /// consensus fact rather than a node-local policy.
+    #[test]
+    fn tx_timestamp_expiry_bound_is_exact_at_both_sides_of_the_edge() {
+        let p = policy();
+        let edge = TEST_BLOCK_TIME_MS - sov_types::TX_TIMESTAMP_MAX_AGE_MS;
+
+        let mut ledger = ledger_with_usa(100);
+        let r = apply_transaction(&mut ledger, &timestamped_transfer(edge, 0), &ts_ctx(&p))
+            .expect("exactly at the max age is still INSIDE the window");
+        assert!(r.succeeded());
+
+        let mut ledger = ledger_with_usa(100);
+        let root0 = ledger.state_root();
+        let err = apply_transaction(&mut ledger, &timestamped_transfer(edge - 1, 0), &ts_ctx(&p))
+            .expect_err("one millisecond older than the max age is EXPIRED");
+        assert!(matches!(
+            err,
+            ExecutionError::TxTimestampExpired {
+                created_at_ms,
+                block_time_ms,
+                max_age_ms,
+            } if created_at_ms == edge - 1
+                && block_time_ms == TEST_BLOCK_TIME_MS
+                && max_age_ms == sov_types::TX_TIMESTAMP_MAX_AGE_MS
+        ));
+        assert_eq!(ledger.state_root(), root0, "a hard reject commits nothing");
+    }
+
+    /// The COMMITTED payload: an accepted envelope puts its declared
+    /// `created_at_ms` — verbatim, the bytes the sender signed — into the
+    /// receipt, and every other receipt keeps `timing: None`.
+    #[test]
+    fn an_accepted_envelope_commits_its_creation_time_to_the_receipt() {
+        let p = policy();
+        let mut ledger = ledger_with_usa(100);
+        let created = TEST_BLOCK_TIME_MS - 5_000;
+        let r =
+            apply_transaction(&mut ledger, &timestamped_transfer(created, 0), &ts_ctx(&p)).unwrap();
+        assert!(r.succeeded());
+        assert_eq!(
+            r.timing,
+            Some(sov_types::ReceiptTiming {
+                created_at_ms: created
+            })
+        );
+        // `waited_ms` is DERIVED, never committed — any verifier recomputes it
+        // from the receipt plus the block header.
+        assert_eq!(TEST_BLOCK_TIME_MS - r.timing.unwrap().created_at_ms, 5_000);
+
+        // An ordinary transfer in the very same (activated) block commits no
+        // timing at all, so its receipt hashes exactly as it always has.
+        let plain = apply_transaction(
+            &mut ledger,
+            &transfer([1; 32], "usa.reserve.sov", "ecb.reserve.sov", 1, 1),
+            &ts_ctx(&p),
+        )
+        .unwrap();
+        assert_eq!(plain.timing, None);
+    }
+
+    /// A FAILED timestamped transaction still commits its creation time: proof
+    /// of when a transaction was created must not depend on whether it worked.
+    #[test]
+    fn a_failed_timestamped_transaction_still_commits_its_creation_time() {
+        let p = policy();
+        let mut ledger = ledger_with_usa(1);
+        let created = TEST_BLOCK_TIME_MS - 1_000;
+        let overspend = signed(
+            [1; 32],
+            "usa.reserve.sov",
+            0,
+            Action::Timestamped {
+                created_at_ms: created,
+                inner: Box::new(Action::Transfer {
+                    to: id("ecb.reserve.sov"),
+                    amount: Balance::from_sov(1_000_000).unwrap(),
+                }),
+            },
+        );
+        let r = apply_transaction(&mut ledger, &overspend, &ts_ctx(&p)).unwrap();
+        assert!(!r.succeeded(), "the inner transfer overspends");
+        assert_eq!(
+            r.timing,
+            Some(sov_types::ReceiptTiming {
+                created_at_ms: created
+            })
+        );
+    }
+
+    /// Pre-activation the envelope is a HARD `FeatureInactive` reject — at the
+    /// top level and inside every carrier — so NO receipt, and hence no
+    /// committed timing, can exist below the activation height. This single gate
+    /// is what makes the whole change dormant.
+    #[test]
+    fn the_envelope_is_a_hard_reject_while_bit_3_is_inactive() {
+        let p = policy();
+        // `fee-auction` is Active here so that the `Tipped` carrier case below
+        // is not short-circuited by ITS own dormant gate — the reject under
+        // test must be the tx-timestamp one.
+        let inactive = BlockContext {
+            fee_auction_active: true,
+            ..ctx(&p)
+        };
+        assert!(!inactive.tx_timestamp_active);
+
+        let envelope = || Action::Timestamped {
+            created_at_ms: TEST_BLOCK_TIME_MS,
+            inner: Box::new(Action::Transfer {
+                to: id("ecb.reserve.sov"),
+                amount: Balance::from_sov(1).unwrap(),
+            }),
+        };
+        let cases: Vec<Action> = vec![
+            // Top level.
+            envelope(),
+            // Under a tip.
+            Action::Tipped {
+                tip: Balance::from_sov(1).unwrap(),
+                inner: Box::new(envelope()),
+            },
+            // Under a multisig proposal.
+            Action::ProposeMultisig {
+                account: id("usa.reserve.sov"),
+                action: Box::new(envelope()),
+            },
+            // Under a multisig execution.
+            Action::MultisigExec {
+                action: Box::new(envelope()),
+                approvals: Vec::new(),
+            },
+            // Nested inside another envelope: still dormant, never `Misplaced`.
+            Action::Timestamped {
+                created_at_ms: TEST_BLOCK_TIME_MS,
+                inner: Box::new(envelope()),
+            },
+        ];
+        for (i, action) in cases.into_iter().enumerate() {
+            let mut ledger = ledger_with_usa(100);
+            let root0 = ledger.state_root();
+            let stx = signed([1; 32], "usa.reserve.sov", 0, action);
+            assert!(
+                matches!(
+                    apply_transaction(&mut ledger, &stx, &inactive),
+                    Err(ExecutionError::FeatureInactive {
+                        feature: "tx-timestamp"
+                    })
+                ),
+                "case {i} must be a hard dormant reject"
+            );
+            assert_eq!(ledger.state_root(), root0, "case {i} commits nothing");
+        }
+    }
+
+    /// Placement guards, POST-activation: an envelope may appear only as the
+    /// outermost action. Nested inside another envelope, or buried under a tip
+    /// or either multisig carrier, is a HARD `MisplacedTimestamp` — so
+    /// `created_at_ms` is never ambiguous and a receipt can never be built from
+    /// a second, hidden declaration.
+    #[test]
+    fn a_misplaced_or_nested_envelope_is_a_hard_reject_post_activation() {
+        let p = policy();
+        // Both `fee-auction` and `tx-timestamp` Active, so the `Tipped` carrier
+        // cases reach the placement guard instead of stopping at a dormant gate.
+        let active = BlockContext {
+            fee_auction_active: true,
+            ..ts_ctx(&p)
+        };
+        let envelope = || Action::Timestamped {
+            created_at_ms: TEST_BLOCK_TIME_MS,
+            inner: Box::new(Action::Transfer {
+                to: id("ecb.reserve.sov"),
+                amount: Balance::from_sov(1).unwrap(),
+            }),
+        };
+        let cases: Vec<Action> = vec![
+            // Nested directly in another envelope.
+            Action::Timestamped {
+                created_at_ms: TEST_BLOCK_TIME_MS,
+                inner: Box::new(envelope()),
+            },
+            // Under a tip.
+            Action::Tipped {
+                tip: Balance::from_sov(1).unwrap(),
+                inner: Box::new(envelope()),
+            },
+            // Two levels down: outermost envelope, then a tip, then another one.
+            Action::Timestamped {
+                created_at_ms: TEST_BLOCK_TIME_MS,
+                inner: Box::new(Action::Tipped {
+                    tip: Balance::from_sov(1).unwrap(),
+                    inner: Box::new(envelope()),
+                }),
+            },
+            // Under a multisig proposal.
+            Action::ProposeMultisig {
+                account: id("usa.reserve.sov"),
+                action: Box::new(envelope()),
+            },
+            // Under a multisig execution.
+            Action::MultisigExec {
+                action: Box::new(envelope()),
+                approvals: Vec::new(),
+            },
+        ];
+        for (i, action) in cases.into_iter().enumerate() {
+            let mut ledger = ledger_with_usa(100);
+            let root0 = ledger.state_root();
+            let stx = signed([1; 32], "usa.reserve.sov", 0, action);
+            assert!(
+                matches!(
+                    apply_transaction(&mut ledger, &stx, &active),
+                    Err(ExecutionError::MisplacedTimestamp)
+                ),
+                "case {i} must be a hard placement reject"
+            );
+            assert_eq!(ledger.state_root(), root0, "case {i} commits nothing");
+        }
+    }
+
+    /// The inner-action guard, mirroring the fee-auction envelope's: wrapping
+    /// `MultisigExec` or `RotateKey` — whose authorization is resolved from the
+    /// TOP-LEVEL action — is a HARD reject rather than a silent change of
+    /// meaning.
+    #[test]
+    fn an_envelope_may_not_wrap_multisig_exec_or_rotate_key() {
+        let p = policy();
+        let kp2 = Keypair::from_seed([2; 32]);
+        let new_key = kp2.public_key();
+        let proof = kp2.sign(&sov_types::rotation_signing_bytes(
+            &id("usa.reserve.sov"),
+            0,
+            &new_key,
+        ));
+        let cases: Vec<Action> = vec![
+            Action::MultisigExec {
+                action: Box::new(Action::Transfer {
+                    to: id("ecb.reserve.sov"),
+                    amount: Balance::from_sov(1).unwrap(),
+                }),
+                approvals: Vec::new(),
+            },
+            // An otherwise WELL-FORMED rotation, so the reject is the envelope
+            // guard talking and not a malformed proof.
+            Action::RotateKey { new_key, proof },
+        ];
+        for (i, inner) in cases.into_iter().enumerate() {
+            let mut ledger = ledger_with_usa(100);
+            let root0 = ledger.state_root();
+            let stx = signed(
+                [1; 32],
+                "usa.reserve.sov",
+                0,
+                Action::Timestamped {
+                    created_at_ms: TEST_BLOCK_TIME_MS,
+                    inner: Box::new(inner),
+                },
+            );
+            assert!(
+                matches!(
+                    apply_transaction(&mut ledger, &stx, &ts_ctx(&p)),
+                    Err(ExecutionError::TimestampInnerNotAllowed)
+                ),
+                "case {i} must be a hard inner-action reject"
+            );
+            assert_eq!(ledger.state_root(), root0, "case {i} commits nothing");
+        }
+    }
+
+    /// A transaction may be BOTH timestamped and tipped: the envelope is the
+    /// outermost carrier and the tip runs underneath it. The tip is really paid
+    /// (miner credited), the transfer really lands, and the receipt commits the
+    /// creation time — the composition works, it is not merely tolerated.
+    #[test]
+    fn timestamped_over_tipped_executes_and_pays_the_tip() {
+        let p = policy();
+        let both = BlockContext {
+            tx_timestamp_active: true,
+            ..auction_ctx(&p, 0)
+        };
+        let mut ledger = ledger_with_usa(100);
+        let created = TEST_BLOCK_TIME_MS - 60_000;
+        let tip = Balance::from_sov(2).unwrap();
+        let stx = signed(
+            [1; 32],
+            "usa.reserve.sov",
+            0,
+            Action::Timestamped {
+                created_at_ms: created,
+                inner: Box::new(Action::Tipped {
+                    tip,
+                    inner: Box::new(Action::Transfer {
+                        to: id("ecb.reserve.sov"),
+                        amount: Balance::from_sov(10).unwrap(),
+                    }),
+                }),
+            },
+        );
+        let r = apply_transaction(&mut ledger, &stx, &both).unwrap();
+        assert!(r.succeeded());
+        assert_eq!(
+            r.timing,
+            Some(sov_types::ReceiptTiming {
+                created_at_ms: created
+            })
+        );
+        assert_eq!(ledger.account(&miner_id()).balance, tip, "the tip was paid");
+        assert_eq!(
+            ledger.account(&id("ecb.reserve.sov")).balance,
+            Balance::from_sov(10).unwrap()
+        );
+        assert_eq!(
+            ledger.account(&id("usa.reserve.sov")).balance,
+            Balance::from_sov(100 - 10 - 2).unwrap()
+        );
+    }
+
+    /// An envelope wrapping a *dormant* feature is still caught: the dormant
+    /// walk descends through `Timestamped`, so wrapping is never a way to
+    /// smuggle an inactive action past its own gate.
+    #[test]
+    fn an_envelope_cannot_smuggle_a_dormant_inner_action() {
+        let p = policy();
+        let mut ledger = ledger_with_usa(100);
+        let stx = signed(
+            [1; 32],
+            "usa.reserve.sov",
+            0,
+            Action::Timestamped {
+                created_at_ms: TEST_BLOCK_TIME_MS,
+                inner: Box::new(Action::ShieldedV2 {
+                    bundle: vec![7u8; 64],
+                }),
+            },
+        );
+        assert!(matches!(
+            apply_transaction(&mut ledger, &stx, &ts_ctx(&p)),
+            Err(ExecutionError::FeatureInactive {
+                feature: "shielded-v2"
+            })
+        ));
+    }
+
+    /// Wrapping never widens the BIP-110 data cap: the cap is read THROUGH the
+    /// envelope, so an oversized payload is refused whether or not it is wrapped.
+    #[test]
+    fn the_envelope_does_not_widen_the_data_cap() {
+        let mut p = MiningPolicy::test();
+        p.max_code_bytes = 16;
+        let mut ledger = ledger_with_usa(10);
+        let stx = signed(
+            [1; 32],
+            "usa.reserve.sov",
+            0,
+            Action::Timestamped {
+                created_at_ms: TEST_BLOCK_TIME_MS,
+                inner: Box::new(Action::Deploy {
+                    code: vec![0u8; 100],
+                }),
+            },
+        );
+        assert!(matches!(
+            apply_transaction(&mut ledger, &stx, &ts_ctx(&p)),
+            Err(ExecutionError::DataTooLarge {
+                limit: 16,
+                got: 100
+            })
+        ));
     }
 }

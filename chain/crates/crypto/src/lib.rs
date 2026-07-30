@@ -8,7 +8,9 @@
 //!   to a high-throughput chain.
 //! - [`merkle_root`] — a domain-separated binary Merkle root over
 //!   [`sov_primitives::Hash`] leaves, used to commit to a block's transactions
-//!   and receipts.
+//!   and receipts — plus [`merkle_proof`] / [`verify_merkle_proof`], the
+//!   inclusion proof that lets a verifier holding ONLY the root check a single
+//!   leaf without trusting whoever served it.
 //!
 //! Following best practice, this crate does not implement any cryptographic
 //! algorithm itself: signing delegates to the audited `ed25519-dalek`, and
@@ -22,5 +24,5 @@ pub mod merkle;
 pub mod signature;
 
 pub use keys::{KeyError, Keypair, PublicKey, ML_DSA_65_PK_LEN};
-pub use merkle::merkle_root;
+pub use merkle::{merkle_proof, merkle_root, verify_merkle_proof, MerkleStep};
 pub use signature::{Signature, ML_DSA_65_SIG_LEN};

@@ -375,6 +375,12 @@ fn stf_vector() -> Value {
         ),
     ];
 
+    /// Fixed block clock for the KAT generator. Nothing in a KAT vector depends
+    /// on it (`tx_timestamp_active` is false, and no other rule reads the block
+    /// clock), but it is pinned rather than sampled so generation stays
+    /// bit-for-bit reproducible on any machine at any time.
+    const KAT_BLOCK_TIME_MS: u64 = 1_700_000_000_000;
+
     let ctx = BlockContext {
         height,
         prev_hash,
@@ -389,6 +395,11 @@ fn stf_vector() -> Value {
         // they stay byte-identical across the `fee-auction` deployment.
         fee_auction_active: false,
         shielded_v2_active: false,
+        tx_timestamp_active: false,
+        // Only the (dormant) `tx-timestamp` path reads the block clock, so this
+        // value can never reach a KAT vector; a fixed placeholder keeps the
+        // generator deterministic (never `SystemTime::now()`).
+        block_time_ms: KAT_BLOCK_TIME_MS,
         // Only the (dormant) shielded-v2 path reads this, so it never touches a
         // KAT vector — a placeholder keeps the vectors byte-identical.
         chain_domain: sov_primitives::SigningDomain::new("sov-kat", sov_primitives::Hash::ZERO),
