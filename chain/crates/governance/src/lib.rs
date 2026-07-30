@@ -69,7 +69,7 @@ pub const MAX_SIGNAL_BIT: u8 = 28;
 // ── The signal-bit registry (forward-compat law F1) ──────────────────────────
 // ONE table owns every signaling bit SOV has ever assigned. Adding a deployment
 // means claiming the next bit HERE first; nothing else may reuse or renumber a
-// bit. Bits 3..=28 are reserved and unassigned.
+// bit. Bits 4..=28 are reserved and unassigned.
 
 /// Signal bit 0 — the `tx-domain` hard fork (chain-bound tx/intent signatures).
 /// Armed and ACTIVATED on mainnet (v0.1.99, active at height 11520).
@@ -86,6 +86,16 @@ pub const BIT_FEE_AUCTION: u8 = 1;
 pub const BIT_SHIELDED_V2: u8 = 2;
 /// The canonical deployment name for signal bit [`BIT_SHIELDED_V2`].
 pub const SHIELDED_V2_DEPLOYMENT: &str = "shielded-v2";
+/// Signal bit 3 — the `tx-timestamp` deployment: the `Action::Timestamped`
+/// envelope, which carries a sender-declared creation time that consensus
+/// BOUNDS against the including block's `timestamp_ms` (see
+/// `sov_types::TX_TIMESTAMP_FUTURE_TOLERANCE_MS` /
+/// `sov_types::TX_TIMESTAMP_MAX_AGE_MS`). Until it is Active the envelope is a
+/// hard `FeatureInactive` reject everywhere, so pre-activation execution — and
+/// therefore genesis `cb0272ff…` and every KAT vector — is byte-identical.
+pub const BIT_TX_TIMESTAMP: u8 = 3;
+/// The canonical deployment name for signal bit [`BIT_TX_TIMESTAMP`].
+pub const TX_TIMESTAMP_DEPLOYMENT: &str = "tx-timestamp";
 
 /// Errors constructing or operating the governance machine.
 ///

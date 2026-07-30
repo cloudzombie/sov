@@ -393,7 +393,86 @@ pub enum Action {
         #[borsh(deserialize_with = "bounded_v2_bundle_bytes")]
         bundle: Vec<u8>,
     },
+    /// A **bounded creation-time envelope** (`tx-timestamp`, signal bit 3):
+    /// declare when this transaction was created, then execute `inner`.
+    /// Appended LAST so every existing action's Borsh discriminant — and thus
+    /// genesis `cb0272ff…` and every KAT vector — is byte-identical.
+    ///
+    /// **What it proves, honestly.** `created_at_ms` is *sender-declared*, and
+    /// a sender can write anything. What makes it meaningful is that consensus
+    /// REFUSES to include it unless it falls inside a window anchored on the
+    /// including block's own `timestamp_ms`:
+    ///
+    /// ```text
+    /// block.timestamp_ms - TX_TIMESTAMP_MAX_AGE_MS
+    ///     <= created_at_ms <=
+    /// block.timestamp_ms + TX_TIMESTAMP_FUTURE_TOLERANCE_MS
+    /// ```
+    ///
+    /// So the guarantee is a **bounded** creation time — provably within a
+    /// known window of a block the network mined — not an absolute attested
+    /// one. The block's own timestamp is itself boxed in by the in-consensus
+    /// median-time-past lower bound and the node-local 2-hour future-drift
+    /// rule, so those are the outer limits of what a colluding miner could
+    /// stretch. Two independent observers can therefore always agree on the
+    /// window; nobody can prove the exact instant.
+    ///
+    /// **Expiry falls out of the lower bound.** A transaction that is not mined
+    /// within [`TX_TIMESTAMP_MAX_AGE_MS`] of its declared creation time can
+    /// never be mined afterwards: every later block's `timestamp_ms` puts it
+    /// outside the window. That is transaction expiry, expressed as a
+    /// consensus rule rather than a node-local policy, and it is deliberately
+    /// set equal to the mempool's stranded-entry TTL so the two agree.
+    ///
+    /// **Shape.** This is the OUTERMOST carrier: it may wrap a
+    /// [`Action::Tipped`] envelope (so a transaction can be both timestamped
+    /// and tipped), but a `Timestamped` may never appear below the top level,
+    /// never nest inside another `Timestamped`, and — mirroring `Tipped`'s
+    /// guard exactly — may not wrap [`Action::MultisigExec`] or
+    /// [`Action::RotateKey`], whose authorization is resolved from the
+    /// top-level action.
+    Timestamped {
+        /// The sender's declared creation time, Unix milliseconds. Consensus
+        /// bounds it against the including block's `timestamp_ms`; it is never
+        /// trusted as an absolute instant.
+        created_at_ms: u64,
+        /// The action actually performed once the bound check passes.
+        #[borsh(deserialize_with = "bounded_nested_action")]
+        inner: Box<Action>,
+    },
 }
+
+/// How far ahead of the including block's `timestamp_ms` a declared
+/// [`Action::Timestamped`] creation time may sit before consensus rejects it.
+///
+/// **Derivation.** The only honest source of a positive delta is clock skew
+/// between the sender and the miner: an NTP-disciplined host is within
+/// milliseconds, and an undisciplined consumer clock is typically within tens
+/// of seconds. 2 minutes covers that with room to spare while staying BELOW the
+/// 150,000 ms (2.5-minute) block target — so a future-dated transaction can
+/// never be pushed even one full block interval ahead of the chain, which is
+/// far tighter than Bitcoin's 2-hour header rule. Tighter is affordable here
+/// because we bound a *transaction* against a block that already exists, not a
+/// header against a network that has not seen it yet.
+pub const TX_TIMESTAMP_FUTURE_TOLERANCE_MS: u64 = 2 * 60 * 1000;
+
+/// How far BEHIND the including block's `timestamp_ms` a declared
+/// [`Action::Timestamped`] creation time may sit before consensus rejects it —
+/// equivalently, the transaction's maximum lifetime.
+///
+/// **Derivation.** Deliberately equal to `sov_mempool::STRANDED_TTL_MS` (30
+/// minutes), the horizon at which a node already reaps an entry it cannot
+/// confirm. Making the consensus bound identical to the pool's TTL means the
+/// two rules agree instead of fighting: a timestamped transaction the mempool
+/// would drop is exactly one consensus refuses to mine, and a transaction still
+/// held in a pool is always still mineable. 30 minutes is also ~12 blocks at the
+/// 2.5-minute target — far longer than any honest confirmation wait — so no live
+/// transaction is ever expired out from under its sender.
+///
+/// `sov-types` cannot depend on `sov-mempool` (the dependency runs the other
+/// way), so the equality is pinned by a test in the mempool crate rather than by
+/// a shared definition.
+pub const TX_TIMESTAMP_MAX_AGE_MS: u64 = 30 * 60 * 1000;
 
 /// Maximum bytes accepted when Borsh-**decoding** an [`Action::ShieldedV2`]
 /// bundle payload — checked BEFORE any allocation, so a hostile declared
@@ -434,8 +513,9 @@ fn bounded_v2_bundle_bytes<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Res
 
 /// Maximum nesting depth accepted when Borsh-**decoding** an [`Action`].
 ///
-/// [`Action`] is recursive through three `Box<Action>` fields
-/// ([`Action::MultisigExec`], [`Action::ProposeMultisig`], [`Action::Tipped`]).
+/// [`Action`] is recursive through four `Box<Action>` fields
+/// ([`Action::MultisigExec`], [`Action::ProposeMultisig`], [`Action::Tipped`],
+/// [`Action::Timestamped`]).
 /// A derived Borsh decoder recurses once per nesting level, so a maliciously
 /// deep payload (~2000 levels, ~34 KB — far under the P2P frame cap) would
 /// overflow the stack and **abort the process**: a remote crash-DoS. Bounding
@@ -1165,4 +1245,60 @@ mod tests {
         assert!(json.contains("\"type\":\"tipped\""));
         assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), tipped);
     }
+
+    /// The creation-time envelope is APPENDED: it takes the next free Borsh
+    /// discriminant and moves no existing one. That is what keeps genesis
+    /// `cb0272ff…`, every KAT vector, and the TypeScript second client
+    /// byte-identical across this deployment — the signed preimage of every
+    /// transaction that exists today is unchanged.
+    #[test]
+    fn timestamped_takes_the_next_discriminant_and_moves_no_existing_one() {
+        // Discriminant 0 is still `Transfer` — the first byte a v1 transfer has
+        // encoded to since genesis.
+        let transfer = Action::Transfer {
+            to: AccountId::new("ecb.reserve.sov").unwrap(),
+            amount: Balance::from_sov(1).unwrap(),
+        };
+        let transfer_bytes = borsh::to_vec(&transfer).unwrap();
+        assert_eq!(transfer_bytes[0], 0, "Transfer is still discriminant 0");
+
+        // `Timestamped` sits one past `ShieldedV2`, the previous tail.
+        let v2 = borsh::to_vec(&Action::ShieldedV2 { bundle: vec![] }).unwrap()[0];
+        let ts = borsh::to_vec(&Action::Timestamped {
+            created_at_ms: 0,
+            inner: Box::new(transfer.clone()),
+        })
+        .unwrap()[0];
+        assert_eq!(ts, v2 + 1, "appended at the tail, never inserted");
+
+        // And the envelope round-trips through Borsh and JSON.
+        let wrapped = Action::Timestamped {
+            created_at_ms: 1_700_000_000_000,
+            inner: Box::new(transfer),
+        };
+        let bytes = borsh::to_vec(&wrapped).unwrap();
+        assert_eq!(Action::try_from_slice(&bytes).unwrap(), wrapped);
+        let json = serde_json::to_string(&wrapped).unwrap();
+        assert!(json.contains("\"type\":\"timestamped\""));
+        assert!(
+            json.contains("\"created_at_ms\":1700000000000"),
+            "the declared time is surfaced verbatim for the explorer: {json}"
+        );
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), wrapped);
+    }
+
+    /// The bound constants are the ones documented, and the window is
+    /// asymmetric on purpose: generous backwards (a real confirmation wait),
+    /// tight forwards (clock skew only, and under one block interval). Checked
+    /// at COMPILE time — these are consensus constants, so a build that
+    /// violates the derivation must not exist, let alone run.
+    const _: () = {
+        assert!(TX_TIMESTAMP_FUTURE_TOLERANCE_MS == 2 * 60 * 1000);
+        assert!(TX_TIMESTAMP_MAX_AGE_MS == 30 * 60 * 1000);
+        // The forward tolerance stays under one 2.5-minute block interval, so a
+        // future-dated transaction can never lead the chain by a whole block.
+        assert!(TX_TIMESTAMP_FUTURE_TOLERANCE_MS < 150_000);
+        // Backwards is generous, forwards is tight.
+        assert!(TX_TIMESTAMP_MAX_AGE_MS > TX_TIMESTAMP_FUTURE_TOLERANCE_MS * 10);
+    };
 }

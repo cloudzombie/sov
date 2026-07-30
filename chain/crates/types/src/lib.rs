@@ -26,7 +26,7 @@ pub use block::{compute_tx_root, Block, BlockHeader};
 pub use receipt::{receipts_root, Event, ExecutionStatus, Receipt};
 pub use transaction::{
     multisig_signing_bytes, rotation_signing_bytes, Action, MultisigApproval, SignedTransaction,
-    Transaction, TxError,
+    Transaction, TxError, TX_TIMESTAMP_FUTURE_TOLERANCE_MS, TX_TIMESTAMP_MAX_AGE_MS,
 };
 pub use weight::{
     block_weight, fee_rate, tx_weight, verify_weight, MAX_BLOCK_WEIGHT, MAX_TX_WEIGHT,

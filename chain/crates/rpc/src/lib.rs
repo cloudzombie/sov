@@ -31,7 +31,10 @@
 //! `sov_getStateRoot`, `sov_getDifficulty`, `sov_estimateFee`,
 //! `sov_getMempoolSize`, `sov_getMempoolHistogram` (effective-tip buckets for
 //! multi-block projection), `sov_getMempoolInfo` (ready/queued occupancy, bounds,
-//! next-block floor, entry ages), `sov_getPeerInfo` (live P2P/sync state),
+//! next-block floor, entry ages), `sov_getMempoolTxs` (paged per-transaction
+//! pool contents with each entry's age since THIS node admitted it — an
+//! observation, never a self-reported creation time), `sov_getPeerInfo` (live
+//! P2P/sync state),
 //! `sov_getConfirmations`, `sov_isFinal`,
 //! `sov_getMiners`, `sov_listTokens` (paged), `sov_getTokenInfo`,
 //! `sov_getTokenBalances`, `sov_getHtlc`. SNS (Sovereign Name Service):
@@ -169,6 +172,14 @@ const MAX_TOKEN_PAGE: usize = 200;
 /// any affordable tip (≤ total supply), so in practice every bucket is exact —
 /// and the XUS Miner client is written against exactly this cap.
 pub const HISTOGRAM_MAX_BUCKETS: usize = 128;
+
+/// Hard cap on how many entries `sov_getMempoolTxs` returns in one call, and its
+/// default when the caller names no `limit`. Sized at the default per-block
+/// transaction capacity, so one un-paged call always covers at least the
+/// forming block's worth of backlog while the response stays bounded no matter
+/// how large the pool is (the pool's own capacity default is 16,384 — two
+/// orders of magnitude more). Callers page with `offset`.
+pub const MAX_MEMPOOL_TX_PAGE: usize = 256;
 
 /// Hard cap on how many transaction ids `sov_getBlockTemplate` will enumerate in
 /// its `txIds` array. Equal to the default `max_block_txs`, so under the default
@@ -1222,6 +1233,74 @@ fn call(
                 "floorGrains": node.next_block_floor_grains().to_string(),
                 "poolFloorGrains": node.mempool_pool_floor_grains().to_string(),
                 "buckets": buckets,
+            }))
+        }
+        // Per-transaction mempool CONTENTS with ARRIVAL TIMING — the
+        // per-entry complement to `sov_getMempoolInfo`'s aggregates. Params:
+        // `offset` (default 0) and `limit` (default and hard cap
+        // MAX_MEMPOOL_TX_PAGE). Returns
+        // `{ txs: [...], offset, limit, txCount, queuedCount, hasMore }`.
+        //
+        // READ-ONLY, NODE-LOCAL, NON-CONSENSUS. Nothing here is committed to a
+        // block, and `ageMs` is explicitly THIS NODE'S OBSERVATION — how long
+        // ago this node admitted the transaction to its own pool — not a
+        // property of the transaction and not a self-reported creation time.
+        // A SOV transaction carries no creation time of its own unless it is
+        // wrapped in an `Action::Timestamped` envelope (signal bit 3), so
+        // "first seen by this node" is the only timing a node can honestly
+        // attest to for everything else. Two honest nodes WILL report different
+        // ages for the same transaction; whichever saw it first reports more.
+        //
+        // The age is read from the SAME admission clock that drives TTL
+        // eviction and `sov_getMempoolInfo`'s `oldestPendingAgeMs`, so the two
+        // views can never disagree — there is one arrival clock in the pool,
+        // not a parallel one added for this method.
+        "sov_getMempoolTxs" => {
+            let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let limit = (params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(MAX_MEMPOOL_TX_PAGE as u64) as usize)
+                .clamp(1, MAX_MEMPOOL_TX_PAGE);
+            // Take the page plus one extra to learn whether another exists,
+            // bounded by the cap either way.
+            let take = offset
+                .saturating_add(limit)
+                .saturating_add(1)
+                .min(offset.saturating_add(MAX_MEMPOOL_TX_PAGE + 1));
+            let entries = node.mempool_entries(take);
+            let mut page: Vec<Value> = entries
+                .into_iter()
+                .skip(offset)
+                .take(limit + 1)
+                .map(|e| {
+                    json!({
+                        "txId": e.id.to_hex(),
+                        "signer": e.signer.as_str(),
+                        "nonce": e.nonce,
+                        // Decimal-string grains, the codebase's large-integer
+                        // convention. This is `effective_tip` — the auction bid.
+                        "tipGrains": e.tip_grains.to_string(),
+                        "sizeBytes": e.size_bytes,
+                        "weight": e.weight,
+                        // Milliseconds since THIS node first admitted it.
+                        "ageMs": e.age_ms,
+                        // READY (mineable now) vs QUEUED (future nonce, parked
+                        // until its sender's gap fills) — a queued entry is NOT
+                        // waiting on fees, it is waiting on a missing nonce.
+                        "state": if e.ready { "ready" } else { "queued" },
+                    })
+                })
+                .collect();
+            let has_more = page.len() > limit;
+            page.truncate(limit);
+            Ok(json!({
+                "txs": page,
+                "offset": offset,
+                "limit": limit,
+                "txCount": node.mempool_len(),
+                "queuedCount": node.mempool_queued_len(),
+                "hasMore": has_more,
             }))
         }
         "sov_getMempoolInfo" => {

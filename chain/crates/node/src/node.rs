@@ -134,6 +134,15 @@ impl Node {
         self.mempool.pool_floor_grains()
     }
 
+    /// A bounded snapshot of the mempool's CONTENTS with per-entry arrival
+    /// timing — the per-transaction view `sov_getMempoolTxs` serves. Read-only,
+    /// node-local, non-consensus. See [`Mempool::entries`].
+    ///
+    /// [`Mempool::entries`]: sov_mempool::Mempool::entries
+    pub fn mempool_entries(&self, limit: usize) -> Vec<sov_mempool::MempoolEntry> {
+        self.mempool.entries(limit)
+    }
+
     /// Ages (ms) of the oldest ready and oldest queued mempool entries —
     /// `(pending, queued)`, `None` for an empty region.
     pub fn mempool_oldest_ages_ms(&self) -> (Option<u64>, Option<u64>) {

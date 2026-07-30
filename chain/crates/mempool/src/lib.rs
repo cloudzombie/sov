@@ -322,6 +322,40 @@ struct EvictionVictim {
     sender_count: usize,
 }
 
+/// One pooled transaction as [`Mempool::entries`] reports it — the unit
+/// `sov_getMempoolTxs` serves.
+///
+/// **`age_ms` is this NODE's observation**, not a property of the transaction:
+/// how long ago THIS node admitted it to THIS pool. It is read from the very
+/// same `inserted_at` / `queued_at_ms` clock that drives TTL eviction and
+/// [`Mempool::oldest_pending_age_ms`], so there is exactly one admission clock
+/// in the pool and no second source of truth to drift. Two honest nodes will
+/// legitimately report different ages for the same transaction — whichever saw
+/// it first reports the larger one.
+#[derive(Debug, Clone)]
+pub struct MempoolEntry {
+    /// The transaction id (Blake3 of the Borsh-encoded [`sov_types::Transaction`]).
+    pub id: Hash,
+    /// The signing account.
+    pub signer: AccountId,
+    /// The transaction's nonce.
+    pub nonce: u64,
+    /// [`effective_tip`] in grains — this transaction's bid in the blockspace
+    /// auction. Zero for an untipped (legacy) transaction.
+    pub tip_grains: u128,
+    /// Serialized size in bytes.
+    pub size_bytes: usize,
+    /// Full weight (`size_bytes` + verification cost), the unit the pool's
+    /// weight bound and the block weight cap are measured in.
+    pub weight: u64,
+    /// Milliseconds since THIS node admitted the transaction. Saturating, so it
+    /// is never negative under clock jitter.
+    pub age_ms: u64,
+    /// `true` for a READY (mineable) entry, `false` for a QUEUED (future-nonce)
+    /// one that cannot be mined until its sender's nonce gap fills.
+    pub ready: bool,
+}
+
 /// One effective-tip bucket of [`Mempool::tip_histogram`] — the unit
 /// `sov_getMempoolHistogram` serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1237,6 +1271,73 @@ impl Mempool {
             .values()
             .map(|q| now.saturating_sub(q.queued_at_ms))
             .max()
+    }
+
+    /// A bounded snapshot of the pool's CONTENTS with per-entry arrival timing:
+    /// up to `limit` entries, READY (mineable) first — highest
+    /// [`effective_tip`] first within each region, so the order matches the one
+    /// [`select`](Self::select) mines in — then QUEUED (future-nonce) entries,
+    /// oldest first.
+    ///
+    /// Read-only, node-local, and NON-consensus: nothing here is committed to a
+    /// block or affects any rule. It is the per-transaction complement to the
+    /// aggregates [`oldest_pending_age_ms`](Self::oldest_pending_age_ms) and
+    /// [`tip_histogram`](Self::tip_histogram), and it reads the SAME admission
+    /// clock they do, so ages can never disagree between the two views.
+    ///
+    /// `limit` is applied by the caller's own cap; the whole response is bounded
+    /// by it regardless of pool size.
+    pub fn entries(&self, limit: usize) -> Vec<MempoolEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let now = now_millis();
+        let mut ready: Vec<MempoolEntry> = self
+            .by_id
+            .iter()
+            .map(|(id, stx)| MempoolEntry {
+                id: *id,
+                signer: stx.transaction.signer.clone(),
+                nonce: stx.transaction.nonce,
+                tip_grains: effective_tip(stx).grains(),
+                size_bytes: stx.serialized_size(),
+                weight: tx_weight(stx),
+                age_ms: now.saturating_sub(*self.inserted_at.get(id).unwrap_or(&now)),
+                ready: true,
+            })
+            .collect();
+        // Highest bid first, then oldest first, then by id — a total order, so
+        // the snapshot is deterministic for a given pool state rather than
+        // dependent on `HashMap` iteration order.
+        ready.sort_by(|a, b| {
+            b.tip_grains
+                .cmp(&a.tip_grains)
+                .then(b.age_ms.cmp(&a.age_ms))
+                .then(a.id.to_hex().cmp(&b.id.to_hex()))
+        });
+        ready.truncate(limit);
+        if ready.len() == limit {
+            return ready;
+        }
+        let remaining = limit - ready.len();
+        let mut queued: Vec<MempoolEntry> = self
+            .queued
+            .iter()
+            .map(|((signer, nonce), q)| MempoolEntry {
+                id: q.stx.id(),
+                signer: signer.clone(),
+                nonce: *nonce,
+                tip_grains: effective_tip(&q.stx).grains(),
+                size_bytes: q.stx.serialized_size(),
+                weight: tx_weight(&q.stx),
+                age_ms: now.saturating_sub(q.queued_at_ms),
+                ready: false,
+            })
+            .collect();
+        queued.sort_by(|a, b| b.age_ms.cmp(&a.age_ms).then(a.nonce.cmp(&b.nonce)));
+        queued.truncate(remaining);
+        ready.extend(queued);
+        ready
     }
 
     /// The `n`-th highest [`effective_tip`] among READY transactions (1-based),
@@ -3160,5 +3261,160 @@ mod tests {
         // or two nodes disagree about what they relay.
         let again = pool.eviction_victim(&id("boj.reserve.sov")).unwrap();
         assert_eq!(v.id, again.id, "victim selection is deterministic");
+    }
+
+    // ── `Mempool::entries`: per-transaction contents with arrival timing ────
+
+    /// The consensus expiry bound and this pool's stranded-entry TTL are ONE
+    /// number by design: a timestamped transaction the pool would reap is
+    /// exactly one consensus refuses to mine, and anything still pooled is
+    /// still mineable. `sov-types` cannot depend on `sov-mempool` (the
+    /// dependency runs the other way), so this test is the pin that stops the
+    /// two definitions from drifting apart.
+    #[test]
+    fn the_consensus_expiry_bound_equals_this_pools_stranded_ttl() {
+        assert_eq!(
+            STRANDED_TTL_MS,
+            sov_types::TX_TIMESTAMP_MAX_AGE_MS,
+            "if you change one, change the other — they are the same horizon"
+        );
+    }
+
+    #[test]
+    fn entries_reports_ready_first_by_bid_then_queued_and_distinguishes_them() {
+        let mut pool = Mempool::new(64);
+        // Two ready (contiguous from nonce 0) with different bids, plus a
+        // future-nonce entry that lands in the QUEUED region.
+        pool.insert(tipped([1; 32], "usa.reserve.sov", 0, 100), 0, big())
+            .unwrap();
+        pool.insert(tipped([1; 32], "usa.reserve.sov", 1, 900), 0, big())
+            .unwrap();
+        assert_eq!(
+            pool.insert(tx([2; 32], "ecb.reserve.sov", 7), 0, big())
+                .unwrap(),
+            Admitted::Queued,
+            "a future nonce parks in the queued region"
+        );
+
+        let entries = pool.entries(10);
+        assert_eq!(entries.len(), 3);
+
+        // READY first, highest bid first — the order `select` mines in.
+        assert!(entries[0].ready && entries[1].ready);
+        assert_eq!(entries[0].tip_grains, 900);
+        assert_eq!(entries[1].tip_grains, 100);
+        assert_eq!(entries[0].signer, id("usa.reserve.sov"));
+        assert_eq!(entries[0].nonce, 1);
+
+        // Then the QUEUED entry, explicitly marked as such — it is waiting on a
+        // missing nonce, not on fees.
+        assert!(!entries[2].ready, "queued is distinguishable from ready");
+        assert_eq!(entries[2].signer, id("ecb.reserve.sov"));
+        assert_eq!(entries[2].nonce, 7);
+        assert_eq!(entries[2].tip_grains, 0, "an untipped tx bids zero");
+
+        // Every entry carries real, non-fabricated size/weight.
+        for e in &entries {
+            assert!(e.size_bytes > 0);
+            assert!(e.weight >= e.size_bytes as u64);
+        }
+
+        // The counts agree with the aggregates `sov_getMempoolInfo` serves.
+        assert_eq!(entries.iter().filter(|e| e.ready).count(), pool.len());
+        assert_eq!(
+            entries.iter().filter(|e| !e.ready).count(),
+            pool.queued_len()
+        );
+    }
+
+    #[test]
+    fn entries_ages_come_from_the_same_admission_clock_as_the_aggregates() {
+        let mut pool = Mempool::new(64);
+        pool.insert(tx([1; 32], "usa.reserve.sov", 0), 0, big())
+            .unwrap();
+        pool.insert(tx([2; 32], "ecb.reserve.sov", 5), 0, big())
+            .unwrap();
+
+        let entries = pool.entries(10);
+        let ready = entries.iter().find(|e| e.ready).expect("a ready entry");
+        let queued = entries.iter().find(|e| !e.ready).expect("a queued entry");
+
+        // Sane: an age is a duration since admission, so it is bounded by the
+        // oldest age the aggregate reports for the same region. Never negative
+        // (saturating), and never larger than what `oldest_*_age_ms` computes
+        // off the identical `inserted_at` / `queued_at_ms` clock.
+        let oldest_ready = pool
+            .oldest_pending_age_ms()
+            .expect("ready region is not empty");
+        let oldest_queued = pool
+            .oldest_queued_age_ms()
+            .expect("queued region is not empty");
+        assert!(
+            ready.age_ms <= oldest_ready.saturating_add(1_000),
+            "ready age {} vs aggregate oldest {oldest_ready}",
+            ready.age_ms
+        );
+        assert!(
+            queued.age_ms <= oldest_queued.saturating_add(1_000),
+            "queued age {} vs aggregate oldest {oldest_queued}",
+            queued.age_ms
+        );
+
+        // Monotonic: sampled again later, an entry's age never goes backwards.
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let later = pool.entries(10);
+        let later_ready = later.iter().find(|e| e.ready).expect("still ready");
+        assert!(
+            later_ready.age_ms >= ready.age_ms,
+            "age is monotonic: {} then {}",
+            ready.age_ms,
+            later_ready.age_ms
+        );
+    }
+
+    #[test]
+    fn entries_is_bounded_by_its_limit_and_zero_returns_nothing() {
+        let mut pool = Mempool::new(64);
+        for n in 0..12u64 {
+            pool.insert(tx([1; 32], "usa.reserve.sov", n), 0, big())
+                .unwrap();
+        }
+        assert_eq!(pool.len(), 12);
+        assert_eq!(pool.entries(0).len(), 0, "a zero limit returns nothing");
+        assert_eq!(pool.entries(5).len(), 5, "the limit is a hard bound");
+        assert_eq!(pool.entries(12).len(), 12);
+        assert_eq!(
+            pool.entries(1_000).len(),
+            12,
+            "asking for more than exists returns only what exists"
+        );
+
+        // Deterministic for a fixed pool state — not `HashMap` iteration order.
+        let a: Vec<_> = pool.entries(12).into_iter().map(|e| e.id).collect();
+        let b: Vec<_> = pool.entries(12).into_iter().map(|e| e.id).collect();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn entries_never_starves_the_ready_region_for_queued_ones() {
+        // The limit is spent on READY entries first: a client asking for a small
+        // page must see the mineable backlog, not a pile of parked future
+        // nonces.
+        let mut pool = Mempool::new(64);
+        for n in 0..4u64 {
+            pool.insert(tx([1; 32], "usa.reserve.sov", n), 0, big())
+                .unwrap();
+        }
+        for n in 20..24u64 {
+            pool.insert(tx([2; 32], "ecb.reserve.sov", n), 0, big())
+                .unwrap();
+        }
+        assert_eq!(pool.len(), 4);
+        assert_eq!(pool.queued_len(), 4);
+        let page = pool.entries(4);
+        assert!(
+            page.iter().all(|e| e.ready),
+            "the first page is entirely ready entries"
+        );
     }
 }

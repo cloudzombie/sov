@@ -130,6 +130,12 @@ pub struct Blockchain {
     /// Arming is a later, separately-audited release that installs a
     /// deployment here, exactly as v0.1.99 did for bits 0/1.
     shielded_v2_deployment: Option<sov_governance::Deployment>,
+    /// The miner-signaled `tx-timestamp` deployment (signal bit 3 — the
+    /// `Action::Timestamped` bounded creation-time envelope), if this chain
+    /// schedules one. `None` keeps the envelope a hard `FeatureInactive` reject
+    /// at every height — execution, the genesis hash, and every KAT vector
+    /// byte-identical to a build without it.
+    tx_timestamp_deployment: Option<sov_governance::Deployment>,
     /// Transaction receipts for the **active chain**, indexed for RPC lookup.
     /// `active_receipts[h]` holds the receipts of the active block at height `h`
     /// (in transaction order); only heights with at least one transaction appear.
@@ -588,6 +594,7 @@ impl Blockchain {
             tx_domain_grace_blocks: TX_DOMAIN_GRACE_BLOCKS,
             fee_auction_deployment: None,
             shielded_v2_deployment: None,
+            tx_timestamp_deployment: None,
             active_receipts: HashMap::new(),
             tx_height: HashMap::new(),
             undo_ring: VecDeque::new(),
@@ -1045,6 +1052,17 @@ impl Blockchain {
         self.shielded_v2_deployment = Some(deployment);
     }
 
+    /// Schedule the miner-signaled `tx-timestamp` deployment (signal bit 3):
+    /// once `deployment` activates under the BIP-9/8 state machine, an
+    /// `Action::Timestamped` envelope executes — its declared `created_at_ms`
+    /// bounded against the including block's header timestamp, then its inner
+    /// action run. Dormant until activation: pre-activation execution (and thus
+    /// the genesis hash and every KAT vector) is byte-identical, because the
+    /// envelope stays a hard reject.
+    pub fn set_tx_timestamp_deployment(&mut self, deployment: sov_governance::Deployment) {
+        self.tx_timestamp_deployment = Some(deployment);
+    }
+
     /// The live BIP-9/BIP-8 state of every registered governance deployment, evaluated
     /// over the ACTIVE chain's committed miner signals at the current height. This is
     /// read-only observability for `sov_getDeployments`; the exact same evaluation
@@ -1082,6 +1100,7 @@ impl Blockchain {
             .fee_auction_deployment
             .iter()
             .chain(self.shielded_v2_deployment.iter())
+            .chain(self.tx_timestamp_deployment.iter())
         {
             out.push(DeploymentStatus {
                 name: d.name.clone(),
@@ -1372,6 +1391,21 @@ impl Blockchain {
     /// evaluates activation over *that branch's* signals.
     fn shielded_v2_active_with(&self, height: u64, signals: &sov_governance::SignalLog) -> bool {
         Self::deployment_active_at(self.shielded_v2_deployment.as_ref(), height, signals)
+    }
+
+    /// Whether the miner-signaled `tx-timestamp` deployment (bit 3) is `Active`
+    /// for a block at `height`, over the active chain's committed signals.
+    /// `false` before activation, or if no schedule is baked — which keeps
+    /// `Action::Timestamped` a hard reject.
+    pub fn tx_timestamp_active(&self, height: u64) -> bool {
+        self.tx_timestamp_active_with(height, &self.signals)
+    }
+
+    /// As [`tx_timestamp_active`](Self::tx_timestamp_active), but over an
+    /// explicit signal history, so fork-choice replay of a competing branch
+    /// evaluates activation over *that branch's* signals.
+    fn tx_timestamp_active_with(&self, height: u64, signals: &sov_governance::SignalLog) -> bool {
+        Self::deployment_active_at(self.tx_timestamp_deployment.as_ref(), height, signals)
     }
 
     /// Whether `deployment` (if any) has reached `Active` at or below the
@@ -1761,6 +1795,8 @@ impl Blockchain {
             tx_domain: self.resolved_tx_domain_mode(next_height),
             fee_auction_active: self.fee_auction_active(next_height),
             shielded_v2_active: self.shielded_v2_active(next_height),
+            tx_timestamp_active: self.tx_timestamp_active(next_height),
+            block_time_ms: timestamp_ms,
             chain_domain: self.chain_domain(),
         };
         apply_coinbase(&mut probe, &selection_ctx)?;
@@ -1824,6 +1860,8 @@ impl Blockchain {
             tx_domain: self.resolved_tx_domain_mode(next_height),
             fee_auction_active: self.fee_auction_active(next_height),
             shielded_v2_active: self.shielded_v2_active(next_height),
+            tx_timestamp_active: self.tx_timestamp_active(next_height),
+            block_time_ms: timestamp_ms,
             chain_domain: self.chain_domain(),
         };
         apply_coinbase(&mut scratch, &ctx)?;
@@ -2546,6 +2584,8 @@ impl Blockchain {
             tx_domain: self.resolved_tx_domain_mode_with(height, signals),
             fee_auction_active: self.fee_auction_active_with(height, signals),
             shielded_v2_active: self.shielded_v2_active_with(height, signals),
+            tx_timestamp_active: self.tx_timestamp_active_with(height, signals),
+            block_time_ms: block.header.timestamp_ms,
             chain_domain: self.chain_domain(),
         };
         apply_coinbase(ledger, &ctx)?;
@@ -5747,6 +5787,267 @@ mod tests {
             .resume_from_snapshot(ledger, receipts, Hash::digest(b"wrong head"), 5, &log)
             .unwrap();
         assert!(!ok, "a snapshot head off the heaviest chain is rejected");
+    }
+
+    // ── `tx-timestamp` (signal bit 3): bounded creation time ───────────────
+
+    /// A `Timestamped{created_at_ms, Transfer{to, sov}}` from `usa.reserve.sov`.
+    fn usa_stamped_transfer(
+        created_at_ms: u64,
+        to: &str,
+        sov: u128,
+        nonce: u64,
+    ) -> SignedTransaction {
+        let kp = Keypair::from_seed([2; 32]);
+        let tx = Transaction {
+            signer: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce,
+            action: Action::Timestamped {
+                created_at_ms,
+                inner: Box::new(Action::Transfer {
+                    to: id(to),
+                    amount: Balance::from_sov(sov).unwrap(),
+                }),
+            },
+        };
+        SignedTransaction::sign(tx, &kp).unwrap()
+    }
+
+    /// A chain whose `tx-timestamp` deployment activates for the block at
+    /// height 12, driven by REAL committed miner signals (window 4, 3-of-4,
+    /// signaling opens at 4 → LockedIn at 8 → Active at 12) — the same window
+    /// math the fee-auction and tx-domain activation tests use. Returns the
+    /// chain and the next block timestamp to use.
+    fn chain_with_tx_timestamp_active_at_12() -> (Blockchain, u64) {
+        use sov_governance::{Deployment, Threshold};
+        let mut chain = fresh_chain();
+        chain.set_tx_timestamp_deployment(
+            Deployment::new(
+                sov_governance::TX_TIMESTAMP_DEPLOYMENT,
+                sov_governance::BIT_TX_TIMESTAMP,
+                BlockHeight::new(4),
+                BlockHeight::new(400),
+                4,
+                Threshold::new(3, 4).unwrap(),
+                BlockHeight::new(0),
+                true,
+            )
+            .unwrap(),
+        );
+        chain.set_signal_mask(1 << sov_governance::BIT_TX_TIMESTAMP);
+        // Realistic wall-clock block timestamps, so the 30-minute lower bound is
+        // a real bound rather than one that saturates at zero.
+        let mut ts = 1_700_000_000_000u64;
+        for _ in 1..=11 {
+            let block = chain.produce_block(vec![], ts).unwrap();
+            assert_eq!(
+                block.header.version_bits,
+                1 << sov_governance::BIT_TX_TIMESTAMP,
+                "blocks carry the bit-3 signal"
+            );
+            chain.import_block(block).unwrap();
+            ts += 1_000;
+        }
+        (chain, ts)
+    }
+
+    #[test]
+    fn tx_timestamp_is_dormant_until_miners_signal_it() {
+        // Before any schedule is baked, bit 3 is inactive at every height and a
+        // `Timestamped` transaction is unmineable — the producer excludes it
+        // (leaving the block empty) and a smuggled one is rejected on import.
+        let mut chain = fresh_chain();
+        for h in [0u64, 1, 10, 10_000, 1_000_000] {
+            assert!(!chain.tx_timestamp_active(h), "dormant at height {h}");
+        }
+        let ts = 1_700_000_000_000u64;
+        let stamped = usa_stamped_transfer(ts, "ecb.reserve.sov", 10, 0);
+        let block = chain.produce_block(vec![stamped.clone()], ts).unwrap();
+        assert!(
+            block.transactions.is_empty(),
+            "a dormant envelope is never selected into a block"
+        );
+        chain.import_block(block).unwrap();
+
+        // Smuggled in by a hostile/upgraded producer: import re-execution
+        // refuses the whole block, so it can never enter the chain.
+        let mut smuggled = chain.produce_block(vec![], ts + 1_000).unwrap();
+        smuggled.transactions.push(stamped);
+        assert!(
+            chain.import_block(smuggled).is_err(),
+            "a block carrying a dormant envelope is INVALID"
+        );
+        assert_eq!(
+            chain.ledger().account(&id("ecb.reserve.sov")).balance,
+            Balance::ZERO,
+            "nothing moved"
+        );
+    }
+
+    #[test]
+    fn miner_signaled_tx_timestamp_activates_and_a_stamped_tx_mines() {
+        let (mut chain, mut ts) = chain_with_tx_timestamp_active_at_12();
+
+        // Activation is derived purely from committed header bits.
+        assert!(!chain.tx_timestamp_active(11), "still dormant at height 11");
+        assert!(chain.tx_timestamp_active(12), "active for the block at 12");
+        assert!(chain.tx_timestamp_active(13), "and stays active (terminal)");
+
+        let supply_before = chain.ledger().total_supply().unwrap();
+        let reward = chain.mint_reward();
+
+        // Declared 30 seconds before the block it lands in — comfortably inside
+        // the window.
+        let stamped = usa_stamped_transfer(ts - 30_000, "ecb.reserve.sov", 10, 0);
+        let block = chain.produce_block(vec![stamped], ts).unwrap();
+        assert_eq!(
+            block.transactions.len(),
+            1,
+            "a bounded creation time is mineable once bit 3 is active"
+        );
+        // The declared time is committed in the block, so any client reading the
+        // block can compute made -> confirmed without trusting a node's memory.
+        assert!(matches!(
+            block.transactions[0].transaction.action,
+            Action::Timestamped { created_at_ms, .. } if created_at_ms == ts - 30_000
+        ));
+        chain.import_block(block).unwrap();
+
+        let l = chain.ledger();
+        assert_eq!(
+            l.account(&id("ecb.reserve.sov")).balance,
+            Balance::from_sov(10).unwrap(),
+            "the inner transfer executed"
+        );
+        assert_eq!(
+            l.total_supply().unwrap(),
+            supply_before.checked_add(reward).unwrap(),
+            "supply rose by exactly the coinbase — the envelope mints nothing"
+        );
+        ts += 1_000;
+        let _ = ts;
+    }
+
+    #[test]
+    fn an_out_of_window_creation_time_is_unmineable_at_both_edges() {
+        let (mut chain, ts) = chain_with_tx_timestamp_active_at_12();
+
+        for (label, created) in [
+            (
+                "future-dated past the tolerance",
+                ts + sov_types::TX_TIMESTAMP_FUTURE_TOLERANCE_MS + 1,
+            ),
+            (
+                "expired / back-dated past the maximum age",
+                ts - sov_types::TX_TIMESTAMP_MAX_AGE_MS - 1,
+            ),
+        ] {
+            let stx = usa_stamped_transfer(created, "ecb.reserve.sov", 10, 0);
+            // The producer excludes it — with the honest reason.
+            let (candidate, excluded) = chain
+                .build_candidate(vec![stx.clone()], ts)
+                .expect("candidate builds");
+            assert!(
+                candidate.block.transactions.is_empty(),
+                "{label}: never selected"
+            );
+            assert_eq!(excluded.len(), 1, "{label}: reported as excluded");
+
+            // And a smuggled one invalidates the whole block.
+            let mut smuggled = chain.produce_block(vec![], ts).unwrap();
+            smuggled.transactions.push(stx);
+            assert!(
+                chain.import_block(smuggled).is_err(),
+                "{label}: a block carrying it is INVALID"
+            );
+        }
+        assert_eq!(
+            chain.ledger().account(&id("ecb.reserve.sov")).balance,
+            Balance::ZERO,
+            "no out-of-window transaction had any effect"
+        );
+    }
+
+    #[test]
+    fn tx_timestamp_activation_resolves_over_the_candidates_own_branch() {
+        use sov_governance::{Deployment, Threshold};
+
+        // Validation runs for blocks on ANY branch. A block must be judged by
+        // ITS OWN parent branch's committed signals, never by the active
+        // chain's — otherwise two nodes with different heads could disagree
+        // about whether bit 3 applies to the very same block, and split.
+        //
+        // Built as a fork of the SIGNALING chain: a side branch whose blocks do
+        // NOT carry bit 3 must not inherit activation from the active chain.
+        let mut chain = fresh_chain();
+        let deployment = Deployment::new(
+            sov_governance::TX_TIMESTAMP_DEPLOYMENT,
+            sov_governance::BIT_TX_TIMESTAMP,
+            BlockHeight::new(4),
+            BlockHeight::new(400),
+            4,
+            Threshold::new(3, 4).unwrap(),
+            BlockHeight::new(0),
+            true,
+        )
+        .unwrap();
+        chain.set_tx_timestamp_deployment(deployment);
+
+        // A chain that signals NOTHING never activates, at any height — the
+        // resolution reads committed bits, not the local schedule.
+        chain.set_signal_mask(0);
+        let mut ts = 1_700_000_000_000u64;
+        for _ in 1..=11 {
+            let block = chain.produce_block(vec![], ts).unwrap();
+            assert_eq!(block.header.version_bits, 0, "this branch signals nothing");
+            chain.import_block(block).unwrap();
+            ts += 1_000;
+        }
+        assert!(
+            !chain.tx_timestamp_active(12),
+            "no committed signals ⇒ never Active, even with the schedule installed"
+        );
+        let stamped = usa_stamped_transfer(ts, "ecb.reserve.sov", 10, 0);
+        let block = chain.produce_block(vec![stamped], ts).unwrap();
+        assert!(
+            block.transactions.is_empty(),
+            "and the envelope stays unmineable on that branch"
+        );
+
+        // The identical schedule, driven by REAL committed signals, does
+        // activate — so the difference is the branch's own header bits and
+        // nothing else.
+        let (signaling, _) = chain_with_tx_timestamp_active_at_12();
+        assert!(signaling.tx_timestamp_active(12));
+    }
+
+    #[test]
+    fn deployment_states_reports_tx_timestamp_for_getdeployments_rpc() {
+        use sov_governance::{Deployment, Threshold};
+        let mut chain = fresh_chain();
+        chain.set_tx_timestamp_deployment(
+            Deployment::new(
+                sov_governance::TX_TIMESTAMP_DEPLOYMENT,
+                sov_governance::BIT_TX_TIMESTAMP,
+                BlockHeight::new(288),
+                BlockHeight::new(1_152),
+                288,
+                Threshold::new(9, 10).unwrap(),
+                BlockHeight::new(576),
+                false,
+            )
+            .unwrap(),
+        );
+        let states = chain.deployment_states();
+        let ts = states
+            .iter()
+            .find(|d| d.name == sov_governance::TX_TIMESTAMP_DEPLOYMENT)
+            .expect("tx-timestamp is observable over the deployments RPC");
+        assert_eq!(ts.bit, sov_governance::BIT_TX_TIMESTAMP);
+        assert_eq!(ts.bit, 3, "bit 3 — 0/1/2 are taken");
+        assert_eq!(ts.start_height, 288);
+        assert_eq!(ts.period, 288);
     }
 }
 
