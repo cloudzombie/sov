@@ -351,6 +351,17 @@ pub struct MempoolEntry {
     /// Milliseconds since THIS node admitted the transaction. Saturating, so it
     /// is never negative under clock jitter.
     pub age_ms: u64,
+    /// The absolute Unix-millisecond instant THIS node admitted the transaction
+    /// — the same `inserted_at` / `queued_at_ms` value [`age_ms`](Self::age_ms)
+    /// is derived from, reported directly.
+    ///
+    /// Both are served because they fail differently. A client that subtracts
+    /// `age_ms` from its OWN clock silently folds node/client clock skew into
+    /// the answer; one that reads this takes the node's instant as-is. Neither
+    /// is more authoritative than the other about *reality* — both are this
+    /// node's observation — but for pairing against a block's `timestamp_ms`
+    /// (also a producer's clock, not the client's) this is the closer match.
+    pub first_seen_ms: u64,
     /// `true` for a READY (mineable) entry, `false` for a QUEUED (future-nonce)
     /// one that cannot be mined until its sender's nonce gap fills.
     pub ready: bool,
@@ -1303,6 +1314,7 @@ impl Mempool {
                 size_bytes: stx.serialized_size(),
                 weight: tx_weight(stx),
                 age_ms: now.saturating_sub(*self.inserted_at.get(id).unwrap_or(&now)),
+                first_seen_ms: *self.inserted_at.get(id).unwrap_or(&now),
                 ready: true,
             })
             .collect();
@@ -1331,6 +1343,7 @@ impl Mempool {
                 size_bytes: q.stx.serialized_size(),
                 weight: tx_weight(&q.stx),
                 age_ms: now.saturating_sub(q.queued_at_ms),
+                first_seen_ms: q.queued_at_ms,
                 ready: false,
             })
             .collect();
@@ -3313,10 +3326,19 @@ mod tests {
         assert_eq!(entries[2].nonce, 7);
         assert_eq!(entries[2].tip_grains, 0, "an untipped tx bids zero");
 
-        // Every entry carries real, non-fabricated size/weight.
+        // Every entry carries real, non-fabricated size/weight, and the two
+        // arrival views agree: `first_seen_ms + age_ms` is the sampling instant.
         for e in &entries {
             assert!(e.size_bytes > 0);
             assert!(e.weight >= e.size_bytes as u64);
+            assert!(
+                e.first_seen_ms > 0,
+                "the absolute admission instant is reported, not just the age"
+            );
+            assert!(
+                e.first_seen_ms.saturating_add(e.age_ms) >= e.first_seen_ms,
+                "age is a duration since first_seen_ms, on one clock"
+            );
         }
 
         // The counts agree with the aggregates `sov_getMempoolInfo` serves.

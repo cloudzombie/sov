@@ -1283,8 +1283,15 @@ fn call(
                         "tipGrains": e.tip_grains.to_string(),
                         "sizeBytes": e.size_bytes,
                         "weight": e.weight,
-                        // Milliseconds since THIS node first admitted it.
+                        // Milliseconds since THIS node first admitted it, and
+                        // the absolute Unix-ms instant it did. Both are the
+                        // SAME observation off the SAME clock — `ageMs` for a
+                        // client that just wants "how long has this waited",
+                        // `firstSeenMs` for one pairing against a block's
+                        // `timestamp_ms` (also a producer's clock), which
+                        // avoids folding client clock skew into the answer.
                         "ageMs": e.age_ms,
+                        "firstSeenMs": e.first_seen_ms,
                         // READY (mineable now) vs QUEUED (future nonce, parked
                         // until its sender's gap fills) — a queued entry is NOT
                         // waiting on fees, it is waiting on a missing nonce.

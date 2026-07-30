@@ -3346,6 +3346,16 @@ mod tests {
             age >= oldest.saturating_sub(1_000),
             "per-entry age {age} agrees with the aggregate {oldest}"
         );
+        // The absolute instant, for a client pairing against a block timestamp
+        // rather than against its own clock. Same observation, same clock.
+        let first_seen = ready_entry
+            .get("firstSeenMs")
+            .and_then(serde_json::Value::as_u64)
+            .expect("the absolute admission instant is disclosed too");
+        assert!(
+            first_seen > 1_700_000_000_000,
+            "a real Unix-ms instant, not a duration: {first_seen}"
+        );
 
         // QUEUED entries are distinguishable — they wait on a missing nonce,
         // not on fees.
