@@ -12915,6 +12915,13 @@ fn setup_node_dir(node_dir: &Path, spec_filename: &str) -> Result<(), String> {
         block_time_ms: 60_000,
         mempool_capacity: 16_384,
         max_block_txs: 4_096,
+        // Node-local transaction-timing observability (`sov_getTxTiming`) at its
+        // defaults: ~7.5 days of blocks, capped at 200k rows. Non-consensus —
+        // it is this node's own record of how long transactions waited, is
+        // committed to no block, receipt, or state root, and can differ freely
+        // from any other node's.
+        tx_timing_retention_blocks: sov_rpc::daemon::TX_TIMING_DEFAULT_RETENTION_BLOCKS,
+        tx_timing_max_entries: sov_rpc::daemon::TX_TIMING_DEFAULT_MAX_ENTRIES,
         // Start in SYNC-ONLY mode: the node connects, serves, and downloads the chain
         // WITHOUT mining, so it never burns CPU on proof-of-work while catching up (the
         // thing that starved sync on slow machines). Mining is an explicit opt-in from

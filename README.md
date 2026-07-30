@@ -202,6 +202,16 @@ Selected methods:
 | Assets & names | `sov_listTokens` · `sov_getTokenInfo` · `sov_getTokenBalances` · `sov_listNfts` · `sov_getNft` · `sov_resolveName` · `sov_listNames` |
 | Multisig & swaps | `sov_getMultisigProposals` · `sov_getHtlc` · `sov_getShieldedInfo` |
 | Network | `sov_getPeerInfo` · `sov_getMiners` · `sov_getMempoolSize` |
+| Mempool & timing | `sov_getMempoolInfo` · `sov_getMempoolHistogram` · `sov_getMempoolTxs` · `sov_getTxTiming` |
+
+The mempool/timing group is **node-local observability**, not chain data:
+`sov_getMempoolTxs` reports each pooled transaction's `firstSeenMs`/`ageMs` and
+`sov_getTxTiming` reports how long a mined transaction waited — both as *this
+node* observed it. Nothing there is committed to a block, a receipt, or a state
+root, and two honest nodes will legitimately report different values for the
+same transaction. A node that never held a transaction in its own mempool
+answers `observed: false` with null waits rather than substituting the block
+time for an arrival it never witnessed.
 
 ---
 

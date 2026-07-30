@@ -21,11 +21,21 @@ use sov_mempool::{Admitted, Mempool, MempoolError};
 use sov_primitives::{AccountId, Hash};
 use sov_types::{Action, Block, Receipt, SignedTransaction};
 
+use crate::timing::{TxTiming, TxTimingIndex};
+
 /// A running SOV node.
 pub struct Node {
     chain: Blockchain,
     mempool: Mempool,
     max_block_txs: usize,
+    /// NODE-LOCAL transaction timing (see [`crate::timing`]): how long each
+    /// mined transaction waited, as THIS node observed it.
+    ///
+    /// It is written only by [`Node::record_block_timing`] and read only by
+    /// [`Node::tx_timing`] — there is no path from it into block validation,
+    /// execution, selection, or fork choice, so it cannot influence any
+    /// committed root. Bounded by construction; persisted outside the block log.
+    timing: TxTimingIndex,
 }
 
 /// The outcome of mining one block.
@@ -44,9 +54,19 @@ impl Node {
             chain,
             mempool: Mempool::new(mempool_capacity),
             max_block_txs,
+            timing: TxTimingIndex::new(),
         };
         node.refresh_mempool_domain();
         node
+    }
+
+    /// Override the node-local timing index's retention bounds (blocks of depth,
+    /// hard row ceiling) — the operator-configurable form of
+    /// [`crate::timing::DEFAULT_RETENTION_BLOCKS`] /
+    /// [`crate::timing::DEFAULT_MAX_ENTRIES`]. Discards any rows already held,
+    /// so it is a startup knob, applied before the index is loaded from disk.
+    pub fn set_tx_timing_limits(&mut self, retention_blocks: u64, max_entries: usize) {
+        self.timing = TxTimingIndex::with_limits(retention_blocks, max_entries);
     }
 
     /// Refresh the mempool's `tx-domain` verification mode to the one resolved at
@@ -58,9 +78,17 @@ impl Node {
     /// window closes, at which point a legacy or cross-network signature is
     /// refused at the door. Called after every tip change so the pool tracks the
     /// rollout.
+    ///
+    /// The same tip-change hook also tells the pool the node's current height,
+    /// so every admission is stamped with WHERE in the chain this node was when
+    /// it saw the transaction — the height half of the one admission
+    /// observation that [`Mempool::first_seen`](sov_mempool::Mempool::first_seen)
+    /// reports. That is node-local bookkeeping; the pool reads it for nothing
+    /// else.
     fn refresh_mempool_domain(&mut self) {
         let mode = self.chain.resolved_tx_domain_mode(self.chain.height() + 1);
         self.mempool.set_mode(mode);
+        self.mempool.set_chain_height(self.chain.height());
     }
 
     /// Name the account this node's mined blocks credit the coinbase to — the
@@ -132,6 +160,129 @@ impl Node {
     /// [`Mempool::pool_floor_grains`].
     pub fn mempool_pool_floor_grains(&self) -> u128 {
         self.mempool.pool_floor_grains()
+    }
+
+    /// A bounded snapshot of the mempool's CONTENTS with per-entry arrival
+    /// timing — the per-transaction view `sov_getMempoolTxs` serves. Read-only,
+    /// node-local, non-consensus. See [`Mempool::entries`].
+    ///
+    /// [`Mempool::entries`]: sov_mempool::Mempool::entries
+    pub fn mempool_entries(&self, limit: usize) -> Vec<sov_mempool::MempoolEntry> {
+        self.mempool.entries(limit)
+    }
+
+    /// This node's recorded timing for transaction `id`, or `None` when it holds
+    /// no row — the transaction was never mined on this node's active chain, or
+    /// its row has aged out of the retention window. See [`crate::timing`].
+    ///
+    /// Read-only, node-local, non-consensus.
+    pub fn tx_timing(&self, id: &Hash) -> Option<TxTiming> {
+        self.timing.get(id)
+    }
+
+    /// How many timing rows this node retains, and the bounds it retains them
+    /// under: `(rows, retention_blocks, max_entries)`. For operator visibility
+    /// into a structure whose whole point is that it stays bounded.
+    pub fn tx_timing_stats(&self) -> (usize, u64, usize) {
+        (
+            self.timing.len(),
+            self.timing.retention_blocks(),
+            self.timing.max_entries(),
+        )
+    }
+
+    /// The timing index's persisted form — written to `data_dir/txtiming.dat`
+    /// beside `mempool.dat`, so an operator's view of transaction latency
+    /// survives a restart. See [`TxTimingIndex::snapshot`].
+    pub fn tx_timing_snapshot(&self) -> Vec<(Hash, TxTiming)> {
+        self.timing.snapshot()
+    }
+
+    /// Reload a persisted timing index, re-applying this node's CONFIGURED
+    /// bounds. A missing or unreadable file simply means an empty index: it is
+    /// non-consensus metadata, so losing it must never keep a node from booting.
+    pub fn restore_tx_timing(&mut self, rows: Vec<(Hash, TxTiming)>) {
+        self.timing.restore(rows);
+    }
+
+    /// Record node-local timing for every transaction in `block`, which must
+    /// already be committed on the ACTIVE chain.
+    ///
+    /// **Call order matters.** This reads each transaction's admission stamp out
+    /// of the mempool, so it has to run BEFORE the block-connect path prunes
+    /// those entries — once they are gone, the observation is gone with them and
+    /// every row would be recorded as unobserved. Both connect paths
+    /// ([`commit_mined`](Self::commit_mined) and
+    /// [`import_block`](Self::import_block)) call it as their first step after a
+    /// successful import, ahead of any pool mutation.
+    ///
+    /// A transaction this node never pooled — the normal case for a block synced
+    /// from a peer — is recorded as UNOBSERVED: the inclusion facts are kept, the
+    /// wait is `None`, and the block's own timestamp is never substituted for the
+    /// arrival this node did not witness.
+    ///
+    /// A block that did not join the active chain (a self-mined block that lost
+    /// the race, or a peer block filed on a lighter side branch) records nothing:
+    /// there is no honest `included_height` for a block nobody is building on.
+    fn record_block_timing(&mut self, block: &Block) {
+        let height = block.header.height.get();
+        // Only the active chain gets rows. Comparing by hash (not just height)
+        // is what distinguishes "this block is the one at that height" from
+        // "some other block occupies that height now".
+        if self.chain.block_by_height(height).map(|b| b.hash()) != Some(block.hash()) {
+            return;
+        }
+        let timestamp_ms = block.header.timestamp_ms;
+        let ids: Vec<Hash> = block.transactions.iter().map(|stx| stx.id()).collect();
+        // One batched lookup, not one per transaction: the queued region is
+        // keyed by `(signer, nonce)`, so a per-id query re-hashes the whole
+        // parked region every time — quadratic for a full block against a full
+        // queue, on the block-connect hot path.
+        let seen = self.mempool.first_seen_batch(&ids);
+        for (id, seen) in ids.into_iter().zip(seen) {
+            let timing = match seen {
+                Some(seen) => TxTiming::observed(seen.at_ms, seen.at_height, height, timestamp_ms),
+                None => TxTiming::unobserved(height, timestamp_ms),
+            };
+            self.timing.record(id, timing);
+        }
+    }
+
+    /// Repair the timing index after a REORG, so no row is left claiming a
+    /// transaction sits in a block that is no longer on the active chain.
+    ///
+    /// `reverted` is the set of transactions the reorg orphaned off the old
+    /// active chain (`Imported::reverted_txs`). Their rows are WITHDRAWN first —
+    /// a withdrawn row is honest (the RPC reports "no timing for this
+    /// transaction"), a stale one is not. Then every active block from the
+    /// lowest withdrawn height up to the new tip is re-recorded, which RE-POINTS
+    /// any transaction that appears on both branches to its real new height and
+    /// fills in the new branch's intermediate blocks (which were only ever
+    /// imported as side-branch blocks, so they were never recorded).
+    ///
+    /// Bounded by the reorg's depth, and a no-op when nothing was orphaned.
+    /// Called before the mempool prunes, so re-recorded transactions still find
+    /// their admission stamps.
+    fn repair_timing_after_reorg(&mut self, reverted: &[SignedTransaction]) {
+        if reverted.is_empty() {
+            return;
+        }
+        let mut from = None;
+        for stx in reverted {
+            if let Some(old) = self.timing.remove(&stx.id()) {
+                from = Some(from.map_or(old.included_height, |f: u64| f.min(old.included_height)));
+            }
+        }
+        let Some(from) = from else { return };
+        // `from` can never predate the retention window, because a row outside it
+        // has already been evicted and so could not have been withdrawn above —
+        // the walk is bounded by the window even for an absurdly deep reorg.
+        for height in from..=self.chain.height() {
+            let Some(block) = self.chain.block_by_height(height).cloned() else {
+                continue;
+            };
+            self.record_block_timing(&block);
+        }
     }
 
     /// Ages (ms) of the oldest ready and oldest queued mempool entries —
@@ -311,10 +462,19 @@ impl Node {
     /// heaviest-work fork choice files this block on a side branch instead —
     /// exactly how a mining race between two nodes resolves in Bitcoin.
     pub fn commit_mined(&mut self, block: Block) -> Result<Produced, NodeError> {
-        let receipts = self
+        // `import_block_tracked` is the same import as `import_block` (which is a
+        // thin wrapper over it); taking the tracked form here changes no mempool
+        // behavior — the orphaned set is consumed ONLY to keep the node-local
+        // timing index honest across a reorg.
+        let imported = self
             .chain
-            .import_block(block.clone())
+            .import_block_tracked(block.clone())
             .map_err(NodeError::Chain)?;
+        let receipts = imported.receipts;
+        // Timing FIRST: the mempool still holds this block's transactions, so
+        // their admission stamps are still readable. See `record_block_timing`.
+        self.repair_timing_after_reorg(&imported.reverted_txs);
+        self.record_block_timing(&block);
         for stx in &block.transactions {
             self.mempool.remove(&stx.id());
         }
@@ -359,6 +519,11 @@ impl Node {
             .chain
             .import_block_tracked(block.clone())
             .map_err(NodeError::Chain)?;
+        // Timing FIRST, before any pool mutation: the mempool still holds this
+        // block's transactions, so their admission stamps are still readable.
+        // See `record_block_timing`.
+        self.repair_timing_after_reorg(&imported.reverted_txs);
+        self.record_block_timing(&block);
         // Tip advanced — refresh the pool's signing domain before re-admitting any
         // reverted transactions, so admission checks them under the new tip's rules.
         self.refresh_mempool_domain();
@@ -835,6 +1000,296 @@ mod tests {
             err,
             NodeError::Mempool(MempoolError::Stale { current: 1, got: 0 })
         ));
+    }
+
+    #[test]
+    fn timing_pairs_a_real_admission_with_a_real_inclusion() {
+        // The core pairing: a transaction admitted at a known time and height,
+        // mined into a later block at a known time and height, must report the
+        // exact difference in BOTH units — and nothing else may be inferred.
+        let mut node = devnet_node();
+        let stx = usa_transfer("ecb.reserve.sov", 10, 0);
+        let tx_id = stx.id();
+
+        // Advance the chain so admission does not happen at height 0 — a
+        // `waited_blocks` that is right only because both heights are zero
+        // proves nothing.
+        node.produce(1_000).unwrap();
+        node.produce(2_000).unwrap();
+        assert_eq!(node.chain().height(), 2, "admitted against height 2");
+
+        node.submit(stx).unwrap();
+        let seen = node
+            .mempool
+            .first_seen(&tx_id)
+            .expect("the pool holds an admission observation for it");
+        assert_eq!(seen.at_height, 2, "stamped with the height it was seen at");
+
+        // Mine it at a block timestamp we control.
+        let included_ms = seen.at_ms + 90_000;
+        let produced = node.produce(included_ms).unwrap();
+        assert_eq!(produced.block.header.height.get(), 3);
+        assert!(produced.block.transactions.iter().any(|t| t.id() == tx_id));
+
+        let timing = node.tx_timing(&tx_id).expect("row recorded at inclusion");
+        assert!(timing.is_observed());
+        assert_eq!(timing.first_seen_ms, Some(seen.at_ms));
+        assert_eq!(timing.first_seen_height, Some(2));
+        assert_eq!(timing.included_height, 3);
+        assert_eq!(timing.included_timestamp_ms, included_ms);
+        assert_eq!(timing.waited_ms(), Some(90_000), "the exact ms difference");
+        assert_eq!(timing.waited_blocks(), Some(1), "height 3 minus height 2");
+    }
+
+    #[test]
+    fn timing_counts_every_block_a_tx_waited_through_not_just_the_last_one() {
+        // A wait of more than one block: with room for a single transaction per
+        // block, the loser of the first round waits through it and is mined in
+        // the next — `waited_blocks` must count BOTH blocks, measured from the
+        // height it was admitted at, not from the block before inclusion.
+        let config = GenesisConfig {
+            chain_id: "sov-devnet".into(),
+            timestamp_ms: 0,
+            accounts: vec![
+                GenesisAccount {
+                    account: id("val01.node.sov"),
+                    key: Keypair::from_seed([1; 32]).public_key(),
+                    balance: Balance::ZERO,
+                },
+                GenesisAccount {
+                    account: id("usa.reserve.sov"),
+                    key: Keypair::from_seed([2; 32]).public_key(),
+                    balance: Balance::from_sov(1_000).unwrap(),
+                },
+                GenesisAccount {
+                    account: id("ecb.reserve.sov"),
+                    key: Keypair::from_seed([3; 32]).public_key(),
+                    balance: Balance::from_sov(1_000).unwrap(),
+                },
+            ],
+            mining: sov_mining::MiningPolicy::test(),
+            vesting: vec![],
+        };
+        let mut node = Node::new(Blockchain::new(&config).unwrap(), 1024, 1);
+        node.set_coinbase(id("val01.node.sov"));
+
+        let from_ecb = {
+            let kp = Keypair::from_seed([3; 32]);
+            let tx = Transaction {
+                signer: id("ecb.reserve.sov"),
+                public_key: kp.public_key(),
+                nonce: 0,
+                action: Action::Transfer {
+                    to: id("val01.node.sov"),
+                    amount: Balance::from_sov(1).unwrap(),
+                },
+            };
+            SignedTransaction::sign(tx, &kp).unwrap()
+        };
+        // Both admitted at height 0, one block apart in inclusion.
+        node.submit(usa_transfer("val01.node.sov", 1, 0)).unwrap();
+        node.submit(from_ecb).unwrap();
+
+        let first = node.produce(1_000).unwrap().block;
+        assert_eq!(first.transactions.len(), 1, "one slot per block");
+        let second = node.produce(2_000).unwrap().block;
+        assert_eq!(second.transactions.len(), 1);
+
+        let early = node.tx_timing(&first.transactions[0].id()).unwrap();
+        let late = node.tx_timing(&second.transactions[0].id()).unwrap();
+        assert_eq!(early.first_seen_height, Some(0));
+        assert_eq!(late.first_seen_height, Some(0));
+        assert_eq!(early.waited_blocks(), Some(1), "mined in the next block");
+        assert_eq!(late.waited_blocks(), Some(2), "waited one block out");
+        // The block timestamps here are synthetic (1_000/2_000 ms) and precede
+        // the real admission clock, so both ms-waits saturate to zero — the
+        // clamp working as designed rather than wrapping to ~2^64. The ms
+        // pairing itself is pinned by
+        // `timing_pairs_a_real_admission_with_a_real_inclusion`.
+        assert_eq!(early.included_timestamp_ms, 1_000);
+        assert_eq!(late.included_timestamp_ms, 2_000);
+        assert_eq!(early.waited_ms(), Some(0));
+        assert_eq!(late.waited_ms(), Some(0));
+    }
+
+    #[test]
+    fn a_tx_this_node_never_pooled_reports_an_unknown_wait_not_a_fabricated_one() {
+        // THE HONESTY RULE. A block synced from a peer carries transactions this
+        // node never saw waiting. It must record the inclusion facts and refuse
+        // to invent an arrival — no block time, no zero, no estimate.
+        let mut producer = devnet_node();
+        producer
+            .submit(usa_transfer("ecb.reserve.sov", 10, 0))
+            .unwrap();
+        let block = producer.produce(1_000).unwrap().block;
+        let tx_id = block.transactions[0].id();
+
+        // A second node that never held the transaction imports the block.
+        let mut observer = devnet_node();
+        assert!(
+            observer.mempool.first_seen(&tx_id).is_none(),
+            "precondition: this node never saw it"
+        );
+        observer.import_block(block.clone()).unwrap();
+
+        let timing = observer
+            .tx_timing(&tx_id)
+            .expect("inclusion is still recorded");
+        assert!(!timing.is_observed(), "observed is false, not 'instant'");
+        assert_eq!(timing.first_seen_ms, None);
+        assert_eq!(timing.first_seen_height, None);
+        assert_eq!(timing.waited_ms(), None);
+        assert_eq!(timing.waited_blocks(), None);
+        // The inclusion half is fact, and is kept.
+        assert_eq!(timing.included_height, 1);
+        assert_eq!(timing.included_timestamp_ms, block.header.timestamp_ms);
+
+        // And the node that DID see it wait reports a real number for the same
+        // transaction — two honest nodes, legitimately different answers.
+        let mine = producer
+            .tx_timing(&tx_id)
+            .expect("the producer observed it");
+        assert!(mine.is_observed());
+        assert!(mine.waited_ms().is_some());
+    }
+
+    #[test]
+    fn a_reorg_withdraws_timing_rows_instead_of_leaving_a_stale_height_claim() {
+        // Build a chain, then feed a heavier competing branch. The transaction
+        // mined on the branch that loses must NOT keep claiming it sits in a
+        // block that is no longer on the active chain.
+        let mut node = devnet_node();
+        node.submit(usa_transfer("ecb.reserve.sov", 10, 0)).unwrap();
+        let orphaned = node.produce(1_000).unwrap().block;
+        let orphan_tx = orphaned.transactions[0].id();
+        assert_eq!(
+            node.tx_timing(&orphan_tx).map(|t| t.included_height),
+            Some(1),
+            "recorded on the branch that is active right now"
+        );
+
+        // A competing, HEAVIER branch built independently from genesis.
+        let mut rival = devnet_node();
+        let b1 = rival.produce(1_100).unwrap().block;
+        let b2 = rival.produce(1_200).unwrap().block;
+        assert_ne!(b1.hash(), orphaned.hash(), "a genuinely different branch");
+
+        node.import_block(b1).unwrap();
+        node.import_block(b2).unwrap();
+        assert_eq!(node.chain().height(), 2, "the heavier branch was adopted");
+
+        // The row is WITHDRAWN. Reporting nothing is honest; reporting
+        // "included at height 1" would be a claim about a block the node is no
+        // longer building on.
+        match node.tx_timing(&orphan_tx) {
+            None => {}
+            Some(t) => {
+                let still_there = node
+                    .chain()
+                    .block_by_height(t.included_height)
+                    .map(|b| b.transactions.iter().any(|s| s.id() == orphan_tx))
+                    .unwrap_or(false);
+                assert!(
+                    still_there,
+                    "a surviving row must point at a block that really contains the tx"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_block_that_loses_the_race_records_no_timing() {
+        // A self-mined block that lands on a LIGHTER side branch is not on the
+        // active chain, so there is no honest `included_height` for it and
+        // nothing may be recorded.
+        let mut node = devnet_node();
+        // Give the node a heavier chain first, so the stale block below is
+        // filed on a side branch rather than extending the head.
+        let mut rival = devnet_node();
+        rival
+            .submit(usa_transfer("ecb.reserve.sov", 10, 0))
+            .unwrap();
+        let side = rival.produce(1_000).unwrap().block;
+        let side_tx = side.transactions[0].id();
+
+        node.produce(1_100).unwrap();
+        node.produce(1_200).unwrap();
+        // The rival's height-1 block is now on a lighter branch.
+        node.import_block(side).unwrap();
+        assert!(
+            node.tx_timing(&side_tx).is_none(),
+            "a side-branch block commits nothing, so it times nothing"
+        );
+    }
+
+    #[test]
+    fn the_timing_index_stays_bounded_as_blocks_accumulate() {
+        // Retention is a hard property, not a hope: with a 2-block window the
+        // index can never hold rows from more than the last two heights, no
+        // matter how many blocks are mined.
+        let mut node = devnet_node();
+        node.set_tx_timing_limits(2, 1_000);
+        let mut ids = Vec::new();
+        for nonce in 0..6u64 {
+            let stx = usa_transfer("ecb.reserve.sov", 1, nonce);
+            ids.push(stx.id());
+            node.submit(stx).unwrap();
+            node.produce(1_000 + nonce * 1_000).unwrap();
+        }
+        let (rows, retention, max) = node.tx_timing_stats();
+        assert_eq!((retention, max), (2, 1_000));
+        assert!(rows <= 2, "bounded to the window, got {rows}");
+        assert!(
+            node.tx_timing(&ids[0]).is_none(),
+            "the oldest row aged out first"
+        );
+        assert!(
+            node.tx_timing(&ids[5]).is_some(),
+            "the newest row is retained"
+        );
+    }
+
+    #[test]
+    fn the_admission_clock_has_exactly_one_source() {
+        // REGRESSION GUARD. The timing feature must read the pool's EXISTING
+        // admission clock, never a second one kept alongside it. If a parallel
+        // clock were ever introduced, the value the timing index pairs with an
+        // inclusion would drift away from the value `sov_getMempoolTxs` and
+        // `sov_getMempoolInfo` report for the same transaction. Here we pin all
+        // three to the same underlying stamp.
+        let mut node = devnet_node();
+        let stx = usa_transfer("ecb.reserve.sov", 10, 0);
+        let tx_id = stx.id();
+        node.submit(stx).unwrap();
+
+        let seen = node.mempool.first_seen(&tx_id).unwrap();
+        let entry = node
+            .mempool_entries(16)
+            .into_iter()
+            .find(|e| e.id == tx_id)
+            .expect("the entry is in the paged view");
+        assert_eq!(
+            entry.first_seen_ms, seen.at_ms,
+            "`entries` and `first_seen` read the same stamp"
+        );
+        // ...and the aggregate `oldest_pending_age_ms` is derived from that same
+        // stamp too, so no view can report an age the others disagree with.
+        let (oldest, _) = node.mempool_oldest_ages_ms();
+        let oldest = oldest.expect("one ready entry");
+        assert!(
+            oldest >= entry.age_ms && oldest - entry.age_ms <= 50,
+            "aggregate age {oldest} tracks the per-entry age {}",
+            entry.age_ms
+        );
+
+        // Mine it: the row the index stores is that SAME stamp, unmodified.
+        let block = node.produce(seen.at_ms + 5_000).unwrap().block;
+        assert!(block.transactions.iter().any(|t| t.id() == tx_id));
+        assert_eq!(
+            node.tx_timing(&tx_id).unwrap().first_seen_ms,
+            Some(seen.at_ms),
+            "the index pairs the pool's own stamp, not a re-read of any clock"
+        );
     }
 
     #[test]

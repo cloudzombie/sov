@@ -17,6 +17,11 @@ sov-chain = { path = "../chain" }
 sov-wallet = { path = "../wallet" }
 sov-mining = { path = "../mining" }
 sov-pow = { path = "../pow" }
+# Only for the NODE-LOCAL tx-timing index's on-disk form (`data_dir/txtiming.dat`),
+# the same encoding `mempool.dat` uses. Already a workspace dependency — nothing new
+# enters the dependency graph, and nothing Borsh-encoded here is ever committed to a
+# block, a receipt, or a state root.
+borsh.workspace = true
 thiserror.workspace = true
 
 [lints.rust]

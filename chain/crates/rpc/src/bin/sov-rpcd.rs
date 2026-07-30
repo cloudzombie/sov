@@ -138,6 +138,16 @@ fn run(config_path: &str, spec_path: &str, keystore_path: &str) -> Result<(), Bo
         ),
     );
 
+    // Apply the operator's retention bounds for the NODE-LOCAL transaction-timing
+    // index (`sov_getTxTiming`). Non-consensus observability: nothing in the index
+    // reaches a block, a receipt, or a state root, so these may differ freely
+    // across the network. Applied here rather than at construction so the
+    // configured window also governs the rows already on disk.
+    daemon = daemon.with_tx_timing_limits(
+        config.tx_timing_retention_blocks,
+        config.tx_timing_max_entries,
+    );
+
     // Install any trusted weak-subjectivity checkpoints from the config, so a
     // forged long-range history is rejected on import.
     let checkpoints = config

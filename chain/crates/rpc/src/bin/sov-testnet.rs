@@ -422,6 +422,9 @@ fn cmd_gen(flags: &Flags) -> Result<(), Box<dyn Error>> {
             block_time_ms,
             mempool_capacity: 16_384,
             max_block_txs: 4_096,
+            // Node-local timing observability at its defaults (non-consensus).
+            tx_timing_retention_blocks: sov_node::DEFAULT_RETENTION_BLOCKS,
+            tx_timing_max_entries: sov_node::DEFAULT_MAX_ENTRIES,
             mine: true,
             mining_duty_pct: None,
             p2p_addr: Some(node_entries[idx].p2p_addr.clone()),
@@ -545,6 +548,9 @@ fn cmd_join(flags: &Flags) -> Result<(), Box<dyn Error>> {
         block_time_ms,
         mempool_capacity: 16_384,
         max_block_txs: 4_096,
+        // Node-local timing observability at its defaults (non-consensus).
+        tx_timing_retention_blocks: sov_node::DEFAULT_RETENTION_BLOCKS,
+        tx_timing_max_entries: sov_node::DEFAULT_MAX_ENTRIES,
         mine: true,
         mining_duty_pct: None,
         p2p_addr: Some(p2p_addr.clone()),

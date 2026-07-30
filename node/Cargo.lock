@@ -4158,6 +4158,7 @@ dependencies = [
 name = "sov-node"
 version = "0.0.0"
 dependencies = [
+ "borsh",
  "sov-chain",
  "sov-crypto",
  "sov-mempool",
@@ -4297,7 +4298,7 @@ dependencies = [
 
 [[package]]
 name = "sov-station"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "chacha20poly1305",
  "eframe",
