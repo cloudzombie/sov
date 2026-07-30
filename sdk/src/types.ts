@@ -438,6 +438,19 @@ export interface Event {
   data: number[];
 }
 
+/**
+ * A transaction's COMMITTED creation time. Mirrors `types::ReceiptTiming`.
+ *
+ * Present only on a receipt for a transaction that used the `Timestamped`
+ * envelope (`tx-timestamp`, signal bit 3), so it is absent from every receipt
+ * below that deployment's activation height. `waited_ms` is deliberately not
+ * carried: it is `block.header.timestamp_ms - created_at_ms`, which any holder
+ * of the receipt and the header derives exactly.
+ */
+export interface ReceiptTiming {
+  created_at_ms: number;
+}
+
 /** The recorded result of one transaction. Mirrors `types::Receipt`. */
 export interface Receipt {
   tx_id: HashHex;
@@ -447,4 +460,10 @@ export interface Receipt {
   return_data: number[];
   /** Events emitted by a contract call (empty otherwise). */
   events: Event[];
+  /**
+   * The committed creation time, omitted entirely when the transaction did not
+   * use the `Timestamped` envelope — which is why an ordinary receipt's JSON is
+   * byte-for-byte what it was before this field existed.
+   */
+  timing?: ReceiptTiming;
 }

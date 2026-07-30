@@ -167,6 +167,7 @@ pub fn verify_weight(action: &Action) -> u64 {
         Action::ShieldedV2 { .. } => SHIELDED_V2_VERIFY_WEIGHT,
         // Carriers price whatever they carry — wrapping is never a discount.
         Action::Tipped { inner, .. } => verify_weight(inner),
+        Action::Timestamped { inner, .. } => verify_weight(inner),
         Action::MultisigExec { action, .. } => verify_weight(action),
         Action::ProposeMultisig { action, .. } => verify_weight(action),
         // Everything else — every action that exists on the live chain today —

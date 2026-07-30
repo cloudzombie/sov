@@ -1814,6 +1814,25 @@ mod tests {
         assert!(pool.first_seen(&id).is_none());
     }
 
+    /// The consensus expiry bound of the `tx-timestamp` envelope
+    /// (`sov_types::TX_TIMESTAMP_MAX_AGE_MS`) is DEFINED to equal this pool's
+    /// stranded TTL, so the two rules agree instead of fighting: a timestamped
+    /// transaction the pool would reap is exactly one consensus refuses to mine,
+    /// and one still held here is always still mineable.
+    ///
+    /// `sov-types` cannot depend on `sov-mempool` (the dependency runs the other
+    /// way), so the equality cannot be expressed as a shared definition — this
+    /// test is what pins it. Changing either constant alone fails here, which is
+    /// the point: they must move together or not at all.
+    #[test]
+    fn tx_timestamp_max_age_equals_the_stranded_ttl() {
+        assert_eq!(
+            sov_types::TX_TIMESTAMP_MAX_AGE_MS,
+            STRANDED_TTL_MS,
+            "the consensus expiry bound and the mempool stranded TTL are one policy"
+        );
+    }
+
     /// `(min tip, count)` pairs of a histogram — the shape most assertions care
     /// about, without restating byte totals.
     fn rates(hist: &[TipBucket]) -> Vec<(u128, u64)> {

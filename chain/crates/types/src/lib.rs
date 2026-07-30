@@ -8,7 +8,9 @@
 //! - [`Block`] / [`BlockHeader`] — ordered batches of transactions, committing
 //!   to their contents via Merkle roots and to resulting state via a state root.
 //! - [`Receipt`] — the recorded outcome of executing a transaction, committed to
-//!   via [`receipts_root`].
+//!   via [`receipts_root`], plus [`receipt_proof`] / [`verify_receipt_proof`],
+//!   the inclusion proof that lets a light client check a single receipt against
+//!   a block header alone.
 //!
 //! These types only *describe* the ledger and check their own internal
 //! consistency (signatures verify, Merkle roots match their contents). Applying
@@ -23,10 +25,13 @@ pub mod transaction;
 pub mod weight;
 
 pub use block::{compute_tx_root, Block, BlockHeader};
-pub use receipt::{receipts_root, Event, ExecutionStatus, Receipt};
+pub use receipt::{
+    receipt_proof, receipts_root, verify_receipt_proof, Event, ExecutionStatus, Receipt,
+    ReceiptProof, ReceiptTiming,
+};
 pub use transaction::{
     multisig_signing_bytes, rotation_signing_bytes, Action, MultisigApproval, SignedTransaction,
-    Transaction, TxError,
+    Transaction, TxError, TX_TIMESTAMP_FUTURE_TOLERANCE_MS, TX_TIMESTAMP_MAX_AGE_MS,
 };
 pub use weight::{
     block_weight, fee_rate, tx_weight, verify_weight, MAX_BLOCK_WEIGHT, MAX_TX_WEIGHT,

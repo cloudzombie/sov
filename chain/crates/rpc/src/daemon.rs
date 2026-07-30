@@ -1048,11 +1048,17 @@ struct BakedDeployments {
     /// release gate must not report green over untested v2 steps). `None` for
     /// any preset that schedules no pool-v2 fork.
     shielded_v2: Option<sov_governance::Deployment>,
+    /// The `tx-timestamp` deployment (bit 3): the `Action::Timestamped` bounded
+    /// creation-time envelope. ARMED on MAINNET as of 0.2.6 (`Some`), on a
+    /// schedule with real fleet lead time
+    /// (`MAINNET_TX_TIMESTAMP_START_HEIGHT`). `None` for any preset that
+    /// schedules no tx-timestamp fork.
+    tx_timestamp: Option<sov_governance::Deployment>,
     /// The tx-domain grace window `G` in blocks — consensus-critical once armed,
     /// baked here so no per-node divergence is possible.
     grace_blocks: u64,
-    /// The version-bits mask this node's mined blocks commit (mainnet 0.2.5:
-    /// bits 0, 1, and 2 — it signals readiness for all three deployments).
+    /// The version-bits mask this node's mined blocks commit (mainnet 0.2.6:
+    /// bits 0, 1, 2 and 3 — it signals readiness for all four deployments).
     signal_mask: u32,
 }
 
@@ -1099,9 +1105,10 @@ const E2E_REHEARSAL_V2_START_HEIGHT: u64 = 512;
 /// Mainnet: every deployment is DORMANT machinery until miner signaling reaches
 /// the 9/10 threshold over a full 288-block window at/after its start height
 /// (bits 0/1 at 10944; bit 2, `shielded-v2`, at
-/// `MAINNET_SHIELDED_V2_START_HEIGHT` as of 0.2.5) — pre-activation validation
+/// `MAINNET_SHIELDED_V2_START_HEIGHT` as of 0.2.5; bit 3, `tx-timestamp`, at
+/// `MAINNET_TX_TIMESTAMP_START_HEIGHT` as of 0.2.6) — pre-activation validation
 /// and execution are byte-identical. What DOES change immediately: a mainnet
-/// 0.2.5 node stamps `version_bits = 0b111` in headers it mines (the intended,
+/// 0.2.6 node stamps `version_bits = 0b1111` in headers it mines (the intended,
 /// non-breaking signaling — old nodes record the bits but do not enforce them).
 ///
 /// E2E rehearsal namespace: bit 0 only, period 32, start 384, threshold 9/10,
@@ -1134,8 +1141,21 @@ fn baked_deployments(chain_id: &str) -> Option<BakedDeployments> {
 /// guard, `start + 288`), `Active` one period after that (`start + 576`).
 const MAINNET_SHIELDED_V2_START_HEIGHT: u64 = 14_976;
 
-/// The release-pinned mainnet activation preset (bits 0, 1, and — as of 0.2.5 —
-/// 2). These values are consensus-coordinating: two nodes with different heights,
+/// The `tx-timestamp` (bit 3) signaling START height on MAINNET — the single
+/// knob the coordinator adjusts to give the fleet lead time before the window
+/// opens.
+///
+/// A 288-block window boundary (`60 * 288 = 17_280`) chosen ~2,880 blocks
+/// (~5 days at the 2.5-min target) above the ~14,400 mainnet head at the time
+/// 0.2.6 was cut, and a full 2,304 blocks clear of
+/// `MAINNET_SHIELDED_V2_START_HEIGHT` so the two activations never share a
+/// window. Activation follows the SAME cadence bits 0/1/2 used: `Started`
+/// here, `LockedIn` one period later (the min-activation guard,
+/// `start + 288`), `Active` one period after that (`start + 576`).
+const MAINNET_TX_TIMESTAMP_START_HEIGHT: u64 = 17_280;
+
+/// The release-pinned mainnet activation preset (bits 0, 1, 2, and — as of
+/// 0.2.6 — 3). These values are consensus-coordinating: two nodes with different heights,
 /// thresholds, or grace `G` would split at activation / at `H_a + G`.
 fn mainnet_deployments() -> BakedDeployments {
     // 90% of a 288-block (~12h) window; all heights are exact window boundaries
@@ -1183,6 +1203,22 @@ fn mainnet_deployments() -> BakedDeployments {
         false,
     )
     .expect("baked mainnet shielded-v2 deployment is valid");
+    // `tx-timestamp` (bit 3): the bounded creation-time envelope. Same
+    // 288-block window, 9/10 threshold, and non-LOT rule as bits 0/1/2, with
+    // the identical min-activation and timeout offsets (`start + 288`,
+    // `start + 3 * 288`). Byte-identical behavior until that activation height:
+    // `Action::Timestamped` stays a hard `FeatureInactive` reject everywhere.
+    let tx_timestamp = sov_governance::Deployment::new(
+        sov_governance::TX_TIMESTAMP_DEPLOYMENT,
+        sov_governance::BIT_TX_TIMESTAMP,
+        BlockHeight::new(MAINNET_TX_TIMESTAMP_START_HEIGHT),
+        BlockHeight::new(MAINNET_TX_TIMESTAMP_START_HEIGHT + 3 * 288),
+        288,
+        threshold,
+        BlockHeight::new(MAINNET_TX_TIMESTAMP_START_HEIGHT + 288),
+        false,
+    )
+    .expect("baked mainnet tx-timestamp deployment is valid");
     BakedDeployments {
         tx_domain,
         fee_auction: Some(fee_auction),
@@ -1193,8 +1229,11 @@ fn mainnet_deployments() -> BakedDeployments {
         // accepted-pending per the arming bar; activation is miner-signaled and
         // requires the fleet running 0.2.5.
         shielded_v2: Some(shielded_v2),
+        // Bit 3 is ARMED on mainnet as of 0.2.6, and `signal_mask` below sets
+        // bit 3 so mainnet nodes broadcast their readiness vote.
+        tx_timestamp: Some(tx_timestamp),
         grace_blocks: 576,
-        signal_mask: 0b111,
+        signal_mask: 0b1111,
     }
 }
 
@@ -1239,6 +1278,10 @@ fn e2e_rehearsal_deployments() -> BakedDeployments {
         tx_domain,
         fee_auction: None,
         shielded_v2: Some(shielded_v2),
+        // The rehearsal net does not exercise bit 3 (its own dedicated
+        // activation tests live in `sov-chain`), so it schedules none and does
+        // not signal it — `Action::Timestamped` stays a hard reject there.
+        tx_timestamp: None,
         grace_blocks: 0,
         // Signal readiness for bit 0 AND bit 2 (bit 1, fee-auction, is not
         // scheduled on this net).
@@ -1269,6 +1312,9 @@ fn genesis_chain_with_baked_preset(genesis: &GenesisConfig) -> Result<Blockchain
         }
         if let Some(shielded_v2) = baked.shielded_v2 {
             chain.set_shielded_v2_deployment(shielded_v2);
+        }
+        if let Some(tx_timestamp) = baked.tx_timestamp {
+            chain.set_tx_timestamp_deployment(tx_timestamp);
         }
         chain.set_tx_domain_grace_blocks(baked.grace_blocks);
         chain.set_signal_mask(baked.signal_mask);
@@ -1307,7 +1353,18 @@ const SNAPSHOT_EVERY_BLOCKS: u64 = 50;
 /// with a different version, a bad checksum, or any decode error is simply IGNORED —
 /// the node falls back to replaying the (authoritative) block log — so this never
 /// blocks a boot or risks mis-loading state.
-const SNAPSHOT_VERSION: u32 = 1;
+///
+/// Bumped 1 → 2 in 0.2.6: `Receipt` gained the appended `timing:
+/// Option<ReceiptTiming>` field, so a receipt's Borsh STORAGE encoding grew a
+/// trailing byte and a v1 snapshot's `active_receipts` no longer decodes under
+/// the v2 layout. A stale snapshot would in practice fail to decode anyway
+/// (Borsh rejects a short/over-long payload), but relying on that is a silent
+/// invariant — the version check makes the incompatibility explicit. The
+/// snapshot is only a fast-start CACHE, so the cost of the bump is one
+/// block-log replay on first boot after upgrade, and NOTHING about consensus
+/// changes: `Receipt::hash` (the committed form) is unaffected for an untimed
+/// receipt.
+const SNAPSHOT_VERSION: u32 = 2;
 
 /// Serialize a chainstate snapshot of `chain` to a checksummed byte blob:
 /// `[checksum: 32-byte BLAKE3 of payload][payload]`, where the payload is Borsh
@@ -2482,8 +2539,45 @@ mod tests {
         assert_eq!(v2.period, 288);
         assert_eq!(v2.threshold, sov_governance::Threshold::new(9, 10).unwrap());
         assert!(!v2.lockinontimeout);
+        // tx-timestamp (bit 3): ARMED as of 0.2.6, same window/threshold/LOT
+        // and the same `start + 288` / `start + 3 * 288` offsets as bits 0/1/2.
+        let ts = baked
+            .tx_timestamp
+            .as_ref()
+            .expect("mainnet arms tx-timestamp as of 0.2.6");
+        assert_eq!(ts.name, sov_governance::TX_TIMESTAMP_DEPLOYMENT);
+        assert_eq!(ts.bit, sov_governance::BIT_TX_TIMESTAMP);
+        assert_eq!(
+            ts.start_height.get(),
+            MAINNET_TX_TIMESTAMP_START_HEIGHT,
+            "the single knob the coordinator adjusts"
+        );
+        assert_eq!(
+            ts.min_activation_height.get(),
+            MAINNET_TX_TIMESTAMP_START_HEIGHT + 288
+        );
+        assert_eq!(
+            ts.timeout_height.get(),
+            MAINNET_TX_TIMESTAMP_START_HEIGHT + 3 * 288
+        );
+        assert_eq!(ts.period, 288);
+        assert_eq!(ts.threshold, sov_governance::Threshold::new(9, 10).unwrap());
+        assert!(!ts.lockinontimeout);
+        assert_eq!(
+            MAINNET_TX_TIMESTAMP_START_HEIGHT % 288,
+            0,
+            "every armed start height is an exact window boundary"
+        );
+        // A relationship between two constants, so a const block proves it at
+        // BUILD time rather than at test time.
+        const {
+            assert!(
+                MAINNET_TX_TIMESTAMP_START_HEIGHT >= MAINNET_SHIELDED_V2_START_HEIGHT + 3 * 288,
+                "bit 3 opens clear of bit 2's whole window, so the two activations never overlap"
+            )
+        };
         assert_eq!(baked.grace_blocks, 576);
-        assert_eq!(baked.signal_mask, 0b111, "signals bits 0, 1 AND 2");
+        assert_eq!(baked.signal_mask, 0b1111, "signals bits 0, 1, 2 AND 3");
     }
 
     #[test]
@@ -2611,7 +2705,7 @@ mod tests {
         // resolves to the frozen mainnet preset (the mainnet arm is tested first).
         let both = baked_deployments("sov-e2e-mainnet").expect("mainnet arm wins");
         assert_eq!(both.tx_domain.period, 288);
-        assert_eq!(both.signal_mask, 0b111);
+        assert_eq!(both.signal_mask, 0b1111);
         // And the canonical ids are untouched by the new namespace.
         assert!(baked_deployments("sov-testnet-1").is_none());
     }
@@ -2625,7 +2719,7 @@ mod tests {
         // a preset-less chain cannot replay a post-activation Tipped log is
         // `sov-chain`'s `post_activation_tipped_log_cold_replays_only_with_the_
         // deployment_installed`.) Observable here without mining to height 10944:
-        // the installed signal mask stamps `version_bits = 0b111` on the very first
+        // the installed signal mask stamps `version_bits = 0b1111` on the very first
         // produced block, and a non-mainnet chain stays untouched (bits 0).
         let genesis_for = |chain_id: &str| GenesisConfig {
             chain_id: chain_id.into(),
@@ -2643,7 +2737,7 @@ mod tests {
             .expect("mainnet chain builds");
         let block = mainnet.produce_block(vec![], 2_000).unwrap();
         assert_eq!(
-            block.header.version_bits, 0b111,
+            block.header.version_bits, 0b1111,
             "the baked signal mask is live on the FIRST produced block — the preset \
              is installed at construction, before any replay could run"
         );
