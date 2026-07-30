@@ -31,7 +31,14 @@
 //! `sov_getStateRoot`, `sov_getDifficulty`, `sov_estimateFee`,
 //! `sov_getMempoolSize`, `sov_getMempoolHistogram` (effective-tip buckets for
 //! multi-block projection), `sov_getMempoolInfo` (ready/queued occupancy, bounds,
-//! next-block floor, entry ages), `sov_getPeerInfo` (live P2P/sync state),
+//! next-block floor, entry ages), `sov_getMempoolTxs` (paged per-transaction
+//! pool contents with each entry's `firstSeenMs`/`ageMs` since THIS node
+//! admitted it — an observation, never a self-reported creation time),
+//! `sov_getTxTiming` (by `txId` or `height`: how long a MINED transaction
+//! waited, as this node observed it — `observed: false` with null waits when it
+//! never held the transaction, because a node that did not watch a transaction
+//! wait must not invent a number for it), `sov_getPeerInfo` (live
+//! P2P/sync state),
 //! `sov_getConfirmations`, `sov_isFinal`,
 //! `sov_getMiners`, `sov_listTokens` (paged), `sov_getTokenInfo`,
 //! `sov_getTokenBalances`, `sov_getHtlc`. SNS (Sovereign Name Service):
@@ -169,6 +176,21 @@ const MAX_TOKEN_PAGE: usize = 200;
 /// any affordable tip (≤ total supply), so in practice every bucket is exact —
 /// and the XUS Miner client is written against exactly this cap.
 pub const HISTOGRAM_MAX_BUCKETS: usize = 128;
+
+/// Hard cap on how many entries `sov_getMempoolTxs` returns in one call, and its
+/// default when the caller names no `limit`.
+///
+/// Deliberately much SMALLER than either the pool's default capacity (16,384) or
+/// the default per-block transaction budget (4,096): this method serves a
+/// human-scale operator view — the top of the auction queue and the oldest
+/// entries — not a bulk export of the pool. Each entry carries a signer, a tip,
+/// sizes and two timestamps, so an uncapped response over a full pool would be
+/// megabytes of JSON built under the node lock, on an UNAUTHENTICATED read. 256
+/// keeps one response comfortably small while still showing far more than any
+/// dashboard displays at once, and a caller that genuinely wants the whole pool
+/// pages through it with `offset`. Every list-returning read in this crate is
+/// capped the same way, for the same reason.
+pub const MAX_MEMPOOL_TX_PAGE: usize = 256;
 
 /// Hard cap on how many transaction ids `sov_getBlockTemplate` will enumerate in
 /// its `txIds` array. Equal to the default `max_block_txs`, so under the default
@@ -662,6 +684,29 @@ fn opt_u64_flexible(params: &Value, key: &str) -> Result<Option<u64>, RpcError> 
     } else {
         param_u64_flexible(params, key).map(Some)
     }
+}
+
+/// One `sov_getTxTiming` row as JSON.
+///
+/// The four observation-dependent fields (`firstSeenMs`, `firstSeenHeight`,
+/// `waitedMs`, `waitedBlocks`) are `null` together or present together, and
+/// `observed` states which case it is — so a caller never has to infer from a
+/// `null` whether the wait was zero or unknown. The two inclusion fields are
+/// always present, because they are facts about the block, not about what this
+/// node happened to witness.
+fn tx_timing_value(tx_id: &Hash, t: &sov_node::TxTiming) -> Value {
+    json!({
+        "txId": tx_id.to_hex(),
+        "firstSeenMs": t.first_seen_ms,
+        "firstSeenHeight": t.first_seen_height,
+        "includedHeight": t.included_height,
+        "includedTimestampMs": t.included_timestamp_ms,
+        "waitedMs": t.waited_ms(),
+        "waitedBlocks": t.waited_blocks(),
+        // `false` exactly when `firstSeenMs` is null — this node never held the
+        // transaction, so it has no arrival time and invents none.
+        "observed": t.is_observed(),
+    })
 }
 
 /// Bound a list response with `offset`/`limit` so a read RPC can never return an
@@ -1223,6 +1268,155 @@ fn call(
                 "poolFloorGrains": node.mempool_pool_floor_grains().to_string(),
                 "buckets": buckets,
             }))
+        }
+        // Per-transaction mempool CONTENTS with ARRIVAL TIMING — the
+        // per-entry complement to `sov_getMempoolInfo`'s aggregates. Params:
+        // `offset` (default 0) and `limit` (default and hard cap
+        // MAX_MEMPOOL_TX_PAGE). Returns
+        // `{ txs: [...], offset, limit, txCount, queuedCount, hasMore }`.
+        //
+        // READ-ONLY, NODE-LOCAL, NON-CONSENSUS. Nothing here is committed to a
+        // block, and `firstSeenMs`/`ageMs` are explicitly THIS NODE'S
+        // OBSERVATION — when this node admitted the transaction to its own pool,
+        // and how long ago that was — not a property of the transaction and not
+        // a self-reported creation time.
+        // A SOV transaction carries NO creation time of its own — nothing in
+        // `Transaction` is a timestamp — so "first seen by this node" is the
+        // only arrival timing a node can honestly attest to. Two honest nodes
+        // WILL report different ages for the same transaction; whichever saw it
+        // first reports the larger one.
+        //
+        // Both are read from the SAME admission clock that drives TTL eviction
+        // and `sov_getMempoolInfo`'s `oldestPendingAgeMs`, so the views can
+        // never disagree — there is one arrival clock in the pool, not a
+        // parallel one added for this method. `firstSeenMs` is the raw stamp
+        // (absolute Unix ms; stable across polls, so a client can correlate
+        // arrivals) and `ageMs` is `now - firstSeenMs` off a single reading of
+        // that clock, so `firstSeenMs + ageMs` is the same instant for every
+        // entry in a page.
+        "sov_getMempoolTxs" => {
+            let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let limit = (params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(MAX_MEMPOOL_TX_PAGE as u64) as usize)
+                .clamp(1, MAX_MEMPOOL_TX_PAGE);
+            // Take the page plus one extra to learn whether another exists,
+            // bounded by the cap either way.
+            let take = offset
+                .saturating_add(limit)
+                .saturating_add(1)
+                .min(offset.saturating_add(MAX_MEMPOOL_TX_PAGE + 1));
+            let entries = node.mempool_entries(take);
+            let mut page: Vec<Value> = entries
+                .into_iter()
+                .skip(offset)
+                .take(limit + 1)
+                .map(|e| {
+                    json!({
+                        "txId": e.id.to_hex(),
+                        "signer": e.signer.as_str(),
+                        "nonce": e.nonce,
+                        // Decimal-string grains, the codebase's large-integer
+                        // convention. This is `effective_tip` — the auction bid.
+                        "tipGrains": e.tip_grains.to_string(),
+                        "sizeBytes": e.size_bytes,
+                        "weight": e.weight,
+                        // Absolute Unix ms at which THIS node admitted it, and
+                        // the age derived from the same clock reading.
+                        "firstSeenMs": e.first_seen_ms,
+                        "ageMs": e.age_ms,
+                        // READY (mineable now) vs QUEUED (future nonce, parked
+                        // until its sender's gap fills) — a queued entry is NOT
+                        // waiting on fees, it is waiting on a missing nonce.
+                        "state": if e.ready { "ready" } else { "queued" },
+                    })
+                })
+                .collect();
+            let has_more = page.len() > limit;
+            page.truncate(limit);
+            Ok(json!({
+                "txs": page,
+                "offset": offset,
+                "limit": limit,
+                "txCount": node.mempool_len(),
+                "queuedCount": node.mempool_queued_len(),
+                "hasMore": has_more,
+            }))
+        }
+        // How long a MINED transaction waited, as THIS node observed it — the
+        // other half of the story `sov_getMempoolTxs` tells about transactions
+        // still waiting. Exactly one of two params:
+        //
+        //   { "txId": "<hex>" } -> one timing object, or `null` if this node
+        //                          holds no row (never mined on its active
+        //                          chain, or aged out of the retention window).
+        //                          `null`-on-miss matches `sov_getReceipt`.
+        //   { "height": N }     -> { height, txs: [ <one object per tx, in
+        //                          block order> ] }, or `null` when there is no
+        //                          active block at that height.
+        //
+        // Supplying BOTH or NEITHER is an invalid-params error rather than a
+        // silent preference for one: a caller that sent both does not know what
+        // it asked for, and answering anyway would hide the bug.
+        //
+        // READ-ONLY, NODE-LOCAL, NON-CONSENSUS. The index behind this method
+        // lives in `data_dir/txtiming.dat`, outside every committed root; no
+        // block, receipt, or state root is derived from it, and deleting the
+        // file changes nothing any peer can observe about this node's chain.
+        //
+        // THE HONESTY RULE: `firstSeenMs` is THIS NODE'S OBSERVATION. When a
+        // transaction reached this node already mined — inside a peer's block —
+        // this node never saw it wait, so `firstSeenMs`, `firstSeenHeight`,
+        // `waitedMs`, and `waitedBlocks` are all `null` and `observed` is
+        // `false`. The block's own timestamp is NEVER substituted: that would
+        // report a wait of zero for a transaction that may have queued for an
+        // hour elsewhere. `observed: false` therefore means "unknown", never
+        // "instant" — and two honest nodes will legitimately disagree about the
+        // same transaction, because they saw it at different moments (or, for
+        // one of them, not at all).
+        "sov_getTxTiming" => {
+            let by_id = params.get("txId").filter(|v| !v.is_null()).is_some();
+            let by_height = params.get("height").filter(|v| !v.is_null()).is_some();
+            match (by_id, by_height) {
+                (true, true) => Err(RpcError::invalid_params(
+                    "give either `txId` or `height`, not both",
+                )),
+                (false, false) => Err(RpcError::invalid_params(
+                    "missing param: give either `txId` (hex) or `height` (integer)",
+                )),
+                (true, false) => {
+                    let tx_id = param_tx_id(params)?;
+                    Ok(node
+                        .tx_timing(&tx_id)
+                        .map_or(Value::Null, |t| tx_timing_value(&tx_id, &t)))
+                }
+                (false, true) => {
+                    let h = params
+                        .get("height")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| RpcError::invalid_params("`height` must be a u64"))?;
+                    let Some(block) = node.chain().block_by_height(h) else {
+                        return Ok(Value::Null);
+                    };
+                    // In BLOCK ORDER, and one entry per transaction even when
+                    // this node holds no row for it: the inclusion facts come
+                    // from the block itself, so a missing row degrades to an
+                    // honest `observed: false` rather than a hole in the array.
+                    let txs: Vec<Value> = block
+                        .transactions
+                        .iter()
+                        .map(|stx| {
+                            let id = stx.id();
+                            let timing = node.tx_timing(&id).unwrap_or_else(|| {
+                                sov_node::TxTiming::unobserved(h, block.header.timestamp_ms)
+                            });
+                            tx_timing_value(&id, &timing)
+                        })
+                        .collect();
+                    Ok(json!({ "height": h, "txs": txs }))
+                }
+            }
         }
         "sov_getMempoolInfo" => {
             // NEW (additive, law F5): the operator's waiting-room view — how much

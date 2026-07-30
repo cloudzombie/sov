@@ -322,6 +322,49 @@ struct EvictionVictim {
     sender_count: usize,
 }
 
+/// One pooled transaction as [`Mempool::entries`] reports it — the unit
+/// `sov_getMempoolTxs` serves.
+///
+/// **`first_seen_ms`/`age_ms` are this NODE's observation**, not a property of
+/// the transaction: when THIS node admitted it to THIS pool, and how long ago
+/// that was. They are read from the very same `inserted_at` / `queued_at_ms`
+/// clock that drives TTL eviction and [`Mempool::oldest_pending_age_ms`], so
+/// there is exactly one admission clock in the pool and no second source of
+/// truth to drift — `first_seen_ms` is the raw stamp and `age_ms` is
+/// `now - first_seen_ms` off the same reading of the clock, so the two are
+/// always consistent with each other. Two honest nodes will legitimately report
+/// different values for the same transaction — whichever saw it first reports
+/// the smaller `first_seen_ms` and the larger `age_ms`.
+#[derive(Debug, Clone)]
+pub struct MempoolEntry {
+    /// The transaction id (Blake3 of the Borsh-encoded [`sov_types::Transaction`]).
+    pub id: Hash,
+    /// The signing account.
+    pub signer: AccountId,
+    /// The transaction's nonce.
+    pub nonce: u64,
+    /// [`effective_tip`] in grains — this transaction's bid in the blockspace
+    /// auction. Zero for an untipped (legacy) transaction.
+    pub tip_grains: u128,
+    /// Serialized size in bytes.
+    pub size_bytes: usize,
+    /// Full weight (`size_bytes` + verification cost), the unit the pool's
+    /// weight bound and the block weight cap are measured in.
+    pub weight: u64,
+    /// ABSOLUTE Unix-epoch milliseconds at which THIS node admitted the
+    /// transaction — the raw admission stamp behind [`age_ms`](Self::age_ms).
+    /// Reported alongside the age so a caller can correlate arrivals across
+    /// polls (an age shifts every second; a stamp does not).
+    pub first_seen_ms: u64,
+    /// Milliseconds since THIS node admitted the transaction — exactly
+    /// `now - first_seen_ms` off one reading of the clock. Saturating, so it
+    /// is never negative under clock jitter.
+    pub age_ms: u64,
+    /// `true` for a READY (mineable) entry, `false` for a QUEUED (future-nonce)
+    /// one that cannot be mined until its sender's nonce gap fills.
+    pub ready: bool,
+}
+
 /// One effective-tip bucket of [`Mempool::tip_histogram`] — the unit
 /// `sov_getMempoolHistogram` serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,6 +390,34 @@ pub struct TipBucket {
 struct QueuedTx {
     stx: SignedTransaction,
     queued_at_ms: u64,
+    /// The chain height this node was at when the entry was parked — the height
+    /// half of the same admission observation as `queued_at_ms`, stamped from
+    /// [`Mempool::chain_height`]. Purely node-local bookkeeping.
+    queued_at_height: u64,
+}
+
+/// When THIS node first admitted a transaction to THIS pool: the wall-clock
+/// stamp and the chain height at that moment.
+///
+/// It is an OBSERVATION, not a property of the transaction. A SOV transaction
+/// carries no self-reported creation time, so "first seen here" is the only
+/// arrival timing a node can honestly attest to — and two honest nodes will
+/// legitimately disagree, because they saw it at different moments. A node that
+/// never held the transaction in its pool (it arrived already mined, inside a
+/// peer's block) has no observation at all, and the lookup returns `None`
+/// rather than a guess.
+///
+/// Both halves come from the pool's ONE admission record, written and cleared at
+/// the same two call sites as `inserted_at`, so they can never drift apart or
+/// outlive the entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirstSeen {
+    /// Unix-epoch milliseconds at admission (the `inserted_at`/`queued_at_ms`
+    /// clock — the same one TTL eviction uses).
+    pub at_ms: u64,
+    /// The node's chain height at admission, as last reported by
+    /// [`Mempool::set_chain_height`].
+    pub at_height: u64,
 }
 
 /// A bounded pool of pending, validated transactions.
@@ -359,6 +430,22 @@ pub struct Mempool {
     /// entries stranded behind a gap. Keyed by tx id; kept in lockstep with
     /// `by_id`.
     inserted_at: HashMap<Hash, u64>,
+    /// The chain height at which each ready entry was admitted — the height half
+    /// of the pool's ONE admission observation, written and cleared at exactly
+    /// the same two call sites as `inserted_at` (`admit_ready` and `remove`), so
+    /// it is bounded by the pool's own contents and can never outlive an entry.
+    ///
+    /// This is NOT a second clock: the time still comes from `inserted_at`
+    /// alone. It records *where in the chain* the pool was when it saw the
+    /// transaction, which is what turns a wait into a number of BLOCKS as well
+    /// as a number of milliseconds. Node-local, non-consensus.
+    inserted_at_height: HashMap<Hash, u64>,
+    /// The node's current chain height, pushed in by the node on every tip
+    /// change (see [`Mempool::set_chain_height`]) and stamped onto each
+    /// admission. The pool does not own a chain, so it cannot read this itself;
+    /// a node that never sets it simply records height 0 everywhere, which is
+    /// honest for a pool with no chain behind it.
+    chain_height: u64,
     capacity: usize,
     /// Max transactions one sender may hold at once (anti-DoS fairness bound).
     max_per_sender: usize,
@@ -410,6 +497,8 @@ impl Mempool {
             by_id: HashMap::new(),
             by_sender: BTreeMap::new(),
             inserted_at: HashMap::new(),
+            inserted_at_height: HashMap::new(),
+            chain_height: 0,
             capacity,
             max_per_sender: max_per_sender.max(1),
             queued: BTreeMap::new(),
@@ -442,6 +531,106 @@ impl Mempool {
     /// block execution does.
     pub fn set_mode(&mut self, mode: TxDomainMode) {
         self.mode = mode;
+    }
+
+    /// Tell the pool the node's current chain height, so each admission can be
+    /// stamped with WHERE in the chain this node was when it saw the
+    /// transaction. The node refreshes this on every tip change, next to
+    /// [`set_mode`](Self::set_mode).
+    ///
+    /// Node-local bookkeeping only: it feeds [`first_seen`](Self::first_seen),
+    /// and nothing in admission, selection, eviction, or any consensus rule
+    /// reads it. A pool whose owner never sets it records height 0 — honest for
+    /// a pool with no chain behind it — and behaves exactly as before.
+    pub fn set_chain_height(&mut self, height: u64) {
+        self.chain_height = height;
+    }
+
+    /// The node's current chain height as last set by
+    /// [`set_chain_height`](Self::set_chain_height).
+    pub fn chain_height(&self) -> u64 {
+        self.chain_height
+    }
+
+    /// When THIS node first admitted `id` to THIS pool, or `None` if the pool
+    /// does not hold it.
+    ///
+    /// `None` is the honest answer, not a failure: a transaction that reached
+    /// this node already mined — inside a peer's block — was never observed
+    /// waiting here, so this node has no arrival time for it and must not
+    /// invent one (substituting the block's timestamp would report a wait of
+    /// zero for a transaction that may have queued for an hour elsewhere).
+    ///
+    /// Reads the pool's ONE admission record: `inserted_at` for a READY entry,
+    /// the queued entry's own stamp for a parked one. The queued lookup is a
+    /// scan that re-hashes each parked transaction, because that region is keyed
+    /// by `(signer, nonce)` rather than by id — bounded by the queued capacity
+    /// (`capacity/16` by default), but not free. Use
+    /// [`first_seen_batch`](Self::first_seen_batch) to look up a whole block's
+    /// worth of ids, which pays that scan once instead of once per id.
+    ///
+    /// A transaction that was parked and later PROMOTED reports its promotion
+    /// time, because the ready region stamps its clock at ready-admission — the
+    /// same instant TTL eviction starts counting from. That is deliberately the
+    /// existing clock rather than a second one kept alongside it.
+    pub fn first_seen(&self, id: &Hash) -> Option<FirstSeen> {
+        if let Some(at_ms) = self.inserted_at.get(id) {
+            return Some(FirstSeen {
+                at_ms: *at_ms,
+                at_height: self.inserted_at_height.get(id).copied().unwrap_or(0),
+            });
+        }
+        self.queued
+            .values()
+            .find(|q| q.stx.id() == *id)
+            .map(|q| FirstSeen {
+                at_ms: q.queued_at_ms,
+                at_height: q.queued_at_height,
+            })
+    }
+
+    /// [`first_seen`](Self::first_seen) for many ids at once, in the same order.
+    ///
+    /// The block-connect path asks about every transaction in a block, and most
+    /// of them will not be in the queued region at all. Doing that one id at a
+    /// time would re-hash the whole parked region once PER transaction —
+    /// quadratic in exactly the case that matters (a full block against a full
+    /// queue). This pays the queued scan ONCE, and only when at least one id
+    /// misses the ready region, so the common case (every transaction was
+    /// pooled ready, or none of them were pooled at all) stays a hash lookup per
+    /// id.
+    pub fn first_seen_batch(&self, ids: &[Hash]) -> Vec<Option<FirstSeen>> {
+        let mut out: Vec<Option<FirstSeen>> = ids
+            .iter()
+            .map(|id| {
+                self.inserted_at.get(id).map(|at_ms| FirstSeen {
+                    at_ms: *at_ms,
+                    at_height: self.inserted_at_height.get(id).copied().unwrap_or(0),
+                })
+            })
+            .collect();
+        if out.iter().all(Option::is_some) || self.queued.is_empty() {
+            return out;
+        }
+        let parked: HashMap<Hash, FirstSeen> = self
+            .queued
+            .values()
+            .map(|q| {
+                (
+                    q.stx.id(),
+                    FirstSeen {
+                        at_ms: q.queued_at_ms,
+                        at_height: q.queued_at_height,
+                    },
+                )
+            })
+            .collect();
+        for (slot, id) in out.iter_mut().zip(ids) {
+            if slot.is_none() {
+                *slot = parked.get(id).copied();
+            }
+        }
+        out
     }
 
     /// Number of pending transactions from `signer`.
@@ -825,6 +1014,7 @@ impl Mempool {
         self.by_sender.insert(slot, id);
         self.by_id.insert(id, stx);
         self.inserted_at.insert(id, now_millis());
+        self.inserted_at_height.insert(id, self.chain_height);
         debug_assert_eq!(
             self.weight_total,
             self.recompute_weight(),
@@ -903,6 +1093,7 @@ impl Mempool {
                 QueuedTx {
                     stx,
                     queued_at_ms: now_millis(),
+                    queued_at_height: self.chain_height,
                 },
             );
             return Ok(Admitted::Queued);
@@ -962,6 +1153,7 @@ impl Mempool {
             QueuedTx {
                 stx,
                 queued_at_ms: now_millis(),
+                queued_at_height: self.chain_height,
             },
         );
         Ok(Admitted::Queued)
@@ -990,6 +1182,7 @@ impl Mempool {
                 break;
             };
             let queued_at_ms = q.queued_at_ms;
+            let queued_at_height = q.queued_at_height;
             match self.insert_inner(q.stx.clone(), current_nonce, balance) {
                 Ok(Admitted::Ready) => continue,
                 Ok(Admitted::Queued) => {
@@ -1008,6 +1201,7 @@ impl Mempool {
                         QueuedTx {
                             stx: q.stx,
                             queued_at_ms,
+                            queued_at_height,
                         },
                     );
                     break;
@@ -1054,6 +1248,7 @@ impl Mempool {
         self.by_sender
             .remove(&(stx.transaction.signer.clone(), stx.transaction.nonce));
         self.inserted_at.remove(id);
+        self.inserted_at_height.remove(id);
         debug_assert_eq!(
             self.weight_total,
             self.recompute_weight(),
@@ -1237,6 +1432,84 @@ impl Mempool {
             .values()
             .map(|q| now.saturating_sub(q.queued_at_ms))
             .max()
+    }
+
+    /// A bounded snapshot of the pool's CONTENTS with per-entry arrival timing:
+    /// up to `limit` entries, READY (mineable) first — highest
+    /// [`effective_tip`] first within each region, so the order matches the one
+    /// [`select`](Self::select) mines in — then QUEUED (future-nonce) entries,
+    /// oldest first.
+    ///
+    /// Read-only, node-local, and NON-consensus: nothing here is committed to a
+    /// block or affects any rule. It is the per-transaction complement to the
+    /// aggregates [`oldest_pending_age_ms`](Self::oldest_pending_age_ms) and
+    /// [`tip_histogram`](Self::tip_histogram), and it reads the SAME admission
+    /// clock they do, so ages can never disagree between the two views.
+    ///
+    /// Each entry carries BOTH the absolute admission stamp
+    /// ([`first_seen_ms`](MempoolEntry::first_seen_ms)) and the derived
+    /// [`age_ms`](MempoolEntry::age_ms), computed from a single reading of the
+    /// clock so `first_seen_ms + age_ms` is that reading for every entry in the
+    /// page — the two can never tell different stories.
+    ///
+    /// `limit` is applied by the caller's own cap; the whole response is bounded
+    /// by it regardless of pool size.
+    pub fn entries(&self, limit: usize) -> Vec<MempoolEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let now = now_millis();
+        let mut ready: Vec<MempoolEntry> = self
+            .by_id
+            .iter()
+            .map(|(id, stx)| {
+                let first_seen_ms = *self.inserted_at.get(id).unwrap_or(&now);
+                MempoolEntry {
+                    id: *id,
+                    signer: stx.transaction.signer.clone(),
+                    nonce: stx.transaction.nonce,
+                    tip_grains: effective_tip(stx).grains(),
+                    size_bytes: stx.serialized_size(),
+                    weight: tx_weight(stx),
+                    first_seen_ms,
+                    age_ms: now.saturating_sub(first_seen_ms),
+                    ready: true,
+                }
+            })
+            .collect();
+        // Highest bid first, then oldest first, then by id — a total order, so
+        // the snapshot is deterministic for a given pool state rather than
+        // dependent on `HashMap` iteration order.
+        ready.sort_by(|a, b| {
+            b.tip_grains
+                .cmp(&a.tip_grains)
+                .then(b.age_ms.cmp(&a.age_ms))
+                .then(a.id.to_hex().cmp(&b.id.to_hex()))
+        });
+        ready.truncate(limit);
+        if ready.len() == limit {
+            return ready;
+        }
+        let remaining = limit - ready.len();
+        let mut queued: Vec<MempoolEntry> = self
+            .queued
+            .iter()
+            .map(|((signer, nonce), q)| MempoolEntry {
+                id: q.stx.id(),
+                signer: signer.clone(),
+                nonce: *nonce,
+                tip_grains: effective_tip(&q.stx).grains(),
+                size_bytes: q.stx.serialized_size(),
+                weight: tx_weight(&q.stx),
+                first_seen_ms: q.queued_at_ms,
+                age_ms: now.saturating_sub(q.queued_at_ms),
+                ready: false,
+            })
+            .collect();
+        queued.sort_by(|a, b| b.age_ms.cmp(&a.age_ms).then(a.nonce.cmp(&b.nonce)));
+        queued.truncate(remaining);
+        ready.extend(queued);
+        ready
     }
 
     /// The `n`-th highest [`effective_tip`] among READY transactions (1-based),
@@ -1467,6 +1740,78 @@ mod tests {
     /// A balance large enough that the affordability gate never trips in these tests.
     fn big() -> Balance {
         Balance::from_grains(u128::MAX)
+    }
+
+    #[test]
+    fn the_pool_has_exactly_one_admission_clock() {
+        // REGRESSION GUARD for the whole timing feature. Every arrival view the
+        // pool exposes must read the SAME stamp:
+        //   * `first_seen` (what the timing index pairs with an inclusion),
+        //   * `entries().first_seen_ms` (what `sov_getMempoolTxs` serves),
+        //   * `entries().age_ms` and `oldest_pending_age_ms` (the derived ages).
+        // If a second clock were ever added for any one of them, a transaction
+        // would report two different arrival times over two different RPCs and
+        // there would be no way to tell which was real.
+        let mut pool = Mempool::new(64);
+        pool.set_chain_height(42);
+        let stx = tx([1; 32], "usa.reserve.sov", 0);
+        let id = stx.id();
+        pool.insert(stx, 0, big()).unwrap();
+
+        let seen = pool.first_seen(&id).expect("admitted");
+        assert_eq!(seen.at_height, 42, "stamped with the height the node set");
+        let entry = pool
+            .entries(16)
+            .into_iter()
+            .find(|e| e.id == id)
+            .expect("listed");
+        assert_eq!(
+            entry.first_seen_ms, seen.at_ms,
+            "`entries` and `first_seen` are the same stamp, not two readings"
+        );
+        // The stamp and the age are two views of ONE clock: adding them lands on
+        // the moment the page was built, so they can never contradict.
+        let now = now_millis();
+        assert!(entry.first_seen_ms + entry.age_ms <= now + 5);
+        let oldest = pool.oldest_pending_age_ms().expect("one ready entry");
+        assert!(
+            oldest >= entry.age_ms && oldest - entry.age_ms <= 50,
+            "the aggregate age is derived from the same stamp: {oldest} vs {}",
+            entry.age_ms
+        );
+
+        // A QUEUED entry answers from the queued half of the same one record...
+        let queued_tx = tx([1; 32], "usa.reserve.sov", 7);
+        let queued_id = queued_tx.id();
+        pool.set_chain_height(43);
+        pool.insert(queued_tx, 0, big()).unwrap();
+        let queued_seen = pool.first_seen(&queued_id).expect("parked, still observed");
+        assert_eq!(queued_seen.at_height, 43);
+        let queued_entry = pool
+            .entries(16)
+            .into_iter()
+            .find(|e| e.id == queued_id)
+            .expect("listed");
+        assert!(!queued_entry.ready, "it is parked behind a nonce gap");
+        assert_eq!(queued_entry.first_seen_ms, queued_seen.at_ms);
+
+        // ...and a transaction the pool never held has NO observation at all —
+        // the honest answer that becomes `observed: false` over RPC.
+        let never = tx([2; 32], "ecb.reserve.sov", 0);
+        assert!(pool.first_seen(&never.id()).is_none());
+
+        // The BATCH form (what the block-connect path uses) must answer
+        // identically for every case, in order — ready, parked, and never-seen.
+        let batch = pool.first_seen_batch(&[id, queued_id, never.id()]);
+        assert_eq!(
+            batch,
+            vec![Some(seen), Some(queued_seen), None],
+            "batched and single lookups are the same answer, not two code paths"
+        );
+
+        // The record dies WITH the entry: no stamp outlives its transaction.
+        pool.remove(&id);
+        assert!(pool.first_seen(&id).is_none());
     }
 
     /// `(min tip, count)` pairs of a histogram — the shape most assertions care

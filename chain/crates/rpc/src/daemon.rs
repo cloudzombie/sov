@@ -28,7 +28,7 @@ use sov_chain::{Blockchain, ChainError, GenesisAccount, GenesisConfig};
 use sov_crypto::{Keypair, PublicKey};
 use sov_mining::MiningPolicy;
 use sov_network::{NetMessage, TcpNode};
-use sov_node::{Node, NodeError, Produced};
+use sov_node::{Node, NodeError, Produced, TxTiming};
 use sov_primitives::{AccountId, Balance, BlockHeight, Hash};
 use sov_state::Ledger;
 use sov_types::{Block, Receipt, SignedTransaction};
@@ -302,6 +302,25 @@ pub struct NodeConfig {
     /// Maximum transactions per block.
     #[serde(default = "default_max_block_txs")]
     pub max_block_txs: usize,
+    /// How many blocks of history the NODE-LOCAL transaction-timing index keeps
+    /// in `data_dir/txtiming.dat` (`sov_getTxTiming`). Default
+    /// [`sov_node::DEFAULT_RETENTION_BLOCKS`] — 4,320 blocks, about 7.5 days at
+    /// the 2.5-minute block target.
+    ///
+    /// NON-CONSENSUS: the index records how long transactions waited *as this
+    /// node observed it*, is committed to no block, receipt, or state root, and
+    /// is invisible to validation and fork choice. Two nodes may run wildly
+    /// different values and still agree on the chain byte for byte.
+    #[serde(default = "default_tx_timing_retention_blocks")]
+    pub tx_timing_retention_blocks: u64,
+    /// Hard ceiling on rows in that index, applied together with
+    /// [`tx_timing_retention_blocks`](Self::tx_timing_retention_blocks) —
+    /// whichever binds first, evicted oldest-first. Default
+    /// [`sov_node::DEFAULT_MAX_ENTRIES`] (200,000 rows, roughly 12 MB on disk).
+    /// The depth bound alone is not a memory bound, because a block's
+    /// transaction count is not fixed.
+    #[serde(default = "default_tx_timing_max_entries")]
+    pub tx_timing_max_entries: usize,
     /// Whether this node MINES. `true` (default) = a normal miner. `false` = a
     /// RELAY-ONLY node: it still serves RPC, snapshots, and imports/relays peers'
     /// blocks (so it anchors the network as an always-on seed), but never produces
@@ -385,6 +404,24 @@ fn default_mempool_capacity() -> usize {
 }
 fn default_max_block_txs() -> usize {
     4_096
+}
+/// The node-local tx-timing index's default retention bounds, re-exported so a
+/// caller that builds a [`NodeConfig`] literal (the desktop Station, the testnet
+/// generator) can name them without taking a direct dependency on `sov-node`.
+/// See [`sov_node::timing`] for the derivations.
+pub use sov_node::{
+    DEFAULT_MAX_ENTRIES as TX_TIMING_DEFAULT_MAX_ENTRIES,
+    DEFAULT_RETENTION_BLOCKS as TX_TIMING_DEFAULT_RETENTION_BLOCKS,
+};
+
+/// 4,320 blocks ≈ 7.5 days at the 2.5-minute target — see
+/// [`sov_node::DEFAULT_RETENTION_BLOCKS`] for the derivation.
+fn default_tx_timing_retention_blocks() -> u64 {
+    sov_node::DEFAULT_RETENTION_BLOCKS
+}
+/// 200,000 rows — see [`sov_node::DEFAULT_MAX_ENTRIES`] for the derivation.
+fn default_tx_timing_max_entries() -> usize {
+    sov_node::DEFAULT_MAX_ENTRIES
 }
 fn default_true() -> bool {
     true
@@ -812,6 +849,90 @@ fn snapshot_path(dir: &Path) -> PathBuf {
 /// against live state on load (stale/unaffordable ones are dropped).
 fn mempool_path(dir: &Path) -> PathBuf {
     dir.join("mempool.dat")
+}
+
+/// The persisted NODE-LOCAL transaction-timing index (see
+/// [`sov_node::timing`]): how long each mined transaction waited *as this node
+/// observed it*, so that view survives a restart instead of resetting to
+/// "nothing observed" every boot.
+///
+/// Persisted exactly like [`mempool_path`]'s file and for the same reason —
+/// best-effort, non-consensus, atomically replaced. It is stamped with
+/// [`TXTIMING_FILE_VERSION`] and a content checksum; a missing, truncated,
+/// mis-versioned, or otherwise unreadable file simply yields an EMPTY index. It
+/// commits to nothing (no receipt, no state root, no block), so unlike the block
+/// log there is nothing here worth refusing to boot over.
+fn txtiming_path(dir: &Path) -> PathBuf {
+    dir.join("txtiming.dat")
+}
+
+/// On-disk format version of `txtiming.dat`, independent of the block-log schema
+/// ([`DATA_SCHEMA_VERSION`]) — which is the point: the timing index is
+/// non-consensus metadata, so changing its shape must never force operators onto
+/// a fresh data dir. A file written by a different version is IGNORED (start
+/// empty), never migrated and never fatal.
+const TXTIMING_FILE_VERSION: u32 = 1;
+
+/// Serialize the node-local timing index and durably write it (atomic
+/// temp+rename), under a brief node lock — the same shape and schedule as
+/// [`write_mempool`]: on each periodic snapshot tick and once more on clean
+/// shutdown. Bounded by the index's own retention caps, so the write stays cheap.
+fn write_txtiming(path: &Path, node: &Mutex<Node>) {
+    let rows = match node.lock() {
+        Ok(n) => n.tx_timing_snapshot(),
+        Err(_) => return,
+    };
+    let Ok(payload) = borsh::to_vec(&(TXTIMING_FILE_VERSION, rows)) else {
+        return;
+    };
+    let mut bytes = Hash::digest(&payload).as_bytes().to_vec();
+    bytes.extend_from_slice(&payload);
+    let _ = write_snapshot_bytes(path, &bytes);
+}
+
+/// Load `path` into `node`'s timing index, reporting (never propagating) a
+/// damaged file. Shared by boot and by
+/// [`Daemon::with_tx_timing_limits`](Daemon::with_tx_timing_limits), which
+/// re-loads once the operator's bounds are in place so the configured window
+/// applies to the restored rows and not just to newly recorded ones.
+fn restore_txtiming_into(node: &mut Node, path: &Path) {
+    match load_txtiming(path) {
+        Ok(rows) => node.restore_tx_timing(rows),
+        Err(why) => eprintln!(
+            "sov: tx-timing index at {path:?} discarded ({why}) — starting with an empty one; \
+             this is node-local, non-consensus metadata and no chain data is affected"
+        ),
+    }
+}
+
+/// Read a persisted timing index. `Ok(rows)` when the file is intact (an ABSENT
+/// file is `Ok(vec![])` — a first boot, not a fault); `Err(reason)` for a short
+/// file, a bad checksum, a version mismatch, or any decode error.
+///
+/// Deliberately total — no panic, no error path that can propagate into boot.
+/// The caller reports the reason and starts with an empty index: this is
+/// observational metadata, so a torn file is a reason to forget what this node
+/// saw, never a reason to refuse to run. Returning the reason (rather than
+/// swallowing it) keeps the decision testable and tells the operator their view
+/// was reset instead of leaving them wondering where yesterday's timings went.
+fn load_txtiming(path: &Path) -> Result<Vec<(Hash, TxTiming)>, String> {
+    let Ok(bytes) = fs::read(path) else {
+        return Ok(Vec::new()); // no file yet — a first boot
+    };
+    if bytes.len() < Hash::LEN {
+        return Err("file is truncated".into());
+    }
+    let (checksum, payload) = bytes.split_at(Hash::LEN);
+    if Hash::digest(payload).as_bytes() != checksum {
+        return Err("checksum does not match its contents".into());
+    }
+    match borsh::from_slice::<(u32, Vec<(Hash, TxTiming)>)>(payload) {
+        Ok((TXTIMING_FILE_VERSION, rows)) => Ok(rows),
+        Ok((version, _)) => Err(format!(
+            "file is format v{version}, this binary writes v{TXTIMING_FILE_VERSION}"
+        )),
+        Err(e) => Err(format!("file will not decode ({e})")),
+    }
 }
 
 /// Baked trusted **assumevalid** checkpoints for mainnet: `(height, block-hash)` pairs a
@@ -1399,6 +1520,11 @@ pub struct Daemon {
     snapshot_path: PathBuf,
     /// Where the pending mempool is persisted, so it survives a restart.
     mempool_path: PathBuf,
+    /// Where the NODE-LOCAL transaction-timing index is persisted, so this
+    /// node's view of how long transactions waited survives a restart. Beside
+    /// the mempool file, written on the same schedule, and — like it — committed
+    /// to nothing.
+    txtiming_path: PathBuf,
     /// Whether this boot resumed from a chainstate snapshot (tier 1) rather than
     /// replaying the block log. Observability for operators/tests.
     resumed_fast: bool,
@@ -1610,6 +1736,15 @@ impl Daemon {
             node.restore_mempool(restored);
         }
 
+        // Restore this node's NODE-LOCAL transaction-timing observations, under
+        // the node's DEFAULT retention bounds; an operator who configures
+        // different ones re-applies them (and re-loads) via
+        // [`with_tx_timing_limits`](Self::with_tx_timing_limits). A damaged file
+        // resets the view and says so; it never blocks the boot, because nothing
+        // here is committed to the chain.
+        let tt_path = txtiming_path(&data_dir);
+        restore_txtiming_into(&mut node, &tt_path);
+
         Ok(Daemon {
             node: Arc::new(Mutex::new(node)),
             resumed,
@@ -1617,6 +1752,7 @@ impl Daemon {
             gossip: None,
             snapshot_path: snap_path,
             mempool_path: mp_path,
+            txtiming_path: tt_path,
             resumed_fast,
             sync_status: None,
             log: None,
@@ -1690,6 +1826,28 @@ impl Daemon {
         if let Ok(mut node) = self.node.lock() {
             // ADD, so the baked network checkpoints installed at construction survive.
             node.add_checkpoints(checkpoints);
+        }
+        self
+    }
+
+    /// Set the NODE-LOCAL transaction-timing index's retention bounds:
+    /// `retention_blocks` of chain depth and at most `max_entries` rows,
+    /// whichever binds first, evicted oldest-first.
+    ///
+    /// Defaults are [`sov_node::DEFAULT_RETENTION_BLOCKS`] (4,320 blocks ≈ 7.5
+    /// days at the 2.5-minute target) and [`sov_node::DEFAULT_MAX_ENTRIES`]
+    /// (200,000 rows). An operator lowers them to spend less disk on
+    /// observability, or raises them to keep a longer local latency history.
+    ///
+    /// Applying new bounds re-reads `txtiming.dat`, so the configured window
+    /// governs the rows already on disk and not merely the ones recorded after
+    /// this call. Non-consensus: the index is invisible to block validation,
+    /// execution, and fork choice, so this knob can differ across the network
+    /// without any node disagreeing about the chain.
+    pub fn with_tx_timing_limits(self, retention_blocks: u64, max_entries: usize) -> Self {
+        if let Ok(mut node) = self.node.lock() {
+            node.set_tx_timing_limits(retention_blocks, max_entries);
+            restore_txtiming_into(&mut node, &self.txtiming_path);
         }
         self
     }
@@ -1820,6 +1978,7 @@ impl Daemon {
         let block_log = Arc::clone(&self.block_log);
         let snap_path = self.snapshot_path.clone();
         let mp_path = self.mempool_path.clone();
+        let tt_path = self.txtiming_path.clone();
         let sync_status = self.sync_status.clone();
         let log = self.log.clone();
         let sd = Arc::clone(&shutdown);
@@ -1878,6 +2037,10 @@ impl Daemon {
                     // Persist the pending pool alongside each chainstate snapshot, so a
                     // crash between here and shutdown still recovers most of the pool.
                     write_mempool(&mp_path, &node);
+                    // Same schedule for the node-local timing index, for the same
+                    // reason: a crash then loses at most one snapshot interval of
+                    // observations rather than the whole retention window.
+                    write_txtiming(&tt_path, &node);
                 }
 
                 // RELAY-ONLY / MINING-OFF: a seed/anchor node — or any node whose user
@@ -2219,6 +2382,9 @@ impl Daemon {
             }
             // Persist the pending pool on clean shutdown, so it survives the restart.
             write_mempool(&mp_path, &node);
+            // …and this node's timing observations, so an operator's latency view
+            // is not reset to empty by every restart.
+            write_txtiming(&tt_path, &node);
         });
 
         Ok(DaemonHandle {
@@ -2997,6 +3163,371 @@ mod tests {
                 .iter()
                 .any(|t| t.id() == tx_id));
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tx_timing_survives_a_restart_and_a_corrupt_file_starts_empty() {
+        // PERSISTENCE + RESILIENCE for the node-local timing index. It is
+        // observational metadata, so it must (a) survive a restart, or an
+        // operator's latency view resets to nothing every boot, and (b) NEVER
+        // block a boot when its file is damaged — there is no chain data in it
+        // to protect, so refusing to start would trade a real capability for a
+        // worthless one.
+        use sov_types::{Action, Transaction};
+        let genesis = gate_test_genesis();
+        let dir = std::env::temp_dir().join(format!(
+            "sov-txtiming-persist-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let signer = AccountId::new("val01.node.sov").unwrap();
+        let kp = Keypair::from_seed([7; 32]);
+        let stx = SignedTransaction::sign(
+            Transaction {
+                signer: signer.clone(),
+                public_key: kp.public_key(),
+                nonce: 0,
+                action: Action::Transfer {
+                    to: signer.clone(),
+                    amount: Balance::ZERO,
+                },
+            },
+            &kp,
+        )
+        .unwrap();
+        let tx_id = stx.id();
+        let keys = || vec![(signer.clone(), Keypair::from_seed([7; 32]))];
+
+        // First boot: submit, mine, and persist the timing index.
+        let recorded = {
+            let daemon = Daemon::new(&genesis, &dir, 1024, 256, keys()).unwrap();
+            let node = daemon.node();
+            {
+                let mut n = node.lock().unwrap();
+                n.submit(stx).unwrap();
+                n.produce(2_000).unwrap();
+            }
+            let recorded = node
+                .lock()
+                .unwrap()
+                .tx_timing(&tx_id)
+                .expect("mining the tx records its timing");
+            assert!(recorded.is_observed(), "this node watched it wait");
+            assert_eq!(recorded.included_height, 1);
+            write_txtiming(&txtiming_path(&dir), &node);
+            recorded
+        };
+
+        // Restart: the same observation is back, byte for byte.
+        {
+            let daemon = Daemon::new(&genesis, &dir, 1024, 256, keys()).unwrap();
+            let restored = daemon
+                .node()
+                .lock()
+                .unwrap()
+                .tx_timing(&tx_id)
+                .expect("timing must survive a restart");
+            assert_eq!(restored, recorded);
+        }
+
+        // Now CORRUPT the file (truncate it past its checksum) and boot again:
+        // the daemon must come up with an EMPTY index and no panic.
+        {
+            let path = txtiming_path(&dir);
+            let bytes = fs::read(&path).unwrap();
+            fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+            let daemon = Daemon::new(&genesis, &dir, 1024, 256, keys())
+                .expect("a torn file never blocks a boot");
+            let node = daemon.node();
+            let n = node.lock().unwrap();
+            assert_eq!(n.tx_timing_stats().0, 0, "the view resets to empty");
+            assert!(n.tx_timing(&tx_id).is_none());
+            // The CHAIN is unaffected either way: it is rebuilt from the block
+            // log alone (which this test drives the node directly and so never
+            // appends to), and the timing file commits to nothing that could
+            // change it.
+            assert_eq!(n.chain().height(), 0);
+        }
+
+        // Direct unit coverage of every rejection the loader must survive.
+        let path = txtiming_path(&dir);
+        fs::write(&path, b"x").unwrap();
+        assert!(load_txtiming(&path).is_err(), "a short file is rejected");
+        let payload =
+            borsh::to_vec(&(TXTIMING_FILE_VERSION + 1, Vec::<(Hash, TxTiming)>::new())).unwrap();
+        let mut wrong_version = Hash::digest(&payload).as_bytes().to_vec();
+        wrong_version.extend_from_slice(&payload);
+        fs::write(&path, &wrong_version).unwrap();
+        assert!(
+            load_txtiming(&path).is_err(),
+            "a future on-disk format is ignored, not migrated"
+        );
+        let mut bad_checksum = vec![0u8; Hash::LEN];
+        bad_checksum.extend_from_slice(&payload);
+        fs::write(&path, &bad_checksum).unwrap();
+        assert!(load_txtiming(&path).is_err(), "a bad checksum is rejected");
+        let _ = fs::remove_file(&path);
+        assert_eq!(
+            load_txtiming(&path).unwrap().len(),
+            0,
+            "an absent file is a first boot, not a fault"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mempool_txs_and_tx_timing_over_the_real_socket() {
+        // The two visibility methods end-to-end over a real RPC socket:
+        //
+        //  * `sov_getMempoolTxs` — full response SHAPE, `firstSeenMs`/`ageMs`
+        //    consistent with each other, ready-vs-queued classification, the
+        //    `limit` cap, `offset` paging, and `hasMore`.
+        //  * `sov_getTxTiming` — by `txId` and by `height`, the both/neither
+        //    param rejection, and `null` for an unknown id (matching
+        //    `sov_getReceipt`'s miss).
+        use crate::{RpcClient, MAX_MEMPOOL_TX_PAGE};
+        use serde_json::json;
+        use sov_types::{Action, Transaction};
+        let genesis = gate_test_genesis();
+        let dir = std::env::temp_dir().join(format!(
+            "sov-txtiming-rpc-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let signer = AccountId::new("val01.node.sov").unwrap();
+        let kp = Keypair::from_seed([7; 32]);
+        let self_transfer = |nonce: u64| {
+            SignedTransaction::sign(
+                Transaction {
+                    signer: signer.clone(),
+                    public_key: kp.public_key(),
+                    nonce,
+                    action: Action::Transfer {
+                        to: signer.clone(),
+                        amount: Balance::ZERO,
+                    },
+                },
+                &kp,
+            )
+            .unwrap()
+        };
+        let daemon = Daemon::new(
+            &genesis,
+            &dir,
+            1024,
+            256,
+            vec![(signer.clone(), Keypair::from_seed([7; 32]))],
+        )
+        .unwrap();
+        let node = daemon.node();
+        let _serial = crate::NET_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Mining OFF, so the pool's contents are ours to control.
+        let handle = daemon.run("127.0.0.1:0", 1, 20, false, 50).unwrap();
+        let client = RpcClient::new(handle.rpc_addr().to_string());
+
+        // Three READY (nonces 0..2) and one FUTURE-nonce entry (nonce 5, behind
+        // a gap) so both regions are populated.
+        for nonce in [0u64, 1, 2, 5] {
+            let r = client
+                .call(
+                    "sov_submitTransaction",
+                    serde_json::to_value(self_transfer(nonce)).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(r.get("accepted"), Some(&json!(true)));
+        }
+
+        // ---- SHAPE ----
+        let page = client.call("sov_getMempoolTxs", json!({})).unwrap();
+        assert_eq!(page.get("txCount"), Some(&json!(3)), "ready region");
+        assert_eq!(page.get("queuedCount"), Some(&json!(1)), "queued region");
+        assert_eq!(page.get("offset"), Some(&json!(0)));
+        assert_eq!(
+            page.get("limit"),
+            Some(&json!(MAX_MEMPOOL_TX_PAGE)),
+            "an unspecified limit defaults to the cap"
+        );
+        assert_eq!(page.get("hasMore"), Some(&json!(false)));
+        let txs = page.get("txs").unwrap().as_array().unwrap();
+        assert_eq!(txs.len(), 4, "both regions are listed");
+        for e in txs {
+            assert!(e.get("txId").unwrap().as_str().unwrap().len() == 64);
+            assert_eq!(e.get("signer").unwrap().as_str(), Some(signer.as_str()));
+            assert!(e.get("nonce").unwrap().is_u64());
+            assert!(
+                e.get("tipGrains").unwrap().is_string(),
+                "grains ride as decimal strings, the codebase convention"
+            );
+            assert!(e.get("sizeBytes").unwrap().as_u64().unwrap() > 0);
+            assert!(e.get("weight").unwrap().as_u64().unwrap() > 0);
+            let first_seen = e.get("firstSeenMs").unwrap().as_u64().unwrap();
+            let age = e.get("ageMs").unwrap().as_u64().unwrap();
+            // CONSISTENCY: the stamp is a real recent wall-clock time and the
+            // age is that stamp measured against now — one clock, two views.
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            assert!(
+                first_seen <= now && now - first_seen < 120_000,
+                "firstSeenMs is an absolute, recent Unix-ms stamp: {first_seen}"
+            );
+            assert!(
+                first_seen + age <= now + 1_000 && first_seen + age + 120_000 >= now,
+                "firstSeenMs + ageMs lands on the same instant the page was built"
+            );
+            let state = e.get("state").unwrap().as_str().unwrap();
+            assert!(state == "ready" || state == "queued");
+        }
+        // ---- READY vs QUEUED classification ----
+        let queued: Vec<&serde_json::Value> = txs
+            .iter()
+            .filter(|e| e.get("state").unwrap() == "queued")
+            .collect();
+        assert_eq!(queued.len(), 1, "exactly the future-nonce entry is parked");
+        assert_eq!(
+            queued[0].get("nonce"),
+            Some(&json!(5)),
+            "and it is the one behind the nonce gap"
+        );
+        assert!(
+            txs.iter()
+                .filter(|e| e.get("state").unwrap() == "ready")
+                .count()
+                == 3
+        );
+
+        // ---- LIMIT CLAMPING ----
+        let over = client
+            .call(
+                "sov_getMempoolTxs",
+                json!({ "limit": (MAX_MEMPOOL_TX_PAGE as u64) * 100 }),
+            )
+            .unwrap();
+        assert_eq!(
+            over.get("limit"),
+            Some(&json!(MAX_MEMPOOL_TX_PAGE)),
+            "an oversized limit is clamped to the hard cap, never honored"
+        );
+        let zero = client
+            .call("sov_getMempoolTxs", json!({ "limit": 0 }))
+            .unwrap();
+        assert_eq!(zero.get("limit"), Some(&json!(1)), "clamped up from zero");
+
+        // ---- OFFSET PAGING + hasMore ----
+        let first = client
+            .call("sov_getMempoolTxs", json!({ "limit": 2, "offset": 0 }))
+            .unwrap();
+        assert_eq!(first.get("txs").unwrap().as_array().unwrap().len(), 2);
+        assert_eq!(
+            first.get("hasMore"),
+            Some(&json!(true)),
+            "two of four returned → more remain"
+        );
+        let second = client
+            .call("sov_getMempoolTxs", json!({ "limit": 2, "offset": 2 }))
+            .unwrap();
+        assert_eq!(second.get("txs").unwrap().as_array().unwrap().len(), 2);
+        assert_eq!(
+            second.get("hasMore"),
+            Some(&json!(false)),
+            "the last page says so"
+        );
+        let page_ids = |v: &serde_json::Value| -> Vec<String> {
+            v.get("txs")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e.get("txId").unwrap().as_str().unwrap().to_string())
+                .collect()
+        };
+        let (a, b) = (page_ids(&first), page_ids(&second));
+        assert!(
+            a.iter().all(|id| !b.contains(id)),
+            "pages do not overlap: {a:?} vs {b:?}"
+        );
+        let past_end = client
+            .call("sov_getMempoolTxs", json!({ "offset": 1_000 }))
+            .unwrap();
+        assert!(past_end.get("txs").unwrap().as_array().unwrap().is_empty());
+        assert_eq!(past_end.get("hasMore"), Some(&json!(false)));
+
+        // ---- MINE, then sov_getTxTiming ----
+        let mined_id = {
+            let mut n = node.lock().unwrap();
+            let block = n.produce(9_000).unwrap().block;
+            assert_eq!(block.transactions.len(), 3, "the three ready txs");
+            block.transactions[0].id()
+        };
+        let t = client
+            .call("sov_getTxTiming", json!({ "txId": mined_id.to_hex() }))
+            .unwrap();
+        assert_eq!(
+            t.get("txId").unwrap().as_str(),
+            Some(mined_id.to_hex().as_str())
+        );
+        assert_eq!(t.get("observed"), Some(&json!(true)));
+        assert!(t.get("firstSeenMs").unwrap().is_u64());
+        assert_eq!(t.get("firstSeenHeight"), Some(&json!(0)));
+        assert_eq!(t.get("includedHeight"), Some(&json!(1)));
+        assert_eq!(t.get("includedTimestampMs"), Some(&json!(9_000)));
+        assert!(t.get("waitedMs").unwrap().is_u64());
+        assert_eq!(t.get("waitedBlocks"), Some(&json!(1)));
+
+        // By HEIGHT: one object per transaction, in block order.
+        let at_height = client
+            .call("sov_getTxTiming", json!({ "height": 1 }))
+            .unwrap();
+        assert_eq!(at_height.get("height"), Some(&json!(1)));
+        let rows = at_height.get("txs").unwrap().as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].get("txId").unwrap().as_str(),
+            Some(mined_id.to_hex().as_str()),
+            "block order, not hash order"
+        );
+        for r in rows {
+            assert_eq!(r.get("observed"), Some(&json!(true)));
+            assert_eq!(r.get("includedHeight"), Some(&json!(1)));
+        }
+        assert!(
+            client
+                .call("sov_getTxTiming", json!({ "height": 999 }))
+                .unwrap()
+                .is_null(),
+            "no block at that height → null"
+        );
+
+        // ---- MISSES + PARAM ERRORS ----
+        let unknown = Hash::digest(b"never mined here").to_hex();
+        assert!(
+            client
+                .call("sov_getTxTiming", json!({ "txId": unknown }))
+                .unwrap()
+                .is_null(),
+            "an unknown txId is null, exactly like sov_getReceipt's miss"
+        );
+        assert!(
+            client
+                .call("sov_getTxTiming", json!({ "txId": unknown, "height": 1 }))
+                .is_err(),
+            "both params is an error, not a silent preference"
+        );
+        assert!(
+            client.call("sov_getTxTiming", json!({})).is_err(),
+            "neither param is an error"
+        );
+
+        handle.shutdown();
         let _ = fs::remove_dir_all(&dir);
     }
 
