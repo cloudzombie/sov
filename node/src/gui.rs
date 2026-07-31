@@ -14023,6 +14023,11 @@ mod tests {
     /// disk.
     #[test]
     fn operational_logs_persist_to_disk_and_are_pruned() {
+        // Takes the same lock as every other test that mutates `SOV_STATION_DIR`.
+        // Without it this raced the chain-dir guards: those resolve the DEFAULT
+        // station dir, so a concurrent override here made them read this scratch
+        // path and fail intermittently in the release gate.
+        let _g = env_guard();
         let dir = std::env::temp_dir().join(format!("sov-log-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let prev = std::env::var("SOV_STATION_DIR").ok();
