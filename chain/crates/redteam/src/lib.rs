@@ -407,6 +407,468 @@ fn atk_equal_work_tiebreak() -> Outcome {
     }
 }
 
+// ── foreign-chain injection ─────────────────────────────────────────────────
+//
+// The class: "build your own chain and try to spend it onto the honest chain."
+// An attacker can always mint a private universe — its own genesis, its own
+// balances, its own (fabricated) proof of work — for free. The only thing that
+// matters is whether ANY artifact of that universe (a block, a transaction, a
+// heavier-looking branch) can cross over onto a chain that never agreed to it.
+
+/// The attacker's key. Its IMPLICIT account id (`hex(blake3(pubkey))`) is
+/// cryptographically bound to the key on EVERY chain, so the attacker genuinely
+/// controls the same account name on the honest chain too — the interesting case.
+/// Nothing about the identity is forged; only the BALANCE is, and only on the
+/// attacker's own chain.
+const ATTACKER_SEED: [u8; 32] = [42; 32];
+
+/// The attacker's account id: implicit, key-bound, identical on both chains.
+fn attacker_account() -> AccountId {
+    Keypair::from_seed(ATTACKER_SEED)
+        .public_key()
+        .implicit_account_id()
+}
+
+/// The attacker's OWN chain: a different `chain_id` (⇒ a different genesis hash),
+/// same test mining policy (so its blocks carry REAL PoW under that policy), and
+/// an attacker account minted 1,000,000 SOV out of thin air in ITS genesis. This
+/// is exactly what an adversary can build on a laptop in one second, for free.
+fn attacker_chain() -> Blockchain {
+    let config = GenesisConfig {
+        chain_id: "sov-attacker".into(),
+        timestamp_ms: 1_000,
+        accounts: vec![
+            GenesisAccount {
+                account: id("val01.node.sov"),
+                key: Keypair::from_seed([1; 32]).public_key(),
+                balance: Balance::ZERO,
+            },
+            GenesisAccount {
+                account: attacker_account(),
+                key: Keypair::from_seed(ATTACKER_SEED).public_key(),
+                balance: Balance::from_sov(1_000_000).unwrap(),
+            },
+        ],
+        mining: MiningPolicy::test(),
+        vesting: vec![],
+    };
+    Blockchain::new(&config).unwrap()
+}
+
+/// A fresh sink account (implicit, zero balance, never a coinbase recipient) that
+/// receives the attacker's fabricated value, so "did value move?" is unambiguous.
+fn sink_account(seed: u8) -> AccountId {
+    Keypair::from_seed([seed; 32])
+        .public_key()
+        .implicit_account_id()
+}
+
+/// FOREIGN-CHAIN: import a block mined on a chain with a DIFFERENT GENESIS.
+///
+/// The attacker mines a real, fully-sealed block on its own chain (real PoW under
+/// the test policy — nothing about the block is malformed) and offers it to an
+/// honest node. Its `prev_hash` is the attacker's genesis, a hash the honest chain
+/// has never seen, so the block cannot connect to any known parent. Acceptance
+/// would mean an honest node adopting a stranger's history wholesale.
+fn atk_foreign_genesis_block_import() -> Outcome {
+    let c = "foreign-chain";
+    let name = "import a block from a foreign genesis";
+    let mut evil = attacker_chain();
+    let Ok(evil_block) = evil.produce_block(vec![], 2_000) else {
+        return Outcome::info(c, name, "could not seal a block on the attacker chain");
+    };
+    evil.import_block(evil_block.clone())
+        .expect("the attacker's own chain accepts its own block");
+    // Sanity: the two chains really do disagree about genesis.
+    let mut honest = fresh_chain();
+    if honest.head().hash() == evil_block.header.prev_hash {
+        return Outcome::info(
+            c,
+            name,
+            "the two genesis blocks collided — no foreign parent",
+        );
+    }
+    let before = honest.head().hash();
+    match honest.import_block(evil_block) {
+        Err(err) => {
+            if honest.head().hash() != before {
+                return Outcome::vulnerable(
+                    c,
+                    name,
+                    "the foreign block was rejected but still moved the tip",
+                );
+            }
+            Outcome::defended(
+                c,
+                name,
+                format!("rejected ({err:?}) — its parent is the ATTACKER's genesis, unknown here"),
+            )
+        }
+        Ok(_) => Outcome::vulnerable(
+            c,
+            name,
+            "a block from a foreign genesis was ACCEPTED — histories are interchangeable",
+        ),
+    }
+}
+
+/// FOREIGN-CHAIN: the literal "spend it onto mainnet" attack.
+///
+/// The attacker prints itself 1,000,000 SOV on its own chain, spends it there for
+/// real (mined + imported, recipient credited — proof the transaction is VALID in
+/// its universe), then lifts that SAME signed transaction onto the honest chain.
+/// Two independent defenses can fire: the account holds ZERO here (the transfer
+/// reverts, moving nothing), and — once the `tx-domain` fork is active — the
+/// signature is bound to the attacker's (chain_id, genesis) and fails outright.
+/// We report which one actually did the work.
+fn atk_extract_tx_from_foreign_chain() -> Outcome {
+    let c = "foreign-chain";
+    let name = "spend a foreign-chain balance onto the honest chain";
+    let kp = Keypair::from_seed(ATTACKER_SEED);
+    let attacker = attacker_account();
+    let victim = sink_account(11);
+    let amount = Balance::from_sov(500_000).unwrap();
+    let tx = SignedTransaction::sign(
+        Transaction {
+            signer: attacker.clone(),
+            public_key: kp.public_key(),
+            nonce: 0,
+            action: Action::Transfer {
+                to: victim.clone(),
+                amount,
+            },
+        },
+        &kp,
+    )
+    .unwrap();
+
+    // 1. Prove the transaction is genuinely VALID on the attacker's chain.
+    let mut evil = attacker_chain();
+    advance(&mut evil, 3);
+    let Ok(evil_block) = evil.produce_block(vec![tx.clone()], 100_000) else {
+        return Outcome::info(
+            c,
+            name,
+            "the attacker chain refused to build with its own tx",
+        );
+    };
+    if evil.import_block(evil_block).is_err()
+        || evil.ledger().account(&victim).balance.grains() != amount.grains()
+    {
+        return Outcome::info(
+            c,
+            name,
+            "could not establish the transaction as valid on the attacker chain",
+        );
+    }
+
+    // 2. Offer that identical transaction to the honest chain.
+    let mut honest = fresh_chain();
+    advance(&mut honest, 3);
+    let held = honest.ledger().account(&attacker).balance.grains();
+    let before = honest.ledger().account(&victim).balance.grains();
+    let domain_bound = honest.resolved_tx_domain(honest.height() + 1).is_some();
+    let Ok(block) = honest.produce_block(vec![tx.clone()], 100_000) else {
+        return Outcome::defended(
+            c,
+            name,
+            "the honest producer refused to build with the foreign transaction",
+        );
+    };
+    let landed = block.transactions.iter().any(|t| t.id() == tx.id());
+    let imported = honest.import_block(block).is_ok();
+    let after = honest.ledger().account(&victim).balance.grains();
+    if after != before {
+        return Outcome::vulnerable(
+            c,
+            name,
+            format!(
+                "foreign-minted value CREDITED on the honest chain (+{} grains)",
+                after - before
+            ),
+        );
+    }
+    let defense = if !landed {
+        "excluded at block selection"
+    } else if !imported {
+        "the block carrying it failed strict import"
+    } else {
+        "mined but REVERTED"
+    };
+    let domain = if domain_bound {
+        "tx-domain active: the signature is also bound to the attacker's (chain_id, genesis)"
+    } else {
+        "tx-domain dormant here, so BALANCE is the live defense: the attacker holds nothing"
+    };
+    Outcome::defended(
+        c,
+        name,
+        format!("{defense} — attacker balance {held} grains on this chain; {domain}"),
+    )
+}
+
+/// FOREIGN-CHAIN: a rival branch claiming work it never did.
+///
+/// This targets the assumevalid PoW-skip directly. A checkpoint is pinned ABOVE
+/// the tip (exactly as mainnet bakes one), and the attacker offers a branch of
+/// blocks that sit BELOW that checkpoint height but descend from nothing pinned —
+/// their seals do not meet target at all. Under a HEIGHT-gated skip every one of
+/// them would be waved through, and a free branch could out-weigh the honest
+/// chain. Under the ANCESTRY gate (`is_linked_to_checkpoint`, blockchain.rs:2187)
+/// an unlinked block gets its seal verified like any other, and fabricated PoW
+/// fails.
+fn atk_fabricated_heavier_branch() -> Outcome {
+    let c = "foreign-chain";
+    let name = "fabricated-PoW branch under a checkpoint";
+    // A scratch chain (identical genesis) supplies well-formed, correctly-retargeted
+    // blocks; we then break each seal, so the ONLY thing wrong is the proof of work.
+    let mut scratch = fresh_chain();
+    advance(&mut scratch, 5);
+    let mut branch = Vec::new();
+    let mut ts = 20_000;
+    for _ in 0..3 {
+        let Ok(b) = scratch.produce_block(vec![], ts) else {
+            return Outcome::info(c, name, "could not build the branch blocks");
+        };
+        scratch.import_block(b.clone()).expect("scratch extends");
+        let mut fake = b;
+        fake.header.nonce ^= 0xdead_beef; // seal no longer meets target
+        branch.push(fake);
+        ts += 2_000;
+    }
+
+    let mut honest = fresh_chain();
+    advance(&mut honest, 5);
+    // Pin a checkpoint FAR above the tip — the height-gated skip's whole surface.
+    honest.add_checkpoints([(100_000, flip_hash(honest.head().hash()))]);
+    let tip = honest.head().hash();
+    let first = branch[0].clone();
+    if honest.is_linked_to_checkpoint(&first.hash()) {
+        return Outcome::info(
+            c,
+            name,
+            "the fabricated block was (impossibly) proven checkpoint-linked",
+        );
+    }
+    let mut accepted = 0usize;
+    let mut reason = String::new();
+    for b in branch {
+        match honest.import_block(b) {
+            Ok(_) => accepted += 1,
+            Err(err) => {
+                if reason.is_empty() {
+                    reason = format!("{err:?}");
+                }
+            }
+        }
+    }
+    if accepted > 0 || honest.head().hash() != tip {
+        return Outcome::vulnerable(
+            c,
+            name,
+            format!("{accepted} fabricated-PoW block(s) below the checkpoint were ACCEPTED — the assumevalid skip is height-gated"),
+        );
+    }
+    Outcome::defended(
+        c,
+        name,
+        format!(
+            "rejected ({reason}) — the PoW skip is ancestry-gated (is_linked_to_checkpoint), \
+             not height-gated, so a fabricated branch gets full PoW verification and fails"
+        ),
+    )
+}
+
+/// FOREIGN-CHAIN: spend on the honest chain, then try to erase it privately.
+///
+/// The attacker pays a victim, lets it confirm, then reveals a branch it built in
+/// private from BEFORE the payment, omitting it. Fork choice is heaviest-WORK, and
+/// a LIGHTER branch cannot move the tip: the payment stands. Reversal is not a
+/// protocol trick here, it is a hashpower purchase. (We do not fake extra
+/// hashpower — that is the point.)
+///
+/// We then push the honest case one notch further and reveal an EQUAL-work branch,
+/// because that is where SOV differs from first-seen Bitcoin: at exactly equal
+/// cumulative work the tip is chosen by SMALLER TIP HASH (`import_block_tracked`,
+/// the convergence rule that stops equal-work miners fork-warring forever). That
+/// rule is deliberate, but it means an attacker who MATCHES the honest chain's
+/// work over the reorg span — and who can grind extra seals and publish the one
+/// with the smallest hash — reverses the payment deterministically rather than
+/// with 50% luck. That is reported as INFO, not as a green: it is a real property
+/// at the parity boundary, and it costs the attacker the full honest work.
+fn atk_private_reorg_double_spend() -> Outcome {
+    let c = "foreign-chain";
+    let name = "private branch double-spend (reorg out a confirmed payment)";
+    let victim = sink_account(12);
+    let amount = Balance::from_sov(250).unwrap();
+    let kp = Keypair::from_seed([2; 32]);
+    let pay = SignedTransaction::sign(
+        Transaction {
+            signer: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce: 0,
+            action: Action::Transfer {
+                to: victim.clone(),
+                amount,
+            },
+        },
+        &kp,
+    )
+    .unwrap();
+
+    // Honest chain: 3 blocks (the shared prefix), then the payment, then 2
+    // confirmations on top of it.
+    let mut honest = fresh_chain();
+    advance(&mut honest, 3);
+    let fork_point = honest.head().hash();
+    let Ok(pay_block) = honest.produce_block(vec![pay.clone()], 8_000) else {
+        return Outcome::info(c, name, "could not mine the payment");
+    };
+    if honest.import_block(pay_block).is_err() {
+        return Outcome::info(c, name, "the payment block did not import");
+    }
+    let paid = honest.ledger().account(&victim).balance.grains();
+    if paid != amount.grains() {
+        return Outcome::info(c, name, "the payment did not credit the victim");
+    }
+    for ts in [10_000u64, 12_000] {
+        let b = honest.produce_block(vec![], ts).expect("confirmation");
+        honest.import_block(b).expect("confirmation imports");
+    }
+    let honest_tip = honest.head().hash();
+    let honest_work = honest.chain_work();
+
+    // The PRIVATE branch: same genesis, same shared prefix (block production is
+    // deterministic, so replaying the first 3 blocks reproduces them exactly),
+    // then blocks that OMIT the payment. It is built with real work — just not
+    // MORE of it than the honest chain has.
+    let mut private = fresh_chain();
+    advance(&mut private, 3);
+    if private.head().hash() != fork_point {
+        return Outcome::info(c, name, "could not reproduce the shared prefix");
+    }
+    let mut hidden = Vec::new();
+    let mut ts = 8_500;
+    for _ in 0..2 {
+        let Ok(b) = private.produce_block(vec![], ts) else {
+            return Outcome::info(c, name, "could not build the private branch");
+        };
+        private.import_block(b.clone()).expect("private extends");
+        hidden.push(b);
+        ts += 2_000;
+    }
+    if private.chain_work() >= honest_work {
+        return Outcome::info(
+            c,
+            name,
+            "the private branch was not lighter — the work premise did not hold",
+        );
+    }
+    // Reveal it.
+    for b in hidden {
+        let _ = honest.import_block(b);
+    }
+    let still_paid = honest.ledger().account(&victim).balance.grains() == paid;
+    if honest.head().hash() == honest_tip && still_paid {
+        // The lighter branch failed. Now the parity case: one more private block,
+        // making the hidden branch EQUAL in work to the honest chain.
+        let equal_work_reversed = private_branch_at_parity();
+        if equal_work_reversed {
+            return Outcome::info(
+                c,
+                name,
+                "a LIGHTER private branch cannot reorg out a confirmed payment (heaviest-work \
+                 fork choice held); an EQUAL-work branch did reverse it via the deterministic \
+                 smaller-tip-hash tie-break — reversal still costs the attacker work equal to \
+                 the honest chain's over the span (~parity hashpower), but at parity it is \
+                 deterministic, not a coin flip",
+            );
+        }
+        Outcome::defended(
+            c,
+            name,
+            "fork choice is heaviest-work: a private branch without MORE real work \
+             cannot reorg out a confirmed payment (equal-work branch did not reverse it either)",
+        )
+    } else if !still_paid {
+        Outcome::vulnerable(
+            c,
+            name,
+            "a lighter private branch REVERSED a confirmed payment — double-spend for free",
+        )
+    } else {
+        Outcome::vulnerable(
+            c,
+            name,
+            "a lighter private branch replaced the tip — fork choice is not work-ordered",
+        )
+    }
+}
+
+/// The parity case of [`atk_private_reorg_double_spend`]: the same confirmed
+/// payment, against a private branch of EQUAL cumulative work (same length, same
+/// per-block difficulty). Returns true if the payment was actually reversed —
+/// i.e. real fork choice adopted the hidden branch on the tie-break. Drives the
+/// same real `produce_block` / `import_block` path; nothing is simulated.
+fn private_branch_at_parity() -> bool {
+    let victim = sink_account(13);
+    let amount = Balance::from_sov(250).unwrap();
+    let kp = Keypair::from_seed([2; 32]);
+    let Ok(pay) = SignedTransaction::sign(
+        Transaction {
+            signer: id("usa.reserve.sov"),
+            public_key: kp.public_key(),
+            nonce: 0,
+            action: Action::Transfer {
+                to: victim.clone(),
+                amount,
+            },
+        },
+        &kp,
+    ) else {
+        return false;
+    };
+    let mut honest = fresh_chain();
+    advance(&mut honest, 3);
+    let Ok(b) = honest.produce_block(vec![pay], 8_000) else {
+        return false;
+    };
+    if honest.import_block(b).is_err() {
+        return false;
+    }
+    let paid = honest.ledger().account(&victim).balance.grains();
+    for ts in [10_000u64, 12_000] {
+        let Ok(b) = honest.produce_block(vec![], ts) else {
+            return false;
+        };
+        if honest.import_block(b).is_err() {
+            return false;
+        }
+    }
+    // Three hidden blocks against the honest chain's three post-fork blocks.
+    let mut private = fresh_chain();
+    advance(&mut private, 3);
+    let mut hidden = Vec::new();
+    let mut ts = 8_500;
+    for _ in 0..3 {
+        let Ok(b) = private.produce_block(vec![], ts) else {
+            return false;
+        };
+        if private.import_block(b.clone()).is_err() {
+            return false;
+        }
+        hidden.push(b);
+        ts += 2_000;
+    }
+    if private.chain_work() != honest.chain_work() {
+        return false; // not the parity case; nothing to report
+    }
+    for b in hidden {
+        let _ = honest.import_block(b);
+    }
+    honest.ledger().account(&victim).balance.grains() != paid
+}
+
 // ── signature tampering helper ───────────────────────────────────────────────
 
 enum Half {
@@ -727,6 +1189,11 @@ pub fn run_all() -> Vec<Outcome> {
         atk_equal_work_tiebreak(),
         // flood / DoS
         atk_tx_flood(),
+        // foreign-chain injection
+        atk_foreign_genesis_block_import(),
+        atk_extract_tx_from_foreign_chain(),
+        atk_fabricated_heavier_branch(),
+        atk_private_reorg_double_spend(),
     ]
 }
 
@@ -735,4 +1202,84 @@ fn flip_hash(h: sov_primitives::Hash) -> sov_primitives::Hash {
     let mut bytes = *h.as_bytes();
     bytes[0] ^= 0xff;
     sov_primitives::Hash::from_bytes(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The verdict of every foreign-chain vector, asserted against what REAL
+    /// consensus did — not against a fixture. A regression that lets any of these
+    /// through turns the assertion (and the harness's exit code) red.
+    fn assert_defended(o: Outcome) {
+        assert!(
+            o.verdict == Verdict::Defended,
+            "{}: {} — {}",
+            o.category,
+            o.name,
+            o.detail
+        );
+    }
+
+    #[test]
+    fn foreign_genesis_block_is_rejected() {
+        assert_defended(atk_foreign_genesis_block_import());
+    }
+
+    #[test]
+    fn foreign_chain_transaction_cannot_move_value_here() {
+        assert_defended(atk_extract_tx_from_foreign_chain());
+    }
+
+    #[test]
+    fn fabricated_pow_branch_under_a_checkpoint_is_rejected() {
+        assert_defended(atk_fabricated_heavier_branch());
+    }
+
+    /// A LIGHTER private branch must never reverse a confirmed payment. The
+    /// attack's verdict is DEFENDED, or INFO when the parity probe fires (an
+    /// EQUAL-work branch wins the documented smaller-tip-hash tie-break) — never
+    /// VULNERABLE, which is what a free reversal would be.
+    #[test]
+    fn lighter_private_branch_cannot_reverse_a_payment() {
+        let o = atk_private_reorg_double_spend();
+        assert!(
+            o.verdict != Verdict::Vulnerable,
+            "{}: {} — {}",
+            o.category,
+            o.name,
+            o.detail
+        );
+    }
+
+    /// The parity boundary, pinned as an observed fact rather than an assumption:
+    /// at EQUAL cumulative work the tie-break can adopt the hidden branch, so a
+    /// reversal at parity is possible and is disclosed by the harness.
+    #[test]
+    fn equal_work_parity_reversal_is_observed_not_assumed() {
+        let reversed = private_branch_at_parity();
+        let o = atk_private_reorg_double_spend();
+        assert_eq!(
+            reversed,
+            o.verdict == Verdict::Info,
+            "the parity probe and the reported verdict must agree: {}",
+            o.detail
+        );
+    }
+
+    /// The whole battery still runs clean, and the new class is registered.
+    #[test]
+    fn run_all_registers_the_foreign_chain_class_and_reports_no_vulnerability() {
+        let all = run_all();
+        assert_eq!(
+            all.iter().filter(|o| o.category == "foreign-chain").count(),
+            4
+        );
+        let bad: Vec<_> = all
+            .iter()
+            .filter(|o| o.verdict == Verdict::Vulnerable)
+            .map(|o| format!("{}: {} — {}", o.category, o.name, o.detail))
+            .collect();
+        assert!(bad.is_empty(), "VULNERABLE: {bad:#?}");
+    }
 }
