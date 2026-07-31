@@ -325,13 +325,42 @@ impl Pool {
         }
     }
 
+    /// A distinct SHAPE per pool, so which pool is armed is identifiable at a
+    /// glance and in greyscale. The post-quantum distinction is a money-safety
+    /// cue; it may never rest on colour, which a screenshot, a projector, or a
+    /// colour-vision deficiency can all remove.
+    ///
+    /// Open ring for v1 (its privacy has a hole a quantum adversary can widen),
+    /// solid diamond for v2 (closed under the same adversary).
+    fn glyph(self) -> &'static str {
+        match self {
+            Pool::V1 => "○",
+            Pool::V2 => "◆",
+        }
+    }
+
+    /// The post-quantum status as a short WORD, for a badge beside the name.
+    /// Spelled out, never implied by a colour or a checkmark.
+    fn pq_badge(self) -> &'static str {
+        match self {
+            Pool::V1 => "NOT PQ",
+            Pool::V2 => "PQ",
+        }
+    }
+
     /// The pool as ONE unambiguous line, for a control where the operator is
     /// CHOOSING between the two. The three facts are never separated: a selector
     /// reading only "Pool v1 / Pool v2" makes the most consequential property of
     /// the choice — whether the privacy survives a quantum adversary — invisible
     /// at the moment of choosing.
     fn selector_label(self) -> String {
-        format!("{} · {} · {}", self.name(), self.crypto(), self.pq_claim())
+        format!(
+            "{} {} · {} · {}",
+            self.glyph(),
+            self.name(),
+            self.crypto(),
+            self.pq_claim()
+        )
     }
 
     /// The receiving-address prefix that belongs to this pool. The pools are
@@ -2973,6 +3002,172 @@ fn private_send_dispatch(pool: Pool, v2: PoolState) -> Result<Pool, &'static str
     }
 }
 
+/// Why nothing can be sent yet when the operator has not picked a pool.
+///
+/// There is deliberately NO default. A pre-selected pool is a choice made on the
+/// operator's behalf, and the thing being chosen is whether the privacy of this
+/// payment survives a quantum adversary — so it is not a decision the app may
+/// make quietly. Until a pool is picked, nothing is armed and nothing can be
+/// sent.
+const NO_POOL_CHOSEN: &str =
+    "no pool is armed — choose Pool v1 or Pool v2 above before sending privately";
+
+/// What is ARMED right now: the single authority for "which pool would this send
+/// actually spend from", given what the operator picked and what the chain says.
+///
+/// `Err` is not a nuance — it means **nothing is armed**, and no send may be
+/// built. Critically, a v2 choice on a non-Active chain resolves to `Err`, never
+/// to `Ok(Pool::V1)`: falling back to the non-post-quantum pool because the
+/// post-quantum one is unavailable would hand the operator the exact privacy
+/// property they were trying to avoid, silently.
+fn armed_pool(chosen: Option<Pool>, v2: PoolState) -> Result<Pool, &'static str> {
+    match chosen {
+        None => Err(NO_POOL_CHOSEN),
+        Some(pool) => private_send_dispatch(pool, v2),
+    }
+}
+
+/// The operator's pool choice, together with the wallet it was made FOR.
+///
+/// A choice is about a specific wallet's notes in a specific pool. Carrying it
+/// silently onto a different wallet would arm a pool the operator never picked
+/// for that wallet — so the account is stored alongside the choice and the
+/// choice is dropped the moment they disagree. The pairing is the invariant;
+/// there is no way to read the pool without naming the account it must match.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+struct PoolSelection {
+    pool: Option<Pool>,
+    /// The account the choice was made for. Empty when nothing is chosen.
+    for_account: String,
+}
+
+impl PoolSelection {
+    /// The pool chosen FOR `account`, dropping a choice made for any other
+    /// wallet. Called once per paint, so a wallet switch disarms before a single
+    /// control is drawn.
+    fn chosen_for(&mut self, account: &str) -> Option<Pool> {
+        if self.pool.is_some() && self.for_account != account {
+            self.clear();
+        }
+        self.pool
+    }
+
+    /// Record a deliberate choice.
+    fn choose(&mut self, pool: Pool, account: &str) {
+        self.pool = Some(pool);
+        self.for_account = account.to_string();
+    }
+
+    /// Disarm. Used after a send completes — the choice was for THAT payment,
+    /// and leaving it armed invites the next one to inherit it unexamined.
+    fn clear(&mut self) {
+        self.pool = None;
+        self.for_account.clear();
+    }
+}
+
+/// Where a pending send draws its value from.
+///
+/// This is an enum rather than a `from_pool: bool` plus an optional pool so that
+/// **a pool spend cannot exist without naming its pool**. The review modal reads
+/// its statement straight off this type via [`SendSource::confirm_line`], which
+/// is total — so there is no reachable path to a confirm screen that fails to
+/// say which pool moves and whether it is post-quantum.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SendSource {
+    /// A transparent account. Nothing is shielded; the pools are not involved.
+    Transparent,
+    /// A shielded pool, named.
+    Pool(Pool),
+}
+
+impl SendSource {
+    fn pool(self) -> Option<Pool> {
+        match self {
+            SendSource::Transparent => None,
+            SendSource::Pool(p) => Some(p),
+        }
+    }
+
+    /// True for a fully-private spend out of a shielded pool — dispatched
+    /// through that pool's shielded path, not the transparent send.
+    fn is_pool_spend(self) -> bool {
+        matches!(self, SendSource::Pool(_))
+    }
+
+    /// The sentence the confirm screen shows, in the terms that decide whether
+    /// this payment's privacy is durable: the pool, its cryptography by name,
+    /// and the plain post-quantum truth. Never colour alone — the glyph and the
+    /// words carry it in greyscale.
+    fn confirm_line(self) -> String {
+        match self {
+            SendSource::Transparent => {
+                "⚠ PUBLIC — transparent account · nothing is shielded · sender, recipient, and \
+                 amount are visible on-chain"
+                    .to_string()
+            }
+            SendSource::Pool(p) => format!(
+                "{} SPENDING FROM {} · {} · {}",
+                p.glyph(),
+                p.name(),
+                p.crypto(),
+                p.pq_claim()
+            ),
+        }
+    }
+}
+
+/// The armed-pool statement, in words and shapes — no colour required to read
+/// it, and no inference required to understand it.
+///
+/// `Err` renders as "NOTHING IS ARMED" rather than as a hint about the pool that
+/// happens to still be highlighted. That distinction is the point of failure
+/// mode 7: an operator who picked v2 on a dormant chain must be told nothing is
+/// armed, not left to assume the send will simply go out some other way.
+fn arm_statement(armed: Result<Pool, &'static str>) -> String {
+    match armed {
+        Ok(p) => format!(
+            "▶ ARMED · {} {} · {} · {} — this send spends {} notes",
+            p.glyph(),
+            p.name(),
+            p.crypto(),
+            p.pq_claim(),
+            p.name()
+        ),
+        Err(why) => format!("⛔ NOTHING IS ARMED — {why}"),
+    }
+}
+
+/// Render [`arm_statement`] as the app's standard emphatic line. Used at both
+/// ends of the send form so the two can never disagree.
+fn arm_banner(ui: &mut egui::Ui, armed: Result<Pool, &'static str>) {
+    let color = match armed {
+        Ok(Pool::V1) => palette::warning(),
+        Ok(Pool::V2) => palette::success(),
+        Err(_) => palette::error(),
+    };
+    ui.label(
+        egui::RichText::new(arm_statement(armed))
+            .strong()
+            .monospace()
+            .color(color),
+    );
+}
+
+/// The line written to the activity log and the status banner once a private
+/// send lands. It names the pool and its post-quantum status, so the RECORD of
+/// what happened is unambiguous after the fact — not just the moment of choosing.
+fn pool_send_receipt(pool: Pool, grains: u128, txid: &str) -> String {
+    format!(
+        "sent {} XUS privately from {} · {} · {} (tx {})",
+        xus(&grains.to_string()),
+        pool.name(),
+        pool.crypto(),
+        pool.pq_claim(),
+        &txid[..txid.len().min(14)]
+    )
+}
+
 /// Which of a wallet's addresses the Receive view shows (shielded is the private
 /// default).
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -3003,16 +3198,13 @@ struct PendingSend {
     /// True when BOTH ends are public (transparent→transparent): the amount and
     /// both parties are visible on-chain — the privacy downgrade to warn about.
     links_public: bool,
-    /// True for a fully-private spend FROM the shielded pool (sender, recipient,
-    /// and amount all hidden) — dispatched via `shielded_send`, not `send`.
-    from_pool: bool,
-    /// WHICH shielded pool the value leaves, for a pool spend — `None` for a
-    /// transparent send, which leaves no pool at all. Carried on the pending send
-    /// rather than re-derived at confirm time so the modal states, and the
-    /// dispatch uses, the same pool the operator selected. The two pools are
-    /// separate value spaces with different cryptography, so "which pool moved"
-    /// is never left to inference.
-    pool: Option<Pool>,
+    /// WHERE the value comes from — a transparent account, or a NAMED shielded
+    /// pool. Carried on the pending send rather than re-derived at confirm time,
+    /// so the modal states, and the dispatch uses, exactly the pool the operator
+    /// armed. Being an enum rather than a flag plus an optional pool is the
+    /// point: a pool spend cannot be constructed without naming its pool, so the
+    /// confirm screen can never omit which pool moves.
+    source: SendSource,
     /// The exact network fee consensus charges for this route (`sov_estimateFee`),
     /// captured at review time.
     fee_grains: u128,
@@ -3020,6 +3212,19 @@ struct PendingSend {
     /// the modal shows the SAME number that gets signed — not a figure that could
     /// drift with the pool between review and confirm.
     tip_grains: u128,
+}
+
+impl PendingSend {
+    /// The pool this send leaves, if any. Reads straight off [`SendSource`], so
+    /// there is no second place where "which pool" could be recorded wrongly.
+    fn pool(&self) -> Option<Pool> {
+        self.source.pool()
+    }
+
+    /// True for a fully-private spend out of a shielded pool.
+    fn is_pool_spend(&self) -> bool {
+        self.source.is_pool_spend()
+    }
 }
 
 /// The local node, running **in-process** inside sov-station (the Bitcoin Core
@@ -3264,11 +3469,11 @@ pub struct Station {
     ofl_msg: String,          // offline-tools status line
     send_to: String,
     send_amount: String,
-    /// Which shielded pool the private-send form spends from. A deliberate,
-    /// visible choice rather than an inference from the recipient's prefix: the
-    /// two pools have different cryptography and only one of them is
-    /// post-quantum, so the operator picks, and the form follows.
-    send_pool: Pool,
+    /// Which shielded pool the private-send form spends from, and the wallet
+    /// that choice was made for. A deliberate, visible choice rather than an
+    /// inference from the recipient's prefix — and, because it starts empty,
+    /// never a choice this app makes on the operator's behalf.
+    pool_selection: PoolSelection,
     private_to: String, // recipient for a fully-private (shielded→shielded) send
     private_amount: String, // amount (XUS) for the private send
     deshield_amount: String, // amount (XUS) to de-shield (pool → transparent), variable
@@ -3556,9 +3761,9 @@ impl Station {
             ofl_msg: String::new(),
             send_to: String::new(),
             send_amount: String::new(),
-            // v1 by default: it is the pool that is live today. The operator is
-            // never moved onto v2 without choosing it.
-            send_pool: Pool::V1,
+            // NOTHING is armed until the operator picks. There is no default,
+            // because a default here is a privacy property chosen for them.
+            pool_selection: PoolSelection::default(),
             private_to: String::new(),
             private_amount: String::new(),
             deshield_amount: String::new(),
@@ -4740,9 +4945,15 @@ impl Station {
         };
         let shield_to = self.shield_v2_to.trim().to_string();
         let to = self.private_v2_to.trim().to_string();
-        if matches!(what, V2Action::Send) && to.is_empty() {
-            finish(&self.action, "enter a pool-v2 (xusq1…) recipient address");
-            return;
+        // Re-checked at SUBMIT, not merely at render: the recipient must belong
+        // to POOL V2. A pool-v1 `xus1…` address reaching here would pay a
+        // different recipient in a different value space, out of a pool the
+        // operator did not arm. Refused with the specific reason, never coerced.
+        if matches!(what, V2Action::Send) {
+            if let Err(why) = pool_recipient_check(Pool::V2, &to) {
+                finish(&self.action, why);
+                return;
+            }
         }
         let rpc = self
             .config
@@ -4764,7 +4975,13 @@ impl Station {
             };
             match result {
                 Ok(id) => {
-                    let line = format!("{} (tx {})", what.done(), &id[..id.len().min(14)]);
+                    // A completed private send names the POOL it left and
+                    // whether that pool is post-quantum — the durable record of
+                    // which value space actually moved.
+                    let line = match what {
+                        V2Action::Send => pool_send_receipt(Pool::V2, grains, &id),
+                        _ => format!("{} (tx {})", what.done(), &id[..id.len().min(14)]),
+                    };
                     finish(&action, &format!("{line} — updating pool-v2 balance…"));
                     record(&activity, &line);
                     ctx.request_repaint();
@@ -4779,7 +4996,15 @@ impl Station {
                             v.message = format!("scanned to height {}", store.scanned_height());
                         }
                     }
-                    finish(&action, "confirmed — pool-v2 balance updated");
+                    finish(
+                        &action,
+                        &format!(
+                            "confirmed — {} · {} · {} balance updated",
+                            Pool::V2.name(),
+                            Pool::V2.crypto(),
+                            Pool::V2.pq_claim()
+                        ),
+                    );
                 }
                 Err(e) => {
                     let msg = format!("{} failed: {e}", what.noun());
@@ -4804,6 +5029,13 @@ impl Station {
         let seed = w.seed;
         let signer = w.effective_account();
         let to = self.private_to.trim().to_string();
+        // Re-checked at SUBMIT, not merely at render: the recipient must belong
+        // to the pool this path spends from. A pool-v2 address reaching the v1
+        // spender would pay a recipient who cannot spend it, in a pool the
+        // operator did not arm. It is refused, never coerced.
+        if let Err(why) = pool_recipient_check(Pool::V1, &to) {
+            return self.set_action(why);
+        }
         let Some(grains) = parse_xus(&self.private_amount) else {
             return self.set_action("amount must be a number of XUS (e.g. 1.5)");
         };
@@ -4826,18 +5058,25 @@ impl Station {
         std::thread::spawn(move || {
             match shielded_send(&rpc, seed, &signer, &to, grains, &params, &action) {
                 Ok(id) => {
-                    let line = format!(
-                        "sent {} XUS privately (tx {})",
-                        xus(&grains.to_string()),
-                        &id[..id.len().min(14)]
-                    );
+                    // The record names the pool and its post-quantum status, so
+                    // "which pool moved" is unambiguous after the fact and not
+                    // only at the moment of choosing.
+                    let line = pool_send_receipt(Pool::V1, grains, &id);
                     finish(&action, &format!("{line} — updating balance…"));
                     record(&activity, &line);
                     ctx.request_repaint();
                     // The spend's nullifier lands when the tx is mined; re-scan so
                     // the shielded view drops the spent note (no stale balance).
                     refresh_shielded_view(&rpc, seed, &account, &shielded, &ctx);
-                    finish(&action, "private send confirmed — shielded balance updated");
+                    finish(
+                        &action,
+                        &format!(
+                            "private send confirmed — {} · {} · {} balance updated",
+                            Pool::V1.name(),
+                            Pool::V1.crypto(),
+                            Pool::V1.pq_claim()
+                        ),
+                    );
                 }
                 Err(e) => {
                     let msg = format!("private send failed: {e}");
@@ -10369,8 +10608,7 @@ impl Station {
                         // Any transparent route puts sender, recipient, and amount
                         // on-chain in the clear — the privacy downgrade.
                         links_public: !route.private(),
-                        from_pool: false,
-                        pool: None,
+                        source: SendSource::Transparent,
                         fee_grains: fee,
                         tip_grains: tip,
                     });
@@ -10653,14 +10891,25 @@ impl Station {
                 balance_grains: v2v.balance as u128,
                 window_budget: snap.shielded_v2.as_ref().map(|i| i.deshieldable_now),
             };
+            // The operator's choice FOR THIS WALLET. `chosen_for` drops a choice
+            // made for a different wallet before a single control is drawn, so a
+            // wallet switch can never leave someone else's pool armed.
+            let chosen = self.pool_selection.chosen_for(&account);
+
             // The selector itself. Both options are always VISIBLE — hiding v2
             // while it is dormant would leave an operator unable to learn that a
             // post-quantum pool exists — but v2 is selectable only when consensus
             // will actually accept a v2 spend, and the reason is stated beneath it
             // rather than left to a greyed-out control to imply.
+            //
+            // NOTHING is pre-selected. `Option<Pool>` rather than `Pool` is the
+            // whole mechanism: there is no value the app can supply on the
+            // operator's behalf, so a private send cannot be completed by someone
+            // who never looked at this control.
             let v2_selectable = v2_state == PoolState::Active;
+            let mut pick = chosen;
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.send_pool, Pool::V1, Pool::V1.selector_label())
+                ui.selectable_value(&mut pick, Some(Pool::V1), Pool::V1.selector_label())
                     .on_hover_text(
                         "Zcash Orchard / Halo2, live since genesis. Its hiding is discrete-log \
                          based: a future quantum adversary who recorded this chain could break \
@@ -10668,8 +10917,8 @@ impl Station {
                     );
                 ui.add_enabled_ui(v2_selectable, |ui| {
                     ui.selectable_value(
-                        &mut self.send_pool,
-                        Pool::V2,
+                        &mut pick,
+                        Some(Pool::V2),
                         format!("{} {}", Pool::V2.selector_label(), v2_state.glyph()),
                     )
                     .on_hover_text(
@@ -10679,6 +10928,12 @@ impl Station {
                     );
                 });
             });
+            if pick != chosen {
+                if let Some(p) = pick {
+                    self.pool_selection.choose(p, &account);
+                }
+            }
+            let chosen = pick;
             if !v2_selectable {
                 ui.label(
                     egui::RichText::new(format!("{} {V2_DORMANT_REASON}", v2_state.glyph()))
@@ -10687,209 +10942,249 @@ impl Station {
                 );
             }
 
-            // The consequence of the choice, stated before the form: which pool is
-            // about to be spent from, what it costs in privacy terms, and how much
-            // is actually in it.
+            // WHAT IS ARMED — the single authority, restated in words and shapes.
+            // A v2 choice on a chain where v2 is not Active resolves to "nothing
+            // armed", never to a quiet fall-back to v1: handing someone the
+            // non-post-quantum pool because the post-quantum one was unavailable
+            // would give them the exact property they were trying to avoid.
+            let armed = armed_pool(chosen, v2_state);
             ui.add_space(sp::S);
-            let sel = self.send_pool;
-            let sel_balance: u128 = match sel {
-                Pool::V1 => sv.balance as u128,
-                Pool::V2 => v2v.balance as u128,
-            };
-            let sel_state = match sel {
-                Pool::V1 => PoolState::classify_v1(snap.online, for_this && sv.scanned_height > 0),
-                Pool::V2 => v2_state,
-            };
-            // A balance is shown ONLY when this wallet's notes in that pool have
-            // actually been scanned. An unscanned pool has an UNKNOWN balance, and
-            // rendering a bare `0` beside the word "balance" is exactly how an
-            // operator concludes their funds are gone — so the state word replaces
-            // the figure rather than sitting next to a misleading one.
-            let sel_balance_text = match sel_state {
-                PoolState::Active => format!("{} XUS scanned", xus(&sel_balance.to_string())),
-                PoolState::Dormant => format!("{} — no notes can exist yet", sel_state.word()),
-                PoolState::Unavailable => format!("{} — balance unknown", sel_state.word()),
-            };
-            ui.label(
-                egui::RichText::new(format!(
-                    "spending from {} · {} · {} — {} {sel_balance_text}",
-                    sel.name(),
-                    sel.crypto(),
-                    sel.pq_claim(),
-                    sel_state.glyph(),
-                ))
-                .small()
-                .color(match sel {
-                    Pool::V1 => palette::warning(),
-                    Pool::V2 => palette::success(),
-                }),
-            );
+            arm_banner(ui, armed);
 
-            // The recipient must belong to the SELECTED pool. A cross-pool paste
-            // names the pool it actually belongs to and the one action that fixes
-            // it — never a generic "invalid".
-            let priv_to_field = match sel {
-                Pool::V1 => &mut self.private_to,
-                Pool::V2 => &mut self.private_v2_to,
-            };
-            ui.horizontal(|ui| {
-                ui.label("To");
-                ui.add(
-                    egui::TextEdit::singleline(priv_to_field)
-                        .hint_text(format!("{} (recipient stays private)", sel.address_hint()))
-                        .desired_width(420.0),
+            // No pool chosen ⇒ no form at all. An operator must not be able to
+            // fill in a recipient and an amount and only then discover which pool
+            // it was going to come out of.
+            if chosen.is_none() {
+                ui.add_space(sp::S);
+                empty_hint(
+                    ui,
+                    "Choose a pool before you can send privately",
+                    "The two shielded pools use different cryptography and only Pool v2 is \
+                     post-quantum. Nothing is pre-selected, because which pool your payment \
+                     leaves decides whether its privacy survives a future quantum adversary — \
+                     that is your choice to make, not this app's. Pick one above.",
                 );
-            });
-            let priv_to_text = match sel {
-                Pool::V1 => self.private_to.clone(),
-                Pool::V2 => self.private_v2_to.clone(),
-            };
-            let recipient_check = pool_recipient_check(sel, &priv_to_text);
-            if !priv_to_text.trim().is_empty() {
-                if let Err(why) = recipient_check {
-                    ui.label(
-                        egui::RichText::new(format!("✗ {why}"))
-                            .small()
-                            .color(palette::error()),
-                    );
-                }
             }
-
-            let priv_amount_field = match sel {
-                Pool::V1 => &mut self.private_amount,
-                Pool::V2 => &mut self.private_v2_amount,
-            };
-            let mut set_max = false;
-            ui.horizontal(|ui| {
-                ui.label("Amount XUS");
-                ui.add(egui::TextEdit::singleline(priv_amount_field).desired_width(160.0));
-                if ui
-                    .button("Max")
-                    .on_hover_text("send your full scanned balance in the selected pool")
-                    .clicked()
-                {
-                    set_max = true;
-                }
-            });
-            if set_max {
-                match sel {
-                    Pool::V1 => self.private_amount = grains_to_xus_plain(sel_balance),
-                    Pool::V2 => self.private_v2_amount = grains_to_xus_plain(sel_balance),
-                }
-            }
-            let priv_grains = parse_xus(match sel {
-                Pool::V1 => &self.private_amount,
-                Pool::V2 => &self.private_v2_amount,
-            });
-
-            // Whether the send may proceed, per pool. v1 keeps its existing
-            // conditions; v2 defers ENTIRELY to `v2_allows`, the same pure function
-            // that gates shield and de-shield — no second copy of that judgement.
-            // Both are then run through `private_send_dispatch`, which is what the
-            // submit path re-checks, so render and submit agree by construction.
-            let (priv_ok, priv_reason): (bool, String) = match sel {
-                Pool::V1 => {
-                    let ok = for_this
-                        && recipient_check.is_ok()
-                        && matches!(priv_grains, Some(g) if g > 0 && g <= sv.balance as u128)
-                        && !sv.scanning
-                        && !busy;
-                    // Tell the user EXACTLY what's blocking the button. You do NOT
-                    // need to de-shield to send privately — a private send spends
-                    // your shielded notes directly.
-                    let why: String = if w_watch_only {
-                        "watch-only wallet — cannot send".into()
-                    } else if sv.scanning {
-                        "scanning the pool…".into()
-                    } else if !for_this || sv.scanned_height == 0 {
-                        "loading your shielded balance…".into()
-                    } else if sv.balance == 0 {
-                        "no pool-v1 funds yet — use “Shield to pool” above to move XUS in (you do \
-                         NOT need to de-shield to send privately)"
-                            .into()
-                    } else if let Err(r) = recipient_check {
-                        r.into()
-                    } else if !matches!(priv_grains, Some(g) if g > 0) {
-                        "enter an amount".into()
-                    } else if matches!(priv_grains, Some(g) if g > sv.balance as u128) {
-                        "amount exceeds your pool-v1 balance".into()
-                    } else {
-                        String::new()
-                    };
-                    (ok, why)
-                }
-                Pool::V2 => {
-                    let verdict = v2_allows(
-                        &v2_guard,
-                        V2Intent::Send {
-                            to: &priv_to_text,
-                            amount: priv_grains,
-                        },
-                    );
-                    let dispatch = private_send_dispatch(sel, v2_state);
-                    let why: String = if w_watch_only {
-                        "watch-only wallet — cannot send".into()
-                    } else if let Err(r) = dispatch {
-                        r.into()
-                    } else if let Err(r) = verdict {
-                        // The selector-aware cross-pool wording wins over the
-                        // generic one when both apply — same refusal, more
-                        // actionable sentence.
-                        match recipient_check {
-                            Err(c) if !priv_to_text.trim().is_empty() => c.into(),
-                            _ => r.into(),
-                        }
-                    } else {
-                        String::new()
-                    };
-                    (verdict.is_ok() && dispatch.is_ok(), why)
-                }
-            };
-            if !priv_ok && !priv_reason.is_empty() {
+            if let Some(sel) = chosen {
+                // The consequence of the choice, stated before the form: which pool is
+                // about to be spent from, what it costs in privacy terms, and how much
+                // is actually in it.
+                ui.add_space(sp::S);
+                let sel_balance: u128 = match sel {
+                    Pool::V1 => sv.balance as u128,
+                    Pool::V2 => v2v.balance as u128,
+                };
+                let sel_state = match sel {
+                    Pool::V1 => {
+                        PoolState::classify_v1(snap.online, for_this && sv.scanned_height > 0)
+                    }
+                    Pool::V2 => v2_state,
+                };
+                // A balance is shown ONLY when this wallet's notes in that pool have
+                // actually been scanned. An unscanned pool has an UNKNOWN balance, and
+                // rendering a bare `0` beside the word "balance" is exactly how an
+                // operator concludes their funds are gone — so the state word replaces
+                // the figure rather than sitting next to a misleading one.
+                let sel_balance_text = match sel_state {
+                    PoolState::Active => format!("{} XUS scanned", xus(&sel_balance.to_string())),
+                    PoolState::Dormant => format!("{} — no notes can exist yet", sel_state.word()),
+                    PoolState::Unavailable => format!("{} — balance unknown", sel_state.word()),
+                };
                 ui.label(
-                    egui::RichText::new(format!("→ {priv_reason}"))
-                        .small()
-                        .color(palette::warning()),
+                    egui::RichText::new(format!(
+                        "spending from {} · {} · {} — {} {sel_balance_text}",
+                        sel.name(),
+                        sel.crypto(),
+                        sel.pq_claim(),
+                        sel_state.glyph(),
+                    ))
+                    .small()
+                    .color(match sel {
+                        Pool::V1 => palette::warning(),
+                        Pool::V2 => palette::success(),
+                    }),
                 );
-            }
-            ui.add_enabled_ui(priv_ok, |ui| {
-                if ui.button("Review private send →").clicked() {
-                    // Re-decided at click time, not inherited from paint: the pool
-                    // state can change between the two.
-                    if let (Some(g), Ok(dispatch_pool)) =
-                        (priv_grains, private_send_dispatch(sel, v2_state))
-                    {
-                        let to = priv_to_text.trim().to_string();
-                        let self_send = match dispatch_pool {
-                            Pool::V1 => to == shielded || to == unified,
-                            Pool::V2 => to == v2_addr,
-                        };
-                        new_pending = Some(PendingSend {
-                            from_label: label.clone(),
-                            from_account: effective.clone(),
-                            to,
-                            amount_grains: g,
-                            from_balance_grains: sel_balance,
-                            route_label: format!(
-                                "{} → {} · {} (fully private)",
-                                dispatch_pool.name(),
-                                dispatch_pool.name(),
-                                dispatch_pool.crypto(),
-                            ),
-                            self_send,
-                            links_public: false,
-                            from_pool: true,
-                            pool: Some(dispatch_pool),
-                            // A pool spend pays the fee from the transparent
-                            // account that carries it; tips are not wired on this
-                            // route yet, so the bid is honestly zero rather than a
-                            // number the send would not actually carry.
-                            fee_grains: s.fee_shielded_grains,
-                            tip_grains: 0,
-                        });
+
+                // The recipient must belong to the SELECTED pool. A cross-pool paste
+                // names the pool it actually belongs to and the one action that fixes
+                // it — never a generic "invalid".
+                let priv_to_field = match sel {
+                    Pool::V1 => &mut self.private_to,
+                    Pool::V2 => &mut self.private_v2_to,
+                };
+                ui.horizontal(|ui| {
+                    ui.label("To");
+                    ui.add(
+                        egui::TextEdit::singleline(priv_to_field)
+                            .hint_text(format!("{} (recipient stays private)", sel.address_hint()))
+                            .desired_width(420.0),
+                    );
+                });
+                let priv_to_text = match sel {
+                    Pool::V1 => self.private_to.clone(),
+                    Pool::V2 => self.private_v2_to.clone(),
+                };
+                let recipient_check = pool_recipient_check(sel, &priv_to_text);
+                if !priv_to_text.trim().is_empty() {
+                    if let Err(why) = recipient_check {
+                        ui.label(
+                            egui::RichText::new(format!("✗ {why}"))
+                                .small()
+                                .color(palette::error()),
+                        );
                     }
                 }
-            });
+
+                let priv_amount_field = match sel {
+                    Pool::V1 => &mut self.private_amount,
+                    Pool::V2 => &mut self.private_v2_amount,
+                };
+                let mut set_max = false;
+                ui.horizontal(|ui| {
+                    ui.label("Amount XUS");
+                    ui.add(egui::TextEdit::singleline(priv_amount_field).desired_width(160.0));
+                    if ui
+                        .button("Max")
+                        .on_hover_text("send your full scanned balance in the selected pool")
+                        .clicked()
+                    {
+                        set_max = true;
+                    }
+                });
+                if set_max {
+                    match sel {
+                        Pool::V1 => self.private_amount = grains_to_xus_plain(sel_balance),
+                        Pool::V2 => self.private_v2_amount = grains_to_xus_plain(sel_balance),
+                    }
+                }
+                let priv_grains = parse_xus(match sel {
+                    Pool::V1 => &self.private_amount,
+                    Pool::V2 => &self.private_v2_amount,
+                });
+
+                // Whether the send may proceed, per pool. v1 keeps its existing
+                // conditions; v2 defers ENTIRELY to `v2_allows`, the same pure function
+                // that gates shield and de-shield — no second copy of that judgement.
+                // Both are then run through `private_send_dispatch`, which is what the
+                // submit path re-checks, so render and submit agree by construction.
+                let (priv_ok, priv_reason): (bool, String) = match sel {
+                    Pool::V1 => {
+                        let ok = for_this
+                            && recipient_check.is_ok()
+                            && matches!(priv_grains, Some(g) if g > 0 && g <= sv.balance as u128)
+                            && !sv.scanning
+                            && !busy;
+                        // Tell the user EXACTLY what's blocking the button. You do NOT
+                        // need to de-shield to send privately — a private send spends
+                        // your shielded notes directly.
+                        let why: String = if w_watch_only {
+                            "watch-only wallet — cannot send".into()
+                        } else if sv.scanning {
+                            "scanning the pool…".into()
+                        } else if !for_this || sv.scanned_height == 0 {
+                            "loading your shielded balance…".into()
+                        } else if sv.balance == 0 {
+                            "no pool-v1 funds yet — use “Shield to pool” above to move XUS in (you do \
+                         NOT need to de-shield to send privately)"
+                            .into()
+                        } else if let Err(r) = recipient_check {
+                            r.into()
+                        } else if !matches!(priv_grains, Some(g) if g > 0) {
+                            "enter an amount".into()
+                        } else if matches!(priv_grains, Some(g) if g > sv.balance as u128) {
+                            "amount exceeds your pool-v1 balance".into()
+                        } else {
+                            String::new()
+                        };
+                        (ok, why)
+                    }
+                    Pool::V2 => {
+                        let verdict = v2_allows(
+                            &v2_guard,
+                            V2Intent::Send {
+                                to: &priv_to_text,
+                                amount: priv_grains,
+                            },
+                        );
+                        let dispatch = private_send_dispatch(sel, v2_state);
+                        let why: String = if w_watch_only {
+                            "watch-only wallet — cannot send".into()
+                        } else if let Err(r) = dispatch {
+                            r.into()
+                        } else if let Err(r) = verdict {
+                            // The selector-aware cross-pool wording wins over the
+                            // generic one when both apply — same refusal, more
+                            // actionable sentence.
+                            match recipient_check {
+                                Err(c) if !priv_to_text.trim().is_empty() => c.into(),
+                                _ => r.into(),
+                            }
+                        } else {
+                            String::new()
+                        };
+                        (verdict.is_ok() && dispatch.is_ok(), why)
+                    }
+                };
+                let priv_ok = priv_ok && armed.is_ok();
+                if !priv_ok && !priv_reason.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("→ {priv_reason}"))
+                            .small()
+                            .color(palette::warning()),
+                    );
+                }
+                // The armed pool restated IMMEDIATELY above the button that acts on
+                // it. The statement at the top of the section can be scrolled off; the
+                // one adjacent to the control cannot be missed by anyone about to
+                // click it. Same sentence, same shapes — one source, rendered twice.
+                ui.add_space(sp::S);
+                arm_banner(ui, armed);
+                ui.add_enabled_ui(priv_ok, |ui| {
+                    if ui.button("Review private send →").clicked() {
+                        // EVERY condition re-decided at click time, not inherited from
+                        // paint: what is armed, and whether the recipient belongs to
+                        // the armed pool. Both can go stale between the two.
+                        let to = priv_to_text.trim().to_string();
+                        match (priv_grains, armed_pool(chosen, v2_state)) {
+                            (Some(g), Ok(dispatch_pool)) => {
+                                if let Err(why) = pool_recipient_check(dispatch_pool, &to) {
+                                    self.set_action(why);
+                                } else {
+                                    let self_send = match dispatch_pool {
+                                        Pool::V1 => to == shielded || to == unified,
+                                        Pool::V2 => to == v2_addr,
+                                    };
+                                    new_pending = Some(PendingSend {
+                                        from_label: label.clone(),
+                                        from_account: effective.clone(),
+                                        to,
+                                        amount_grains: g,
+                                        from_balance_grains: sel_balance,
+                                        route_label: format!(
+                                            "{} → {} · {} (fully private)",
+                                            dispatch_pool.name(),
+                                            dispatch_pool.name(),
+                                            dispatch_pool.crypto(),
+                                        ),
+                                        self_send,
+                                        links_public: false,
+                                        source: SendSource::Pool(dispatch_pool),
+                                        // A pool spend pays the fee from the
+                                        // transparent account that carries it; tips are
+                                        // not wired on this route yet, so the bid is
+                                        // honestly zero rather than a number the send
+                                        // would not actually carry.
+                                        fee_grains: s.fee_shielded_grains,
+                                        tip_grains: 0,
+                                    });
+                                }
+                            }
+                            (_, Err(why)) => self.set_action(why),
+                            _ => {}
+                        }
+                    }
+                });
+            }
 
             // ── Pool v2 (post-quantum) — shield in / de-shield out ────────────
             // Shown only when bit 2 is live. Offering these while dormant would
@@ -11138,8 +11433,37 @@ impl Station {
                             } else {
                                 pill(ui, "PRIVATE", palette::success());
                             }
+                            // The post-quantum status as a WORD, beside the
+                            // privacy pill. "PRIVATE" alone is the dangerous
+                            // half-truth — private against whom, and for how
+                            // long, is what the pool decides.
+                            if let Some(pool) = p.pool() {
+                                pill(
+                                    ui,
+                                    pool.pq_badge(),
+                                    match pool {
+                                        Pool::V1 => palette::warning(),
+                                        Pool::V2 => palette::success(),
+                                    },
+                                );
+                            }
                         });
                     });
+                    // The source, stated where it cannot be missed and in terms
+                    // that decide the durability of this payment's privacy. Read
+                    // straight off `SendSource`, which is total — every reachable
+                    // confirm screen carries this line, pool or transparent.
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(p.source.confirm_line())
+                            .strong()
+                            .monospace()
+                            .color(match p.pool() {
+                                Some(Pool::V1) => palette::warning(),
+                                Some(Pool::V2) => palette::success(),
+                                None => palette::warning(),
+                            }),
+                    );
                     ui.add_space(10.0);
                     egui::Grid::new("confirm_grid")
                         .num_columns(2)
@@ -11159,14 +11483,16 @@ impl Station {
                             ui.end_row();
                             kv(ui, "Route", &p.route_label);
                             // WHICH pool moves, and whether its privacy is
-                            // post-quantum. Spelled out on the confirm screen so
-                            // nobody has to remember what the selector was on.
-                            if let Some(pool) = p.pool {
+                            // post-quantum, as a named row as well as the banner
+                            // below — so it is present both where the eye scans
+                            // for facts and where it cannot be skipped.
+                            if let Some(pool) = p.pool() {
                                 kv(
                                     ui,
                                     "Pool",
                                     &format!(
-                                        "{} · {} · {}",
+                                        "{} {} · {} · {}",
+                                        pool.glyph(),
                                         pool.name(),
                                         pool.crypto(),
                                         pool.pq_claim()
@@ -11258,14 +11584,19 @@ impl Station {
                             // are different circuits, so the pool travels with the
                             // pending send rather than being re-inferred here. Every
                             // other route goes through the transparent/shield send.
-                            if p.from_pool {
-                                match p.pool {
-                                    Some(Pool::V2) => do_send_v2 = true,
-                                    _ => do_private_send = true,
+                            match p.source {
+                                SendSource::Pool(Pool::V2) => do_send_v2 = true,
+                                SendSource::Pool(Pool::V1) => do_private_send = true,
+                                SendSource::Transparent => {
+                                    do_send = true;
+                                    confirmed_tip_grains = p.tip_grains;
                                 }
-                            } else {
-                                do_send = true;
-                                confirmed_tip_grains = p.tip_grains;
+                            }
+                            // DISARM. The choice was made for THIS payment; the
+                            // next one gets made deliberately too, rather than
+                            // inheriting a pool nobody re-examined.
+                            if p.is_pool_spend() {
+                                self.pool_selection.clear();
                             }
                             self.pending_send = None;
                         }
@@ -17587,6 +17918,386 @@ mod pool_selector_tests {
             )
             .is_err(),
             "the v2 send must be bounded by the v2 balance, not v1's"
+        );
+    }
+}
+
+/// The selector's **explicitness** guarantees, one test per way it could go
+/// wrong.
+///
+/// The standard here is not "the code looks right". It is: *it must be
+/// impossible to move funds through the wrong pool without having deliberately
+/// and knowingly chosen it.* Pool v1 is not post-quantum and pool v2 is —
+/// confusing them silently costs the operator the privacy property they believe
+/// they bought, and they find out years later or never.
+///
+/// Each test names the failure mode it closes, and each asserts the PERMITTED
+/// path as well as the refused one. A selector that never arms anything would
+/// satisfy every safety assertion here and be worthless, so "it arms the right
+/// pool when it should" is tested first in every case.
+#[cfg(test)]
+mod pool_selector_explicit_tests {
+    use super::*;
+
+    fn v2_addr() -> String {
+        encode_shielded_v2(&PqShieldedKey::from_leaf_seed(&[11u8; 32]).address())
+    }
+
+    fn v1_addr() -> String {
+        encode_shielded(&ShieldedKey::from_seed([11u8; 32]).unwrap().address())
+    }
+
+    // ── Failure mode 1: a silently-usable default ────────────────────────────
+
+    #[test]
+    fn nothing_is_armed_until_the_operator_actually_chooses() {
+        // A fresh selection holds no pool. There is no value the app supplies on
+        // the operator's behalf — the type has no default variant to fall into.
+        let fresh = PoolSelection::default();
+        assert_eq!(fresh.pool, None, "no pool may be pre-selected");
+
+        // …and with nothing chosen, NOTHING is armed, on a fully live chain.
+        // The chain being healthy is exactly the case where a default would be
+        // invisible, so it is the case asserted.
+        let idle = armed_pool(None, PoolState::Active);
+        let why = idle.expect_err("an unchosen pool must arm nothing even on a live chain");
+        assert_eq!(why, NO_POOL_CHOSEN);
+        assert!(why.contains("choose Pool v1 or Pool v2"), "{why}");
+
+        // THE ACTIVE PATH: one deliberate choice arms exactly that pool.
+        let mut sel = PoolSelection::default();
+        sel.choose(Pool::V1, "alice");
+        assert_eq!(armed_pool(sel.pool, PoolState::Active), Ok(Pool::V1));
+        sel.choose(Pool::V2, "alice");
+        assert_eq!(
+            armed_pool(sel.pool, PoolState::Active),
+            Ok(Pool::V2),
+            "choosing v2 on a live chain must arm v2 — the selector has to actually work"
+        );
+    }
+
+    #[test]
+    fn the_armed_statement_is_present_and_unambiguous_in_every_state() {
+        // Rendered twice in the UI (section head and immediately above the Send
+        // button) from this ONE function, so the two can never disagree.
+        for pool in [Pool::V1, Pool::V2] {
+            let st = arm_statement(Ok(pool));
+            assert!(st.contains("ARMED"), "{st}");
+            assert!(st.contains(pool.name()), "{st}");
+            assert!(st.contains(pool.crypto()), "{st}");
+            assert!(st.contains(pool.pq_claim()), "{st}");
+            assert!(st.contains(pool.glyph()), "{st}");
+        }
+        // Nothing chosen, and a dormant v2 choice, both read as NOTHING ARMED —
+        // never as a pool.
+        for st in [
+            arm_statement(armed_pool(None, PoolState::Active)),
+            arm_statement(armed_pool(Some(Pool::V2), PoolState::Dormant)),
+        ] {
+            assert!(st.contains("NOTHING IS ARMED"), "{st}");
+            assert!(
+                !st.contains("ARMED ·"),
+                "must not read as an armed pool: {st}"
+            );
+        }
+    }
+
+    // ── Failure mode 2: a confirm screen that omits the pool ─────────────────
+
+    #[test]
+    fn every_reachable_confirm_screen_states_the_pool_and_the_pq_truth() {
+        // `SendSource` is the ONLY way a pending send records where value comes
+        // from, and `confirm_line` is total over it — so this loop is the entire
+        // reachable space, not a sample. There is no variant that can omit the
+        // statement, and none that can carry a pool without naming it.
+        for src in [
+            SendSource::Transparent,
+            SendSource::Pool(Pool::V1),
+            SendSource::Pool(Pool::V2),
+        ] {
+            let line = src.confirm_line();
+            assert!(!line.trim().is_empty(), "{src:?} produced no statement");
+            match src.pool() {
+                Some(pool) => {
+                    assert!(line.contains(pool.name()), "{line}");
+                    assert!(line.contains(pool.crypto()), "{line}");
+                    assert!(
+                        line.contains(pool.pq_claim()),
+                        "the confirm screen must state the post-quantum truth in plain words: \
+                         {line}"
+                    );
+                    assert!(line.contains(pool.glyph()), "{line}");
+                    assert!(line.contains("SPENDING FROM"), "{line}");
+                }
+                None => assert!(line.contains("PUBLIC"), "{line}"),
+            }
+        }
+
+        // The two pool statements must not be confusable with each other.
+        let v1 = SendSource::Pool(Pool::V1).confirm_line();
+        let v2 = SendSource::Pool(Pool::V2).confirm_line();
+        assert_ne!(v1, v2);
+        assert!(v1.contains("NOT post-quantum"), "{v1}");
+        assert!(!v2.contains("NOT post-quantum"), "{v2}");
+
+        // And a pool send necessarily reports a pool — `is_pool_spend` and `pool`
+        // cannot disagree, because both read the same enum.
+        assert!(SendSource::Pool(Pool::V2).is_pool_spend());
+        assert_eq!(SendSource::Pool(Pool::V2).pool(), Some(Pool::V2));
+        assert!(!SendSource::Transparent.is_pool_spend());
+        assert_eq!(SendSource::Transparent.pool(), None);
+    }
+
+    // ── Failure mode 3: sticky selection carried where it wasn't chosen ──────
+
+    #[test]
+    fn a_choice_never_survives_into_a_context_where_it_was_not_made() {
+        let mut sel = PoolSelection::default();
+
+        // THE ACTIVE PATH first: within one wallet the choice PERSISTS. Leaving
+        // and returning to the tab re-reads it and finds the same pool — an
+        // operator must never come back to a different pool than they last saw.
+        sel.choose(Pool::V2, "alice");
+        assert_eq!(sel.chosen_for("alice"), Some(Pool::V2));
+        assert_eq!(
+            sel.chosen_for("alice"),
+            Some(Pool::V2),
+            "re-entering the tab must show the SAME pool, not a different one"
+        );
+
+        // Switching wallets disarms. The choice was about alice's notes in a
+        // pool; it says nothing about bob's.
+        assert_eq!(
+            sel.chosen_for("bob"),
+            None,
+            "a choice made for one wallet must never arm a pool for another"
+        );
+        // …and it stays disarmed on returning to alice: the choice is gone, not
+        // merely hidden.
+        assert_eq!(sel.chosen_for("alice"), None);
+
+        // Completing a send disarms, so the next payment is chosen deliberately
+        // rather than inheriting an unexamined pool.
+        sel.choose(Pool::V1, "alice");
+        assert_eq!(sel.chosen_for("alice"), Some(Pool::V1));
+        sel.clear();
+        assert_eq!(sel.chosen_for("alice"), None);
+        assert!(
+            sel.for_account.is_empty(),
+            "clearing must drop the account binding too, or a later choice could \
+             inherit a stale pairing"
+        );
+
+        // The pool going non-Active does not rewrite the choice — it changes
+        // what is ARMED. The distinction matters: the operator's v2 choice is
+        // still theirs, it simply cannot fire.
+        sel.choose(Pool::V2, "alice");
+        assert_eq!(sel.chosen_for("alice"), Some(Pool::V2));
+        assert!(armed_pool(sel.pool, PoolState::Dormant).is_err());
+        assert_eq!(armed_pool(sel.pool, PoolState::Active), Ok(Pool::V2));
+    }
+
+    // ── Failure mode 4: an ambiguous record of what happened ─────────────────
+
+    #[test]
+    fn a_completed_send_reports_which_pool_moved() {
+        for pool in [Pool::V1, Pool::V2] {
+            let line = pool_send_receipt(pool, 250_000_000, "abcdef0123456789deadbeef");
+            assert!(line.contains(pool.name()), "{line}");
+            assert!(line.contains(pool.crypto()), "{line}");
+            assert!(
+                line.contains(pool.pq_claim()),
+                "the record must state the post-quantum status, not just the pool: {line}"
+            );
+            assert!(line.contains("2.5"), "the amount must survive: {line}");
+            assert!(line.contains("abcdef"), "the txid must survive: {line}");
+        }
+    }
+
+    #[test]
+    fn a_completed_v2_send_reports_v2_and_could_not_be_mistaken_for_v1() {
+        let v2 = pool_send_receipt(Pool::V2, 1, "0011223344556677");
+        assert!(v2.contains("Pool v2"), "{v2}");
+        assert!(v2.contains("ML-KEM-768 / STARK"), "{v2}");
+        assert!(v2.contains("post-quantum"), "{v2}");
+        assert!(
+            !v2.contains("NOT post-quantum"),
+            "a v2 send must never be recorded as non-post-quantum: {v2}"
+        );
+        assert!(
+            !v2.contains("Orchard"),
+            "a v2 send must never name v1's cryptography: {v2}"
+        );
+        assert_ne!(v2, pool_send_receipt(Pool::V1, 1, "0011223344556677"));
+    }
+
+    // ── Failure mode 5: a cross-pool recipient reaching submit ───────────────
+
+    #[test]
+    fn a_recipient_from_the_other_pool_can_never_be_coerced_through() {
+        let v1 = v1_addr();
+        let v2 = v2_addr();
+
+        // THE ACTIVE PATH: the matching address is accepted by the very check
+        // both submit paths run — `send_private` for v1, `run_v2_action` for v2.
+        assert!(pool_recipient_check(Pool::V1, &v1).is_ok());
+        assert!(pool_recipient_check(Pool::V2, &v2).is_ok());
+
+        // No surface form of the wrong address gets through: padded, upper-cased,
+        // newline-wrapped from a paste. None may become Ok, and none may panic.
+        for raw in [
+            v2.clone(),
+            format!(" {v2} "),
+            format!("\n{v2}\n"),
+            format!("\t{v2}"),
+            v2.to_uppercase(),
+        ] {
+            assert!(
+                pool_recipient_check(Pool::V1, &raw).is_err(),
+                "a pool-v2 address must never be accepted by the pool-v1 path"
+            );
+        }
+        for raw in [
+            v1.clone(),
+            format!(" {v1} "),
+            format!("\n{v1}\n"),
+            v1.to_uppercase(),
+        ] {
+            assert!(
+                pool_recipient_check(Pool::V2, &raw).is_err(),
+                "a pool-v1 address must never be accepted by the pool-v2 path"
+            );
+        }
+
+        // The refusal is specific enough to act on, in both directions.
+        assert!(pool_recipient_check(Pool::V1, &v2)
+            .unwrap_err()
+            .contains("switch the selector to Pool v2"));
+        assert!(pool_recipient_check(Pool::V2, &v1)
+            .unwrap_err()
+            .contains("switch the selector to Pool v1"));
+    }
+
+    // ── Failure mode 6: a distinction that needs colour to read ──────────────
+
+    #[test]
+    fn the_post_quantum_distinction_is_legible_without_colour() {
+        // Shapes differ.
+        assert_ne!(Pool::V1.glyph(), Pool::V2.glyph());
+        // Words differ, and say the thing outright.
+        assert_eq!(Pool::V1.pq_badge(), "NOT PQ");
+        assert_eq!(Pool::V2.pq_badge(), "PQ");
+        assert_ne!(Pool::V1.pq_badge(), Pool::V2.pq_badge());
+
+        // Every surface an operator reads carries BOTH a shape and the words —
+        // strip all colour and the meaning is still fully present.
+        for pool in [Pool::V1, Pool::V2] {
+            for surface in [
+                pool.selector_label(),
+                arm_statement(Ok(pool)),
+                SendSource::Pool(pool).confirm_line(),
+            ] {
+                assert!(
+                    surface.contains(pool.glyph()),
+                    "surface lacks the pool's shape: {surface}"
+                );
+                assert!(
+                    surface.contains(pool.pq_claim()),
+                    "surface lacks the post-quantum words: {surface}"
+                );
+            }
+        }
+        // The two selector labels are distinguishable as plain text.
+        assert_ne!(Pool::V1.selector_label(), Pool::V2.selector_label());
+    }
+
+    // ── Failure mode 7: dormant v2 quietly leaving v1 armed ──────────────────
+
+    #[test]
+    fn choosing_a_dormant_v2_arms_nothing_and_never_falls_back_to_v1() {
+        for st in [PoolState::Dormant, PoolState::Unavailable] {
+            let armed = armed_pool(Some(Pool::V2), st);
+            assert!(armed.is_err(), "a non-Active v2 must arm nothing ({st:?})");
+            assert_ne!(
+                armed,
+                Ok(Pool::V1),
+                "falling back to the NON-post-quantum pool because the post-quantum one \
+                 is unavailable would hand the operator exactly the property they were \
+                 avoiding ({st:?})"
+            );
+            let statement = arm_statement(armed);
+            assert!(statement.contains("NOTHING IS ARMED"), "{statement}");
+            assert!(
+                !statement.contains(Pool::V1.name()),
+                "the disarmed statement must not name v1 — nothing about v1 was chosen: \
+                 {statement}"
+            );
+            assert!(statement.contains("15,552"), "{statement}");
+        }
+
+        // THE ACTIVE PATH: the same choice, on a chain where v2 is live, arms v2.
+        assert_eq!(
+            armed_pool(Some(Pool::V2), PoolState::Active),
+            Ok(Pool::V2),
+            "the dormancy guard must not be a blanket refusal — v2 has to work when live"
+        );
+        // And an explicit v1 choice is unaffected by v2's state throughout.
+        for st in [
+            PoolState::Active,
+            PoolState::Dormant,
+            PoolState::Unavailable,
+        ] {
+            assert_eq!(armed_pool(Some(Pool::V1), st), Ok(Pool::V1));
+        }
+    }
+
+    // ── The whole space, swept ───────────────────────────────────────────────
+
+    #[test]
+    fn the_entire_choice_by_state_matrix_arms_only_what_was_chosen() {
+        // Every reachable (choice, chain state) pair. The invariant asserted is
+        // the one that matters: `armed_pool` NEVER returns a pool other than the
+        // one chosen. It may refuse; it may not substitute.
+        for chosen in [None, Some(Pool::V1), Some(Pool::V2)] {
+            for st in [
+                PoolState::Active,
+                PoolState::Dormant,
+                PoolState::Unavailable,
+            ] {
+                match armed_pool(chosen, st) {
+                    Ok(armed) => {
+                        assert_eq!(
+                            Some(armed),
+                            chosen,
+                            "armed {armed:?} but the operator chose {chosen:?} ({st:?})"
+                        );
+                        // Anything armed must be genuinely spendable now.
+                        if armed == Pool::V2 {
+                            assert_eq!(st, PoolState::Active);
+                        }
+                    }
+                    Err(why) => assert!(!why.is_empty(), "a refusal must carry a reason"),
+                }
+            }
+        }
+        // Exactly four of the nine pairs may arm anything.
+        let armable = [None, Some(Pool::V1), Some(Pool::V2)]
+            .iter()
+            .flat_map(|c| {
+                [
+                    PoolState::Active,
+                    PoolState::Dormant,
+                    PoolState::Unavailable,
+                ]
+                .iter()
+                .map(move |s| armed_pool(*c, *s))
+            })
+            .filter(|r| r.is_ok())
+            .count();
+        assert_eq!(
+            armable, 4,
+            "v1 arms in all three chain states, v2 only when Active — and an unchosen \
+             pool never arms"
         );
     }
 }
