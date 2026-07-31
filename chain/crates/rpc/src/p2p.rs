@@ -1621,6 +1621,17 @@ impl SyncState {
                 // backtrack walk is decided in `apply_verify_report`.
                 self.inflight = None;
                 self.stalled_logged = false; // a reply arrived — clear the stall latch
+                                             // A DELIVERED block substantiates this peer's advertised chain, so any
+                                             // stall strikes it accrued while briefly slow are forgiven. Without
+                                             // this, a peer whose strikes reached STATUS_MAX_STRIKES could never
+                                             // recover: strikes were only cleared by `advance_or_done`, which only
+                                             // runs for a peer that gets SELECTED — and a struck-out peer is never
+                                             // selected again (`status_actionable`), a deadlock that permanently
+                                             // disqualified the only honest heavier peer after a transient stall
+                                             // (the mainnet sync-reorg wedge). A liar that advertises a chain but
+                                             // never answers still accrues strikes and stays disqualified — the
+                                             // invariant this counter exists for is preserved.
+                self.sync_strikes.remove(&peer);
                 self.submit_verify(
                     node,
                     VerifyJob {
@@ -1652,6 +1663,13 @@ impl SyncState {
                     self.sync_next.remove(&peer); // at/past the peer's head
                     return;
                 }
+                // A delivered (non-empty) batch substantiates the peer's claim: forgive
+                // its stall strikes so a briefly-slow peer can recover eligibility (see
+                // the identical clearing in the BlockResponse arm for the rationale —
+                // the strike deadlock behind the mainnet sync-reorg wedge). An EMPTY
+                // response deliberately does not clear: delivering nothing
+                // substantiates nothing.
+                self.sync_strikes.remove(&peer);
                 // Hand the whole batch to the verifier thread and go straight back to
                 // servicing the socket. This is the line that ends the outage: for the
                 // seconds-to-minutes this batch takes to validate, we keep announcing,
@@ -1741,6 +1759,13 @@ impl SyncState {
                 match headers_fork_point(node, &headers) {
                     Some(fork) => {
                         self.bt_step.remove(&peer); // forward mode
+                                                    // A valid, attached headers reply substantiates the peer just
+                                                    // like a delivered block batch does: forgive its stall strikes
+                                                    // (see the BlockResponse arm — the strike deadlock behind the
+                                                    // mainnet sync-reorg wedge). Without this, the fork point below
+                                                    // is resolved and logged, but a struck-out peer is never asked
+                                                    // to serve the download it just enabled.
+                        self.sync_strikes.remove(&peer);
                         self.sync_next.insert(peer, fork + 1);
                         // Remember it GLOBALLY, not just for this connection. The fork
                         // point is a fact about OUR chain; every honest peer shares it.
@@ -3327,6 +3352,10 @@ mod tests {
             for (peer, msg) in tcp_a.drain() {
                 state_a.handle(&tcp_a, &node_a, &config_a, peer, msg);
             }
+            // As `P2p::start` does each iteration: apply finished verification
+            // reports (with no verifier thread attached the job ran inline in
+            // `handle`, but its report still arrives via the report channel).
+            state_a.collect_verify_reports(&tcp_a, &node_a);
             {
                 let n = node_a.lock().unwrap();
                 if n.chain().height() == B_HEIGHT && n.chain().head().hash() == target_head {
@@ -3351,6 +3380,360 @@ mod tests {
         assert!(
             batch_reqs <= 4,
             "forward download stays batched ({batch_reqs} GetBlocks round-trips)"
+        );
+    }
+
+    /// REGRESSION (mainnet incident, 2026-07): a node sitting on its OWN divergent
+    /// fork — mined from (or near) GENESIS, not a shallow stale tip — must be able
+    /// to reorg onto a strictly heavier canonical chain via the real sync loop.
+    ///
+    /// In the field a minority-fork miner (sgp1) poisoned syncing nodes: the sync
+    /// loop thrashed between "fork point at height X → downloading forward from
+    /// X+1" and backward single-block walks and never converged. This drives the
+    /// REAL loop bodies (`request_missing` + `handle` on both ends, over the real
+    /// encrypted loopback transport) with the incident's shape: A mined
+    /// `A_DIVERGENT` blocks from genesis (chain F), B holds the strictly heavier
+    /// canonical chain M (`B_HEIGHT` blocks) that shares ONLY genesis with F.
+    /// The test passes iff A ends on M's tip.
+    // Ignored by default for the same reason as
+    // `stale_tip_node_finds_fork_point_in_one_headers_exchange_and_catches_up`:
+    // it drives two REAL TcpNodes over the encrypted transport, which flakes on
+    // starved shared CI runners. Run: `cargo test -p sov-rpc --lib -- --ignored`.
+    #[test]
+    #[ignore = "real-TCP loopback; run with --ignored (see the sibling stale-tip test)"]
+    fn divergent_fork_node_reorgs_onto_heavier_canonical_chain_via_sync() {
+        let _serial = crate::NET_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        const A_DIVERGENT: u64 = 256; // A's own fork F, from genesis
+        const B_HEIGHT: u64 = 300; // canonical chain M, strictly heavier
+
+        // Chain F: A mined its own branch from genesis (offset timestamps ⇒
+        // different blocks than M at every height).
+        let mut chain_a = Blockchain::new(&test_genesis()).unwrap();
+        let genesis_hash = chain_a.head().hash();
+        for i in 1..=A_DIVERGENT {
+            let b = chain_a
+                .produce_block(vec![], 1_000 + i * 1_000 + 500)
+                .unwrap();
+            chain_a.import_block(b).unwrap();
+        }
+        // Chain M: the canonical chain, sharing ONLY genesis with F.
+        let chain_b = mined_chain(B_HEIGHT);
+        assert_eq!(chain_a.height(), A_DIVERGENT);
+        assert_eq!(chain_b.height(), B_HEIGHT);
+        assert!(
+            chain_a.block_by_height(1).unwrap().hash()
+                != chain_b.block_by_height(1).unwrap().hash(),
+            "F and M diverge at genesis"
+        );
+        assert!(
+            chain_b.chain_work() > chain_a.chain_work(),
+            "M is strictly heavier than F"
+        );
+
+        let node_a = Arc::new(Mutex::new(Node::new(chain_a, 1024, 256)));
+        let node_b = Mutex::new(Node::new(chain_b, 1024, 256));
+        let target_head = node_b.lock().unwrap().chain().head().hash();
+
+        let tcp_a = TcpNode::bind("127.0.0.1:0").unwrap();
+        let tcp_b = TcpNode::bind("127.0.0.1:0").unwrap();
+        tcp_a.connect(&tcp_b.local_addr().to_string()).unwrap();
+        let mut linked = false;
+        for _ in 0..1500 {
+            if !tcp_a.connected_peers().is_empty() && !tcp_b.connected_peers().is_empty() {
+                linked = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(linked, "nodes connected");
+        let b_seen_by_a = tcp_a.connected_peers()[0];
+        let a_seen_by_b = tcp_b.connected_peers()[0];
+
+        let config_a = P2pConfig {
+            chain_id: "sov-test".into(),
+            genesis_hash,
+            account: AccountId::new("val02.node.sov").unwrap(),
+            keypair: Keypair::from_seed([2; 32]),
+        };
+        let config_b = P2pConfig {
+            chain_id: "sov-test".into(),
+            genesis_hash,
+            account: AccountId::new("val03.node.sov").unwrap(),
+            keypair: Keypair::from_seed([3; 32]),
+        };
+
+        // Post-handshake sync state: mutually authenticated, A knows B speaks
+        // protocol v2 and advertises the heavier canonical chain. A runs the REAL
+        // verifier thread (as `P2p::start` does) and keeps a log we can inspect;
+        // B re-announces its Status on the real cadence, exactly as a live peer
+        // would, so A's view of B never goes artificially stale.
+        let log_a: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut state_a = SyncState::new(None, Some(Arc::clone(&log_a)));
+        let mut state_b = SyncState::new(None, None);
+        state_a.attach_verifier(Arc::clone(&node_a));
+        state_a.authenticated.insert(b_seen_by_a);
+        state_a
+            .peer_agents
+            .insert(b_seen_by_a, (2, "sov/test".into()));
+        {
+            let n = node_b.lock().unwrap();
+            state_a.peer_status.insert(
+                b_seen_by_a,
+                PeerStatus {
+                    height: n.chain().height(),
+                    head: n.chain().head().hash(),
+                    chain_work: n.chain().chain_work().to_be_bytes(),
+                    received_at: Instant::now(),
+                },
+            );
+        }
+        state_b.authenticated.insert(a_seen_by_b);
+
+        let mut get_headers_reqs = 0usize;
+        let mut single_block_reqs = 0usize;
+        let mut batch_reqs = 0usize;
+        let mut synced = false;
+        let mut last_announce = Instant::now();
+        for _ in 0..24_000 {
+            if last_announce.elapsed() >= ANNOUNCE_INTERVAL {
+                if let Some(status) = status(&node_b) {
+                    tcp_b.send(a_seen_by_b, &status);
+                }
+                last_announce = Instant::now();
+            }
+            state_a.request_missing(&tcp_a, &node_a);
+            for (peer, msg) in tcp_b.drain() {
+                match &msg {
+                    NetMessage::GetHeaders { .. } => get_headers_reqs += 1,
+                    NetMessage::GetBlock { .. } => single_block_reqs += 1,
+                    NetMessage::GetBlocks { .. } => batch_reqs += 1,
+                    _ => {}
+                }
+                state_b.handle(&tcp_b, &node_b, &config_b, peer, msg);
+            }
+            for (peer, msg) in tcp_a.drain() {
+                state_a.handle(&tcp_a, &node_a, &config_a, peer, msg);
+            }
+            // As `P2p::start` does each iteration: apply finished verification
+            // reports (with no verifier thread attached the job ran inline in
+            // `handle`, but its report still arrives via the report channel).
+            state_a.collect_verify_reports(&tcp_a, &node_a);
+            {
+                let n = node_a.lock().unwrap();
+                if n.chain().height() == B_HEIGHT && n.chain().head().hash() == target_head {
+                    synced = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        state_a.shutdown_verifier();
+        let (final_height, final_head) = {
+            let n = node_a.lock().unwrap();
+            (n.chain().height(), n.chain().head().hash())
+        };
+        println!(
+            "A ended at height {final_height} (target {B_HEIGHT}), on target head: {} — \
+             {get_headers_reqs} GetHeaders, {single_block_reqs} single-block (backtrack) \
+             requests, {batch_reqs} batch requests",
+            final_head == target_head
+        );
+        println!("---- A's sync log ----");
+        for line in log_a.lock().unwrap().iter() {
+            println!("{line}");
+        }
+        assert!(
+            synced,
+            "A never reorged onto the heavier canonical chain: stuck at height \
+             {final_height} after {get_headers_reqs} GetHeaders / {single_block_reqs} \
+             backtrack / {batch_reqs} batch requests (the sync-reorg wedge)"
+        );
+    }
+
+    /// REGRESSION (mainnet incident, 2026-07 — the sgp1 poisoning): a node on its
+    /// OWN divergent fork, connected BOTH to a peer serving that same fork (the
+    /// minority-fork miner) AND to an honest peer on the strictly heavier
+    /// canonical chain, must still converge onto the canonical chain even if the
+    /// honest peer is briefly unresponsive.
+    ///
+    /// The wedge on unfixed code: while the honest peer B is briefly slow (three
+    /// unanswered requests — over a WAN, [`BLOCK_REQUEST_TIMEOUT`] is only 2s, so
+    /// serving a 6MiB batch or a busy verifier easily misses it), A accrues
+    /// [`STATUS_MAX_STRIKES`] strikes against B and PERMANENTLY disqualifies its
+    /// claim via `status_actionable`. Strikes are only cleared by
+    /// `advance_or_done` — which can only run for a peer that gets SELECTED — and
+    /// a disqualified peer is never selected again: a deadlock. Meanwhile the
+    /// fork peer C feeds A its own fork (A absorbs it, so C stops being a
+    /// candidate too), and A is left with a resolved fork point, a live honest
+    /// peer answering every request — and NO peer it is willing to sync from,
+    /// forever. On mainnet this presented as the endless "fork point at height X
+    /// → downloading forward from X+1" / backtrack thrash that only ended when
+    /// the fork miner was removed.
+    // Ignored by default: real-TCP loopback (see the sibling stale-tip test).
+    // Run: `cargo test -p sov-rpc --lib -- --ignored`.
+    #[test]
+    #[ignore = "real-TCP loopback; run with --ignored (see the sibling stale-tip test)"]
+    fn divergent_fork_node_with_fork_peer_recovers_honest_peer_after_transient_stall() {
+        let _serial = crate::NET_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        const A_HEIGHT: u64 = 256; // A's prefix of fork F
+        const C_HEIGHT: u64 = 260; // the fork miner's tip of F (ahead of A)
+        const B_HEIGHT: u64 = 300; // canonical chain M, strictly heavier
+                                   // B answers nothing for this long — enough for STATUS_MAX_STRIKES
+                                   // request timeouts — then answers everything, forever.
+        const B_OUTAGE: Duration = Duration::from_secs(9);
+
+        // Chain F (offset timestamps): C holds all of it, A the first A_HEIGHT.
+        let mut chain_c = Blockchain::new(&test_genesis()).unwrap();
+        let mut chain_a = Blockchain::new(&test_genesis()).unwrap();
+        let genesis_hash = chain_a.head().hash();
+        for i in 1..=C_HEIGHT {
+            let b = chain_c
+                .produce_block(vec![], 1_000 + i * 1_000 + 500)
+                .unwrap();
+            chain_c.import_block(b.clone()).unwrap();
+            if i <= A_HEIGHT {
+                chain_a.import_block(b).unwrap();
+            }
+        }
+        // Chain M: canonical, shares ONLY genesis with F, strictly heaviest.
+        let chain_b = mined_chain(B_HEIGHT);
+        assert!(chain_b.chain_work() > chain_c.chain_work());
+        assert!(chain_c.chain_work() > chain_a.chain_work());
+
+        let node_a = Arc::new(Mutex::new(Node::new(chain_a, 1024, 256)));
+        let node_b = Mutex::new(Node::new(chain_b, 1024, 256));
+        let node_c = Mutex::new(Node::new(chain_c, 1024, 256));
+        let target_head = node_b.lock().unwrap().chain().head().hash();
+
+        let tcp_a = TcpNode::bind("127.0.0.1:0").unwrap();
+        let tcp_b = TcpNode::bind("127.0.0.1:0").unwrap();
+        let tcp_c = TcpNode::bind("127.0.0.1:0").unwrap();
+        // A dials each peer's LISTEN address, so on A's side the connection is
+        // keyed by exactly that address (the transport may add extra gossiped
+        // links between B/C/A; those are simply never authenticated by A).
+        let b_seen_by_a = tcp_b.local_addr();
+        let c_seen_by_a = tcp_c.local_addr();
+        tcp_a.connect(&b_seen_by_a.to_string()).unwrap();
+        tcp_a.connect(&c_seen_by_a.to_string()).unwrap();
+        let mut linked = false;
+        for _ in 0..1500 {
+            let peers = tcp_a.connected_peers();
+            if peers.contains(&b_seen_by_a) && peers.contains(&c_seen_by_a) {
+                linked = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(linked, "A linked to both B and C");
+
+        let config_a = P2pConfig {
+            chain_id: "sov-test".into(),
+            genesis_hash,
+            account: AccountId::new("val02.node.sov").unwrap(),
+            keypair: Keypair::from_seed([2; 32]),
+        };
+        let config_b = P2pConfig {
+            chain_id: "sov-test".into(),
+            genesis_hash,
+            account: AccountId::new("val03.node.sov").unwrap(),
+            keypair: Keypair::from_seed([3; 32]),
+        };
+        let config_c = P2pConfig {
+            chain_id: "sov-test".into(),
+            genesis_hash,
+            account: AccountId::new("val04.node.sov").unwrap(),
+            keypair: Keypair::from_seed([4; 32]),
+        };
+
+        let log_a: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut state_a = SyncState::new(None, Some(Arc::clone(&log_a)));
+        let mut state_b = SyncState::new(None, None);
+        let mut state_c = SyncState::new(None, None);
+        state_a.attach_verifier(Arc::clone(&node_a));
+        for (peer, node) in [(b_seen_by_a, &node_b), (c_seen_by_a, &node_c)] {
+            state_a.authenticated.insert(peer);
+            state_a.peer_agents.insert(peer, (2, "sov/test".into()));
+            let n = node.lock().unwrap();
+            state_a.peer_status.insert(
+                peer,
+                PeerStatus {
+                    height: n.chain().height(),
+                    head: n.chain().head().hash(),
+                    chain_work: n.chain().chain_work().to_be_bytes(),
+                    received_at: Instant::now(),
+                },
+            );
+        }
+        let started = Instant::now();
+        let mut last_announce = Instant::now();
+        let mut synced = false;
+        let deadline = Instant::now() + Duration::from_secs(240);
+        while Instant::now() < deadline {
+            let b_up = started.elapsed() >= B_OUTAGE;
+            if last_announce.elapsed() >= ANNOUNCE_INTERVAL {
+                // C (the fork miner) announces throughout; B only once healthy.
+                if let Some(status) = status(&node_c) {
+                    tcp_c.broadcast(&status);
+                }
+                if b_up {
+                    if let Some(status) = status(&node_b) {
+                        tcp_b.broadcast(&status);
+                    }
+                }
+                last_announce = Instant::now();
+            }
+            state_a.request_missing(&tcp_a, &node_a);
+            // B's socket is only serviced after the outage window; queued
+            // requests are then answered late — exactly a briefly-slow peer.
+            // B and C trust whatever link a message arrives on (auth is not
+            // what is under test on the serving side).
+            if b_up {
+                for (peer, msg) in tcp_b.drain() {
+                    state_b.authenticated.insert(peer);
+                    state_b.handle(&tcp_b, &node_b, &config_b, peer, msg);
+                }
+            }
+            for (peer, msg) in tcp_c.drain() {
+                state_c.authenticated.insert(peer);
+                state_c.handle(&tcp_c, &node_c, &config_c, peer, msg);
+            }
+            for (peer, msg) in tcp_a.drain() {
+                state_a.handle(&tcp_a, &node_a, &config_a, peer, msg);
+            }
+            state_a.collect_verify_reports(&tcp_a, &node_a);
+            {
+                let n = node_a.lock().unwrap();
+                if n.chain().height() == B_HEIGHT && n.chain().head().hash() == target_head {
+                    synced = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        state_a.shutdown_verifier();
+        let (final_height, final_head) = {
+            let n = node_a.lock().unwrap();
+            (n.chain().height(), n.chain().head().hash())
+        };
+        println!(
+            "A ended at height {final_height} (target {B_HEIGHT}), on target head: {}",
+            final_head == target_head
+        );
+        println!("---- A's sync log ----");
+        for line in log_a.lock().unwrap().iter() {
+            println!("{line}");
+        }
+        assert!(
+            synced,
+            "A never reorged onto the canonical chain (stuck at height {final_height}): \
+             a transient {B_OUTAGE:?} outage of the honest peer permanently disqualified \
+             it (sync_strikes never recover), leaving the node wedged on its own fork"
         );
     }
 
