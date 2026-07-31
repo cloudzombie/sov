@@ -17,7 +17,8 @@ use std::time::Duration;
 
 use serde_json::{json, to_value};
 use sov_crypto::{Keypair, Signature};
-use sov_primitives::{AccountId, Balance};
+use sov_intents::{Asset, Intent, Settlement};
+use sov_primitives::{AccountId, Balance, Hash, SigningDomain};
 use sov_rpc::{RpcClient, RpcClientError};
 use sov_types::{Action, SignedTransaction, Transaction};
 
@@ -40,6 +41,19 @@ pub struct GauntletReport {
     pub balance_before: Option<u128>,
     /// Pot balance in grains after — must equal `balance_before`.
     pub balance_after: Option<u128>,
+    /// Pot on-chain nonce before the barrage.
+    pub nonce_before: Option<u64>,
+    /// Pot on-chain nonce after — must equal `nonce_before` (no forgery consumed it).
+    pub nonce_after: Option<u64>,
+    /// The pot's authorizer BEFORE — its registered controlling key (rendered as a
+    /// short hex), or `multisig(m/n)` if it carries a policy. Must not change.
+    pub authorizer_before: Option<String>,
+    /// The pot's authorizer AFTER — must equal `authorizer_before` (no seize landed).
+    pub authorizer_after: Option<String>,
+    /// The node's mempool size BEFORE the barrage.
+    pub mempool_before: Option<usize>,
+    /// The node's mempool size AFTER — a forgery that was admitted would raise it.
+    pub mempool_after: Option<usize>,
     /// One outcome per attack.
     pub outcomes: Vec<Outcome>,
     /// A blocking error (unreachable, etc.).
@@ -59,6 +73,82 @@ impl GauntletReport {
         g.map(|v| format!("{:.8}", v as f64 / 1e8))
             .unwrap_or_else(|| "?".into())
     }
+
+    /// Number of attack VECTORS the battery actually resolved — every outcome the
+    /// chain gave a real verdict on (DEFENDED or VULNERABLE). `Info` lines (a
+    /// vector that could not be exercised, e.g. the node was unreachable) are not
+    /// counted as attempted, so the tally never over-claims.
+    pub fn vectors_attempted(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|o| o.verdict != Verdict::Info)
+            .count()
+    }
+
+    /// Number of vectors that BREACHED — an admitted forgery, a moved grain, a
+    /// seized authorizer. MUST be zero; any nonzero value means the pot is in
+    /// danger and the harness exits nonzero.
+    pub fn vectors_breached(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|o| o.verdict == Verdict::Vulnerable)
+            .count()
+    }
+
+    /// Grains admitted into the mempool by the whole battery, measured as the rise
+    /// in the node's mempool size across it. MUST be zero: every vector is a
+    /// forgery that cannot be admitted, so nothing enters the pool. `None` if the
+    /// node did not report a mempool size at both ends.
+    pub fn mempool_admissions(&self) -> Option<usize> {
+        match (self.mempool_before, self.mempool_after) {
+            (Some(b), Some(a)) => Some(a.saturating_sub(b)),
+            _ => None,
+        }
+    }
+
+    /// The measured metric panel, one line per metric, before → after with the
+    /// invariant each must hold. Rendered by the CLI (and, once wired, the Station
+    /// Red Team tab) so both surfaces show the SAME numbers behind `pot_intact()`.
+    pub fn summary_lines(&self) -> Vec<String> {
+        let ba = self.balance_after;
+        let nu = |o: Option<u64>| o.map(|v| v.to_string()).unwrap_or_else(|| "?".into());
+        let su = |o: &Option<String>| o.clone().unwrap_or_else(|| "?".into());
+        let mem = self
+            .mempool_admissions()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".into());
+        vec![
+            format!(
+                "balance    {} → {} XUS  (Δ must be 0 grains)",
+                Self::xus(self.balance_before),
+                Self::xus(ba)
+            ),
+            format!(
+                "nonce      {} → {}  (unchanged)",
+                nu(self.nonce_before),
+                nu(self.nonce_after)
+            ),
+            format!(
+                "authorizer {} → {}  (unchanged)",
+                su(&self.authorizer_before),
+                su(&self.authorizer_after)
+            ),
+            format!("mempool admissions {mem}  (must be 0)"),
+            format!(
+                "vectors    {} attempted · {} breached  (breached must be 0)",
+                self.vectors_attempted(),
+                self.vectors_breached()
+            ),
+            format!(
+                "verdict    POT {}",
+                if self.pot_intact() && self.vectors_breached() == 0 {
+                    "INTACT"
+                } else {
+                    "IN DANGER"
+                }
+            ),
+        ]
+    }
 }
 
 fn pot_id() -> AccountId {
@@ -77,13 +167,42 @@ fn thief(seed: u8) -> AccountId {
 /// so the tx carries the ATTACKER's key; the chain's authorization then rejects it because
 /// that key's hash is not the pot's id.
 fn drain(kp: &Keypair, nonce: u64, to: AccountId, amount: Balance) -> SignedTransaction {
+    forge(kp, nonce, Action::Transfer { to, amount })
+}
+
+/// The general forgery: ANY `action` declared BY the pot but signed by attacker
+/// `kp`. `drain` is the `Transfer` special case; every other value/authority exit
+/// (`RotateKey`, `SetMultisig`, `IntentSettle`, a carrier envelope, a token/vault/
+/// HTLC/name/NFT move) rides this same builder. `sign` binds the ATTACKER's key
+/// into the transaction, so authorization rejects it: that key's hash is not the
+/// pot's id. Un-admittable by construction — nothing can enter the mempool.
+fn forge(kp: &Keypair, nonce: u64, action: Action) -> SignedTransaction {
     let tx = Transaction {
         signer: pot_id(),
         public_key: kp.public_key(),
         nonce,
-        action: Action::Transfer { to, amount },
+        action,
     };
     SignedTransaction::sign(tx, kp).unwrap()
+}
+
+/// A pot-drain signed under a FOREIGN signing domain (a different chain_id +
+/// genesis), for the domain-swap replay: a signature minted for another network,
+/// replayed here. Rejected either by the `tx-domain` binding (if active) or by the
+/// key/id mismatch (always) — the probe reports which fired.
+fn forge_in_domain(
+    kp: &Keypair,
+    nonce: u64,
+    action: Action,
+    domain: &SigningDomain,
+) -> SignedTransaction {
+    let tx = Transaction {
+        signer: pot_id(),
+        public_key: kp.public_key(),
+        nonce,
+        action,
+    };
+    SignedTransaction::sign_in(tx, kp, Some(domain)).unwrap()
 }
 
 /// Submit `stx` expecting REJECTION. An Ok means a pot-draining tx was ADMITTED — a real
@@ -141,6 +260,12 @@ pub fn probe_gauntlet(rpc_target: &str) -> GauntletReport {
         chain_id,
         balance_before: None,
         balance_after: None,
+        nonce_before: None,
+        nonce_after: None,
+        authorizer_before: None,
+        authorizer_after: None,
+        mempool_before: None,
+        mempool_after: None,
         outcomes: Vec::new(),
         error: None,
     };
@@ -152,6 +277,10 @@ pub fn probe_gauntlet(rpc_target: &str) -> GauntletReport {
         return report;
     };
     report.balance_before = Some(before.grains());
+    // ── metric panel: snapshot the pot's authority + the node's pool BEFORE ──
+    report.nonce_before = client.nonce(&pot).ok();
+    report.authorizer_before = authorizer_of(&client, &pot);
+    report.mempool_before = client.mempool_size().ok();
     let whole = Balance::from_grains(before.grains().max(1)); // drain the lot
     let sink = thief(240);
 
@@ -331,6 +460,289 @@ pub fn probe_gauntlet(rpc_target: &str) -> GauntletReport {
         .outcomes
         .push(expect_rejected(&client, "replay the forged drain", &replay));
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // EXHAUSTIVE LIVE BATTERY — every conceivable key-less path at the pot.
+    // Each is un-admittable by construction (bad sig / wrong key / dormant
+    // feature), so it is side-effect-free: nothing enters the mempool.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ── A1. PQ HALF-STRIP (CRITICAL) — the hybrid conjunction over the wire ──
+    // The pot key is hybrid Ed25519+ML-DSA-65. A forgery that presents only ONE
+    // half must be refused: either half ALONE is not authorization. We cannot
+    // wield the pot's real key here (cold storage), so over live RPC we submit
+    // half-stripped ATTACKER forgeries and confirm rejection; the DEFINITIVE
+    // "both halves load-bearing WITH the pot's own key" proof is the in-process
+    // test `pot_hybrid_conjunction_is_enforced` in lib.rs (real key, real STF).
+    let mut ed_only = drain(
+        &Keypair::hybrid_from_seed([210; 32]),
+        0,
+        sink.clone(),
+        whole,
+    );
+    ed_only.signature = strip_to_half(ed_only.signature, Half::Ed25519);
+    report.outcomes.push(expect_rejected(
+        &client,
+        "PQ half-strip: Ed25519 half alone",
+        &ed_only,
+    ));
+    let mut pq_only = drain(
+        &Keypair::hybrid_from_seed([211; 32]),
+        0,
+        sink.clone(),
+        whole,
+    );
+    pq_only.signature = strip_to_half(pq_only.signature, Half::MlDsa);
+    report.outcomes.push(expect_rejected(
+        &client,
+        "PQ half-strip: ML-DSA half alone",
+        &pq_only,
+    ));
+
+    // ── A2. DOMAIN-SWAP REPLAY — a signature minted for a FOREIGN network ──
+    // Bind a pot-drain to a different (chain_id, genesis) and replay it here.
+    // Rejected by the tx-domain binding if active, else by the key/id mismatch.
+    let foreign = SigningDomain::new("sov-attacker", flip_hash(genesis_or_zero(&client)));
+    let swapped = forge_in_domain(
+        &Keypair::hybrid_from_seed([212; 32]),
+        0,
+        Action::Transfer {
+            to: sink.clone(),
+            amount: whole,
+        },
+        &foreign,
+    );
+    let domain_bound = client.signing_domain().ok().flatten().is_some();
+    let which = if domain_bound {
+        "tx-domain active — the foreign-network signature does not bind here"
+    } else {
+        "tx-domain dormant — the wrong-key/id mismatch is what refuses it"
+    };
+    report
+        .outcomes
+        .push(match client.submit_transaction(&swapped) {
+            Ok(id) => Outcome::vulnerable(
+                CAT,
+                "domain-swap replay",
+                format!(
+                    "ADMITTED — a foreign-domain drain entered the mempool ({})",
+                    short(&id.to_hex())
+                ),
+            ),
+            Err(RpcClientError::Io(e)) => Outcome::info(
+                CAT,
+                "domain-swap replay",
+                format!("could not reach node: {e}"),
+            ),
+            Err(e) => Outcome::defended(
+                CAT,
+                "domain-swap replay",
+                format!("REFUSED ({which}) — {}", trim(&e.to_string())),
+            ),
+        });
+
+    // ── A3. ZERO / EMPTY SIGNATURE (hybrid) — strip the signature entirely ──
+    // (Vector #5 already zeroed a V1 signature; this zeroes BOTH hybrid halves.)
+    let mut zeroed = drain(
+        &Keypair::hybrid_from_seed([213; 32]),
+        0,
+        sink.clone(),
+        whole,
+    );
+    zeroed.signature = strip_to_half(strip_to_half(zeroed.signature, Half::Ed25519), Half::MlDsa);
+    report.outcomes.push(expect_rejected(
+        &client,
+        "all-zero hybrid signature",
+        &zeroed,
+    ));
+
+    // ── A4. NONCE GAMES — a forged drain at a future and a stale nonce ──
+    // Authorization is checked BEFORE the nonce, so a bad-key forgery is refused
+    // regardless of the nonce it carries: the nonce is irrelevant once auth fails.
+    let pot_next = client.next_nonce(&pot).unwrap_or(0);
+    report.outcomes.push(expect_rejected(
+        &client,
+        "forged drain at a FUTURE nonce",
+        &drain(
+            &Keypair::hybrid_from_seed([214; 32]),
+            pot_next.saturating_add(999),
+            sink.clone(),
+            whole,
+        ),
+    ));
+    report.outcomes.push(expect_rejected(
+        &client,
+        "forged drain at a STALE nonce",
+        &drain(
+            &Keypair::hybrid_from_seed([215; 32]),
+            0,
+            sink.clone(),
+            whole,
+        ),
+    ));
+
+    // ── A5. IMPLICIT-ID PREIMAGE NEAR-MISS — a key close to, but NOT, the pot ──
+    // A key whose blake3(pubkey) shares a leading prefix with the pot id proves id
+    // equality is EXACT, not fuzzy: near does not count, only the exact preimage.
+    let (near_kp, shared) = near_miss_key();
+    report.outcomes.push(expect_rejected(
+        &client,
+        "implicit-id preimage near-miss",
+        &forge(
+            &near_kp,
+            0,
+            Action::Transfer {
+                to: sink.clone(),
+                amount: whole,
+            },
+        ),
+    ));
+    report.outcomes.push(Outcome::info(
+        CAT,
+        "  ↑ near-miss shares only a prefix",
+        format!(
+            "attacker key hashes to an id sharing {shared} leading hex with the pot — still not it"
+        ),
+    ));
+
+    // ── A6. MULTISIG SEIZE PATHS — you cannot set the pot's policy w/o its key ──
+    let atk = Keypair::hybrid_from_seed([216; 32]);
+    report.outcomes.push(expect_rejected(
+        &client,
+        "seize via SetMultisig (attacker keys)",
+        &forge(
+            &atk,
+            0,
+            Action::SetMultisig {
+                signers: vec![atk.public_key()],
+                threshold: 1,
+            },
+        ),
+    ));
+    report.outcomes.push(expect_rejected(
+        &client,
+        "seize via MultisigExec (drain)",
+        &forge(
+            &atk,
+            0,
+            Action::MultisigExec {
+                action: Box::new(Action::Transfer {
+                    to: sink.clone(),
+                    amount: whole,
+                }),
+                approvals: vec![],
+            },
+        ),
+    ));
+    report.outcomes.push(expect_rejected(
+        &client,
+        "seize via ProposeMultisig (drain)",
+        &forge(
+            &atk,
+            0,
+            Action::ProposeMultisig {
+                account: pot.clone(),
+                action: Box::new(Action::Transfer {
+                    to: sink.clone(),
+                    amount: whole,
+                }),
+            },
+        ),
+    ));
+    report.outcomes.push(expect_rejected(
+        &client,
+        "seize via ApproveMultisig",
+        &forge(
+            &atk,
+            0,
+            Action::ApproveMultisig {
+                account: pot.clone(),
+                proposal: Hash::ZERO,
+            },
+        ),
+    ));
+
+    // ── A7. INTENTSETTLE BYPASS — the class of the old H001 multisig bypass ──
+    // Move pot value by naming it as an intent owner; the outer envelope is signed
+    // by the attacker, so authorization refuses it before any settlement logic.
+    let intent = Intent {
+        owner: pot.clone(),
+        public_key: atk.public_key(),
+        nonce: 0,
+        give_asset: Asset::Sov,
+        give_amount: whole.grains(),
+        want_asset: Asset::Sov,
+        min_receive: 0,
+        expiry_height: u64::MAX,
+    };
+    let signed_intent = intent.sign(&atk).unwrap();
+    report.outcomes.push(expect_rejected(
+        &client,
+        "IntentSettle bypass (pot as owner)",
+        &forge(
+            &atk,
+            0,
+            Action::IntentSettle {
+                settlement: Settlement {
+                    intent: signed_intent,
+                    solver: sink.clone(),
+                    deliver_amount: 0,
+                },
+            },
+        ),
+    ));
+
+    // ── A8. CARRIER LAUNDERING — a wrapper cannot launder past authorization ──
+    // Wrap a pot-drain in Tipped / Timestamped / a ShieldedV2 bundle. A carrier
+    // either resolves auth from the top-level signer (still the pot ⇒ wrong key)
+    // or is dormant on mainnet (FeatureInactive) — either is DEFENDED.
+    report.outcomes.push(expect_rejected(
+        &client,
+        "carrier laundering: Tipped{drain}",
+        &forge(
+            &atk,
+            0,
+            Action::Tipped {
+                tip: Balance::from_grains(1),
+                inner: Box::new(Action::Transfer {
+                    to: sink.clone(),
+                    amount: whole,
+                }),
+            },
+        ),
+    ));
+    report.outcomes.push(expect_rejected(
+        &client,
+        "carrier laundering: Timestamped{drain}",
+        &forge(
+            &atk,
+            0,
+            Action::Timestamped {
+                created_at_ms: 0,
+                inner: Box::new(Action::Transfer {
+                    to: sink.clone(),
+                    amount: whole,
+                }),
+            },
+        ),
+    ));
+    report.outcomes.push(expect_rejected(
+        &client,
+        "carrier laundering: ShieldedV2 bundle",
+        &forge(&atk, 0, Action::ShieldedV2 { bundle: vec![0; 8] }),
+    ));
+
+    // ── A9. OTHER VALUE / AUTHORITY EXITS — each names the pot as signer ──
+    for (name, action) in other_exits(&pot, &sink, whole) {
+        report
+            .outcomes
+            .push(expect_rejected(&client, name, &forge(&atk, 0, action)));
+    }
+
+    // ── metric panel: snapshot the pot's authority + the node's pool AFTER ──
+    report.nonce_after = client.nonce(&pot).ok();
+    report.authorizer_after = authorizer_of(&client, &pot);
+    report.mempool_after = client.mempool_size().ok();
+
     // ── conservation proof: not a grain moved, no thief was credited ──
     if let Ok(after) = client.balance(&pot) {
         report.balance_after = Some(after.grains());
@@ -359,6 +771,150 @@ pub fn probe_gauntlet(rpc_target: &str) -> GauntletReport {
         });
 
     report
+}
+
+/// Keep only one half of a hybrid signature, zeroing the other — the wire form of
+/// "authorize with just the Ed25519 (or just the ML-DSA) half". A non-hybrid
+/// signature is returned unchanged.
+fn strip_to_half(sig: Signature, keep: Half) -> Signature {
+    match sig {
+        Signature::V2HybridMlDsa65 { ed25519, ml_dsa } => match keep {
+            // Keep Ed25519, strip ML-DSA.
+            Half::Ed25519 => Signature::V2HybridMlDsa65 {
+                ed25519,
+                ml_dsa: [0; sov_crypto::ML_DSA_65_SIG_LEN],
+            },
+            // Keep ML-DSA, strip Ed25519.
+            Half::MlDsa => Signature::V2HybridMlDsa65 {
+                ed25519: [0; 64],
+                ml_dsa,
+            },
+        },
+        other => other,
+    }
+}
+
+/// The node's genesis hash if it reports a signing domain; the zero hash otherwise.
+/// Only used to build a DIFFERENT (foreign) domain, so the exact value is immaterial
+/// — `flip_hash` guarantees it never coincides with the real one.
+fn genesis_or_zero(client: &RpcClient) -> Hash {
+    client
+        .signing_domain()
+        .ok()
+        .flatten()
+        .map(|d| d.genesis())
+        .unwrap_or(Hash::ZERO)
+}
+
+/// Flip the first byte of a hash, so the result is guaranteed distinct from the input.
+fn flip_hash(h: Hash) -> Hash {
+    let mut b = *h.as_bytes();
+    b[0] ^= 0xff;
+    Hash::from_bytes(b)
+}
+
+/// A key whose implicit id shares a leading hex PREFIX with the pot's id but is
+/// NOT the pot — grinds a handful of seeds for the longest shared prefix found.
+/// Returns the key and the number of shared leading hex characters (short by
+/// construction: a full match is a 256-bit preimage, which is infeasible — that
+/// infeasibility is exactly what the vector demonstrates).
+fn near_miss_key() -> (Keypair, usize) {
+    let pot_hex = POT;
+    let mut best = (Keypair::hybrid_from_seed([100; 32]), 0usize);
+    for seed in 100u16..2_000 {
+        let bytes = (seed as u32).to_le_bytes();
+        let mut s = [0u8; 32];
+        s[..4].copy_from_slice(&bytes);
+        let kp = Keypair::hybrid_from_seed(s);
+        let id = kp.public_key().implicit_account_id();
+        let id_hex = id.as_str();
+        let shared = pot_hex
+            .chars()
+            .zip(id_hex.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if shared > best.1 && id_hex != pot_hex {
+            best = (kp, shared);
+        }
+    }
+    best
+}
+
+/// The remaining value/authority-exit actions (A9), each naming the pot as signer.
+/// A `Hash::ZERO` asset/collection/htlc id is fine: authorization refuses the
+/// attacker-signed envelope before any of these ids is ever consulted.
+fn other_exits(_pot: &AccountId, sink: &AccountId, whole: Balance) -> Vec<(&'static str, Action)> {
+    vec![
+        (
+            "exit via TokenTransfer",
+            Action::TokenTransfer {
+                asset: Hash::ZERO,
+                to: sink.clone(),
+                amount: whole,
+            },
+        ),
+        (
+            "exit via TokenBurn",
+            Action::TokenBurn {
+                asset: Hash::ZERO,
+                amount: whole,
+            },
+        ),
+        (
+            "exit via VaultWithdraw",
+            Action::VaultWithdraw { amount: whole },
+        ),
+        ("exit via VaultBurn", Action::VaultBurn { amount: whole }),
+        (
+            "exit via HtlcClaim",
+            Action::HtlcClaim {
+                htlc_id: Hash::ZERO,
+                preimage: vec![0; 8],
+            },
+        ),
+        (
+            "exit via TransferName",
+            Action::TransferName {
+                name: "gauntlet.sov".to_string(),
+                to: sink.clone(),
+            },
+        ),
+        (
+            "exit via NftTransfer",
+            Action::NftTransfer {
+                collection: Hash::ZERO,
+                token_id: vec![0; 4],
+                to: sink.clone(),
+            },
+        ),
+    ]
+}
+
+/// The pot's authorizer, for the metric panel: `multisig(m/n)` if it carries a
+/// policy, else its registered key as short hex, else `keyless` (self-certifying
+/// implicit id — the real pot's state). `None` if the node is unreachable.
+fn authorizer_of(client: &RpcClient, pot: &AccountId) -> Option<String> {
+    // A multisig policy, if any, is the authoritative authorizer.
+    if let Ok(props) = client.call(
+        "sov_getMultisigProposals",
+        json!({ "account": pot.as_str() }),
+    ) {
+        if let Some(first) = props.as_array().and_then(|a| a.first()) {
+            let threshold = first.get("threshold").and_then(|v| v.as_u64()).unwrap_or(0);
+            let signers = first.get("signers").and_then(|v| v.as_u64()).unwrap_or(0);
+            if signers > 0 {
+                return Some(format!("multisig({threshold}/{signers})"));
+            }
+        }
+    }
+    match client.account(pot) {
+        Ok(Some(acct)) => Some(match acct.key {
+            Some(k) => format!("key:{}", short(&k.to_hex())),
+            None => "keyless".to_string(),
+        }),
+        Ok(None) => Some("absent".to_string()),
+        Err(_) => None,
+    }
 }
 
 fn normalize(target: &str) -> String {

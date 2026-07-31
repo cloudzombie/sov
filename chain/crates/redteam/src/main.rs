@@ -58,18 +58,11 @@ fn gauntlet_mode(addr: &str) {
         let (tag, mark) = mark_of(o.verdict, &mut defended, &mut vulnerable, &mut info);
         println!("   {mark} [{tag:<10}] {:<40} {}", o.name, o.detail);
     }
-    if let (Some(b), Some(a)) = (report.balance_before, report.balance_after) {
-        let ok = b == a;
-        println!(
-            "\n  pot {} → {} XUS  ·  {}",
-            GauntletReport::xus(Some(b)),
-            GauntletReport::xus(Some(a)),
-            if ok {
-                "\x1b[32mnot a grain moved\x1b[0m"
-            } else {
-                "\x1b[31mTHE POT MOVED\x1b[0m"
-            }
-        );
+    // The measured metric panel — the same numbers the Station Red Team tab shows,
+    // sourced from the report's Display/summary path (`summary_lines`).
+    println!("\n  ── metrics ──");
+    for line in report.summary_lines() {
+        println!("  {line}");
     }
     println!(
         "  {} attacks · \x1b[32m{defended} defended\x1b[0m · \x1b[31m{vulnerable} vulnerable\x1b[0m · {info} info",
