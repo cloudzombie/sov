@@ -6072,7 +6072,13 @@ impl Station {
     /// (e.g. binding tax keys) or to clear coins mined to an old account.
     fn reset_local_chain(&mut self) {
         self.stop_local_node();
-        let dir = local_node_dir(self.network.data_subdir());
+        let dir = match local_node_dir(self.network.data_subdir()) {
+            Ok(d) => d,
+            Err(e) => {
+                self.node_status = format!("could not locate the local chain: {e}");
+                return;
+            }
+        };
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => {
                 self.node_status =
@@ -12943,21 +12949,16 @@ fn setup_node_dir(node_dir: &Path, spec_filename: &str) -> Result<(), String> {
 
 /// The `SOV_STATION_DIR` override, if one is set and non-empty.
 ///
-/// `station_dir` covers the wallet files. These remaining paths deliberately do NOT
-/// live under `.sov-station` — the node's chain data is in the temp dir, and the
-/// peer/theme/RPC preferences are dotfiles directly in `$HOME` — so they escaped that
-/// helper entirely. They still have to be isolated, for two different reasons:
+/// `station_dir` covers the wallet files AND (since 0.2.7) the chain store. The
+/// peer/theme/RPC preferences are still dotfiles directly in `$HOME`, so they escape
+/// that helper and are isolated here instead: a dev build silently overwriting the
+/// operator's saved peer and theme is reaching into their live install.
 ///
-///   * the CHAIN DIRECTORY is keyed only by network name, so a dev build and the
-///     installed Station open the SAME `sov-station-node-mainnet` directory. Two
-///     processes on one chain database is a corruption and crash vector, and it is the
-///     most likely way a dev build "dies while syncing";
-///   * the PREFERENCE dotfiles are low-stakes, but a dev build silently overwriting the
-///     operator's saved peer and theme is still reaching into their live install.
-///
-/// The override is applied ONLY when it is set. With it unset every path resolves
-/// exactly where it always did, so an existing install keeps its saved peer, theme and
-/// chain — this isolates dev builds without migrating anybody's settings.
+/// The override is applied ONLY when it is set. With it unset the preference files
+/// resolve exactly where they always did, so an existing install keeps its saved peer
+/// and theme. (The chain directory is the one thing that deliberately MOVED — out of
+/// the purgeable temp dir — and it is migrated rather than abandoned; see
+/// [`migrate_node_dir_from_temp`].)
 fn dev_override_dir() -> Option<PathBuf> {
     std::env::var("SOV_STATION_DIR")
         .ok()
@@ -12966,11 +12967,163 @@ fn dev_override_dir() -> Option<PathBuf> {
 }
 
 /// The directory the GUI's supervised local node keeps its chain + keystore in.
-fn local_node_dir(net: &str) -> PathBuf {
-    match dev_override_dir() {
-        Some(d) => d.join(format!("node-{net}")),
-        None => std::env::temp_dir().join(format!("sov-station-node-{net}")),
+///
+/// **This used to be the OS temp directory** — `$TMPDIR/sov-station-node-<net>` —
+/// and that was a data-loss bug, not a style problem. On macOS `$TMPDIR` is a
+/// per-user `/var/folders/.../T` that the OS purges on reboot, under disk
+/// pressure, and on its periodic cleanup schedule. A mainnet node kept its
+/// `blocks.log` there, so the chain was being deleted out from under a running
+/// install and re-synced from genesis with no message and no warning. That is the
+/// real "syncing is endless / it keeps re-walking fork points" experience: the
+/// node was not slow, it was starting over.
+///
+/// A chain store must live where the OS will not touch it, so it now sits under
+/// [`station_dir`] — `<home>/.sov-station/node-<net>` — the same durable directory
+/// that already holds the wallet keystore and device key. One convention for
+/// everything Station must not lose, and `SOV_STATION_DIR` still isolates a dev
+/// build's chain exactly as before (it overrides `station_dir` itself).
+///
+/// Returns an error rather than falling back to anything purgeable: see
+/// [`ensure_durable_node_dir`].
+fn local_node_dir(net: &str) -> Result<PathBuf, String> {
+    Ok(station_dir()?.join(format!("node-{net}")))
+}
+
+/// Where a pre-0.2.7 Station kept this network's chain: the purgeable temp dir.
+/// Retained solely so [`migrate_node_dir_from_temp`] can rescue it.
+fn legacy_temp_node_dir(net: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("sov-station-node-{net}"))
+}
+
+/// Resolve the node directory AND guarantee it exists on durable storage.
+///
+/// Hard-fails instead of degrading. A chain store that quietly lands somewhere the
+/// OS can delete is the bug this whole change exists to remove, so "could not
+/// create the durable directory" is an error the operator sees, never a silent
+/// fallback to `$TMPDIR`.
+fn ensure_durable_node_dir(net: &str) -> Result<PathBuf, String> {
+    // `local_node_dir` derives strictly from `station_dir`, which ERRORS when there
+    // is no home directory rather than substituting anything — so there is no silent
+    // fallback path to begin with. The remaining guard is against the specific
+    // location this bug came from, so it can never be reintroduced by any future
+    // rule change here.
+    let dir = local_node_dir(net)?;
+    if dir == legacy_temp_node_dir(net) {
+        return Err(format!(
+            "refusing to start: the chain directory resolved back to the OS temp \
+             directory ({}), which the operating system deletes — that is the data-loss \
+             bug fixed in 0.2.7. Set SOV_STATION_DIR to a durable path you own.",
+            dir.display()
+        ));
     }
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "could not create the chain directory {} ({e}). Station will not store a \
+             mainnet chain in a location the OS can purge — fix the permissions on \
+             that path, or set SOV_STATION_DIR to a durable directory you own.",
+            dir.display()
+        )
+    })?;
+    Ok(dir)
+}
+
+/// The outcome of the one-time temp-dir → durable-dir chain migration.
+#[derive(Debug, PartialEq, Eq)]
+enum NodeDirMigration {
+    /// No legacy store to rescue (a fresh install, or already migrated and cleaned).
+    Nothing,
+    /// The legacy store was moved to the durable location. Carries a human message.
+    Moved(String),
+    /// BOTH exist. Nothing is touched and nothing is deleted — the durable one is
+    /// used and the legacy one is left in place for the operator to inspect.
+    BothPresent(String),
+}
+
+/// Move a pre-0.2.7 temp-dir chain store to its durable home, ONCE.
+///
+/// The whole point is that nobody re-syncs. An existing `blocks.log` is the
+/// operator's own verified history; it is moved, never re-downloaded and never
+/// deleted.
+///
+/// Rules, all of them chosen so no data can be lost:
+///
+/// * legacy present, durable absent → move it (atomic `rename` when both are on one
+///   filesystem; a copy-then-remove fallback when they are not, which `$TMPDIR` and
+///   `$HOME` frequently are on macOS);
+/// * both present → touch NEITHER. The durable one wins, the legacy one is left
+///   exactly where it is and reported. Guessing which is "newer" and deleting the
+///   other is how a migration destroys a chain;
+/// * a partially-completed copy is left behind rather than removed, and the legacy
+///   source is only removed after the copy fully succeeded.
+fn migrate_node_dir_from_temp(net: &str) -> Result<NodeDirMigration, String> {
+    let legacy = legacy_temp_node_dir(net);
+    let durable = local_node_dir(net)?;
+    // A dev build (SOV_STATION_DIR set) never adopts the installed Station's chain.
+    if dev_override_dir().is_some() || !legacy.is_dir() {
+        return Ok(NodeDirMigration::Nothing);
+    }
+    let durable_has_content = std::fs::read_dir(&durable)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false);
+    if durable_has_content {
+        return Ok(NodeDirMigration::BothPresent(format!(
+            "a legacy chain store still exists at {} — the durable store at {} is in use \
+             and NOTHING was deleted. Remove the legacy copy yourself once you are \
+             satisfied it is not needed.",
+            legacy.display(),
+            durable.display()
+        )));
+    }
+    if let Some(parent) = durable.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "could not create {} for the chain store: {e}",
+                parent.display()
+            )
+        })?;
+    }
+    // Same-filesystem move: atomic, instant, no risk of a half-copy.
+    if std::fs::rename(&legacy, &durable).is_ok() {
+        return Ok(NodeDirMigration::Moved(format!(
+            "moved the chain store out of the OS temp directory ({}) to {} — it is no \
+             longer at risk of being purged, and nothing had to be re-synced.",
+            legacy.display(),
+            durable.display()
+        )));
+    }
+    // Cross-filesystem (the usual macOS $TMPDIR vs $HOME case): copy, verify, then
+    // remove the source. The source survives every failure path.
+    copy_dir_recursive(&legacy, &durable).map_err(|e| {
+        format!(
+            "could not move the chain store from {} to {} ({e}). Your chain is UNTOUCHED at \
+             the old path; free some space or fix permissions and restart.",
+            legacy.display(),
+            durable.display()
+        )
+    })?;
+    let _ = std::fs::remove_dir_all(&legacy);
+    Ok(NodeDirMigration::Moved(format!(
+        "moved the chain store out of the OS temp directory ({}) to {} — it is no longer at \
+         risk of being purged, and nothing had to be re-synced.",
+        legacy.display(),
+        durable.display()
+    )))
+}
+
+/// Recursively copy `from` into `to`, creating directories as needed.
+fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
 }
 
 /// Base directory for network-scoped seed/bootstrap choices. These live outside the
@@ -13344,7 +13497,18 @@ fn build_and_run_node(
     // On Windows, make sure we're allowed inbound through the firewall (once), so LAN
     // peers can actually reach this node — otherwise discovery silently never connects.
     ensure_firewall(logs);
-    let node_dir = local_node_dir(net);
+    // DURABLE CHAIN STORE + one-time rescue of a pre-0.2.7 temp-dir chain. Both run
+    // before anything touches the directory, so a store the OS was about to delete is
+    // moved to safety rather than re-downloaded. See `local_node_dir`.
+    match migrate_node_dir_from_temp(net) {
+        Ok(NodeDirMigration::Nothing) => {}
+        Ok(NodeDirMigration::Moved(msg)) => push_log(logs, format!("startup: {msg}")),
+        Ok(NodeDirMigration::BothPresent(msg)) => push_log(logs, format!("startup: ⚠ {msg}")),
+        // A failed migration must NOT start a node on a fresh empty chain next to a
+        // perfectly good one the operator cannot see. Stop and say why.
+        Err(e) => return Err(e),
+    }
+    let node_dir = ensure_durable_node_dir(net)?;
 
     // Safety: never silently destroy a chain. If this chain was mined to a DIFFERENT
     // wallet, refuse rather than wiping it — the user selects that wallet, or uses
@@ -13916,6 +14080,147 @@ mod tests {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// **A mainnet chain must NEVER live where the OS can delete it.**
+    ///
+    /// Station stored `blocks.log` in `$TMPDIR/sov-station-node-mainnet`. On macOS
+    /// that is a `/var/folders/.../T` directory the OS purges on reboot, under disk
+    /// pressure, and periodically — so the operator's chain was silently deleted and
+    /// re-synced from genesis, over and over. This is the regression guard: whatever
+    /// the resolution rules become, the answer may not be inside the temp directory.
+    #[test]
+    fn the_chain_directory_is_never_inside_the_os_temp_directory() {
+        let _g = env_guard();
+        let prev = std::env::var("SOV_STATION_DIR").ok();
+        std::env::remove_var("SOV_STATION_DIR");
+
+        for net in ["mainnet", "testnet", "devnet"] {
+            let dir = local_node_dir(net).expect("a durable chain dir resolves");
+            assert!(
+                !dir.starts_with(std::env::temp_dir()),
+                "the {net} chain dir resolved inside the purgeable temp dir: {dir:?}"
+            );
+            assert!(
+                dir.starts_with(station_dir().unwrap()),
+                "the {net} chain dir must live beside the keystore in the station dir, \
+                 got {dir:?}"
+            );
+        }
+
+        // The belt-and-braces guard, exercised against a THROWAWAY home so the test
+        // never creates a directory in the operator's real install.
+        let prev_home = std::env::var("HOME").ok();
+        let scratch = std::env::temp_dir().join(format!("sov-durable-test-{}", std::process::id()));
+        std::env::set_var("HOME", &scratch);
+        let made = ensure_durable_node_dir("mainnet").expect("a durable dir is created");
+        assert!(
+            !made.starts_with(std::env::temp_dir().join("sov-station-node-mainnet")),
+            "ensure_durable_node_dir must never hand back the old purgeable path"
+        );
+        assert!(made.is_dir(), "and it creates the directory it promises");
+        let _ = std::fs::remove_dir_all(&scratch);
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        match prev {
+            Some(v) => std::env::set_var("SOV_STATION_DIR", v),
+            None => std::env::remove_var("SOV_STATION_DIR"),
+        }
+    }
+
+    /// The one-time rescue of a chain already sitting in the temp dir: it MOVES,
+    /// it never re-syncs, and it never destroys anything.
+    #[test]
+    fn a_temp_dir_chain_is_migrated_once_and_never_destroyed() {
+        let _g = env_guard();
+        let prev = std::env::var("SOV_STATION_DIR").ok();
+        let scratch = std::env::temp_dir().join(format!(
+            "sov-migrate-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // A unique network name so this test never touches a real store.
+        let net = format!("migtest{}", std::process::id());
+        let legacy = legacy_temp_node_dir(&net);
+        let _ = std::fs::remove_dir_all(&legacy);
+
+        // Home points at the scratch dir, so `station_dir()` (and therefore the
+        // durable node dir) is a throwaway path — the override is deliberately NOT
+        // used, because migration is skipped for dev builds.
+        let prev_home = std::env::var("HOME").ok();
+        std::env::remove_var("SOV_STATION_DIR");
+        std::env::set_var("HOME", &scratch);
+
+        // 1. Nothing to migrate is a clean no-op.
+        assert_eq!(
+            migrate_node_dir_from_temp(&net).unwrap(),
+            NodeDirMigration::Nothing,
+            "a fresh install has nothing to rescue"
+        );
+
+        // 2. A legacy store MOVES, contents intact — no re-sync.
+        std::fs::create_dir_all(legacy.join("node-1/data")).unwrap();
+        std::fs::write(legacy.join("node-1/data/blocks.log"), b"CHAIN-BYTES").unwrap();
+        std::fs::write(legacy.join("miner.txt"), b"acct").unwrap();
+        let moved = migrate_node_dir_from_temp(&net).unwrap();
+        assert!(
+            matches!(moved, NodeDirMigration::Moved(_)),
+            "an existing temp-dir chain must be rescued, got {moved:?}"
+        );
+        let durable = local_node_dir(&net).unwrap();
+        assert_eq!(
+            std::fs::read(durable.join("node-1/data/blocks.log")).unwrap(),
+            b"CHAIN-BYTES",
+            "the chain itself survived the move byte-for-byte"
+        );
+        assert!(durable.join("miner.txt").exists(), "siblings moved too");
+        assert!(
+            !legacy.exists(),
+            "the purgeable copy is gone after a clean move"
+        );
+
+        // 3. Already migrated is a no-op — it must not run again on every start.
+        assert_eq!(
+            migrate_node_dir_from_temp(&net).unwrap(),
+            NodeDirMigration::Nothing
+        );
+
+        // 4. BOTH present destroys NOTHING. This is the case where guessing wrong
+        //    costs someone their chain, so neither side is touched.
+        std::fs::create_dir_all(legacy.join("node-1/data")).unwrap();
+        std::fs::write(legacy.join("node-1/data/blocks.log"), b"OLD-CHAIN").unwrap();
+        let both = migrate_node_dir_from_temp(&net).unwrap();
+        assert!(
+            matches!(both, NodeDirMigration::BothPresent(_)),
+            "with both stores present the migration must stand down, got {both:?}"
+        );
+        assert_eq!(
+            std::fs::read(legacy.join("node-1/data/blocks.log")).unwrap(),
+            b"OLD-CHAIN",
+            "the legacy store is left exactly as it was — never deleted"
+        );
+        assert_eq!(
+            std::fs::read(durable.join("node-1/data/blocks.log")).unwrap(),
+            b"CHAIN-BYTES",
+            "and the durable store is untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&legacy);
+        let _ = std::fs::remove_dir_all(&scratch);
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev {
+            Some(v) => std::env::set_var("SOV_STATION_DIR", v),
+            None => std::env::remove_var("SOV_STATION_DIR"),
+        }
+    }
+
     /// `SOV_STATION_DIR` must actually redirect the data directory.
     ///
     /// This path was hardcoded, so any build run from a working tree opened the
@@ -13953,14 +14258,16 @@ mod tests {
     /// The override must isolate the CHAIN DIRECTORY and the preference dotfiles too,
     /// not only the wallet files.
     ///
-    /// The chain directory is the sharpest of these: it is keyed by network name in the
-    /// temp dir, so without the override a dev build and the installed Station open the
-    /// same `sov-station-node-mainnet` database. Two processes on one chain database is
-    /// how a dev build takes the operator's node down with it.
+    /// The chain directory is the sharpest of these: it is keyed by network name, so
+    /// without the override a dev build and the installed Station open the same
+    /// database. Two processes on one chain database is how a dev build takes the
+    /// operator's node down with it.
     ///
-    /// Equally important is the other direction: with the override UNSET, every path
-    /// must resolve exactly where it always did, or an existing install silently loses
-    /// its saved peer, theme and chain on upgrade.
+    /// Equally important is the other direction: with the override UNSET, the
+    /// preference dotfiles must resolve exactly where they always did, or an existing
+    /// install silently loses its saved peer and theme on upgrade. (The CHAIN dir is
+    /// the one deliberate exception — it moved OUT of the purgeable temp dir in 0.2.7
+    /// and is migrated, not abandoned; see the tests below.)
     #[test]
     fn the_override_isolates_the_chain_dir_and_preferences_without_migrating_anyone() {
         let _g = env_guard();
@@ -13968,7 +14275,7 @@ mod tests {
         let scratch = "/tmp/sov-station-scratch-xyz";
 
         std::env::set_var("SOV_STATION_DIR", scratch);
-        let node = local_node_dir("mainnet");
+        let node = local_node_dir("mainnet").unwrap();
         assert!(
             node.starts_with(scratch),
             "the chain dir must move under the override, got {node:?}"
@@ -13997,9 +14304,9 @@ mod tests {
         // works" half: an operator upgrading must keep their peer, theme and chain.
         std::env::remove_var("SOV_STATION_DIR");
         assert_eq!(
-            local_node_dir("mainnet"),
-            std::env::temp_dir().join("sov-station-node-mainnet"),
-            "without the override the chain dir must be exactly where it always was"
+            local_node_dir("mainnet").unwrap(),
+            station_dir().unwrap().join("node-mainnet"),
+            "the chain dir lives under the durable station dir, beside the keystore"
         );
         assert!(theme_config_path().ends_with(".sov-station-theme"));
         assert!(peer_config_path(Network::Mainnet).ends_with(".sov-station-peer-mainnet"));
