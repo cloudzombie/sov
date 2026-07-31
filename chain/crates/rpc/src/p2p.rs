@@ -44,6 +44,8 @@
 //! * the resolved fork point ([`SyncState::resume_from`]) outlives peer churn, so
 //!   a reconnect resumes forward download instead of re-walking the locator.
 
+#![allow(rustdoc::private_intra_doc_links)]
+
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
