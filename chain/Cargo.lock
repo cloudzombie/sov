@@ -2189,7 +2189,6 @@ name = "sov-wallet"
 version = "0.0.0"
 dependencies = [
  "bip39",
- "getrandom 0.2.17",
  "hmac",
  "sha2 0.10.9",
  "sov-crypto",

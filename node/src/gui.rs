@@ -12347,11 +12347,13 @@ const HTLC_MIN_TIMEOUT_BLOCKS: u64 = 20;
 
 /// A fresh 32-byte HTLC secret from the OS CSPRNG, rendered as lowercase hex. The
 /// secret's bytes are the preimage (hashlock = sha256(secret bytes)), so it must be
-/// unguessable — 256 bits of OS entropy is. Empty on the (near-impossible) RNG
-/// failure, so the entropy gate rejects it rather than let a weak secret through.
+/// unguessable — 256 bits of OS entropy is, drawn through the health-checked
+/// chokepoint (`sov_crypto::fill_secure`, which FAILS CLOSED if the startup RNG
+/// self-test flagged a degraded source). Empty on RNG/health failure, so the
+/// entropy gate rejects it rather than let a weak secret through.
 fn random_secret_hex() -> String {
     let mut buf = [0u8; 32];
-    if getrandom::getrandom(&mut buf).is_err() {
+    if sov_crypto::fill_secure(&mut buf).is_err() {
         return String::new();
     }
     let s = hex_lower(&buf);
@@ -12558,7 +12560,7 @@ fn encrypt_blob(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
     use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let mut nonce = [0u8; 12];
-    getrandom::getrandom(&mut nonce).map_err(|e| e.to_string())?;
+    sov_crypto::fill_secure(&mut nonce).map_err(|e| e.to_string())?;
     let ct = cipher
         .encrypt(Nonce::from_slice(&nonce), plaintext)
         .map_err(|_| "encrypt failed".to_string())?;

@@ -241,10 +241,13 @@ fn derive_seed(domain: &str, seed: &[u8; 32]) -> [u8; 32] {
 }
 
 impl Keypair {
-    /// Generate a fresh Ed25519 keypair from operating-system entropy.
+    /// Generate a fresh Ed25519 keypair from operating-system entropy, drawn
+    /// through the health-checked chokepoint ([`crate::rng::fill_secure`]):
+    /// on a degraded entropy source this FAILS CLOSED with an error instead
+    /// of minting a key.
     pub fn generate() -> Result<Self, KeyError> {
         let mut seed = [0u8; 32];
-        getrandom::getrandom(&mut seed).map_err(|_| KeyError::Entropy)?;
+        crate::rng::fill_secure(&mut seed).map_err(|_| KeyError::Entropy)?;
         let kp = Keypair(KeypairInner::V1(SigningKey::from_bytes(&seed)));
         seed.fill(0); // best-effort wipe of the seed copy
         Ok(kp)
@@ -273,10 +276,12 @@ impl Keypair {
         })
     }
 
-    /// Generate a fresh hybrid keypair from operating-system entropy.
+    /// Generate a fresh hybrid keypair from operating-system entropy, drawn
+    /// through the health-checked chokepoint ([`crate::rng::fill_secure`]);
+    /// FAILS CLOSED on a degraded source, like [`Keypair::generate`].
     pub fn hybrid_generate() -> Result<Self, KeyError> {
         let mut seed = [0u8; 32];
-        getrandom::getrandom(&mut seed).map_err(|_| KeyError::Entropy)?;
+        crate::rng::fill_secure(&mut seed).map_err(|_| KeyError::Entropy)?;
         let kp = Self::hybrid_from_seed(seed);
         seed.fill(0);
         Ok(kp)
@@ -329,8 +334,9 @@ impl fmt::Debug for Keypair {
 /// Error produced while generating key material.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum KeyError {
-    /// The OS entropy source failed.
-    #[error("failed to obtain entropy from the operating system")]
+    /// The OS entropy source failed or did not pass the startup RNG health
+    /// self-test ([`crate::rng`]).
+    #[error("failed to obtain validated entropy from the operating system")]
     Entropy,
 }
 
@@ -415,6 +421,19 @@ mod tests {
         let a = Keypair::generate().unwrap().public_key();
         let b = Keypair::generate().unwrap().public_key();
         assert_ne!(a, b);
+    }
+
+    /// Fail-closed wiring: while the RNG health chokepoint reports a failed
+    /// startup test, key generation must return `Err` — never a key — and
+    /// must recover only when the source is healthy again.
+    #[test]
+    fn generation_fails_closed() {
+        crate::rng::test_support::set_forced_failure(Some(crate::rng::HealthFailure::Stuck));
+        assert_eq!(Keypair::generate().err(), Some(KeyError::Entropy));
+        assert_eq!(Keypair::hybrid_generate().err(), Some(KeyError::Entropy));
+        crate::rng::test_support::set_forced_failure(None);
+        assert!(Keypair::generate().is_ok());
+        assert!(Keypair::hybrid_generate().is_ok());
     }
 
     // ---- Hybrid Ed25519 + ML-DSA-65 (post-quantum) ----
