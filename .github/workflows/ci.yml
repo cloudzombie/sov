@@ -36,16 +36,14 @@ jobs:
             echo "chain/crates/redteam belongs in https://github.com/cloudzombie/sov-redteam" >&2
             exit 1
           fi
-      # The harness attacks THIS repository's consensus. If a copy of it could live here as
-      # a path dep, the attacked code and the attacking code would move together in one
-      # commit — a red team that can be silently edited to keep passing is worthless. So the
-      # GUI must consume it from the standalone repo, never over `../chain/crates/redteam`.
-      - name: Red Team GUI consumes the harness from its own repository
+      # The harness attacks THIS repository's consensus, and its desktop GUI ships from the
+      # same standalone repo. A copy of either here would let the attacked code and the
+      # attacking code move together in one commit — a red team that can be silently edited to
+      # keep passing is worthless. Both live in https://github.com/cloudzombie/sov-redteam.
+      - name: Red Team GUI remains external
         run: |
-          if grep -q 'path = "\.\./chain' redteam-gui/Cargo.toml; then
-            echo "redteam-gui must depend on the sov crates by git, not by path:" >&2
-            grep -n 'path = "\.\./chain' redteam-gui/Cargo.toml >&2
-            echo "a local path dep would also be a SECOND source of sov-crypto, which cargo does not unify" >&2
+          if test -n "$(git ls-files 'redteam-gui/**')"; then
+            echo "redteam-gui belongs in https://github.com/cloudzombie/sov-redteam" >&2
             exit 1
           fi
 

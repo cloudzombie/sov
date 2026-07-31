@@ -29,9 +29,9 @@ Three tools have been extracted to standalone repositories and are guarded by th
   over there instead of a surprise on release day. **This is deliberate and load-bearing** —
   the harness must NOT live in the same commit as the code it attacks, or an inconvenient
   VULNERABLE verdict could be edited away in the same change that caused it.
-  `redteam-gui/` stays here (it is a desktop app, not the engine) and consumes the harness by
-  **git**, never by path; CI enforces that too, because a `../chain/...` path dep would also be
-  a second, non-unifying source of `sov-crypto`.
+  `redteam-gui/` (the desktop app) now lives in that repo too, as a workspace member beside the
+  engine — this monorepo carries NO red-team code at all. CI enforces that both the harness and
+  its GUI stay external.
 
 ## Golden rules (do not break)
 
