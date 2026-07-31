@@ -23,6 +23,17 @@ use sov_mining::{Difficulty, MiningPolicy, Target, Work};
 use sov_primitives::{AccountId, Balance};
 use sov_types::{Action, Block, SignedTransaction, Transaction};
 
+// The steal-the-pot sweep constructs the full Action surface, whose variants name
+// these types; they are exercised only by the in-process tests, so gate the imports.
+#[cfg(test)]
+use sov_compliance::CompliancePolicy;
+#[cfg(test)]
+use sov_intents::{Asset, Intent, Settlement};
+#[cfg(test)]
+use sov_primitives::Hash;
+#[cfg(test)]
+use sov_types::MultisigApproval;
+
 /// Live-fire front-door probe: attack a REAL running node over JSON-RPC.
 pub mod live;
 pub use live::{any_vulnerable as live_any_vulnerable, probe_frontdoor, LiveReport};
@@ -1146,6 +1157,288 @@ fn atk_tx_flood() -> Outcome {
     }
 }
 
+// ── steal-the-pot: EXHAUSTIVE in-process sweep ───────────────────────────────
+//
+// The live Gauntlet (`gauntlet.rs`) attacks the real pot over RPC. This is its
+// CI-runnable twin: a local chain where a pot-like keyless implicit account holds
+// a balance, so the same theft attempts run through REAL consensus
+// (`produce_block`/`import_block`, real signature + authorization verification)
+// with no live node. The completeness guarantee lives here: EVERY `Action` variant
+// is constructed as a pot-theft signed by an ATTACKER key and must be REJECTED with
+// the pot's balance unchanged — no action type has a weak authorization path.
+
+/// The pot's key seed. Hybrid (Ed25519 + ML-DSA-65), exactly like the mainnet pot,
+/// so the post-quantum conjunction can be exercised with the pot's OWN key.
+#[cfg(test)]
+const POT_SEED: [u8; 32] = [77; 32];
+
+/// The attacker's key seed for the sweep — anything that is NOT the pot's key.
+#[cfg(test)]
+const POT_ATTACKER_SEED: [u8; 32] = [88; 32];
+
+/// The number of `Action` variants the sweep must cover. Bump this when a variant
+/// is added — the coverage test (`every_action_variant_has_a_steal_attempt`) fails
+/// until the new variant appears in [`every_pot_theft`], and [`action_kind`]'s
+/// wildcard-free match fails to compile until it is named there too.
+#[cfg(test)]
+const ACTION_VARIANT_COUNT: usize = 33;
+
+/// The pot account: a keyless IMPLICIT id (`id == blake3(pubkey)`), bound to the
+/// pot key — the on-chain shape of the real steal-the-pot account.
+#[cfg(test)]
+fn pot_account() -> AccountId {
+    Keypair::hybrid_from_seed(POT_SEED)
+        .public_key()
+        .implicit_account_id()
+}
+
+/// A chain like [`fresh_chain`] with a funded pot: the pot's implicit id holds 500
+/// SOV under the pot's hybrid key. Same test mining policy, so blocks mine fast.
+#[cfg(test)]
+fn pot_chain() -> Blockchain {
+    let config = GenesisConfig {
+        chain_id: "sov-redteam".into(),
+        timestamp_ms: 1_000,
+        accounts: vec![
+            GenesisAccount {
+                account: id("val01.node.sov"),
+                key: Keypair::from_seed([1; 32]).public_key(),
+                balance: Balance::ZERO,
+            },
+            GenesisAccount {
+                account: pot_account(),
+                key: Keypair::hybrid_from_seed(POT_SEED).public_key(),
+                balance: Balance::from_sov(500).unwrap(),
+            },
+        ],
+        mining: MiningPolicy::test(),
+        vesting: vec![],
+    };
+    Blockchain::new(&config).unwrap()
+}
+
+/// Forge `action` DECLARED by the pot but signed by the attacker key — the
+/// in-process twin of `gauntlet::forge`. The tx carries the attacker's key, so
+/// authorization rejects it (that key's hash is not the pot's id).
+#[cfg(test)]
+fn pot_forgery(action: Action) -> SignedTransaction {
+    let attacker = Keypair::hybrid_from_seed(POT_ATTACKER_SEED);
+    let tx = Transaction {
+        signer: pot_account(),
+        public_key: attacker.public_key(),
+        nonce: 0,
+        action,
+    };
+    SignedTransaction::sign(tx, &attacker).unwrap()
+}
+
+/// The bar every pot-theft must clear on the real chain: mining + importing a block
+/// carrying the forgery leaves the POT BALANCE UNCHANGED, and the forgery is
+/// REJECTED (excluded at selection, or the block that includes it fails import). A
+/// theft that is merely "mined but reverted" would still be a fail here IF it moved
+/// a grain — so we assert on the balance, the thing that actually matters.
+#[cfg(test)]
+fn pot_theft_refused(action: Action) -> bool {
+    let tx = pot_forgery(action);
+    let mut chain = pot_chain();
+    advance(&mut chain, 3);
+    let pot = pot_account();
+    let before = chain.ledger().account(&pot).balance.grains();
+    let Ok(block) = chain.produce_block(vec![tx.clone()], 100_000) else {
+        // The producer refused to build with it — no block, nothing moved.
+        return true;
+    };
+    let landed = block.transactions.iter().any(|t| t.id() == tx.id());
+    let imported = chain.import_block(block).is_ok();
+    let after = chain.ledger().account(&pot).balance.grains();
+    // Refused = the forgery never took effect (excluded, or its block bounced),
+    // AND the pot balance did not move by a single grain.
+    (!landed || !imported) && after == before
+}
+
+/// The kind of an [`Action`], as a compile-time EXHAUSTIVENESS GATE. The match has
+/// no wildcard arm, so adding a new `Action` variant makes this fail to compile
+/// until the variant is named here — the signal to also add its steal-attempt to
+/// [`every_pot_theft`] and bump [`ACTION_VARIANT_COUNT`]. This is the mechanism
+/// that stops a new action type from silently shipping without a theft test.
+#[cfg(test)]
+fn action_kind(a: &Action) -> &'static str {
+    match a {
+        Action::Transfer { .. } => "Transfer",
+        Action::ClaimVesting => "ClaimVesting",
+        Action::Deploy { .. } => "Deploy",
+        Action::Call { .. } => "Call",
+        Action::Shielded { .. } => "Shielded",
+        Action::HtlcLock { .. } => "HtlcLock",
+        Action::HtlcClaim { .. } => "HtlcClaim",
+        Action::HtlcRefund { .. } => "HtlcRefund",
+        Action::TokenIssue { .. } => "TokenIssue",
+        Action::TokenTransfer { .. } => "TokenTransfer",
+        Action::TokenBurn { .. } => "TokenBurn",
+        Action::TokenSetPolicy { .. } => "TokenSetPolicy",
+        Action::IntentSettle { .. } => "IntentSettle",
+        Action::IntentCancel { .. } => "IntentCancel",
+        Action::RotateKey { .. } => "RotateKey",
+        Action::RegisterName { .. } => "RegisterName",
+        Action::TransferName { .. } => "TransferName",
+        Action::NftMint { .. } => "NftMint",
+        Action::NftTransfer { .. } => "NftTransfer",
+        Action::NftSetMeta { .. } => "NftSetMeta",
+        Action::SetMultisig { .. } => "SetMultisig",
+        Action::MultisigExec { .. } => "MultisigExec",
+        Action::ProposeMultisig { .. } => "ProposeMultisig",
+        Action::ApproveMultisig { .. } => "ApproveMultisig",
+        Action::CancelMultisig { .. } => "CancelMultisig",
+        Action::VaultDeposit { .. } => "VaultDeposit",
+        Action::VaultMint { .. } => "VaultMint",
+        Action::VaultBurn { .. } => "VaultBurn",
+        Action::VaultWithdraw { .. } => "VaultWithdraw",
+        Action::OracleUpdate { .. } => "OracleUpdate",
+        Action::Tipped { .. } => "Tipped",
+        Action::ShieldedV2 { .. } => "ShieldedV2",
+        Action::Timestamped { .. } => "Timestamped",
+    }
+}
+
+/// One pot-theft per `Action` variant — the complete steal surface. Every entry
+/// names the pot as signer (built via [`pot_forgery`], attacker-signed) and tries
+/// to move value or seize authority. Ids (`Hash::ZERO` assets/HTLCs/collections,
+/// unregistered names) are placeholders: authorization refuses the attacker's
+/// envelope long before any of them is consulted.
+#[cfg(test)]
+fn every_pot_theft() -> Vec<Action> {
+    let attacker = Keypair::hybrid_from_seed(POT_ATTACKER_SEED);
+    let sink = sink_account(200);
+    let whole = Balance::from_sov(500).unwrap();
+    let drain = Action::Transfer {
+        to: sink.clone(),
+        amount: whole,
+    };
+    // An attacker-signed intent naming the pot as owner (the H001 bypass class).
+    let intent = Intent {
+        owner: pot_account(),
+        public_key: attacker.public_key(),
+        nonce: 0,
+        give_asset: Asset::Sov,
+        give_amount: whole.grains(),
+        want_asset: Asset::Sov,
+        min_receive: 0,
+        expiry_height: u64::MAX,
+    };
+    let signed_intent = intent.clone().sign(&attacker).unwrap();
+    vec![
+        drain.clone(),
+        Action::ClaimVesting,
+        Action::Deploy { code: vec![0; 8] },
+        Action::Call {
+            contract: pot_account(),
+            gas_limit: 1,
+            calldata: vec![],
+        },
+        Action::Shielded { bundle: vec![0; 8] },
+        Action::HtlcLock {
+            recipient: sink.clone(),
+            amount: whole,
+            hashlock: Hash::ZERO,
+            timeout_height: u64::MAX,
+        },
+        Action::HtlcClaim {
+            htlc_id: Hash::ZERO,
+            preimage: vec![0; 8],
+        },
+        Action::HtlcRefund {
+            htlc_id: Hash::ZERO,
+        },
+        Action::TokenIssue {
+            symbol: "STEAL".to_string(),
+            amount: whole,
+            to: sink.clone(),
+        },
+        Action::TokenTransfer {
+            asset: Hash::ZERO,
+            to: sink.clone(),
+            amount: whole,
+        },
+        Action::TokenBurn {
+            asset: Hash::ZERO,
+            amount: whole,
+        },
+        Action::TokenSetPolicy {
+            asset: Hash::ZERO,
+            policy: CompliancePolicy::unrestricted(),
+        },
+        Action::IntentSettle {
+            settlement: Settlement {
+                intent: signed_intent,
+                solver: sink.clone(),
+                deliver_amount: 0,
+            },
+        },
+        Action::IntentCancel { intent },
+        Action::RotateKey {
+            new_key: attacker.public_key(),
+            proof: Signature::V1Ed25519([0; 64]),
+        },
+        Action::RegisterName {
+            name: "steal.sov".to_string(),
+        },
+        Action::TransferName {
+            name: "gauntlet.sov".to_string(),
+            to: sink.clone(),
+        },
+        Action::NftMint {
+            symbol: "STEAL".to_string(),
+            token_id: vec![1],
+            to: sink.clone(),
+            metadata: vec![],
+        },
+        Action::NftTransfer {
+            collection: Hash::ZERO,
+            token_id: vec![1],
+            to: sink.clone(),
+        },
+        Action::NftSetMeta {
+            collection: Hash::ZERO,
+            token_id: vec![1],
+            metadata: vec![0; 4],
+        },
+        Action::SetMultisig {
+            signers: vec![attacker.public_key()],
+            threshold: 1,
+        },
+        Action::MultisigExec {
+            action: Box::new(drain.clone()),
+            approvals: Vec::<MultisigApproval>::new(),
+        },
+        Action::ProposeMultisig {
+            account: pot_account(),
+            action: Box::new(drain.clone()),
+        },
+        Action::ApproveMultisig {
+            account: pot_account(),
+            proposal: Hash::ZERO,
+        },
+        Action::CancelMultisig {
+            account: pot_account(),
+            proposal: Hash::ZERO,
+        },
+        Action::VaultDeposit { amount: whole },
+        Action::VaultMint { amount: whole },
+        Action::VaultBurn { amount: whole },
+        Action::VaultWithdraw { amount: whole },
+        Action::OracleUpdate { price: 1 },
+        Action::Tipped {
+            tip: Balance::from_grains(1),
+            inner: Box::new(drain.clone()),
+        },
+        Action::ShieldedV2 { bundle: vec![0; 8] },
+        Action::Timestamped {
+            created_at_ms: 0,
+            inner: Box::new(drain),
+        },
+    ]
+}
+
 /// Run the full adversarial battery against a fresh in-process chain and return
 /// every attack's [`Outcome`], grouped by class in a stable order. Pure + in-process:
 /// a GUI (SOV Station's Red Team tab) or the CLI can both call this and render the
@@ -1265,6 +1558,81 @@ mod tests {
             "the parity probe and the reported verdict must agree: {}",
             o.detail
         );
+    }
+
+    // ── steal-the-pot: exhaustive in-process sweep ──────────────────────────
+
+    /// EVERY `Action` variant, fired as an attacker-signed pot-theft through real
+    /// consensus, is REJECTED with the pot's balance unchanged. This is the
+    /// completeness guarantee: no action type has a weak authorization path.
+    #[test]
+    fn every_action_variant_is_refused_as_a_pot_theft() {
+        for action in every_pot_theft() {
+            let kind = action_kind(&action);
+            assert!(
+                pot_theft_refused(action.clone()),
+                "STEAL SUCCEEDED via {kind}: an attacker-signed {kind} moved the pot or was admitted",
+            );
+        }
+    }
+
+    /// The sweep is EXHAUSTIVE: it constructs exactly one theft per `Action`
+    /// variant, covering all [`ACTION_VARIANT_COUNT`] of them with no duplicates.
+    /// A newly added variant fails to compile in [`action_kind`] (no wildcard) and
+    /// then fails this test until it is added to [`every_pot_theft`].
+    #[test]
+    fn every_action_variant_has_a_steal_attempt() {
+        let thefts = every_pot_theft();
+        let mut kinds: Vec<&str> = thefts.iter().map(action_kind).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        assert_eq!(
+            kinds.len(),
+            ACTION_VARIANT_COUNT,
+            "the pot-theft sweep must cover all {ACTION_VARIANT_COUNT} Action variants exactly once; \
+             covered {} distinct kinds",
+            kinds.len(),
+        );
+        assert_eq!(
+            thefts.len(),
+            ACTION_VARIANT_COUNT,
+            "one theft per variant — no duplicates, no gaps",
+        );
+    }
+
+    /// The post-quantum conjunction, proven with the POT'S OWN key (what the live
+    /// Gauntlet cannot wield): the pot signs a real self-drain, then ONE hybrid
+    /// half is corrupted. Consensus must refuse it — either half alone is not
+    /// authorization, so a future break of Ed25519 alone still leaves ML-DSA-65
+    /// guarding the pot. This is the definitive backing for the live A1 vector.
+    #[test]
+    fn pot_hybrid_conjunction_is_enforced() {
+        let pot_kp = Keypair::hybrid_from_seed(POT_SEED);
+        let sink = sink_account(201);
+        let base = Transaction {
+            signer: pot_account(),
+            public_key: pot_kp.public_key(),
+            nonce: 0,
+            action: Action::Transfer {
+                to: sink.clone(),
+                amount: Balance::from_sov(1).unwrap(),
+            },
+        };
+        // A genuine, fully-valid pot signature is the control: it MUST verify.
+        let honest = SignedTransaction::sign(base.clone(), &pot_kp).unwrap();
+        assert!(
+            honest.verify_signature(),
+            "sanity: the pot's own real signature must verify",
+        );
+        // Now break each half in turn; the conjunction must fail closed both ways.
+        for half in [Half::Ed25519, Half::MlDsa] {
+            let mut tampered = honest.clone();
+            tampered.signature = tamper_signature(tampered.signature, half);
+            assert!(
+                !tampered.verify_signature(),
+                "the pot signature verified with ONE hybrid half broken — conjunction not enforced",
+            );
+        }
     }
 
     /// The whole battery still runs clean, and the new class is registered.

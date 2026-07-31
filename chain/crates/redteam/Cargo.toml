@@ -12,6 +12,11 @@ path = "src/main.rs"
 sov-primitives = { path = "../primitives" }
 sov-crypto = { path = "../crypto" }
 sov-types = { path = "../types" }
+# Constructing the full Action surface for the Gauntlet's exhaustive steal-the-pot
+# sweep: `IntentSettle` carries a `sov_intents::Settlement`, `TokenSetPolicy` a
+# `sov_compliance::CompliancePolicy`. These are the exact types the Action enum names.
+sov-intents = { path = "../intents" }
+sov-compliance = { path = "../compliance" }
 sov-state = { path = "../state" }
 sov-mining = { path = "../mining" }
 sov-verify = { path = "../verify" }
@@ -27,3 +32,9 @@ sov-network = { path = "../network" }
 sov-wallet = { path = "../wallet" }
 hex = "0.4"
 serde_json = "1"
+
+[dev-dependencies]
+# The Gauntlet's live probe talks JSON-RPC to a real node. For CI (no mainnet), an
+# integration test boots an in-process `sov-node` behind `sov-rpc`'s server, funds a
+# pot-like account, and runs `probe_gauntlet` against it — real RPC, real rejection.
+sov-node = { path = "../node" }
