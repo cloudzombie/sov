@@ -28,6 +28,7 @@ import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 // Importing keys.js initializes @noble/ed25519's synchronous SHA-512 hook (set
 // once at that module's load), which `ed.getPublicKey`/`ed.sign` need here too.
 import { KeyError } from "./keys.js";
+import { fillSecure } from "./rng.js";
 
 const ED_PUB_LEN = 32;
 const ED_SIG_LEN = 64;
@@ -257,10 +258,14 @@ export class HybridKeypair {
     return new HybridKeypair(seed, edSeed, mlSecret, signSeed, publicKey);
   }
 
-  /** Generate a fresh hybrid keypair from cryptographically secure OS entropy. */
+  /**
+   * Generate a fresh hybrid keypair from cryptographically secure OS entropy,
+   * gated by the startup RNG health self-test ({@link fillSecure}) — fails
+   * closed on a degraded entropy source.
+   */
   static generate(): HybridKeypair {
     const seed = new Uint8Array(SEED_LEN);
-    crypto.getRandomValues(seed);
+    fillSecure(seed);
     return HybridKeypair.fromSeed(seed);
   }
 

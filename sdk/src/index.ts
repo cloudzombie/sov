@@ -8,6 +8,18 @@
  * chain data and never fabricates anything.
  */
 
+// Startup RNG health self-test: named exports only — the test-only
+// `__forceUnhealthyForTests` seam is deliberately NOT part of the public API.
+export {
+  fillSecure,
+  healthCheck,
+  EntropyError,
+  STARTUP_TEST_BYTES,
+  RCT_CUTOFF,
+  APT_WINDOW,
+  APT_CUTOFF,
+} from "./rng.js";
+export type { HealthFailure } from "./rng.js";
 export * from "./units.js";
 export * from "./account.js";
 export * from "./keys.js";
