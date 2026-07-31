@@ -12,8 +12,8 @@ No consensus behavior has changed on the live chain. Nothing is armed.
 
 ## Sibling repositories (NOT in this tree)
 
-Two operator tools have been extracted to standalone repositories and are guarded by the
-`repository-boundaries` CI job here — re-adding either path fails CI:
+Three tools have been extracted to standalone repositories and are guarded by the
+`repository-boundaries` CI job here — re-adding any of their paths fails CI:
 
 - **XUS Miner** — https://github.com/cloudzombie/xus-miner (no SOV source dependency at all;
   compatibility via the documented RPC/Stratum contract).
@@ -22,6 +22,16 @@ Two operator tools have been extracted to standalone repositories and are guarde
   `sov-types`, `sov-primitives` — as **git dependencies pinned to a release TAG**, not copies.
   A chain change reaches it only when that pin is deliberately bumped there; changes on this
   branch cannot break its build, and it never modifies this repository.
+- **SOV Red Team** — https://github.com/cloudzombie/sov-redteam (was `chain/crates/redteam`).
+  The adversarial harness. Unlike the two above, it tracks `branch = "main"` rather than a
+  release tag: it exists to catch a consensus regression the day it lands, and its CI runs the
+  full gauntlet daily against this repo's `main`, so a broken defense shows up as a red build
+  over there instead of a surprise on release day. **This is deliberate and load-bearing** —
+  the harness must NOT live in the same commit as the code it attacks, or an inconvenient
+  VULNERABLE verdict could be edited away in the same change that caused it.
+  `redteam-gui/` (the desktop app) now lives in that repo too, as a workspace member beside the
+  engine — this monorepo carries NO red-team code at all. CI enforces that both the harness and
+  its GUI stay external.
 
 ## Golden rules (do not break)
 

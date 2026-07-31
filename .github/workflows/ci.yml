@@ -30,6 +30,22 @@ jobs:
             echo "tools/tx-cannon belongs in https://github.com/cloudzombie/sov-tx-cannon" >&2
             exit 1
           fi
+      - name: Red-team harness remains external
+        run: |
+          if test -n "$(git ls-files 'chain/crates/redteam/**')"; then
+            echo "chain/crates/redteam belongs in https://github.com/cloudzombie/sov-redteam" >&2
+            exit 1
+          fi
+      # The harness attacks THIS repository's consensus, and its desktop GUI ships from the
+      # same standalone repo. A copy of either here would let the attacked code and the
+      # attacking code move together in one commit — a red team that can be silently edited to
+      # keep passing is worthless. Both live in https://github.com/cloudzombie/sov-redteam.
+      - name: Red Team GUI remains external
+        run: |
+          if test -n "$(git ls-files 'redteam-gui/**')"; then
+            echo "redteam-gui belongs in https://github.com/cloudzombie/sov-redteam" >&2
+            exit 1
+          fi
 
   # The RELEASE VERSION CONTRACT guards (scripts/version-contract.sh and
   # scripts/verify-artifact-version.sh) are the last thing standing between a typo and a

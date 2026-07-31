@@ -2003,27 +2003,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sov-redteam"
-version = "0.1.0"
-dependencies = [
- "hex",
- "serde_json",
- "sov-chain",
- "sov-compliance",
- "sov-crypto",
- "sov-intents",
- "sov-mining",
- "sov-network",
- "sov-node",
- "sov-primitives",
- "sov-rpc",
- "sov-state",
- "sov-types",
- "sov-verify",
- "sov-wallet",
-]
-
-[[package]]
 name = "sov-reserve"
 version = "0.0.0"
 dependencies = [
