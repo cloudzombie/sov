@@ -358,6 +358,17 @@ pub struct NodeConfig {
     pub bootstrap_peers: Vec<String>,
     /// Trusted weak-subjectivity checkpoints: blocks at these heights must hash to
     /// the pinned value, rejecting a forged long-range history. Empty by default.
+    ///
+    /// These are ADDED to the network's baked anchors, never replacing them, and
+    /// they are the operator's escape hatch from a stale release: a fresh node can
+    /// be started close to the tip WITHOUT a source-code change or a new binary.
+    /// Take the pair from a node you trust — a running node writes its own
+    /// self-derived anchor to `assumevalid.dat` in its data dir, and
+    /// `scripts/refresh-checkpoint.sh` prints one confirmed on two relays.
+    ///
+    /// Trust here is weak-subjectivity, exactly as for the baked pins: a wrong hash
+    /// does not corrupt anything, it makes the node reject the real chain at that
+    /// height. Take it from a source you would take a binary from.
     #[serde(default)]
     pub checkpoints: Vec<CheckpointSpec>,
     /// P2P allowlist ("noban"): IPs / hosts that are NEVER banned or refused by the
@@ -991,6 +1002,32 @@ const MAINNET_CHECKPOINTS: &[(u64, &str)] = &[
         12800,
         "91be1fa3add5a9bf2b7a40c1a3130d45b3e3ed35e8f04f0c91c80d9abafda475",
     ),
+    // Pinned 2026-07-30 at tip 14873 (this block is ~537 deep — far past the
+    // 6-confirmation finality bar). The canonical hash was independently confirmed
+    // IDENTICAL on the SFO relay (137.184.83.91) and on a separate local full node
+    // before pinning.
+    //
+    // The 12800 anchor had gone stale by ~2,073 blocks — past this file's own
+    // `CHECKPOINT_MAX_LAG_BLOCKS` guard, and the FOURTH time the anchor has drifted
+    // (5000 -> 6800 -> 8300 -> 12800 -> here). PQ signatures made blocks far larger
+    // (~10.8 KB/tx, blocks up to 1.7 MB), so the catch-up validation above the anchor
+    // is heavier than in any prior occurrence.
+    //
+    // THIS PIN IS NOT THE FIX. It shortens a fresh node's catch-up, nothing more.
+    // The failure it used to cause — CPU-bound verification starving the single P2P
+    // worker thread, so peers time out, all connections drop, and the fork-point
+    // locator exchange restarts forever — is fixed structurally in
+    // `chain/crates/rpc/src/p2p.rs`: block verification now runs on a dedicated
+    // verifier thread with a bounded queue, the worker keeps announcing/serving while
+    // it runs, peer liveness deadlines are credited for local stalls, and the resolved
+    // fork point survives peer churn. A stale anchor is now a SLOWNESS, not an outage.
+    //
+    // Weak-subjectivity anchor, genesis-safe, additive — a chain reaching 14336 with a
+    // different hash is still rejected by the hash pin.
+    (
+        14336,
+        "685294af86208f8495cce21d3ae2b19fc0c80d0285d8ee92cbff76b66124e2e5",
+    ),
 ];
 
 /// How far the newest baked checkpoint may fall behind the live tip before the
@@ -1366,6 +1403,52 @@ const SNAPSHOT_EVERY_BLOCKS: u64 = 50;
 /// receipt.
 const SNAPSHOT_VERSION: u32 = 2;
 
+/// Path of this node's SELF-DERIVED assumevalid anchor within a data dir.
+fn local_anchor_path(dir: &Path) -> PathBuf {
+    dir.join("assumevalid.dat")
+}
+
+/// On-disk format version for the self-derived anchor file.
+const LOCAL_ANCHOR_VERSION: u32 = 1;
+
+/// How deep below the tip a node's own block must be buried before it is adopted
+/// as a local assumevalid anchor. Far past [`sov_chain::FINALITY_DEPTH`] (6) — a
+/// day and a half of blocks at the 2.5-minute target — so the anchor a node
+/// self-pins is never anywhere near a plausible reorg.
+const LOCAL_ANCHOR_DEPTH: u64 = 1_000;
+
+/// How many blocks of active-head advance between anchor adoptions. Adoption
+/// re-derives the ancestry proof from local headers — O(chain length), under the
+/// node lock — so it runs on its own slow cadence rather than on every snapshot.
+const LOCAL_ANCHOR_STRIDE: u64 = 500;
+
+/// Serialize a self-derived anchor: `[checksum][version, height, hash]`.
+fn local_anchor_bytes(height: u64, hash: Hash) -> Vec<u8> {
+    let payload = borsh::to_vec(&(LOCAL_ANCHOR_VERSION, height, hash))
+        .expect("anchor serialization is infallible");
+    let mut out = Hash::digest(&payload).as_bytes().to_vec();
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// Read a self-derived anchor written by [`local_anchor_bytes`]. A missing,
+/// truncated, corrupt, or wrong-version file simply yields `None` — the anchor is
+/// an optimization, never a requirement.
+fn load_local_anchor(path: &Path) -> Option<(u64, Hash)> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() <= Hash::LEN {
+        return None;
+    }
+    let (checksum, payload) = bytes.split_at(Hash::LEN);
+    if Hash::digest(payload).as_bytes() != checksum {
+        return None;
+    }
+    match borsh::from_slice::<(u32, u64, Hash)>(payload) {
+        Ok((LOCAL_ANCHOR_VERSION, height, hash)) => Some((height, hash)),
+        _ => None,
+    }
+}
+
 /// Serialize a chainstate snapshot of `chain` to a checksummed byte blob:
 /// `[checksum: 32-byte BLAKE3 of payload][payload]`, where the payload is Borsh
 /// `(version, head_hash, head_height, head_state_root, ledger_bytes, active_receipts)`.
@@ -1575,6 +1658,9 @@ pub struct Daemon {
     gossip: Option<Arc<TcpNode>>,
     /// Where the chainstate fast-start snapshot is written/refreshed.
     snapshot_path: PathBuf,
+    /// Where this node's SELF-DERIVED assumevalid anchor is written/refreshed, so
+    /// the pin maintains itself instead of waiting on the next release.
+    local_anchor_path: PathBuf,
     /// Where the pending mempool is persisted, so it survives a restart.
     mempool_path: PathBuf,
     /// Where the NODE-LOCAL transaction-timing index is persisted, so this
@@ -1784,6 +1870,23 @@ impl Daemon {
         // Operator-configured checkpoints are ADDED on top later (`with_checkpoints`).
         node.add_checkpoints(baked_checkpoints(&genesis.chain_id));
 
+        // SELF-MAINTAINING ANCHOR. The baked pins above are a bootstrap for a node
+        // with no history; they go stale between releases, and every time they have,
+        // the field failure was the same. A node that already has history does not
+        // need them: re-adopt the anchor THIS node derived from its own finalized
+        // chain last run, so a restart never re-verifies its own past and the pin
+        // keeps moving forward without a source-code change.
+        //
+        // Trusting it is trusting our own disk — the same trust the block log already
+        // has — and it is verified against the chain we just replayed before use, so a
+        // stale or foreign file is inert rather than dangerous.
+        let anchor_file = local_anchor_path(&data_dir);
+        if let Some((h, hash)) = load_local_anchor(&anchor_file) {
+            if node.chain().block_by_height(h).map(|b| b.hash()) == Some(hash) {
+                node.add_checkpoints([(h, hash)]);
+            }
+        }
+
         // Restore the pending pool persisted at last shutdown, re-validating every tx
         // against the state we just replayed (stale/unaffordable ones are dropped). The
         // chain is the source of truth, so a missing/corrupt file is harmless.
@@ -1808,6 +1911,7 @@ impl Daemon {
             block_log,
             gossip: None,
             snapshot_path: snap_path,
+            local_anchor_path: anchor_file,
             mempool_path: mp_path,
             txtiming_path: tt_path,
             resumed_fast,
@@ -2034,6 +2138,7 @@ impl Daemon {
         let gossip = self.gossip.clone();
         let block_log = Arc::clone(&self.block_log);
         let snap_path = self.snapshot_path.clone();
+        let anchor_path = self.local_anchor_path.clone();
         let mp_path = self.mempool_path.clone();
         let tt_path = self.txtiming_path.clone();
         let sync_status = self.sync_status.clone();
@@ -2053,6 +2158,9 @@ impl Daemon {
                                    // stalling peer connections. The duty-cycle THROTTLE below (a normal-priority
                                    // thread that sleeps OFF the lock) frees CPU for networking without that risk.
             let mut last_snap_height = 0u64;
+            // Active height at which this node last advanced its own assumevalid
+            // anchor — see LOCAL_ANCHOR_STRIDE.
+            let mut last_anchor_height = 0u64;
             // Track the mining phase so each transition (connecting → syncing → mining) is
             // logged once. `start_at` bounds the connect-before-mining grace window.
             let mut last_phase: Option<MinePhase> = None;
@@ -2090,6 +2198,45 @@ impl Daemon {
                 if let Some((h, bytes)) = pending {
                     if write_snapshot_bytes(&snap_path, &bytes).is_ok() {
                         last_snap_height = h;
+                    }
+                    // SELF-MAINTAINING ASSUMEVALID ANCHOR. On the same cadence, move
+                    // this node's own anchor forward to a block of its own finalized
+                    // history buried LOCAL_ANCHOR_DEPTH deep, and persist it.
+                    //
+                    // This is what takes the anchor off the release checklist: a node
+                    // that has been running keeps its own pin current, so a restart
+                    // never re-verifies its own past, and an operator can hand the
+                    // resulting `(height, hash)` to a fresh node via the config's
+                    // `checkpoints` list without anyone editing source. It cannot widen
+                    // what is skipped — `adopt_local_finalized_checkpoint` refuses
+                    // unless the newest EXISTING pin is matched on this very chain, and
+                    // the seal skip stays ancestry-gated either way.
+                    //
+                    // Only every LOCAL_ANCHOR_STRIDE blocks: adoption re-derives the
+                    // ancestry proof from local headers (O(chain length)) under the
+                    // node lock, so it must not run on every snapshot tick.
+                    let adopted = if h >= last_anchor_height.saturating_add(LOCAL_ANCHOR_STRIDE) {
+                        node.lock().ok().and_then(|mut n| {
+                            n.chain_mut()
+                                .adopt_local_finalized_checkpoint(LOCAL_ANCHOR_DEPTH)
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some((ah, ahash)) = adopted {
+                        last_anchor_height = h;
+                        if write_snapshot_bytes(&anchor_path, &local_anchor_bytes(ah, ahash))
+                            .is_ok()
+                        {
+                            daemon_log(
+                                &log,
+                                format!(
+                                    "⚓ assumevalid anchor advanced to {ah} ({ahash}) from \
+                                     this node's own finalized history — restarts, and fresh \
+                                     nodes configured with it, skip re-verifying below it"
+                                ),
+                            );
+                        }
                     }
                     // Persist the pending pool alongside each chainstate snapshot, so a
                     // crash between here and shutdown still recovers most of the pool.

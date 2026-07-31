@@ -16,11 +16,38 @@
 //! entirely — its blocks and transactions are never applied. Every applied block
 //! is still re-validated by the chain's own import path, so the network is
 //! trustless even among handshaken peers.
+//!
+//! # Verification never runs on the network thread
+//!
+//! Block validation is CPU-bound — a RandomX seal evaluation plus hybrid
+//! (Ed25519 + ML-DSA-65) signature checks per transaction — and a catch-up batch
+//! is up to [`SYNC_BATCH`] blocks. Running that inline on the socket-servicing
+//! worker is what produced the recurring **fresh-node sync outage**: the worker
+//! stopped announcing for the duration of the batch, every remote peer reaped the
+//! silent connection at its own [`PEER_INACTIVITY_TIMEOUT`], the node dropped to
+//! zero peers, and on reconnect the fork-point locator exchange started over —
+//! forever.
+//!
+//! So verification does not live here. [`SyncState`] hands every unit of import
+//! work to a dedicated **verifier thread** ([`SyncState::attach_verifier`]) over a
+//! bounded queue and reads results back as [`VerifyReport`]s. The worker thread
+//! keeps announcing, serving `GetBlocks`/`GetHeaders`, sweeping and publishing
+//! telemetry the whole time it verifies. Three further guards make the starvation
+//! structurally unable to cost us peers or progress:
+//!
+//! * while a batch is being verified, catch-up requests are held (bounded memory)
+//!   and the answering peer is charged **no** stall strike — it answered; we are
+//!   the slow side;
+//! * any worker-loop iteration that overruns [`LOOP_STALL_BUDGET`] credits the
+//!   excess to every peer-liveness deadline ([`SyncState::stall_credit`]), so a
+//!   slow local pass can never be mistaken for a silent peer;
+//! * the resolved fork point ([`SyncState::resume_from`]) outlives peer churn, so
+//!   a reconnect resumes forward download instead of re-walking the locator.
 
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -249,6 +276,10 @@ impl P2p {
 
         let worker = thread::spawn(move || {
             let mut state = SyncState::new(block_log, log_sink);
+            // Move ALL block validation off this thread before the loop starts. From
+            // here on the worker only does network I/O and bookkeeping, so no amount
+            // of catch-up verification can stop it announcing or serving peers.
+            state.attach_verifier(Arc::clone(&node));
             // Periodic tasks are driven by ELAPSED TIME, not a fixed tick count, so the
             // POLL cadence can be adaptive (fast while catching up) without also firing
             // announce/reconnect/sweep far too often. Seed each timer in the past so it
@@ -261,6 +292,13 @@ impl P2p {
             let mut last_sweep = past;
             let mut last_getaddr = past;
             while !stop.load(Ordering::SeqCst) {
+                // Measure this iteration so any overrun can be credited back to every
+                // peer-liveness deadline (see `credit_stall`). Cheap: two clock reads.
+                let iter_started = Instant::now();
+                // Claim node-lock priority for the whole poll: the verifier stands
+                // aside between blocks, so announce/serve/telemetry never queue behind
+                // a long batch. Released before the nap below.
+                state.importer.begin_network_pass();
                 // Announce our identity + head so peers authenticate us and learn whether
                 // they need to sync from us.
                 if last_announce.elapsed() >= ANNOUNCE_INTERVAL {
@@ -288,10 +326,11 @@ impl P2p {
                 for (peer, msg) in tcp.drain() {
                     state.handle(&tcp, &node, &config, peer, msg);
                 }
-                // One fsync for every block imported in this drain (a catch-up batch is
-                // one fsync, not 256) — keeps the single worker thread responsive so peers
-                // are never reaped mid-import.
-                state.sync_log();
+                // Pick up whatever the verifier thread finished (it fsyncs its own
+                // batch, one fsync per job) and apply the follow-up actions here, on
+                // the thread that owns peer bookkeeping and the network. Non-blocking:
+                // a batch still verifying simply reports on a later iteration.
+                state.collect_verify_reports(&tcp, &node);
                 state.request_missing(&tcp, &node);
                 // Publish live telemetry every poll: how many blocks behind the tip we are
                 // (gates the miner only during a real download, not a 1-block race), the
@@ -308,6 +347,9 @@ impl P2p {
                 // vanished peer (clears ghost counts AND stops catch-up forever targeting
                 // a peer that can never answer).
                 if last_sweep.elapsed() >= SWEEP_INTERVAL {
+                    // Bleed off stall credit in real time first, then sweep — so a node
+                    // that has recovered returns to the normal reaping schedule.
+                    state.decay_stall_credit(last_sweep.elapsed());
                     state.sweep_unauthenticated(&tcp);
                     state.reap_dead_peers(&tcp);
                     last_sweep = Instant::now();
@@ -322,16 +364,23 @@ impl P2p {
                 // up) poll fast so batches stream back-to-back, turning a long initial
                 // sync from minutes of idle-tick overhead into seconds; otherwise idle at
                 // the slow cadence so a caught-up node sips CPU.
-                let nap = if state.has_inflight() {
+                let nap = if state.has_inflight() || state.is_verifying() {
                     SYNC_ACTIVE_POLL
                 } else {
                     IDLE_POLL
                 };
+                // Credit any overrun of THIS iteration, release node-lock priority so
+                // verification runs at full speed while we nap, then sleep.
+                state.credit_stall(iter_started.elapsed());
+                state.importer.end_network_pass();
                 thread::sleep(nap);
             }
-            // On shutdown, make durable any records the last drain wrote but hadn't yet
-            // fsync'd — so a clean stop never relies on the OS to flush the tail.
-            state.sync_log();
+            // On shutdown, stop the verifier (waiting for the job it is on) and make
+            // durable any records it wrote but hadn't yet fsync'd — so a clean stop
+            // never relies on the OS to flush the tail.
+            state.shutdown_verifier();
+            state.collect_verify_reports(&tcp, &node);
+            state.importer.sync_log();
         });
 
         P2pHandle {
@@ -560,6 +609,45 @@ const STATUS_MAX_STRIKES: u32 = 3;
 /// later delivers recovers, while a persistent non-deliverer is eventually dropped.
 const UNSUBSTANTIATED_CLAIM_PENALTY: f64 = 20.0;
 
+/// How many verification jobs may be queued for the verifier thread before the
+/// worker runs one itself. Small on purpose: catch-up already keeps exactly one
+/// batch outstanding (see [`SyncState::verifying`]), so this depth exists only to
+/// absorb gossiped tip blocks arriving while a batch verifies. A bounded queue is
+/// what makes the decoupling safe — an unbounded one would just move the stall
+/// into memory growth.
+const VERIFY_QUEUE_DEPTH: usize = 8;
+
+/// How long ONE worker-loop iteration may take before the excess is treated as a
+/// LOCAL stall and credited to every peer-liveness deadline.
+///
+/// The point is structural, not cosmetic: peer liveness is measured against OUR
+/// monotonic clock, so any time the worker is not running is time in which a
+/// perfectly healthy peer *appears* silent. Verification is off this thread now,
+/// but the guard makes the mistake impossible to reintroduce — whatever future
+/// code blocks the loop, the deadlines it blocked are extended by exactly as long
+/// as it blocked them, so "we were busy" can never be read as "the peer is dead".
+const LOOP_STALL_BUDGET: Duration = Duration::from_millis(500);
+
+/// Ceiling on accumulated stall credit, so a pathologically stalled node still
+/// eventually reaps genuinely dead connections instead of holding ghosts forever.
+const MAX_STALL_CREDIT: Duration = Duration::from_secs(600);
+
+/// How long the verifier defers to an in-progress NETWORK pass between blocks.
+///
+/// The verifier takes and releases the node lock once per block. std's `Mutex`
+/// makes no fairness guarantee, so a tight re-acquire loop can starve the worker
+/// thread waiting for that same lock — quietly reintroducing, at lock level, the
+/// starvation the verifier thread exists to remove. (Measured: a plain
+/// `yield_now()` between blocks still left the worker with 8 loop iterations
+/// across a 1.2s batch, worst iteration 453ms.) So the arbitration is explicit:
+/// while the worker is inside its poll, the verifier waits — bounded, so a stuck
+/// worker can never halt verification outright.
+const VERIFY_YIELD_CAP: Duration = Duration::from_millis(5);
+
+/// How long a single verification pass may run before it is reported to the
+/// operator (once), together with the live peer count.
+const LONG_VERIFY_NOTICE: Duration = Duration::from_secs(5);
+
 /// Of several connections to the SAME node, pick the deterministic survivor: the one
 /// with the lexicographically smallest channel binding (Noise handshake hash). Both
 /// ends of a connection share its binding, so each node picks the SAME survivor with
@@ -579,6 +667,154 @@ struct InFlight {
     peer: SocketAddr,
     /// When it was sent (for the [`BLOCK_REQUEST_TIMEOUT`] stall check).
     since: Instant,
+}
+
+/// What kind of import work a [`VerifyJob`] carries, which decides what the worker
+/// thread does with the result.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VerifyMode {
+    /// A batched catch-up reply ([`NetMessage::BlocksResponse`]).
+    Batch,
+    /// One block requested while walking back to a common ancestor
+    /// ([`NetMessage::BlockResponse`]).
+    Backtrack,
+    /// A gossiped tip block ([`NetMessage::NewBlock`]), re-broadcast once if new.
+    Announced,
+}
+
+/// CPU-bound import work handed off to the verifier thread. Owning the blocks
+/// keeps the worker thread free of them the moment the job is queued.
+struct VerifyJob {
+    /// Who sent the blocks (for penalties and catch-up bookkeeping).
+    peer: SocketAddr,
+    mode: VerifyMode,
+    blocks: Vec<Block>,
+}
+
+/// The result of a [`VerifyJob`], applied back on the worker thread — the ONLY
+/// thread that touches peer bookkeeping or the network.
+struct VerifyReport {
+    peer: SocketAddr,
+    mode: VerifyMode,
+    /// `(height, outcome)` per block, in import order. Import stops at the first
+    /// `Rejected`/`Invalid`, so that entry (when present) is the last one.
+    outcomes: Vec<(u64, ImportOutcome)>,
+    /// For [`VerifyMode::Announced`]: the block, carried back so a newly accepted
+    /// tip can be re-broadcast from the thread that owns network I/O.
+    announced: Option<Block>,
+    /// Wall time the CPU-bound pass took. Logged with the block count, which is
+    /// the node's live "blocks verified per second" figure.
+    elapsed: Duration,
+}
+
+/// The verifier thread and the channels to it. Split out so [`SyncState`] can keep
+/// deriving `Default` (the report channel must exist even before a verifier is
+/// attached, because the no-verifier fallback delivers through it too).
+struct VerifyChannel {
+    /// Bounded job queue. `None` until [`SyncState::attach_verifier`] runs (unit
+    /// tests that never spawn one), in which case jobs run inline.
+    job_tx: Option<SyncSender<VerifyJob>>,
+    /// Report sender — cloned into the verifier thread AND used by the inline
+    /// fallback, so BOTH paths deliver results through the same channel and the
+    /// same `apply_verify_report` code. There is no second import path.
+    rep_tx: Sender<VerifyReport>,
+    rep_rx: Receiver<VerifyReport>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Default for VerifyChannel {
+    fn default() -> Self {
+        let (rep_tx, rep_rx) = mpsc::channel();
+        VerifyChannel {
+            job_tx: None,
+            rep_tx,
+            rep_rx,
+            worker: None,
+        }
+    }
+}
+
+/// A verification pass currently in progress on the verifier thread. While this is
+/// set, catch-up asks for nothing more and charges nobody a stall strike.
+struct Verifying {
+    /// The peer whose blocks are being verified.
+    peer: SocketAddr,
+    /// When the pass started (diagnostics only — it is deliberately NOT a timeout;
+    /// a slow local verification is not a fault and must never drop anything).
+    since: Instant,
+}
+
+/// The block-import + durability sink, shared by the worker thread (which needs to
+/// know whether durability latched before serving blocks) and the verifier thread
+/// (which does the importing). Everything here is `Sync`, which is precisely what
+/// lets verification leave the network thread.
+#[derive(Default)]
+struct BlockImporter {
+    /// If set, blocks imported from peers are persisted here so a follower replays
+    /// its own log on restart instead of re-syncing the whole chain.
+    block_log: Option<Arc<BlockLog>>,
+    /// Optional Node-log sink for human-readable durability diagnostics.
+    log: LogSink,
+    /// Latched once a peer block is committed to memory but CANNOT be persisted
+    /// (append or fsync failure). The in-memory chain is then AHEAD of durable
+    /// history; mirroring the mined path's fail-closed posture, we STOP importing
+    /// and STOP serving blocks so a restart can never replay a shorter durable
+    /// prefix than we advertised. Atomic because it is written by the verifier
+    /// thread and read by the worker thread.
+    durable_broken: AtomicBool,
+    /// TEST SEAM: simulated per-block verification cost, applied while holding the
+    /// node lock so it models RandomX exactly where the real cost lives. Absent from
+    /// non-test builds entirely — production has no such knob.
+    #[cfg(test)]
+    verify_delay: Duration,
+    /// Set while the P2P worker thread is inside a poll and therefore wants the node
+    /// lock. The verifier defers to it between blocks — see [`VERIFY_YIELD_CAP`].
+    /// NETWORK I/O OUTRANKS VERIFICATION, always: a node that verifies fast but has
+    /// no peers has synced nothing.
+    network_priority: AtomicBool,
+}
+
+/// Run one verification job to completion. This is the ONLY place peer blocks are
+/// validated, and it runs on the verifier thread (or, with no verifier attached,
+/// synchronously — same function, same report channel).
+fn run_verify_job(node: &Mutex<Node>, importer: &BlockImporter, job: VerifyJob) -> VerifyReport {
+    let started = Instant::now();
+    let VerifyJob { peer, mode, blocks } = job;
+    let mut outcomes = Vec::with_capacity(blocks.len());
+    let mut announced = None;
+    for block in blocks {
+        let height = block.header.height.get();
+        if mode == VerifyMode::Announced {
+            // Keep a copy so the worker can re-broadcast an accepted tip. Only for
+            // single announced blocks, never for a 256-block catch-up batch.
+            announced = Some(block.clone());
+        }
+        let outcome = importer.import_and_persist(node, block);
+        outcomes.push((height, outcome));
+        // FAIRNESS. `import_and_persist` takes and releases the node lock per block,
+        // and a tight re-acquire loop on this thread can starve the worker thread
+        // waiting for the same lock (std's Mutex makes no fairness guarantee) — which
+        // would quietly reintroduce the very starvation this thread exists to remove.
+        // Yielding is not enough on its own (std's Mutex is unfair), so the worker
+        // also gets an explicit priority window — see `await_network_pass`.
+        thread::yield_now();
+        importer.await_network_pass();
+        // Stop at the first block that does not connect or does not validate: the
+        // rest of the batch descends from it and cannot be applied either.
+        if matches!(outcome, ImportOutcome::Rejected | ImportOutcome::Invalid) {
+            break;
+        }
+    }
+    // ONE fsync per job — a 256-block batch costs one, not 256 — exactly as the
+    // per-drain fsync did before, but now off the network thread entirely.
+    importer.sync_log();
+    VerifyReport {
+        peer,
+        mode,
+        outcomes,
+        announced,
+        elapsed: started.elapsed(),
+    }
 }
 
 /// Per-connection sync bookkeeping for the gossip loop.
@@ -618,10 +854,29 @@ struct SyncState {
     last_recv: HashMap<SocketAddr, Instant>,
     /// The block request currently awaiting a response, if any — drives stall
     /// detection so a single slow/withholding peer cannot wedge catch-up.
+    ///
+    /// This tracks time spent waiting on the NETWORK only. It is cleared the moment
+    /// a reply lands, BEFORE the blocks are queued for verification, so local
+    /// verification time is never charged to the peer that answered.
     inflight: Option<InFlight>,
-    /// If set, blocks imported from peers are persisted here so a follower replays
-    /// its own log on restart instead of re-syncing the whole chain.
-    block_log: Option<Arc<BlockLog>>,
+    /// Set while a catch-up batch is being verified off-thread. See [`Verifying`].
+    verifying: Option<Verifying>,
+    /// The verifier thread + its job/report channels.
+    verify: VerifyChannel,
+    /// The shared import + durability sink (also owned by the verifier thread).
+    importer: Arc<BlockImporter>,
+    /// Accumulated LOCAL stall time credited to every peer-liveness deadline, so a
+    /// worker-loop iteration that overran [`LOOP_STALL_BUDGET`] cannot make a healthy
+    /// peer look silent. Decays in real time on each sweep.
+    stall_credit: Duration,
+    /// The next height to download, remembered ACROSS peer churn.
+    ///
+    /// Every honest peer is on one chain, so a resolved fork point is a fact about
+    /// OUR chain, not about the connection that revealed it. Keeping it here — and
+    /// deliberately NOT clearing it in [`SyncState::retain_connected`] — is what
+    /// stops a reconnect from re-running the locator exchange from scratch, the
+    /// endless "fork point" churn an operator sees when connections flap.
+    resume_from: Option<u64>,
     /// Optional Node-log sink for human-readable sync diagnostics (see [`LogSink`]).
     log: LogSink,
     /// Peers we have already logged an "ignoring … from unauthenticated peer" line for,
@@ -633,6 +888,9 @@ struct SyncState {
     /// Whether we have logged the current stall, so "no reply, retrying" fires on the
     /// stall transition rather than continuously.
     stalled_logged: bool,
+    /// Whether the current long verification pass has been reported, so the notice
+    /// fires once per pass rather than every poll.
+    verify_logged: bool,
     /// Consecutive unanswered block requests per peer. A request that stalls
     /// ([`BLOCK_REQUEST_TIMEOUT`]) charges a strike; any forward progress from the peer
     /// clears it. Once a peer reaches [`STATUS_MAX_STRIKES`] its advertised height is
@@ -640,13 +898,6 @@ struct SyncState {
     /// gate — so one authenticated liar advertising a tall chain it never delivers can
     /// no longer hold the node in `Syncing` (never mining) indefinitely.
     sync_strikes: HashMap<SocketAddr, u32>,
-    /// Latched once a peer block is committed to memory but CANNOT be persisted
-    /// (append or fsync failure). The in-memory chain is then AHEAD of durable
-    /// history; mirroring the mined path's fail-closed posture, we STOP importing and
-    /// STOP serving blocks so a restart can never replay a shorter durable prefix than
-    /// we advertised. Interior-mutable because the durability sinks (`import_and_persist`,
-    /// `sync_log`) run on the single worker thread behind `&self`.
-    durable_broken: Cell<bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -675,19 +926,39 @@ enum ImportOutcome {
     Invalid,
 }
 
-impl SyncState {
-    fn new(block_log: Option<Arc<BlockLog>>, log: LogSink) -> Self {
-        SyncState {
-            block_log,
-            log,
-            ..Default::default()
+impl BlockImporter {
+    /// Whether durability has latched closed (read by the worker thread before it
+    /// serves blocks, written by the verifier thread).
+    fn durable_broken(&self) -> bool {
+        self.durable_broken.load(Ordering::SeqCst)
+    }
+
+    /// Called by the P2P worker around its poll: for its duration the verifier
+    /// yields the node lock rather than re-acquiring it the instant it is free.
+    fn begin_network_pass(&self) {
+        self.network_priority.store(true, Ordering::Release);
+    }
+
+    fn end_network_pass(&self) {
+        self.network_priority.store(false, Ordering::Release);
+    }
+
+    /// Called by the verifier BETWEEN blocks: if the worker is mid-poll, stand aside
+    /// so it gets the node lock. Bounded by [`VERIFY_YIELD_CAP`], so a worker that
+    /// somehow never finishes cannot stop the chain from being verified.
+    fn await_network_pass(&self) {
+        if !self.network_priority.load(Ordering::Acquire) {
+            return;
+        }
+        let until = Instant::now() + VERIFY_YIELD_CAP;
+        while self.network_priority.load(Ordering::Acquire) && Instant::now() < until {
+            thread::sleep(Duration::from_micros(100));
         }
     }
 
     /// Flush + fsync the block log once, making durable every record written by the
-    /// imports in this poll iteration. Called once after draining all messages, so a
-    /// 256-block catch-up batch costs ONE fsync instead of 256. A cheap no-op when no
-    /// blocks were written.
+    /// imports in one verification job, so a 256-block catch-up batch costs ONE
+    /// fsync instead of 256. A cheap no-op when no blocks were written.
     fn sync_log(&self) {
         if let Some(log) = &self.block_log {
             if let Err(e) = log.sync() {
@@ -718,7 +989,7 @@ impl SyncState {
     /// does NOT panic the process: a graceful degraded halt matches the mined path,
     /// which stops the mining loop without tearing the node down.
     fn latch_durability_failure(&self, context: &str) {
-        if !self.durable_broken.replace(true) {
+        if !self.durable_broken.swap(true, Ordering::SeqCst) {
             p2p_log(
                 &self.log,
                 format!(
@@ -741,7 +1012,7 @@ impl SyncState {
         // durable history. Do NOT advance the chain further (and thus do not gossip a
         // block via the `New` path) — treat every subsequent block as a benign
         // non-connect so the node degrades quietly instead of widening the divergence.
-        if self.durable_broken.get() {
+        if self.durable_broken() {
             return ImportOutcome::Rejected;
         }
         let Ok(mut n) = node.lock() else {
@@ -750,12 +1021,20 @@ impl SyncState {
         if n.chain().contains_block(&block.hash()) {
             return ImportOutcome::Known;
         }
+        // The simulated cost of verifying this block, under the lock — see
+        // `verify_delay`. Compiled out of non-test builds.
+        #[cfg(test)]
+        if !self.verify_delay.is_zero() {
+            thread::sleep(self.verify_delay);
+        }
         let prev_head = n.chain().head().hash();
         let prev_height = n.chain().height();
-        // Time the import: this whole call holds the node lock (blocking peer I/O, RPC,
-        // mining), and a reorg currently replays its branch from genesis — an O(chain
+        // Time the import: this call holds the node lock for the duration of ONE
+        // block, and a reorg currently replays its branch from genesis — an O(chain
         // length) cost. Surfacing the lock-held time makes that cost visible so a deep
-        // replay can't masquerade as a silent stall / peer drop.
+        // replay can't masquerade as a silent stall. The lock is taken and released
+        // per block (never per batch), which is what keeps the worker thread's own
+        // announce/serve path responsive while a long batch verifies.
         let started = Instant::now();
         match n.import_block(block.clone()) {
             Ok(_) => {}
@@ -828,6 +1107,269 @@ impl SyncState {
             );
         }
         ImportOutcome::New
+    }
+}
+
+impl SyncState {
+    fn new(block_log: Option<Arc<BlockLog>>, log: LogSink) -> Self {
+        SyncState {
+            importer: Arc::new(BlockImporter {
+                block_log,
+                log: log.clone(),
+                ..Default::default()
+            }),
+            log,
+            ..Default::default()
+        }
+    }
+
+    /// Spawn the dedicated **verifier thread** and route all block validation to it.
+    ///
+    /// THIS is the structural fix for the fresh-node sync outage. Before it, a
+    /// catch-up batch of up to [`SYNC_BATCH`] blocks was validated inline on the
+    /// single P2P worker thread, which therefore stopped announcing, stopped serving
+    /// peers, and stopped sweeping for the whole (CPU-bound, minutes-long on a fresh
+    /// node above its assumevalid anchor) pass. Remote peers reaped the silent
+    /// connection and the node fell to zero peers.
+    ///
+    /// After it, the worker thread never validates anything: it hands work over a
+    /// BOUNDED queue and picks results up as [`VerifyReport`]s. The node lock is
+    /// still taken — but per block, not per batch — so the worker's own status /
+    /// serve path is only ever delayed by a single block's verification.
+    fn attach_verifier(&mut self, node: Arc<Mutex<Node>>) {
+        let (job_tx, job_rx) = mpsc::sync_channel::<VerifyJob>(VERIFY_QUEUE_DEPTH);
+        let rep_tx = self.verify.rep_tx.clone();
+        let importer = Arc::clone(&self.importer);
+        let worker = thread::Builder::new()
+            .name("sov-verify".into())
+            .spawn(move || {
+                // Ends when the sender is dropped (node shutdown).
+                for job in job_rx {
+                    if rep_tx.send(run_verify_job(&node, &importer, job)).is_err() {
+                        break; // the worker is gone; nothing to report to
+                    }
+                }
+            })
+            .ok();
+        if worker.is_some() {
+            self.verify.job_tx = Some(job_tx);
+        }
+        self.verify.worker = worker;
+    }
+
+    /// Stop the verifier thread and wait for the job it is on, so a clean shutdown
+    /// never leaves a half-applied batch racing the process exit.
+    fn shutdown_verifier(&mut self) {
+        self.verify.job_tx = None; // closes the queue
+        if let Some(w) = self.verify.worker.take() {
+            let _ = w.join();
+        }
+    }
+
+    /// Hand a unit of import work to the verifier.
+    ///
+    /// Never blocks, and — crucially — **never falls back to verifying on this
+    /// thread just because the queue is busy**. An authenticated peer spraying
+    /// `NewBlock` could otherwise saturate the queue and push CPU-bound work back
+    /// onto the socket loop, quietly restoring the exact starvation this thread
+    /// exists to prevent. A full queue simply drops the job: a gossiped block will
+    /// arrive again through ordinary sync, and a dropped catch-up batch is
+    /// re-requested on the next poll.
+    ///
+    /// Inline execution happens in exactly two cases, neither reachable from the
+    /// network: no verifier attached (unit tests), or the verifier thread has died
+    /// (in which case running inline is better than a node that stops syncing). Both
+    /// deliver their report through the SAME channel as the thread does, so there is
+    /// one result-handling path, not two.
+    fn submit_verify(&mut self, node: &Mutex<Node>, job: VerifyJob) {
+        let catch_up = job.mode != VerifyMode::Announced;
+        // A gossiped tip block is not catch-up: it must not gate downloads.
+        if catch_up {
+            self.verifying = Some(Verifying {
+                peer: job.peer,
+                since: Instant::now(),
+            });
+        }
+        let mut job = job;
+        if let Some(tx) = &self.verify.job_tx {
+            match tx.try_send(job) {
+                Ok(()) => return,
+                Err(TrySendError::Full(_)) => {
+                    // Backpressure, not an error. Drop it; catch-up re-requests.
+                    if catch_up {
+                        self.verifying = None;
+                    }
+                    return;
+                }
+                Err(TrySendError::Disconnected(j)) => job = j,
+            }
+        }
+        let report = run_verify_job(node, &self.importer, job);
+        let _ = self.verify.rep_tx.send(report);
+    }
+
+    /// Apply every finished verification back on the worker thread — the only thread
+    /// that touches peer bookkeeping or the network. Never blocks.
+    fn collect_verify_reports(&mut self, tcp: &TcpNode, node: &Mutex<Node>) {
+        while let Ok(report) = self.verify.rep_rx.try_recv() {
+            if report.mode != VerifyMode::Announced {
+                self.verifying = None;
+            }
+            self.apply_verify_report(tcp, node, report);
+        }
+    }
+
+    /// The follow-up actions for one finished [`VerifyJob`]: advance the catch-up
+    /// cursor, ask for a fork point, penalize a peer, or re-broadcast a new tip.
+    fn apply_verify_report(&mut self, tcp: &TcpNode, node: &Mutex<Node>, report: VerifyReport) {
+        let VerifyReport {
+            peer,
+            mode,
+            outcomes,
+            announced,
+            elapsed,
+        } = report;
+        if mode == VerifyMode::Announced {
+            match outcomes.first().map(|(_, o)| *o) {
+                Some(ImportOutcome::New) => {
+                    if let Some(block) = announced {
+                        tcp.broadcast(&NetMessage::NewBlock(block)); // forward once
+                    }
+                }
+                Some(ImportOutcome::Invalid) => {
+                    tcp.penalize_peer(peer, INVALID_BLOCK_PENALTY);
+                }
+                // Known, or an orphan we can't connect yet (it arrives via sync) —
+                // neither is misbehavior.
+                _ => {}
+            }
+            return;
+        }
+        if mode == VerifyMode::Backtrack {
+            let Some((h, outcome)) = outcomes.first().copied() else {
+                return;
+            };
+            match outcome {
+                ImportOutcome::New | ImportOutcome::Known => {
+                    self.bt_step.remove(&peer); // ancestor found → forward mode
+                    self.advance_or_done(peer, h);
+                }
+                ImportOutcome::Rejected => {
+                    let step = self.bt_step.get(&peer).copied().unwrap_or(1).max(1);
+                    self.sync_next.insert(peer, h.saturating_sub(step).max(1));
+                    self.bt_step.insert(peer, (step * 2).min(BACKTRACK_CAP));
+                }
+                ImportOutcome::Invalid => {
+                    // A fabricated block while backtracking: penalize and stop
+                    // syncing from this peer (don't keep walking its bogus chain).
+                    tcp.penalize_peer(peer, INVALID_BLOCK_PENALTY);
+                    self.sync_next.remove(&peer);
+                    self.bt_step.remove(&peer);
+                }
+            }
+            return;
+        }
+
+        // VerifyMode::Batch — a forward catch-up batch.
+        let mut last_ok: Option<u64> = None;
+        let mut rejected: Option<u64> = None;
+        let mut invalid = false;
+        for (h, outcome) in &outcomes {
+            match outcome {
+                ImportOutcome::New | ImportOutcome::Known => last_ok = Some(*h),
+                ImportOutcome::Rejected => rejected = Some(*h),
+                ImportOutcome::Invalid => invalid = true,
+            }
+        }
+        if invalid {
+            // A fabricated block in the batch (any valid prefix is already
+            // committed): penalize and stop trusting this peer.
+            tcp.penalize_peer(peer, INVALID_BLOCK_PENALTY);
+            self.sync_next.remove(&peer);
+            self.bt_step.remove(&peer);
+            p2p_log(
+                &self.log,
+                format!("✗ {} sent an invalid block — penalized", short_peer(&peer)),
+            );
+        } else if let Some(h) = last_ok {
+            self.bt_step.remove(&peer);
+            self.advance_or_done(peer, h);
+            // Report the measured verification throughput. This is the number that
+            // used to be invisible while the node silently lost every peer.
+            let n = outcomes.len();
+            let ms = elapsed.as_millis().max(1);
+            let per_sec = (n as f64) * 1000.0 / (ms as f64);
+            p2p_log(
+                &self.log,
+                format!(
+                    "← imported blocks up to height {h} ({n} verified in {ms}ms = \
+                     {per_sec:.1} blk/s, off the network thread)"
+                ),
+            );
+        } else if let Some(h) = rejected {
+            // First block didn't connect → we are on a fork (a stale tip).
+            // A protocol-v2 peer names the fork point in ONE round-trip via
+            // a block locator (headers-first, as Bitcoin/Monero/Zcash do);
+            // an older peer keeps the legacy one-block backward walk.
+            let peer_proto = self.peer_agents.get(&peer).map(|(v, _)| *v).unwrap_or(0);
+            let locator = if peer_proto >= HEADERS_MIN_PROTOCOL {
+                build_locator(node)
+            } else {
+                Vec::new()
+            };
+            if !locator.is_empty()
+                && tcp.send(
+                    peer,
+                    &NetMessage::GetHeaders {
+                        locator,
+                        stop: Hash::ZERO,
+                    },
+                )
+            {
+                // Await the Headers reply (one round-trip); the in-flight
+                // marker keeps request_missing from re-asking meanwhile,
+                // and its timeout still protects against a silent peer.
+                self.inflight = Some(InFlight {
+                    peer,
+                    since: Instant::now(),
+                });
+                p2p_log(
+                    &self.log,
+                    format!(
+                        "↩ height {h} didn't connect — asking {} for the fork \
+                         point (block locator)",
+                        short_peer(&peer)
+                    ),
+                );
+            } else {
+                // Legacy peer (protocol < 2), or the send failed: fall back
+                // to the single-block backward walk.
+                self.sync_next.insert(peer, h.saturating_sub(1).max(1));
+                self.bt_step.insert(peer, 1);
+                p2p_log(
+                    &self.log,
+                    format!("↩ height {h} didn't connect — backtracking to find the fork point"),
+                );
+            }
+        }
+    }
+
+    /// Credit a LOCAL worker-loop stall to every peer-liveness deadline.
+    ///
+    /// Peer liveness is measured against our own monotonic clock, so time the worker
+    /// was not running is time in which a perfectly healthy peer looks silent.
+    /// Crediting the overrun makes "we were busy" structurally distinguishable from
+    /// "the peer is dead", whatever future code does the blocking.
+    fn credit_stall(&mut self, iteration: Duration) {
+        if let Some(excess) = iteration.checked_sub(LOOP_STALL_BUDGET) {
+            self.stall_credit = (self.stall_credit + excess).min(MAX_STALL_CREDIT);
+        }
+    }
+
+    /// Bleed off stall credit in real time, so a node that recovered goes back to
+    /// reaping genuinely dead connections on the normal schedule.
+    fn decay_stall_credit(&mut self, by: Duration) {
+        self.stall_credit = self.stall_credit.saturating_sub(by);
     }
 
     fn handle(
@@ -1006,24 +1548,22 @@ impl SyncState {
             NetMessage::NewBlock(block) => {
                 // The block carries its own authority (its proof of work); import
                 // re-validates everything and fork choice decides what it does to
-                // the chain. Persisted under the node lock (order == commit
-                // order); the lock is released before any network I/O.
-                match self.import_and_persist(node, block.clone()) {
-                    ImportOutcome::New => {
-                        tcp.broadcast(&NetMessage::NewBlock(block)); // forward once
-                    }
-                    ImportOutcome::Invalid => {
-                        tcp.penalize_peer(peer, INVALID_BLOCK_PENALTY);
-                    }
-                    // Known, or an orphan we can't connect yet (it arrives via sync) —
-                    // neither is misbehavior.
-                    ImportOutcome::Known | ImportOutcome::Rejected => {}
-                }
+                // the chain. Verification (a RandomX evaluation plus every hybrid
+                // signature) goes to the verifier thread; the re-broadcast happens
+                // when its report comes back, so gossip never blocks the socket loop.
+                self.submit_verify(
+                    node,
+                    VerifyJob {
+                        peer,
+                        mode: VerifyMode::Announced,
+                        blocks: vec![block],
+                    },
+                );
             }
             NetMessage::GetBlock { height } => {
                 // Fail closed: once durability is broken we no longer serve blocks — we
                 // may be advertising a height we cannot recover on restart.
-                let block = if self.durable_broken.get() {
+                let block = if self.importer.durable_broken() {
                     None
                 } else {
                     node.lock()
@@ -1037,7 +1577,7 @@ impl SyncState {
                 // for a peer doing batched catch-up — a few round-trips instead of one
                 // request per block. Fail closed once durability is broken (serve none).
                 let want = count.min(SYNC_BATCH) as usize;
-                let blocks: Vec<Block> = if self.durable_broken.get() {
+                let blocks: Vec<Block> = if self.importer.durable_broken() {
                     Vec::new()
                 } else {
                     node.lock()
@@ -1073,29 +1613,20 @@ impl SyncState {
             }
             NetMessage::BlockResponse(Some(block)) => {
                 // A single-block response — used while BACKTRACKING to a common
-                // ancestor. If it connects, we've found the fork point; resume
-                // forward (batched). If not, keep walking back, doubling the step.
+                // ancestor. The in-flight (network) timer is cleared HERE, before the
+                // block is queued for verification, so the peer that answered is never
+                // charged for our verification time. What the result means for the
+                // backtrack walk is decided in `apply_verify_report`.
                 self.inflight = None;
                 self.stalled_logged = false; // a reply arrived — clear the stall latch
-                let h = block.header.height.get();
-                match self.import_and_persist(node, block) {
-                    ImportOutcome::New | ImportOutcome::Known => {
-                        self.bt_step.remove(&peer); // ancestor found → forward mode
-                        self.advance_or_done(peer, h);
-                    }
-                    ImportOutcome::Rejected => {
-                        let step = self.bt_step.get(&peer).copied().unwrap_or(1).max(1);
-                        self.sync_next.insert(peer, h.saturating_sub(step).max(1));
-                        self.bt_step.insert(peer, (step * 2).min(BACKTRACK_CAP));
-                    }
-                    ImportOutcome::Invalid => {
-                        // A fabricated block while backtracking: penalize and stop
-                        // syncing from this peer (don't keep walking its bogus chain).
-                        tcp.penalize_peer(peer, INVALID_BLOCK_PENALTY);
-                        self.sync_next.remove(&peer);
-                        self.bt_step.remove(&peer);
-                    }
-                }
+                self.submit_verify(
+                    node,
+                    VerifyJob {
+                        peer,
+                        mode: VerifyMode::Backtrack,
+                        blocks: vec![block],
+                    },
+                );
             }
             NetMessage::BlockResponse(None) => {
                 // The peer does not have the requested height: stop waiting on it.
@@ -1103,9 +1634,10 @@ impl SyncState {
                 self.stalled_logged = false;
             }
             NetMessage::BlocksResponse(blocks) => {
-                // A batch of consecutive blocks (forward catch-up). They are on the
-                // peer's chain, so they import in order; the first one only fails if
-                // its parent isn't ours (a fork), which flips us into backtrack.
+                // A batch of consecutive blocks (forward catch-up). The network timer
+                // is cleared HERE, the instant the reply lands and BEFORE any of it is
+                // verified — the peer did its part; the CPU-bound part is ours and is
+                // never charged back to it as a stall.
                 self.inflight = None;
                 self.stalled_logged = false; // a reply arrived — clear the stall latch
                                              // A peer must never return more than we ask for ([`SYNC_BATCH`]); a
@@ -1116,87 +1648,21 @@ impl SyncState {
                 }
                 if blocks.is_empty() {
                     self.sync_next.remove(&peer); // at/past the peer's head
-                } else {
-                    let mut last_ok: Option<u64> = None;
-                    let mut rejected: Option<u64> = None;
-                    let mut invalid = false;
-                    for block in blocks {
-                        let h = block.header.height.get();
-                        match self.import_and_persist(node, block) {
-                            ImportOutcome::New | ImportOutcome::Known => last_ok = Some(h),
-                            ImportOutcome::Rejected => {
-                                rejected = Some(h);
-                                break;
-                            }
-                            ImportOutcome::Invalid => {
-                                // A fabricated block in the batch (any valid prefix is
-                                // already committed): penalize and stop trusting this peer.
-                                tcp.penalize_peer(peer, INVALID_BLOCK_PENALTY);
-                                invalid = true;
-                                break;
-                            }
-                        }
-                    }
-                    if invalid {
-                        self.sync_next.remove(&peer);
-                        self.bt_step.remove(&peer);
-                        p2p_log(
-                            &self.log,
-                            format!("✗ {} sent an invalid block — penalized", short_peer(&peer)),
-                        );
-                    } else if let Some(h) = last_ok {
-                        self.bt_step.remove(&peer);
-                        self.advance_or_done(peer, h);
-                        p2p_log(&self.log, format!("← imported blocks up to height {h}"));
-                    } else if let Some(h) = rejected {
-                        // First block didn't connect → we are on a fork (a stale tip).
-                        // A protocol-v2 peer names the fork point in ONE round-trip via
-                        // a block locator (headers-first, as Bitcoin/Monero/Zcash do);
-                        // an older peer keeps the legacy one-block backward walk.
-                        let peer_proto = self.peer_agents.get(&peer).map(|(v, _)| *v).unwrap_or(0);
-                        let locator = if peer_proto >= HEADERS_MIN_PROTOCOL {
-                            build_locator(node)
-                        } else {
-                            Vec::new()
-                        };
-                        if !locator.is_empty()
-                            && tcp.send(
-                                peer,
-                                &NetMessage::GetHeaders {
-                                    locator,
-                                    stop: Hash::ZERO,
-                                },
-                            )
-                        {
-                            // Await the Headers reply (one round-trip); the in-flight
-                            // marker keeps request_missing from re-asking meanwhile,
-                            // and its timeout still protects against a silent peer.
-                            self.inflight = Some(InFlight {
-                                peer,
-                                since: Instant::now(),
-                            });
-                            p2p_log(
-                                &self.log,
-                                format!(
-                                    "↩ height {h} didn't connect — asking {} for the fork \
-                                     point (block locator)",
-                                    short_peer(&peer)
-                                ),
-                            );
-                        } else {
-                            // Legacy peer (protocol < 2), or the send failed: fall back
-                            // to the single-block backward walk.
-                            self.sync_next.insert(peer, h.saturating_sub(1).max(1));
-                            self.bt_step.insert(peer, 1);
-                            p2p_log(
-                                &self.log,
-                                format!(
-                                    "↩ height {h} didn't connect — backtracking to find the fork point"
-                                ),
-                            );
-                        }
-                    }
+                    return;
                 }
+                // Hand the whole batch to the verifier thread and go straight back to
+                // servicing the socket. This is the line that ends the outage: for the
+                // seconds-to-minutes this batch takes to validate, we keep announcing,
+                // keep serving other peers' GetBlocks/GetHeaders, keep sweeping and
+                // keep publishing telemetry.
+                self.submit_verify(
+                    node,
+                    VerifyJob {
+                        peer,
+                        mode: VerifyMode::Batch,
+                        blocks,
+                    },
+                );
             }
             NetMessage::GetHeaders { locator, stop } => {
                 // Headers-first fork-point discovery (protocol v2): name the fork
@@ -1274,6 +1740,11 @@ impl SyncState {
                     Some(fork) => {
                         self.bt_step.remove(&peer); // forward mode
                         self.sync_next.insert(peer, fork + 1);
+                        // Remember it GLOBALLY, not just for this connection. The fork
+                        // point is a fact about OUR chain; every honest peer shares it.
+                        // Surviving peer churn is what stops a reconnect from re-running
+                        // the locator exchange — the endless "fork point" churn.
+                        self.resume_from = Some(fork + 1);
                         p2p_log(
                             &self.log,
                             format!(
@@ -1349,6 +1820,9 @@ impl SyncState {
         // accrued stall strikes so an honest-but-briefly-slow peer never trips the
         // unsubstantiated-claim bound.
         self.sync_strikes.remove(&peer);
+        // Everything up to `h` is now on our own chain, so `h + 1` is a proven
+        // common ancestor for ANY honest peer — remember it across peer churn.
+        self.resume_from = Some(h.saturating_add(1));
         match self.peer_status.get(&peer) {
             Some(s) if h < s.height => {
                 self.sync_next.insert(peer, h + 1);
@@ -1362,6 +1836,9 @@ impl SyncState {
     /// Forget bookkeeping for peers that are no longer connected, so catch-up never
     /// targets a ghost peer (whose `send` would silently fail and stall sync) and
     /// per-peer state cannot grow without bound across reconnects.
+    /// `resume_from` is deliberately NOT touched here: it is chain state, not peer
+    /// state, and dropping it on every disconnect is what made a flapping link
+    /// restart fork-point discovery from scratch each time.
     fn retain_connected(&mut self, connected: &HashSet<SocketAddr>) {
         self.authenticated.retain(|p| connected.contains(p));
         self.identity.retain(|p, _| connected.contains(p));
@@ -1429,7 +1906,9 @@ impl SyncState {
                 .or_else(|| self.first_seen.get(&peer))
                 .copied()
                 .unwrap_or(now);
-            if now.duration_since(last) >= PEER_INACTIVITY_TIMEOUT {
+            // Local stall credit: never reap a peer for time in which WE were not
+            // running. A silent peer is one that did not talk while we were listening.
+            if now.duration_since(last) >= PEER_INACTIVITY_TIMEOUT + self.stall_credit {
                 tcp.disconnect(&peer);
             }
         }
@@ -1500,6 +1979,39 @@ impl SyncState {
                 }
             }
         }
+
+        // LOCAL VERIFICATION IN PROGRESS. A batch is on the verifier thread.
+        //
+        // Do NOT ask for more (that is what bounds memory while a slow pass runs),
+        // do NOT time anything out, and above all do NOT charge anyone a stall
+        // strike: the peer answered, and the only thing still running is our own
+        // CPU. Conflating the two is precisely how a slow verification used to
+        // penalize, deselect, and ultimately shed every honest peer.
+        //
+        // Note this sits AFTER the linkage-header request above: headers cost a
+        // blake3 each, never a RandomX evaluation, so proving the checkpoint
+        // linkage continues in parallel with body verification.
+        if let Some(v) = &self.verifying {
+            // Surface a long pass ONCE, with the live peer count, so an operator can
+            // see the thing that used to be invisible: we are verifying, and we still
+            // have every peer.
+            let waited = v.since.elapsed();
+            if waited >= LONG_VERIFY_NOTICE && !self.verify_logged {
+                self.verify_logged = true;
+                p2p_log(
+                    &self.log,
+                    format!(
+                        "⏳ verifying a batch from {} ({}s so far) — {} peer(s) still \
+                         connected; catch-up resumes when it lands",
+                        short_peer(&v.peer),
+                        waited.as_secs(),
+                        connected.len()
+                    ),
+                );
+            }
+            return;
+        }
+        self.verify_logged = false;
 
         // A live, un-timed-out request is outstanding: give it time rather than
         // re-asking or thrashing to another peer.
@@ -1576,10 +2088,14 @@ impl SyncState {
             .unwrap_or(candidates[0]);
         let peer_height = self.peer_status[&peer].height;
 
+        // Cursor precedence: this peer's own cursor, else the fork point we already
+        // resolved (kept across peer churn — a reconnecting peer resumes forward
+        // download instead of re-walking the locator), else our tip.
         let height = self
             .sync_next
             .get(&peer)
             .copied()
+            .or(self.resume_from)
             .unwrap_or_else(|| {
                 if peer_height > local.height {
                     local.height + 1
@@ -1633,6 +2149,12 @@ impl SyncState {
         self.inflight.is_some()
     }
 
+    /// Whether a batch is being verified off-thread right now. Polls fast while it
+    /// runs so the finished report is applied the moment it lands.
+    fn is_verifying(&self) -> bool {
+        self.verifying.is_some()
+    }
+
     /// Whether `peer`'s advertised `status` is still ACTIONABLE for catch-up selection
     /// and the mining-gate decision: it was received within [`STATUS_TTL`] (a fresh,
     /// non-stale claim) AND the peer has not accrued [`STATUS_MAX_STRIKES`] unanswered
@@ -1640,7 +2162,10 @@ impl SyncState {
     /// never delivers is disqualified, so it can neither be chosen for sync nor keep the
     /// miner gated). A stale OR unsubstantiated claim is ignored by both consumers.
     fn status_actionable(&self, peer: &SocketAddr, status: &PeerStatus) -> bool {
-        status.received_at.elapsed() < STATUS_TTL
+        // Stall credit again: a claim only goes stale through time we were awake
+        // for, so a long local verification cannot silently drop every peer out of
+        // catch-up selection (which would leave the node "connected but idle").
+        status.received_at.elapsed() < STATUS_TTL + self.stall_credit
             && self.sync_strikes.get(peer).copied().unwrap_or(0) < STATUS_MAX_STRIKES
     }
 
@@ -2028,7 +2553,7 @@ mod tests {
             vec![],
         );
         assert_eq!(
-            state.import_and_persist(&node, orphan),
+            state.importer.import_and_persist(&node, orphan),
             ImportOutcome::Rejected,
             "an unknown-parent block is the benign backtrack signal"
         );
@@ -2045,7 +2570,7 @@ mod tests {
             vec![],
         );
         assert_eq!(
-            state.import_and_persist(&node, bad),
+            state.importer.import_and_persist(&node, bad),
             ImportOutcome::Invalid,
             "a block that fails validation flags the sender as misbehaving"
         );
@@ -2075,7 +2600,9 @@ mod tests {
         ));
         let healthy = SyncState::new(None, None);
         assert_eq!(
-            healthy.import_and_persist(&healthy_node, produced.block.clone()),
+            healthy
+                .importer
+                .import_and_persist(&healthy_node, produced.block.clone()),
             ImportOutcome::New,
         );
         assert_eq!(healthy_node.lock().unwrap().chain().height(), 1);
@@ -2088,10 +2615,14 @@ mod tests {
             256,
         ));
         let broken = SyncState::new(None, None);
-        broken.latch_durability_failure("test-injected durability failure");
-        assert!(broken.durable_broken.get());
+        broken
+            .importer
+            .latch_durability_failure("test-injected durability failure");
+        assert!(broken.importer.durable_broken());
         assert_eq!(
-            broken.import_and_persist(&broken_node, produced.block.clone()),
+            broken
+                .importer
+                .import_and_persist(&broken_node, produced.block.clone()),
             ImportOutcome::Rejected,
             "once durability is broken the import path fails closed (no advance, no gossip)"
         );
@@ -2301,6 +2832,271 @@ mod tests {
             chain.import_block(b).unwrap();
         }
         chain
+    }
+
+    /// A fresh node with a batch of blocks to verify above its assumevalid anchor
+    /// KEEPS ITS PEERS and never re-walks the fork point.
+    ///
+    /// This is the recurring field outage, reproduced. Before this change, `handle`
+    /// validated a whole `BlocksResponse` inline on the single P2P worker thread, so
+    /// for the entire batch that thread did not announce, did not serve peers, did
+    /// not sweep and did not publish telemetry. Remote peers reaped the silent
+    /// connection at their own `PEER_INACTIVITY_TIMEOUT`, the node fell to zero
+    /// peers, and on reconnect the fork-point locator exchange started over — the
+    /// endless "fork point" churn an operator sees.
+    ///
+    /// The test measures the quantity that actually decides the outcome: the WORST
+    /// single worker-loop iteration while a slow batch is verified. Inline, that is
+    /// the whole batch. Off-thread, it is one poll. Both are measured here, in the
+    /// same test, on the same batch.
+    #[test]
+    fn a_slow_verification_batch_keeps_the_worker_live_and_the_fork_point_resolved() {
+        use std::sync::Mutex;
+
+        // 40 blocks at 25ms of simulated seal verification each = a 1-second batch.
+        // Real mainnet numbers are far worse (thousands of blocks above a stale
+        // anchor); this is the same shape, sized to run in a test.
+        const BATCH: u64 = 40;
+        const PER_BLOCK: Duration = Duration::from_millis(25);
+
+        let server = mined_chain(BATCH);
+        let blocks: Vec<Block> = (1..=BATCH)
+            .map(|h| server.block_by_height(h).unwrap().clone())
+            .collect();
+        let peer = addr(7100);
+
+        // ---- BEFORE: verification inline on the network thread. ----------------
+        // `SyncState` with NO verifier attached runs the job on the calling thread —
+        // precisely the old behavior. Time how long that call owns the thread.
+        let mut before = SyncState::new(None, None);
+        Arc::get_mut(&mut before.importer).unwrap().verify_delay = PER_BLOCK;
+        let node_before = Mutex::new(Node::new(
+            Blockchain::new(&test_genesis()).unwrap(),
+            1024,
+            256,
+        ));
+        let t0 = Instant::now();
+        before.submit_verify(
+            &node_before,
+            VerifyJob {
+                peer,
+                mode: VerifyMode::Batch,
+                blocks: blocks.clone(),
+            },
+        );
+        let inline_blocked = t0.elapsed();
+        assert_eq!(
+            node_before.lock().unwrap().chain().height(),
+            BATCH,
+            "the inline path did import the batch"
+        );
+
+        // ---- AFTER: verification on the dedicated verifier thread. -------------
+        let mut state = SyncState::new(None, None);
+        Arc::get_mut(&mut state.importer).unwrap().verify_delay = PER_BLOCK;
+        let node = Arc::new(Mutex::new(Node::new(
+            Blockchain::new(&test_genesis()).unwrap(),
+            1024,
+            256,
+        )));
+        state.attach_verifier(Arc::clone(&node));
+        state.authenticated.insert(peer);
+        state.peer_agents.insert(peer, (2, "sov/test".into()));
+        state.peer_status.insert(peer, peer_status(BATCH, 9));
+        // A socket with no peers: enough for the report path, no handshake, no flake.
+        let tcp = TcpNode::bind("127.0.0.1:0").unwrap();
+
+        let handed_off = Instant::now();
+        state.submit_verify(
+            &node,
+            VerifyJob {
+                peer,
+                mode: VerifyMode::Batch,
+                blocks,
+            },
+        );
+        let hand_off = handed_off.elapsed();
+        assert!(
+            hand_off < PER_BLOCK,
+            "handing a batch to the verifier must not block the network thread \
+             (took {hand_off:?})"
+        );
+
+        // Drive the worker loop exactly as `P2p::start` does, and measure the worst
+        // single iteration plus how many times the announce path (`local_status`,
+        // which takes the node lock) succeeded while the batch verified.
+        let mut worst_iteration = Duration::ZERO;
+        let mut iterations = 0u32;
+        let mut announce_reads = 0u32;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while state.is_verifying() && Instant::now() < deadline {
+            let it = Instant::now();
+            state.importer.begin_network_pass();
+            // What `announce()` does every cycle. If verification held the node lock
+            // for the batch (or ran on this thread at all), this is what would stop.
+            if local_status(&node).is_some() {
+                announce_reads += 1;
+            }
+            state.collect_verify_reports(&tcp, &node);
+            state.request_missing(&tcp, &node);
+            state.reap_dead_peers(&tcp);
+            let took = it.elapsed();
+            state.credit_stall(took);
+            state.importer.end_network_pass();
+            worst_iteration = worst_iteration.max(took);
+            iterations += 1;
+            thread::sleep(SYNC_ACTIVE_POLL);
+        }
+        assert!(!state.is_verifying(), "the batch finished verifying");
+        state.collect_verify_reports(&tcp, &node);
+        // The measurement, printed so `--nocapture` gives the before/after directly.
+        println!(
+            "BEFORE (inline on the network thread): the worker was blocked {inline_blocked:?}              for {BATCH} blocks.\nAFTER  (verifier thread): hand-off {hand_off:?}, worst worker              iteration {worst_iteration:?}, {iterations} loop iterations and {announce_reads}              successful announce-path reads while the SAME batch verified."
+        );
+
+        // 1. The batch was fully imported.
+        assert_eq!(
+            node.lock().unwrap().chain().height(),
+            BATCH,
+            "every block in the batch was imported"
+        );
+
+        // 2. The worker thread stayed live throughout — the property whose absence
+        //    caused the outage. A single iteration never came close to the peer
+        //    inactivity timeout, and the announce path kept working the whole time.
+        assert!(
+            iterations > 10,
+            "the worker loop kept running during verification ({iterations} iterations)"
+        );
+        assert!(
+            announce_reads == iterations,
+            "the announce path (node lock) stayed available every iteration \
+             ({announce_reads}/{iterations})"
+        );
+        assert!(
+            worst_iteration < PEER_INACTIVITY_TIMEOUT,
+            "no worker iteration may approach the peer-liveness deadline \
+             (worst {worst_iteration:?})"
+        );
+        // Tighter: an iteration should never wait longer than roughly ONE block's
+        // verification for the node lock. Generous headroom for loaded CI runners,
+        // but far below the stall budget that would start crediting deadlines.
+        assert!(
+            worst_iteration < LOOP_STALL_BUDGET,
+            "a worker iteration must not even reach the stall budget \
+             (worst {worst_iteration:?}, budget {LOOP_STALL_BUDGET:?})"
+        );
+        // The before/after in one assertion: inline, ONE iteration owned the thread
+        // for the whole batch; off-thread, the worst iteration is a fraction of it.
+        assert!(
+            worst_iteration * 4 < inline_blocked,
+            "off-thread verification must leave the worker vastly more responsive \
+             (worst iteration {worst_iteration:?} vs inline {inline_blocked:?})"
+        );
+        assert!(
+            state.stall_credit.is_zero(),
+            "no iteration overran the stall budget, so nothing had to be credited"
+        );
+
+        // 3. No fork-point re-walk: the batch connected, so we stayed in forward
+        //    mode and the resolved cursor is remembered.
+        assert!(
+            state.bt_step.is_empty(),
+            "a batch that connects never enters the backward fork-point walk"
+        );
+        assert_eq!(
+            state.resume_from,
+            Some(BATCH + 1),
+            "the next height is remembered as a proven common ancestor"
+        );
+
+        // 4. And it SURVIVES losing every peer — so a reconnect resumes forward
+        //    download instead of restarting the locator exchange.
+        state.retain_connected(&HashSet::new());
+        assert_eq!(
+            state.resume_from,
+            Some(BATCH + 1),
+            "peer churn must not erase the fork point (the churn loop's root cause)"
+        );
+
+        state.shutdown_verifier();
+    }
+
+    /// A LOCAL stall must never be read as a silent peer.
+    ///
+    /// Peer liveness is measured against our own monotonic clock, so any time the
+    /// worker is not running is time in which a healthy peer *appears* silent. The
+    /// stall credit makes the two distinguishable no matter what does the blocking.
+    #[test]
+    fn a_local_stall_is_credited_and_never_reaps_a_healthy_peer() {
+        let mut s = SyncState::new(None, None);
+        let peer = addr(7101);
+
+        // A worker iteration that took a minute (the old inline batch import).
+        s.credit_stall(Duration::from_secs(60));
+        assert!(
+            s.stall_credit >= Duration::from_secs(59),
+            "the overrun is credited, minus the budget"
+        );
+
+        // A peer last heard from just inside the raw timeout is NOT dead: almost all
+        // of that silence is time we were not listening.
+        let quiet = Instant::now() - (PEER_INACTIVITY_TIMEOUT + Duration::from_secs(5));
+        s.last_recv.insert(peer, quiet);
+        let deadline = PEER_INACTIVITY_TIMEOUT + s.stall_credit;
+        assert!(
+            Instant::now().duration_since(quiet) < deadline,
+            "with the stall credited, this peer is still live"
+        );
+        // A peer's advertised chain likewise stays actionable across the stall, so a
+        // slow local pass cannot leave the node connected-but-idle.
+        let stale_claim = PeerStatus {
+            received_at: Instant::now() - (STATUS_TTL + Duration::from_secs(5)),
+            ..peer_status(9, 9)
+        };
+        assert!(
+            s.status_actionable(&peer, &stale_claim),
+            "a claim only goes stale through time we were awake for"
+        );
+
+        // Credit bleeds off in real time: once recovered, normal reaping resumes.
+        s.decay_stall_credit(Duration::from_secs(120));
+        assert!(s.stall_credit.is_zero(), "stall credit decays back to zero");
+        assert!(
+            !s.status_actionable(&peer, &stale_claim),
+            "with no stall to credit, a genuinely stale claim is stale again"
+        );
+    }
+
+    /// While a batch is verifying, catch-up asks for nothing more and — critically —
+    /// charges the peer that answered NO stall strike. It answered; we are the slow
+    /// side. Conflating the two is how a slow verification used to penalize,
+    /// deselect and finally shed every honest peer.
+    #[test]
+    fn a_peer_is_never_struck_for_our_own_verification_time() {
+        use std::sync::Mutex;
+        let mut s = SyncState::new(None, None);
+        let peer = addr(7102);
+        let node = Mutex::new(Node::new(mined_chain(2), 1024, 256));
+        s.authenticated.insert(peer);
+        s.peer_status.insert(peer, peer_status(200, 9));
+        s.verifying = Some(Verifying {
+            peer,
+            since: Instant::now(),
+        });
+        let tcp = TcpNode::bind("127.0.0.1:0").unwrap();
+
+        for _ in 0..50 {
+            s.request_missing(&tcp, &node);
+        }
+        assert!(
+            s.sync_strikes.is_empty(),
+            "no strike may be charged while WE are the ones verifying"
+        );
+        assert!(
+            s.inflight.is_none(),
+            "no further request is issued while a batch is being verified (bounded memory)"
+        );
     }
 
     #[test]

@@ -869,6 +869,44 @@ impl Blockchain {
         self.install_checkpoint_linkage(&headers).unwrap_or(0)
     }
 
+    /// Derive an assumevalid anchor from **this node's own finalized history**, so
+    /// the anchor stops being a source-code chore that goes stale between releases.
+    ///
+    /// The baked pins in the release binary are a bootstrap for a node with no
+    /// history. A node that HAS history does not need them: every block on its
+    /// active chain was either fully verified here, or was proven (by
+    /// [`Blockchain::install_checkpoint_linkage`]) to be an ancestor of a pin it
+    /// matched. Once such a block is buried `depth` deep — past
+    /// [`FINALITY_DEPTH`] — it is exactly as good an anchor as a baked one, and it
+    /// is one this node produced for itself.
+    ///
+    /// Two conditions make this sound, and both are enforced:
+    ///
+    /// * the chain must already carry pins ([`Blockchain::checkpoint_satisfied`] is
+    ///   vacuously true with none), so a dev/test chain never starts self-pinning
+    ///   and nothing it does is ever skipped — the KAT is untouched;
+    /// * the newest existing pin must be MATCHED on this chain, not merely passed.
+    ///   Self-pinning a branch that failed its pin would launder a forgery into a
+    ///   trusted anchor, which is the whole hole the ancestry gate closed.
+    ///
+    /// Returns the adopted `(height, hash)`, or `None` when nothing new qualifies.
+    /// The seal skip stays ancestry-gated: adopting re-derives the linkage proof
+    /// from local blocks, it does not widen what may be skipped by height.
+    pub fn adopt_local_finalized_checkpoint(&mut self, depth: u64) -> Option<(u64, Hash)> {
+        if self.checkpoints.is_empty() || !self.checkpoint_satisfied() {
+            return None;
+        }
+        let height = self.height().checked_sub(depth.max(FINALITY_DEPTH))?;
+        if height <= self.newest_checkpoint_height() {
+            return None; // nothing newer than what we already trust
+        }
+        let hash = self.block_by_height(height)?.hash();
+        // `add_checkpoints` re-derives the linkage proof from blocks we already
+        // hold, so the new anchor is ancestry-proven before it is ever used.
+        self.add_checkpoints([(height, hash)]);
+        Some((height, hash))
+    }
+
     /// Whether a block is a PROVEN ancestor of a pinned checkpoint, and so may
     /// have its (expensive) seal skipped.
     pub fn is_linked_to_checkpoint(&self, hash: &Hash) -> bool {
@@ -6191,6 +6229,83 @@ mod assumevalid_ancestry_tests {
             "a chain sitting BELOW its newest checkpoint has matched no pin, so it \
              must not count as satisfied — every block on it takes the PoW skip \
              while nothing vouches for any of them"
+        );
+    }
+
+    /// The assumevalid anchor MAINTAINS ITSELF from a node's own finalized history
+    /// — and refuses to do so in every case where that would be unsound.
+    ///
+    /// The baked pins in a release go stale between releases; every time they have,
+    /// the field failure was the same. A node that already holds verified history
+    /// does not need them, so it re-derives its own anchor. What must never happen
+    /// is a node laundering an UNVERIFIED branch into a trusted anchor, so the
+    /// preconditions are tested here, not just the happy path.
+    #[test]
+    fn a_node_derives_its_own_assumevalid_anchor_but_only_from_verified_history() {
+        // 1. A chain with NO pins never self-pins. Dev/test chains skip nothing, and
+        //    starting to skip there would change what they validate.
+        let mut chain = fresh_chain();
+        for i in 1..=20u64 {
+            let b = chain.produce_block(vec![], 1_000 + i * 1_000).unwrap();
+            chain.import_block(b).unwrap();
+        }
+        assert_eq!(
+            chain.adopt_local_finalized_checkpoint(5),
+            None,
+            "a chain with no checkpoints must never start self-pinning"
+        );
+
+        // 2. A chain that has NOT matched its newest pin must not self-pin either:
+        //    every block on it took the (height-independent) skip on nobody's word,
+        //    so promoting one to an anchor would launder a possible forgery.
+        chain.set_checkpoints([(FAR_CHECKPOINT, Hash::from_bytes([7u8; 32]))]);
+        assert!(!chain.checkpoint_satisfied());
+        assert_eq!(
+            chain.adopt_local_finalized_checkpoint(5),
+            None,
+            "an unsatisfied chain must not promote its own blocks to anchors"
+        );
+
+        // 3. With a pin this chain actually MATCHES, a block buried past finality is
+        //    adopted — and the adoption re-derives the ancestry proof, so the seal
+        //    skip stays ancestry-gated rather than becoming height-gated again.
+        let pinned_height = 10u64;
+        let pinned = chain.block_by_height(pinned_height).unwrap().hash();
+        chain.set_checkpoints([(pinned_height, pinned)]);
+        assert!(chain.checkpoint_satisfied());
+        let (h, hash) = chain
+            .adopt_local_finalized_checkpoint(FINALITY_DEPTH)
+            .expect("a satisfied chain adopts its own finalized block");
+        assert_eq!(h, 20 - FINALITY_DEPTH, "the anchor is buried past finality");
+        assert_eq!(hash, chain.block_by_height(h).unwrap().hash());
+        assert!(
+            chain.is_linked_to_checkpoint(&hash),
+            "the adopted anchor is ancestry-PROVEN from local blocks, not assumed \
+             from its height"
+        );
+        assert!(
+            chain.is_linked_to_checkpoint(&chain.block_by_height(1).unwrap().hash()),
+            "and so is every ancestor below it"
+        );
+        assert!(
+            !chain.is_linked_to_checkpoint(&Hash::from_bytes([9u8; 32])),
+            "a block the proof never walked is still fully verified"
+        );
+
+        // 4. Idempotent: re-adopting at the same tip proposes nothing newer, so the
+        //    anchor advances only as the chain does.
+        assert_eq!(
+            chain.adopt_local_finalized_checkpoint(FINALITY_DEPTH),
+            None,
+            "nothing newer than the anchor we already trust"
+        );
+
+        // 5. A depth below FINALITY_DEPTH is raised to it — the anchor can never be
+        //    shallower than the protocol's own settlement bar.
+        assert_eq!(
+            chain.adopt_local_finalized_checkpoint(0),
+            None,
+            "a zero depth is floored at FINALITY_DEPTH, not taken literally"
         );
     }
 

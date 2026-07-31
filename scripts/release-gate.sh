@@ -159,14 +159,25 @@ ok "consensus invariants + cross-impl KAT vectors hold"
 # battery (monobit · byte χ² · Shannon entropy · serial correlation) on the RAW
 # entropy that seeds them — so a biased/stuck RNG can never ship in a release.
 # ── CHECKPOINT STALENESS ──────────────────────────────────────────────────────
-# The mainnet assumevalid anchor is NOT self-maintaining, and has now gone stale
-# three times (5000 -> 6800 -> 8300 -> 12800). Every time, the same field failure:
+# The mainnet assumevalid anchor has gone stale four times
+# (5000 -> 6800 -> 8300 -> 12800 -> 14336). Every time, the same field failure:
 # a fresh node fast-syncs to the anchor, then re-runs RandomX for thousands of
 # blocks, starving its own P2P thread until it drops every peer and loops on zero
-# connections. Refreshing the anchor without a guard just schedules the next one.
+# connections.
 #
-# So the gate maintains it. If the newest baked checkpoint has fallen more than
-# CHECKPOINT_MAX_LAG_BLOCKS behind the live tip, the release is refused.
+# As of v0.2.7 that failure is fixed at the source: block verification runs on a
+# dedicated thread, so a fresh node above a stale anchor keeps its peers and its
+# fork point and simply takes longer. A stale anchor is now a SLOWNESS, not an
+# outage. The gate stays anyway — slow is still bad — but it now hands you the fix
+# instead of a lecture: `scripts/refresh-checkpoint.sh --write` proposes and applies
+# a new anchor, refusing anything it cannot confirm on two independent relays.
+#
+# The anchor also maintains itself at runtime: a node advances its own pin from its
+# finalized history (Blockchain::adopt_local_finalized_checkpoint, persisted to
+# assumevalid.dat), and operators may supply one via the config's `checkpoints`.
+#
+# If the newest baked checkpoint has fallen more than CHECKPOINT_MAX_LAG_BLOCKS
+# behind the live tip, the release is refused.
 #
 # The tip is read from a public relay. If NO relay answers, this is a WARNING and
 # not a failure: the release must not be hostage to someone else's downtime, and a
@@ -193,7 +204,7 @@ if [ -z "$CP_TIP" ]; then
 else
   CP_LAG=$(( CP_TIP - CP_NEWEST ))
   if [ "$CP_LAG" -gt "$CP_MAX_LAG" ]; then
-    fail "assumevalid checkpoint is STALE: newest anchor $CP_NEWEST, live tip $CP_TIP (lag $CP_LAG > $CP_MAX_LAG). A fresh node would re-run RandomX for ~$CP_LAG blocks and stall its own P2P. Pin a new checkpoint in MAINNET_CHECKPOINTS (confirm the hash on ALL THREE relays first, at a depth well past finality), then re-run."
+    fail "assumevalid checkpoint is STALE: newest anchor $CP_NEWEST, live tip $CP_TIP (lag $CP_LAG > $CP_MAX_LAG). A fresh node would re-verify ~$CP_LAG blocks before reaching the tip — it keeps its peers while doing so (v0.2.7), but it is needlessly slow. Fix it with: scripts/refresh-checkpoint.sh --write   (cross-checks two independent relays and refuses to pin anything they disagree on), then re-run."
   fi
   ok "checkpoint fresh — anchor $CP_NEWEST, tip $CP_TIP (lag $CP_LAG <= $CP_MAX_LAG)"
 fi
