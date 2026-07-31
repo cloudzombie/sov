@@ -35,13 +35,14 @@
 import { hmac } from "@noble/hashes/hmac.js";
 import { sha512 } from "@noble/hashes/sha512.js";
 import {
-  generateMnemonic as scureGenerateMnemonic,
+  entropyToMnemonic,
   mnemonicToSeedSync,
   validateMnemonic as scureValidateMnemonic,
 } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english";
 
 import { Keypair, KeyError } from "./keys.js";
+import { fillSecure } from "./rng.js";
 import { HybridKeypair } from "./hybrid.js";
 
 /** The hardened-derivation offset, 2^31. SLIP-0010 Ed25519 requires every
@@ -177,10 +178,15 @@ function assertIndex(label: string, n: number): void {
 
 /**
  * Generate a fresh BIP-39 mnemonic from secure entropy (default 24 words /
- * 256-bit). The audited `@scure/bip39` draws from `crypto.getRandomValues`.
+ * 256-bit). The entropy is drawn through {@link fillSecure} — the startup
+ * RNG health-test chokepoint, which fails closed on a degraded source — and
+ * encoded with the audited `@scure/bip39` `entropyToMnemonic`, producing the
+ * same phrase the library itself would for those entropy bytes.
  */
 export function generateMnemonic(strength: 128 | 160 | 192 | 224 | 256 = 256): string {
-  return scureGenerateMnemonic(wordlist, strength);
+  const entropy = new Uint8Array(strength / 8);
+  fillSecure(entropy);
+  return entropyToMnemonic(entropy, wordlist);
 }
 
 /** Whether `mnemonic` is a valid BIP-39 phrase (wordlist + checksum). */

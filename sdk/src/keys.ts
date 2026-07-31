@@ -20,6 +20,7 @@
 
 import * as ed from "@noble/ed25519";
 import { sha512 } from "@noble/hashes/sha512.js";
+import { fillSecure } from "./rng.js";
 
 // @noble/ed25519 v2 needs a synchronous SHA-512 hook for its sync sign/verify
 // API. We wire it to @noble/hashes (the audited companion library). This is set
@@ -148,10 +149,14 @@ export class Keypair {
     this.publicKey = publicKey;
   }
 
-  /** Generate a fresh keypair from cryptographically secure OS entropy. */
+  /**
+   * Generate a fresh keypair from cryptographically secure OS entropy, gated
+   * by the startup RNG health self-test ({@link fillSecure}) — fails closed
+   * on a degraded entropy source.
+   */
   static generate(): Keypair {
     const seed = new Uint8Array(SECRET_KEY_LEN);
-    crypto.getRandomValues(seed);
+    fillSecure(seed);
     return Keypair.fromSeed(seed);
   }
 
