@@ -611,6 +611,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block2"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
+dependencies = [
+ "objc2 0.6.4",
+]
+
+[[package]]
 name = "blocking"
 version = "1.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1133,6 +1142,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctrlc"
+version = "3.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0b1fab2ae45819af2d0731d60f2afe17227ebb1a1538a236da84c93e9a60162"
+dependencies = [
+ "dispatch2",
+ "nix 0.31.3",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1221,6 +1241,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
  "bitflags 2.13.0",
+ "block2 0.6.2",
+ "libc",
  "objc2 0.6.4",
 ]
 
@@ -2744,6 +2766,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.13.0",
+ "cfg-if",
+ "cfg_aliases 0.2.1",
+ "libc",
+]
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2846,7 +2880,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4e89ad9e3d7d297152b17d39ed92cd50ca8063a89a9fa569046d41568891eff"
 dependencies = [
  "bitflags 2.13.0",
- "block2",
+ "block2 0.5.1",
  "libc",
  "objc2 0.5.2",
  "objc2-core-data",
@@ -2875,7 +2909,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "74dd3b56391c7a0596a295029734d3c1c5e7e510a4cb30245f8221ccea96b009"
 dependencies = [
  "bitflags 2.13.0",
- "block2",
+ "block2 0.5.1",
  "objc2 0.5.2",
  "objc2-core-location",
  "objc2-foundation 0.2.2",
@@ -2887,7 +2921,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5ff520e9c33812fd374d8deecef01d4a840e7b41862d849513de77e44aa4889"
 dependencies = [
- "block2",
+ "block2 0.5.1",
  "objc2 0.5.2",
  "objc2-foundation 0.2.2",
 ]
@@ -2899,7 +2933,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "617fbf49e071c178c0b24c080767db52958f716d9eabdf0890523aeae54773ef"
 dependencies = [
  "bitflags 2.13.0",
- "block2",
+ "block2 0.5.1",
  "objc2 0.5.2",
  "objc2-foundation 0.2.2",
 ]
@@ -2934,7 +2968,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55260963a527c99f1819c4f8e3b47fe04f9650694ef348ffd2227e8196d34c80"
 dependencies = [
- "block2",
+ "block2 0.5.1",
  "objc2 0.5.2",
  "objc2-foundation 0.2.2",
  "objc2-metal",
@@ -2946,7 +2980,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "000cfee34e683244f284252ee206a27953279d370e309649dc3ee317b37e5781"
 dependencies = [
- "block2",
+ "block2 0.5.1",
  "objc2 0.5.2",
  "objc2-contacts",
  "objc2-foundation 0.2.2",
@@ -2965,7 +2999,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ee638a5da3799329310ad4cfa62fbf045d5f56e3ef5ba4149e7452dcf89d5a8"
 dependencies = [
  "bitflags 2.13.0",
- "block2",
+ "block2 0.5.1",
  "dispatch",
  "libc",
  "objc2 0.5.2",
@@ -2999,7 +3033,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1a1ae721c5e35be65f01a03b6d2ac13a54cb4fa70d8a5da293d7b0020261398"
 dependencies = [
- "block2",
+ "block2 0.5.1",
  "objc2 0.5.2",
  "objc2-app-kit 0.2.2",
  "objc2-foundation 0.2.2",
@@ -3012,7 +3046,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd0cba1276f6023976a406a14ffa85e1fdd19df6b0f737b063b95f6c8c7aadd6"
 dependencies = [
  "bitflags 2.13.0",
- "block2",
+ "block2 0.5.1",
  "objc2 0.5.2",
  "objc2-foundation 0.2.2",
 ]
@@ -3024,7 +3058,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e42bee7bff906b14b167da2bac5efe6b6a07e6f7c0a21a7308d40c960242dc7a"
 dependencies = [
  "bitflags 2.13.0",
- "block2",
+ "block2 0.5.1",
  "objc2 0.5.2",
  "objc2-foundation 0.2.2",
  "objc2-metal",
@@ -3047,7 +3081,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8bb46798b20cd6b91cbd113524c490f1686f4c4e8f49502431415f3512e2b6f"
 dependencies = [
  "bitflags 2.13.0",
- "block2",
+ "block2 0.5.1",
  "objc2 0.5.2",
  "objc2-cloud-kit",
  "objc2-core-data",
@@ -3067,7 +3101,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44fa5f9748dbfe1ca6c0b79ad20725a11eca7c2218bceb4b005cb1be26273bfe"
 dependencies = [
- "block2",
+ "block2 0.5.1",
  "objc2 0.5.2",
  "objc2-foundation 0.2.2",
 ]
@@ -3079,7 +3113,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76cfcbf642358e8689af64cee815d139339f3ed8ad05103ed5eaf73db8d84cb3"
 dependencies = [
  "bitflags 2.13.0",
- "block2",
+ "block2 0.5.1",
  "objc2 0.5.2",
  "objc2-core-location",
  "objc2-foundation 0.2.2",
@@ -3986,6 +4020,7 @@ dependencies = [
 [[package]]
 name = "sov-chain"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "sov-crypto",
  "sov-governance",
@@ -4002,6 +4037,7 @@ dependencies = [
 [[package]]
 name = "sov-compliance"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "borsh",
  "serde",
@@ -4013,6 +4049,7 @@ dependencies = [
 [[package]]
 name = "sov-crypto"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "blake3",
  "borsh",
@@ -4028,6 +4065,7 @@ dependencies = [
 [[package]]
 name = "sov-governance"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "borsh",
  "serde",
@@ -4038,6 +4076,7 @@ dependencies = [
 [[package]]
 name = "sov-intents"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "borsh",
  "serde",
@@ -4049,6 +4088,7 @@ dependencies = [
 [[package]]
 name = "sov-mempool"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "sov-primitives",
  "sov-types",
@@ -4058,6 +4098,7 @@ dependencies = [
 [[package]]
 name = "sov-mining"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "borsh",
  "primitive-types",
@@ -4069,6 +4110,7 @@ dependencies = [
 [[package]]
 name = "sov-network"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "blake3",
  "borsh",
@@ -4085,7 +4127,9 @@ dependencies = [
 [[package]]
 name = "sov-node"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
+ "borsh",
  "sov-chain",
  "sov-crypto",
  "sov-mempool",
@@ -4101,6 +4145,7 @@ dependencies = [
 [[package]]
 name = "sov-pow"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "borsh",
  "randomx-rs",
@@ -4112,6 +4157,7 @@ dependencies = [
 [[package]]
 name = "sov-primitives"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "blake3",
  "borsh",
@@ -4122,12 +4168,15 @@ dependencies = [
 
 [[package]]
 name = "sov-redteam"
-version = "0.1.0"
+version = "0.1.1"
+source = "git+https://github.com/cloudzombie/sov-redteam?branch=main#8a3eeb2b39a6b6ff93fe8c7caeffbef0dba97fd9"
 dependencies = [
  "hex",
  "serde_json",
  "sov-chain",
+ "sov-compliance",
  "sov-crypto",
+ "sov-intents",
  "sov-mining",
  "sov-network",
  "sov-primitives",
@@ -4151,11 +4200,13 @@ dependencies = [
 [[package]]
 name = "sov-rpc"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "argon2",
  "bip39",
  "borsh",
  "chacha20poly1305",
+ "ctrlc",
  "getrandom 0.2.17",
  "hex",
  "serde",
@@ -4163,6 +4214,7 @@ dependencies = [
  "sha2 0.10.9",
  "sov-chain",
  "sov-crypto",
+ "sov-governance",
  "sov-intents",
  "sov-mining",
  "sov-network",
@@ -4171,6 +4223,7 @@ dependencies = [
  "sov-primitives",
  "sov-runtime",
  "sov-shielded",
+ "sov-shielded-pq",
  "sov-state",
  "sov-types",
  "sov-wallet",
@@ -4181,6 +4234,7 @@ dependencies = [
 [[package]]
 name = "sov-runtime"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "borsh",
  "sha2 0.10.9",
@@ -4191,6 +4245,7 @@ dependencies = [
  "sov-pow",
  "sov-primitives",
  "sov-shielded",
+ "sov-shielded-pq",
  "sov-state",
  "sov-types",
  "sov-vm",
@@ -4200,6 +4255,7 @@ dependencies = [
 [[package]]
 name = "sov-shielded"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "bech32",
  "blake3",
@@ -4210,13 +4266,34 @@ dependencies = [
  "orchard",
  "rand",
  "sov-primitives",
+ "sov-shielded-pq",
  "thiserror 2.0.18",
  "zcash_note_encryption",
 ]
 
 [[package]]
+name = "sov-shielded-pq"
+version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
+dependencies = [
+ "blake3",
+ "borsh",
+ "chacha20poly1305",
+ "fips203",
+ "fips204",
+ "hex",
+ "thiserror 2.0.18",
+ "winter-crypto",
+ "winter-math",
+ "winter-utils",
+ "winterfell",
+ "zeroize",
+]
+
+[[package]]
 name = "sov-state"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "borsh",
  "serde",
@@ -4224,12 +4301,14 @@ dependencies = [
  "sov-crypto",
  "sov-primitives",
  "sov-shielded",
+ "sov-shielded-pq",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "sov-types"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "borsh",
  "serde",
@@ -4244,6 +4323,7 @@ dependencies = [
 [[package]]
 name = "sov-verify"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "sov-mining",
  "sov-primitives",
@@ -4254,6 +4334,7 @@ dependencies = [
 [[package]]
 name = "sov-vm"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "sov-primitives",
  "thiserror 2.0.18",
@@ -4263,6 +4344,7 @@ dependencies = [
 [[package]]
 name = "sov-wallet"
 version = "0.0.0"
+source = "git+https://github.com/cloudzombie/sov?branch=main#4f2b02ea94c1d6d8f90b92e22974967f50dba204"
 dependencies = [
  "bip39",
  "getrandom 0.2.17",
@@ -5436,7 +5518,7 @@ dependencies = [
  "android-activity",
  "atomic-waker",
  "bitflags 2.13.0",
- "block2",
+ "block2 0.5.1",
  "bytemuck",
  "calloop 0.13.0",
  "cfg_aliases 0.2.1",
@@ -5485,6 +5567,106 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winter-air"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef01227f23c7c331710f43b877a8333f5f8d539631eea763600f1a74bf018c7c"
+dependencies = [
+ "libm",
+ "winter-crypto",
+ "winter-fri",
+ "winter-math",
+ "winter-utils",
+]
+
+[[package]]
+name = "winter-crypto"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1cdb247bc142438798edb04067ab72a22cf815f57abbd7b78a6fa986fc101db8"
+dependencies = [
+ "blake3",
+ "sha3",
+ "winter-math",
+ "winter-utils",
+]
+
+[[package]]
+name = "winter-fri"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd592b943f9d65545683868aaf1b601eb66e52bfd67175347362efff09101d3a"
+dependencies = [
+ "winter-crypto",
+ "winter-math",
+ "winter-utils",
+]
+
+[[package]]
+name = "winter-math"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7aecfb48ee6a8b4746392c8ff31e33e62df8528a3b5628c5af27b92b14aef1ea"
+dependencies = [
+ "winter-utils",
+]
+
+[[package]]
+name = "winter-maybe-async"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d31a19dae58475d019850e25b0170e94b16d382fbf6afee9c0e80fdc935e73e"
+dependencies = [
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
+name = "winter-prover"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84cc631ed56cd39b78ef932c1ec4060cc6a44d114474291216c32f56655b3048"
+dependencies = [
+ "tracing",
+ "winter-air",
+ "winter-crypto",
+ "winter-fri",
+ "winter-math",
+ "winter-maybe-async",
+ "winter-utils",
+]
+
+[[package]]
+name = "winter-utils"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9951263ef5317740cd0f49e618db00c72fabb70b75756ea26c4d5efe462c04dd"
+
+[[package]]
+name = "winter-verifier"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0425ea81f8f703a1021810216da12003175c7974a584660856224df04b2e2fdb"
+dependencies = [
+ "winter-air",
+ "winter-crypto",
+ "winter-fri",
+ "winter-math",
+ "winter-utils",
+]
+
+[[package]]
+name = "winterfell"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43f824ddd5aec8ca6a54307f20c115485a8a919ea94dd26d496d856ca6185f4f"
+dependencies = [
+ "winter-air",
+ "winter-prover",
+ "winter-verifier",
 ]
 
 [[package]]
@@ -5626,7 +5808,7 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "hex",
- "nix",
+ "nix 0.29.0",
  "ordered-stream",
  "rand",
  "serde",

@@ -12,8 +12,17 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = "0.29"
-sov-redteam = { path = "../chain/crates/redteam" }
+# The harness engine now lives in its OWN repository — cloudzombie/sov-redteam is the
+# single source of truth for it, and this GUI is a consumer like any other. Pinned by the
+# committed Cargo.lock, so a build is reproducible and a bump is a visible commit.
+sov-redteam = { git = "https://github.com/cloudzombie/sov-redteam", branch = "main" }
 # Reconstruct the funded keypair from the seed the operator pastes (held in memory only).
-sov-crypto = { path = "../chain/crates/crypto" }
+#
+# This MUST be a git dep on cloudzombie/sov, not a `../chain/crates/crypto` path dep.
+# `sov-redteam` pulls sov-crypto from git@main; a local path dep would be a SECOND,
+# distinct source of the same crate, and cargo does not unify across sources — the two
+# `Keypair` types would be unrelated and `probe_funded(&target, &kp, ..)` below would
+# fail to typecheck. One source, one crate.
+sov-crypto = { git = "https://github.com/cloudzombie/sov", branch = "main" }
 # Wipe the pasted secret + derived seed from memory when done.
 zeroize = "1"

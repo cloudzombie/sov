@@ -22,7 +22,6 @@ members = [
     "crates/verify",
     "crates/vm",
     "crates/chain",
-    "crates/redteam",
     "crates/wallet",
     "crates/network",
     "crates/node",
