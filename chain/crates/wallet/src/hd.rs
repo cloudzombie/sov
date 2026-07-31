@@ -53,10 +53,24 @@ pub enum HdError {
 }
 
 /// Generate a fresh BIP-39 mnemonic of `word_count` words (12 or 24) from
-/// operating-system entropy (`getrandom`). The phrase is the ONLY backup of the
+/// operating-system entropy drawn through the health-checked chokepoint
+/// ([`sov_crypto::fill_secure`]): if the startup RNG self-test failed, this
+/// FAILS CLOSED with an error rather than minting a phrase from a degraded
+/// source. The phrase is the ONLY backup of the
 /// wallet it seeds — whoever holds it controls the account — so it must be
 /// generated privately and never transmitted. Returns the space-separated phrase.
 pub fn generate_mnemonic(word_count: usize) -> Result<String, HdError> {
+    generate_mnemonic_with(word_count, sov_crypto::fill_secure)
+}
+
+/// [`generate_mnemonic`] with the entropy filler injected — the seam that
+/// lets a unit test prove the fail-closed wiring (a failing filler must yield
+/// `Err`, never a phrase) without weakening the production path, which always
+/// passes [`sov_crypto::fill_secure`].
+fn generate_mnemonic_with(
+    word_count: usize,
+    fill: impl FnOnce(&mut [u8]) -> Result<(), sov_crypto::EntropyError>,
+) -> Result<String, HdError> {
     let entropy_len = match word_count {
         12 => 16,
         24 => 32,
@@ -68,7 +82,7 @@ pub fn generate_mnemonic(word_count: usize) -> Result<String, HdError> {
     };
     let mut entropy = [0u8; 32];
     let slice = &mut entropy[..entropy_len];
-    getrandom::getrandom(slice).map_err(|e| HdError::Mnemonic(format!("OS entropy: {e}")))?;
+    fill(slice).map_err(|e| HdError::Mnemonic(format!("OS entropy: {e}")))?;
     let mnemonic = Mnemonic::from_entropy(slice).map_err(|e| HdError::Mnemonic(e.to_string()))?;
     let phrase = mnemonic.to_string();
     slice.fill(0); // best-effort wipe of the entropy copy
@@ -276,5 +290,26 @@ mod tests {
         );
         // Only 12 or 24 words are accepted.
         assert!(generate_mnemonic(15).is_err());
+    }
+
+    /// Fail-closed wiring: when the entropy chokepoint reports a failed RNG
+    /// health check (or a dead OS source), mnemonic generation must return
+    /// `Err` — never a phrase.
+    #[test]
+    fn generation_fails_closed() {
+        use sov_crypto::{EntropyError, HealthFailure};
+        for err in [
+            EntropyError::Source,
+            EntropyError::HealthCheck(HealthFailure::Stuck),
+        ] {
+            for words in [12, 24] {
+                let e = err.clone();
+                let out = generate_mnemonic_with(words, move |_| Err(e));
+                assert!(
+                    matches!(out, Err(HdError::Mnemonic(ref m)) if m.contains("OS entropy")),
+                    "degraded entropy must not yield a mnemonic: {out:?}"
+                );
+            }
+        }
     }
 }

@@ -13,7 +13,6 @@ sov-crypto = { path = "../crypto" }
 sov-types = { path = "../types" }
 thiserror.workspace = true
 bip39 = "2"
-getrandom = "0.2"
 hmac = "0.12"
 sha2 = "0.10"
 
