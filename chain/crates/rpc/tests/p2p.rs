@@ -1103,3 +1103,98 @@ fn chaos_partition_and_restart_converge_without_forks() {
         h.shutdown();
     }
 }
+
+/// THE BATCH-BOUNDARY FORK REGRESSION (field failure: a fresh Windows node stopped
+/// syncing at height 768 = 3 × SYNC_BATCH, was disconnected from its only peer, and
+/// began mining its own chain).
+///
+/// A fresh node must cross MANY `SYNC_BATCH` (256) boundaries — including 768 and
+/// 1792, the two observed fork points — and must survive losing its only peer
+/// mid-download: on reconnect it resumes (the resolved fork point / cursor survive
+/// churn) and reaches the true tip, on the same head as the server, having produced
+/// no blocks of its own. The client also carries a trusted checkpoint near the tip,
+/// so the checkpoint-linkage path (headers proof + assumevalid skip) is exercised
+/// exactly as a real mainnet joiner exercises it.
+#[test]
+fn fresh_node_syncs_across_many_batch_boundaries_despite_losing_its_only_peer() {
+    const TIP: u64 = 2_100; // > 8 batches: crosses 256·n for n = 1..8, incl. 768 and 1792
+    const PIN: u64 = 2_048; // a checkpoint the joiner must prove linkage to
+
+    let g = genesis();
+    // The server builds a 2,100-block chain entirely on its own.
+    let (a, a_p2p) = build_node(
+        &g,
+        "mb-a",
+        "peera.node.sov",
+        [30; 32],
+        vec![(id("val01.node.sov"), Keypair::from_seed(VAL01_SEED))],
+    );
+    for i in 0..TIP {
+        a.node().lock().unwrap().produce(1_000 + i * 1_000).unwrap();
+    }
+    assert_eq!(a.height(), TIP);
+    let pin_hash = a
+        .node()
+        .lock()
+        .unwrap()
+        .chain()
+        .block_by_height(PIN)
+        .unwrap()
+        .hash();
+    let tip_hash = a.node().lock().unwrap().chain().head().hash();
+
+    // The fresh joiner, pinned to the server's checkpoint (as a mainnet joiner is
+    // pinned to the baked assumevalid anchors).
+    let daemon = Daemon::new(&g, unique_dir("mb-c"), 1024, 256, vec![])
+        .unwrap()
+        .with_checkpoints([(PIN, pin_hash)]);
+    let config = P2pConfig {
+        chain_id: g.chain_id.clone(),
+        genesis_hash: daemon.genesis_hash(),
+        account: id("peerc.node.sov"),
+        keypair: Keypair::from_seed([31; 32]),
+    };
+    let c_p2p = P2p::bind(daemon.node(), config, "127.0.0.1:0")
+        .unwrap()
+        .with_block_log(daemon.block_log());
+    let c = daemon.with_gossip(c_p2p.tcp());
+    let c_p2p = c_p2p.start();
+    c_p2p.connect(&a_p2p.local_addr().to_string()).unwrap();
+
+    // Let it get a few batches in, then kill its ONLY peer mid-download.
+    assert!(
+        wait_until(60, || c.height() >= 300),
+        "the joiner started downloading (reached ≥300; got {})",
+        c.height()
+    );
+    let a_tcp = a_p2p.tcp();
+    for p in a_tcp.connected_peers() {
+        a_tcp.disconnect(&p);
+    }
+    thread::sleep(Duration::from_millis(300));
+
+    // Reconnect (as the dialer's bootstrap loop does on a live node) and require a
+    // full resume to the tip — across every remaining batch boundary.
+    c_p2p.connect(&a_p2p.local_addr().to_string()).unwrap();
+    assert!(
+        wait_until(120, || c.height() == TIP),
+        "the joiner resumed after losing its only peer and reached the tip \
+         (got {} of {TIP})",
+        c.height()
+    );
+    let cn = c.node();
+    let cn = cn.lock().unwrap();
+    assert_eq!(
+        cn.chain().head().hash(),
+        tip_hash,
+        "the joiner is on the SERVER'S chain — it produced nothing of its own"
+    );
+    assert!(
+        cn.chain().checkpoint_satisfied(),
+        "the pinned checkpoint is matched on the synced chain"
+    );
+    drop(cn);
+
+    a_p2p.shutdown();
+    c_p2p.shutdown();
+}

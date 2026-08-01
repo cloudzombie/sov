@@ -116,6 +116,11 @@ impl SyncShared {
     }
 
     /// How many blocks behind the best authenticated peer we are (0 = at/ahead of tip).
+    ///
+    /// `u64::MAX` is the FAIL-CLOSED "unknown" sentinel published by the P2P engine
+    /// when authenticated peers exist but none has advertised a height yet: a node
+    /// that cannot place itself relative to the network must be treated as behind
+    /// (so the mining gate stays shut), never as at the tip.
     pub fn behind_blocks(&self) -> u64 {
         self.behind_blocks.load(Ordering::Relaxed)
     }

@@ -611,6 +611,17 @@ const STATUS_MAX_STRIKES: u32 = 3;
 /// later delivers recovers, while a persistent non-deliverer is eventually dropped.
 const UNSUBSTANTIATED_CLAIM_PENALTY: f64 = 20.0;
 
+/// The strike count at which a persistently non-delivering peer is DISCONNECTED
+/// (double [`STATUS_MAX_STRIKES`]). By this rung the peer has ignored requests
+/// under escalating deadlines (2+4+8+16+32+32 s ≈ 90 s) without delivering one
+/// block or header, while a struck-out claim keeps gating mining (fail closed) —
+/// so an undeliverable claim must eventually LEAVE the peer set rather than pin
+/// the miner forever. Disconnection (with a stiff penalty each cycle) is that
+/// exit: a liar that reconnects and stalls again accumulates per-IP score and is
+/// ultimately banned by the transport; an honest peer clears its strikes with its
+/// first delivery long before this.
+const STRIKE_DISCONNECT: u32 = STATUS_MAX_STRIKES * 2;
+
 /// How many verification jobs may be queued for the verifier thread before the
 /// worker runs one itself. Small on purpose: catch-up already keeps exactly one
 /// batch outstanding (see [`SyncState::verifying`]), so this depth exists only to
@@ -722,6 +733,10 @@ struct VerifyChannel {
     rep_tx: Sender<VerifyReport>,
     rep_rx: Receiver<VerifyReport>,
     worker: Option<JoinHandle<()>>,
+    /// The node handle the verifier runs against, retained so a verifier thread
+    /// that DIED (panicked) can be respawned by the watchdog rather than leaving
+    /// the node verifying inline on the network thread for the rest of its life.
+    node: Option<Arc<Mutex<Node>>>,
 }
 
 impl Default for VerifyChannel {
@@ -732,6 +747,7 @@ impl Default for VerifyChannel {
             rep_tx,
             rep_rx,
             worker: None,
+            node: None,
         }
     }
 }
@@ -1139,6 +1155,11 @@ impl SyncState {
     /// still taken — but per block, not per batch — so the worker's own status /
     /// serve path is only ever delayed by a single block's verification.
     fn attach_verifier(&mut self, node: Arc<Mutex<Node>>) {
+        // Keep the handle so the watchdog in `collect_verify_reports` can RESPAWN a
+        // verifier whose thread died (a panic mid-import) instead of degrading to
+        // inline verification forever — inline verification on the worker thread is
+        // the exact starvation this thread exists to prevent.
+        self.verify.node = Some(Arc::clone(&node));
         let (job_tx, job_rx) = mpsc::sync_channel::<VerifyJob>(VERIFY_QUEUE_DEPTH);
         let rep_tx = self.verify.rep_tx.clone();
         let importer = Arc::clone(&self.importer);
@@ -1218,6 +1239,33 @@ impl SyncState {
                 self.verifying = None;
             }
             self.apply_verify_report(tcp, node, report);
+        }
+        // WATCHDOG: a verifier thread that DIED mid-job (a panic) never sends its
+        // report, so `verifying` would stay set forever and `request_missing` would
+        // never ask for another block — a permanent, silent sync stall at whatever
+        // batch boundary the node had reached. Thread liveness (not a timeout — a
+        // slow verification is not a fault) is the tell: the thread only exits when
+        // its job channel closes at shutdown, so a finished thread with a pass still
+        // marked in-progress is a crash. Clear the marker and RESPAWN the verifier
+        // (verification must never degrade to running inline on this network thread
+        // — that starvation is the outage this thread exists to prevent), so
+        // catch-up re-requests the interrupted batch and keeps making progress.
+        if self.verifying.is_some() {
+            if let Some(w) = &self.verify.worker {
+                if w.is_finished() {
+                    self.verify.job_tx = None;
+                    self.verify.worker = None;
+                    self.verifying = None;
+                    p2p_log(
+                        &self.log,
+                        "⚠ the block-verifier thread died — respawning it; catch-up will \
+                         re-request the interrupted batch",
+                    );
+                    if let Some(n) = self.verify.node.clone() {
+                        self.attach_verifier(n);
+                    }
+                }
+            }
         }
     }
 
@@ -2041,9 +2089,13 @@ impl SyncState {
         self.verify_logged = false;
 
         // A live, un-timed-out request is outstanding: give it time rather than
-        // re-asking or thrashing to another peer.
+        // re-asking or thrashing to another peer. The deadline ESCALATES with the
+        // peer's accrued strikes (see `request_timeout`): a 6 MiB batch over a slow
+        // home link routinely takes more than the base 2 s, and re-asking mid-transfer
+        // only queues ANOTHER copy of the batch behind the first — the death spiral
+        // that struck out honest Windows peers at exact batch boundaries.
         if let Some(f) = &self.inflight {
-            if connected.contains(&f.peer) && f.since.elapsed() < BLOCK_REQUEST_TIMEOUT {
+            if connected.contains(&f.peer) && f.since.elapsed() < self.request_timeout(&f.peer) {
                 return;
             }
         }
@@ -2054,9 +2106,19 @@ impl SyncState {
             // Charge a strike: this peer advertised more work than us but did not deliver
             // the block we asked for. Strikes are cleared by any real forward progress
             // (see `advance_or_done`), so only a peer that PERSISTENTLY fails to
-            // substantiate its claim accrues them. At the bound its claim stops gating
-            // mining / being chosen for sync (via `status_actionable`) and it is
-            // penalized once — closing the "one authenticated liar pins us in Syncing".
+            // substantiate its claim accrues them. The ladder:
+            //   • STATUS_MAX_STRIKES (3, ~14 s of escalating deadlines): the peer stops
+            //     being PREFERRED as a download source (`status_actionable`) and is
+            //     penalized once. Its claim still gates mining — see `telemetry`.
+            //   • STRIKE_DISCONNECT (6, ~90 s with the escalated 32 s deadlines and not
+            //     one delivered block or header in that time): the peer is withholding,
+            //     not slow. Penalize hard and DISCONNECT it — an explicit removal, not a
+            //     silent de-gating, so its claim stops gating mining the honest way (it
+            //     leaves the peer set). Each reconnect-and-stall cycle repeats the
+            //     penalties against the same per-IP score, so a persistent liar walks
+            //     itself into the transport ban.
+            // An honest slow peer never reaches the second rung: any delivered block,
+            // batch, or headers reply clears its strikes entirely.
             let strikes = {
                 let s = self.sync_strikes.entry(sp).or_insert(0);
                 *s = s.saturating_add(1);
@@ -2067,8 +2129,20 @@ impl SyncState {
                 p2p_log(
                     &self.log,
                     format!(
-                        "⚠ {} advertised a chain it has not delivered in {STATUS_MAX_STRIKES} \
-                         requests — its claim no longer gates mining or catch-up",
+                        "⚠ {} advertised a chain it has not delivered in \
+                         {STATUS_MAX_STRIKES} requests — deprioritized for catch-up; \
+                         its claim still gates mining until it disconnects",
+                        short_peer(&sp)
+                    ),
+                );
+            } else if strikes >= STRIKE_DISCONNECT {
+                tcp.penalize_peer(sp, INVALID_BLOCK_PENALTY);
+                tcp.disconnect(&sp);
+                p2p_log(
+                    &self.log,
+                    format!(
+                        "✗ {} withheld every block of the chain it advertised across \
+                         {STRIKE_DISCONNECT} escalating requests — disconnected",
                         short_peer(&sp)
                     ),
                 );
@@ -2080,9 +2154,10 @@ impl SyncState {
                 p2p_log(
                     &self.log,
                     format!(
-                        "… no reply from {} to our block request within {}s — retrying",
+                        "… no reply from {} to our block request within {}s — retrying \
+                         (with a longer deadline)",
                         short_peer(&sp),
-                        BLOCK_REQUEST_TIMEOUT.as_secs()
+                        self.request_timeout(&sp).as_secs()
                     ),
                 );
                 self.stalled_logged = true;
@@ -2101,11 +2176,38 @@ impl SyncState {
             })
             .map(|(p, _)| *p)
             .collect();
+        candidates.sort_by_key(|p| std::cmp::Reverse(self.peer_status[p].chain_work));
+        if candidates.is_empty() {
+            // NEVER GIVE UP while an authenticated, connected peer still claims more
+            // work than us. With every preferred candidate struck out or stale, the
+            // old behavior was to go idle — but a struck-out peer is only ever asked
+            // again by THIS function, so its strikes could never clear and the node
+            // wedged forever at a batch boundary (heights advance a whole batch at a
+            // time, which is why the field failures sat at exact multiples of
+            // SYNC_BATCH). Fall back to the least-struck claimant: an honest slow
+            // peer's next delivery clears its strikes and sync resumes; a liar keeps
+            // striking out, keeps accruing penalties, and is banned by the transport.
+            candidates = self
+                .peer_status
+                .iter()
+                .filter(|(p, s)| {
+                    s.chain_work > local.chain_work
+                        && self.authenticated.contains(p)
+                        && connected.contains(p)
+                })
+                .map(|(p, _)| *p)
+                .collect();
+            candidates.sort_by_key(|p| {
+                (
+                    self.sync_strikes.get(p).copied().unwrap_or(0),
+                    std::cmp::Reverse(self.peer_status[p].chain_work),
+                )
+            });
+        }
         if candidates.is_empty() {
             self.inflight = None;
             return;
         }
-        candidates.sort_by_key(|p| std::cmp::Reverse(self.peer_status[p].chain_work));
 
         // Prefer the best peer; skip the stalled one unless it is our only option.
         let peer = candidates
@@ -2170,6 +2272,21 @@ impl SyncState {
         }
     }
 
+    /// The stall deadline for an outstanding block request to `peer`:
+    /// [`BLOCK_REQUEST_TIMEOUT`], doubled for each strike the peer has accrued
+    /// (capped at 16×, i.e. 32 s). A batch can be up to [`SYNC_BATCH_MAX_BYTES`]
+    /// (6 MiB), which takes well over the base 2 s on an ordinary home uplink —
+    /// treating transfer time as silence is how honest slow peers were struck
+    /// out at batch boundaries (each premature re-request also queued another
+    /// 6 MiB behind the first, making the "stall" self-reinforcing). A truly
+    /// silent peer is still deprioritized within ~14 s (2+4+8 s to
+    /// [`STATUS_MAX_STRIKES`]) and disconnected within ~90 s
+    /// ([`STRIKE_DISCONNECT`]).
+    fn request_timeout(&self, peer: &SocketAddr) -> Duration {
+        let strikes = self.sync_strikes.get(peer).copied().unwrap_or(0).min(4);
+        BLOCK_REQUEST_TIMEOUT * 2u32.saturating_pow(strikes)
+    }
+
     /// Whether a block request is currently outstanding — i.e. we are actively catching
     /// up, so the worker should poll fast rather than idle.
     fn has_inflight(&self) -> bool {
@@ -2182,12 +2299,19 @@ impl SyncState {
         self.verifying.is_some()
     }
 
-    /// Whether `peer`'s advertised `status` is still ACTIONABLE for catch-up selection
-    /// and the mining-gate decision: it was received within [`STATUS_TTL`] (a fresh,
-    /// non-stale claim) AND the peer has not accrued [`STATUS_MAX_STRIKES`] unanswered
-    /// block requests against it (an authenticated peer advertising a tall chain it
-    /// never delivers is disqualified, so it can neither be chosen for sync nor keep the
-    /// miner gated). A stale OR unsubstantiated claim is ignored by both consumers.
+    /// Whether `peer`'s advertised `status` is still ACTIONABLE for catch-up **peer
+    /// selection**: it was received within [`STATUS_TTL`] (a fresh, non-stale claim)
+    /// AND the peer has not accrued [`STATUS_MAX_STRIKES`] unanswered block requests
+    /// against it (an authenticated peer advertising a tall chain it never delivers is
+    /// deprioritized as a download source).
+    ///
+    /// SELECTION ONLY — deliberately NOT the mining gate. The gate (see
+    /// [`telemetry`](Self::telemetry)) counts every authenticated claim, struck-out or
+    /// stale, because dropping a claim from the gate is what turned a transiently slow
+    /// only-peer into a NETWORK FORK: three 2-second stalls at a batch boundary
+    /// disqualified the peer, telemetry then read "0 behind", and the miner started
+    /// producing its own chain thousands of blocks below the real tip. Mining must
+    /// fail CLOSED; a slow download is recoverable, a published fork is not.
     fn status_actionable(&self, peer: &SocketAddr, status: &PeerStatus) -> bool {
         // Stall credit again: a claim only goes stale through time we were awake
         // for, so a long local verification cannot silently drop every peer out of
@@ -2205,6 +2329,17 @@ impl SyncState {
     ///   the tip (a block or two behind) keeps mining, while a far-behind joiner pauses
     ///   to download. Height-based, so a sideways fork at the same height reads as 0
     ///   behind (a race the fork-choice tie-break resolves), not a sync.
+    ///
+    ///   FAIL CLOSED, on two axes. (1) EVERY authenticated peer's claim counts here —
+    ///   including one that is struck out or stale for catch-up *selection*
+    ///   ([`status_actionable`]). A peer's failure to deliver blocks is evidence about
+    ///   its usefulness as a download source, never evidence that its chain does not
+    ///   exist; heights only grow, so even a stale claim is a floor on the real tip.
+    ///   (2) If authenticated peers exist but NONE has advertised a height yet, the
+    ///   answer is *unknown*, reported as `u64::MAX` behind — a node that cannot place
+    ///   itself relative to the network must download, not mine. (Dropping struck-out
+    ///   claims here is what previously let a fresh node with one slow peer read "0
+    ///   behind" mid-download and fork the network from a batch boundary.)
     /// * `best_peer_height` — the tallest authenticated peer chain we have heard of.
     /// * `distinct_peers` — the number of distinct authenticated node IDENTITIES, NOT
     ///   raw socket connections. A redundant inbound+outbound link to the same node
@@ -2221,13 +2356,21 @@ impl SyncState {
         let best = self
             .peer_status
             .iter()
-            .filter(|(p, s)| self.authenticated.contains(p) && self.status_actionable(p, s))
+            .filter(|(p, _)| self.authenticated.contains(p))
             .map(|(_, s)| s.height)
-            .max()
-            .unwrap_or(0);
+            .max();
         let local_height = local_status(node).map(|l| l.height).unwrap_or(0);
-        let behind_blocks = best.saturating_sub(local_height);
-        (behind_blocks, best, distinct.len())
+        let behind_blocks = match best {
+            Some(b) => b.saturating_sub(local_height),
+            // Authenticated peers, but not one advertised height: our position
+            // relative to the network is UNKNOWN. Fail closed — report maximally
+            // behind so the mining gate stays shut until a real claim arrives.
+            // (Keyed off `authenticated` — the same set `best` filters on — not the
+            // identity map, so the two can never disagree about "no claims".)
+            None if !self.authenticated.is_empty() => u64::MAX,
+            None => 0,
+        };
+        (behind_blocks, best.unwrap_or(0), distinct.len())
     }
 
     /// Pull-based discovery: ask each **version-compatible** peer for the addresses it
@@ -2662,8 +2805,11 @@ mod tests {
 
     #[test]
     fn a_stale_status_claim_is_ignored_after_expiry() {
-        // A claim older than STATUS_TTL is stale: it must not keep the miner gated nor
-        // be chosen for catch-up (its socket is separately reaped by inactivity).
+        // A claim older than STATUS_TTL is stale for catch-up SELECTION: the peer is
+        // no longer preferred as a download source. (It still gates MINING — heights
+        // only grow, so an old claim remains a floor on the real tip; the socket of a
+        // truly dead peer is separately reaped by inactivity, which removes the
+        // claim the honest way.)
         let s = SyncState::new(None, None);
         let peer = addr(7101);
 
@@ -2684,11 +2830,16 @@ mod tests {
     }
 
     #[test]
-    fn a_persistently_unsubstantiated_high_claim_stops_gating_mining() {
-        // One authenticated peer advertises a very tall chain it never delivers. Until
-        // it is struck out it holds us "behind" (gating mining); once it has stalled
-        // STATUS_MAX_STRIKES unanswered requests, its claim is dropped from telemetry so
-        // the miner is released — the fix for "one liar pins the node in Syncing forever".
+    fn a_struck_out_claim_still_gates_mining_but_loses_selection_preference() {
+        // THE MAINNET FORK REGRESSION. One authenticated peer advertises a tall
+        // chain and then stalls STATUS_MAX_STRIKES block requests (an honest peer on
+        // a slow link does this too — a 6 MiB batch over home broadband easily
+        // outlives a 2 s deadline). The strike-out may deprioritize it as a
+        // DOWNLOAD SOURCE, but its claim must KEEP gating the miner: dropping the
+        // claim from telemetry made a mid-download fresh node read "0 behind",
+        // released the miner, and forked it off mainnet from an exact batch
+        // boundary. Mining fails CLOSED; the liar case is handled by repeated
+        // penalties → transport ban → disconnect (which removes the claim).
         use std::sync::Mutex;
 
         let node = Mutex::new(Node::new(
@@ -2697,28 +2848,137 @@ mod tests {
             256,
         ));
         let mut s = SyncState::new(None, None);
-        let liar = addr(7102);
+        let peer = addr(7102);
         let claim = peer_status(9_000_000, 9);
-        s.authenticated.insert(liar);
-        s.peer_status.insert(liar, claim);
+        s.authenticated.insert(peer);
+        s.identity
+            .insert(peer, AccountId::new("val01.node.sov").unwrap());
+        s.peer_status.insert(peer, claim);
 
         // Before strikes: the tall claim is counted → we read as far behind → gate on.
-        assert!(s.status_actionable(&liar, &claim));
+        assert!(s.status_actionable(&peer, &claim));
         let (behind_before, best_before, _) = s.telemetry(&node);
         assert_eq!(best_before, 9_000_000);
         assert_eq!(behind_before, 9_000_000);
 
         // Accrue the strike bound (as request_missing does on each unanswered request).
-        s.sync_strikes.insert(liar, STATUS_MAX_STRIKES);
+        s.sync_strikes.insert(peer, STATUS_MAX_STRIKES);
         assert!(
-            !s.status_actionable(&liar, &claim),
-            "an unsubstantiated claim no longer gates mining or is chosen for catch-up"
+            !s.status_actionable(&peer, &claim),
+            "an unsubstantiated claim loses catch-up selection preference"
         );
         let (behind_after, best_after, _) = s.telemetry(&node);
-        assert_eq!(best_after, 0, "the liar's claim is dropped from telemetry");
         assert_eq!(
-            behind_after, 0,
-            "the miner is no longer gated by the phantom chain"
+            best_after, 9_000_000,
+            "the claim must STILL be visible to the mining gate"
+        );
+        assert_eq!(
+            behind_after, 9_000_000,
+            "a struck-out only-peer must keep the miner gated (fail closed) — \
+             releasing it here is what forked a fresh node off mainnet"
+        );
+    }
+
+    #[test]
+    fn peers_with_no_advertised_height_read_as_unknown_and_gate_mining() {
+        // An authenticated peer that has not yet sent a Status leaves our position
+        // relative to the network UNKNOWN. Unknown must gate mining (u64::MAX
+        // behind), never read as "at the tip".
+        use std::sync::Mutex;
+
+        let node = Mutex::new(Node::new(
+            Blockchain::new(&test_genesis()).unwrap(),
+            1024,
+            256,
+        ));
+        let mut s = SyncState::new(None, None);
+        let peer = addr(7103);
+        s.authenticated.insert(peer);
+        s.identity
+            .insert(peer, AccountId::new("val01.node.sov").unwrap());
+        // No peer_status entry at all.
+        let (behind, best, peers) = s.telemetry(&node);
+        assert_eq!(peers, 1);
+        assert_eq!(best, 0);
+        assert_eq!(
+            behind,
+            u64::MAX,
+            "peer height unknown ⇒ fail closed (maximally behind), not 0"
+        );
+
+        // And with NO peers at all, behind is 0 (a solo node is simply alone —
+        // whether it may mine is the daemon's checkpoint-aware decision).
+        let s2 = SyncState::new(None, None);
+        let (behind2, _, peers2) = s2.telemetry(&node);
+        assert_eq!((behind2, peers2), (0, 0));
+    }
+
+    #[test]
+    fn catch_up_falls_back_to_a_struck_out_peer_rather_than_going_idle() {
+        // THE BATCH-BOUNDARY WEDGE REGRESSION. Once the ONLY heavier peer is struck
+        // out, the old candidate filter left request_missing with nothing and it went
+        // idle — but a struck-out peer is only ever re-asked by request_missing
+        // itself, so its strikes could never clear: sync stopped FOREVER at whatever
+        // batch boundary it had reached (768 = 3×SYNC_BATCH in the field), while the
+        // peer stayed connected. The fix: with no preferred candidate, fall back to
+        // the least-struck authenticated claimant and keep requesting.
+        let _serial = crate::NET_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        use std::sync::Mutex;
+
+        let server = TcpNode::bind("127.0.0.1:0").unwrap();
+        let client = TcpNode::bind("127.0.0.1:0").unwrap();
+        client.connect(&server.local_addr().to_string()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while client.connected_peers().is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let peer = *client
+            .connected_peers()
+            .first()
+            .expect("loopback connection established");
+
+        let node = Mutex::new(Node::new(
+            Blockchain::new(&test_genesis()).unwrap(),
+            1024,
+            256,
+        ));
+        let mut s = SyncState::new(None, None);
+        s.authenticated.insert(peer);
+        s.identity
+            .insert(peer, AccountId::new("val01.node.sov").unwrap());
+        s.peer_status.insert(peer, peer_status(5_000, 9));
+        // The peer has struck out: it is no longer status_actionable.
+        s.sync_strikes.insert(peer, STATUS_MAX_STRIKES);
+        assert!(!s.status_actionable(&peer, &s.peer_status[&peer]));
+
+        s.request_missing(&client, &node);
+        assert!(
+            s.inflight.is_some(),
+            "sync must keep requesting from the struck-out only peer (its next \
+             delivery clears the strikes) instead of idling forever at a batch boundary"
+        );
+        assert_eq!(s.inflight.as_ref().unwrap().peer, peer);
+    }
+
+    #[test]
+    fn request_timeout_escalates_with_strikes_and_is_capped() {
+        // A slow honest link gets geometrically more time to deliver a 6 MiB batch
+        // (re-asking mid-transfer only queues more bytes behind the first copy),
+        // while a truly silent peer still strikes out in about a minute.
+        let mut s = SyncState::new(None, None);
+        let peer = addr(7104);
+        assert_eq!(s.request_timeout(&peer), BLOCK_REQUEST_TIMEOUT);
+        s.sync_strikes.insert(peer, 1);
+        assert_eq!(s.request_timeout(&peer), BLOCK_REQUEST_TIMEOUT * 2);
+        s.sync_strikes.insert(peer, 3);
+        assert_eq!(s.request_timeout(&peer), BLOCK_REQUEST_TIMEOUT * 8);
+        s.sync_strikes.insert(peer, 40);
+        assert_eq!(
+            s.request_timeout(&peer),
+            BLOCK_REQUEST_TIMEOUT * 16,
+            "the escalation is capped so a liar is still struck out promptly"
         );
     }
 
@@ -3584,8 +3844,11 @@ mod tests {
         const C_HEIGHT: u64 = 260; // the fork miner's tip of F (ahead of A)
         const B_HEIGHT: u64 = 300; // canonical chain M, strictly heavier
                                    // B answers nothing for this long — enough for STATUS_MAX_STRIKES
-                                   // request timeouts — then answers everything, forever.
-        const B_OUTAGE: Duration = Duration::from_secs(9);
+                                   // request timeouts even under the ESCALATING deadlines
+                                   // (2+4+8 s = 14 s to strike out) — then answers everything,
+                                   // forever. Kept below the ~90 s STRIKE_DISCONNECT rung, so
+                                   // this exercises recovery of a struck-out-but-connected peer.
+        const B_OUTAGE: Duration = Duration::from_secs(16);
 
         // Chain F (offset timestamps): C holds all of it, A the first A_HEIGHT.
         let mut chain_c = Blockchain::new(&test_genesis()).unwrap();
