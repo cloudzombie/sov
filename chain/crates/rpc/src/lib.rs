@@ -1595,7 +1595,11 @@ fn call(
                 // in. "unmapped" = outbound-only: fully functional, but a leaf.
                 "reachability": reachability,
                 "bestPeerHeight": best,
-                "behindBlocks": behind,
+                // `u64::MAX` is the fail-closed "peer height unknown" sentinel (see
+                // `SyncShared::behind_blocks`) — surface it as null rather than a
+                // nonsense number, with `syncing` still true (unknown gates mining).
+                "behindBlocks": (behind != u64::MAX).then_some(behind),
+                "behindKnown": behind != u64::MAX,
                 "syncing": behind > 0,
             }))
         }

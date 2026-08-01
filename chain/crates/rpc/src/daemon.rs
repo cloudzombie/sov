@@ -1602,14 +1602,61 @@ const CONNECT_GRACE: Duration = Duration::from_secs(15);
 
 /// What the block-production loop is doing right now — tracked so each transition is
 /// logged once (not every iteration).
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum MinePhase {
-    /// Waiting for peers to connect before mining (startup grace).
+    /// Waiting for peers to connect before mining (startup grace — or, on a
+    /// checkpointed chain, for as long as no peer is connected: see
+    /// [`decide_mine_phase`]).
     Connecting,
     /// Connected but behind a heavier peer chain — downloading, not mining.
     Syncing,
     /// At the tip (or solo past the grace) — actively mining.
     Mining,
+}
+
+/// Decide the production phase. Pure — every input is a fact the caller measured —
+/// so the mining gate itself is unit-testable.
+///
+/// The gate FAILS CLOSED on a checkpointed chain. Baked/configured checkpoints exist
+/// precisely because a live network exists (dev/test chains have none), and on such a
+/// chain a node may mine only while it can DEMONSTRATE it is at that network's tip:
+///
+/// * `unpinned` (the newest checkpoint is not matched on our active chain) ⇒ Syncing.
+///   A branch that never reaches the pin is vouched for by nothing (finding A2).
+/// * `pinned_chain && peers == 0` ⇒ Connecting, **indefinitely** — not just for the
+///   startup grace. With zero peers there is no evidence about the network tip at
+///   all; "no one told me about a heavier chain" must never be read as "I am the
+///   tip". This is the exact failure that forked a fresh node off mainnet: its only
+///   peer was dropped mid-download and, once the 15 s grace lapsed, it started
+///   mining "solo" thousands of blocks below the real tip.
+/// * `behind` (which includes the fail-closed "peer height unknown" sentinel — see
+///   [`SyncShared::behind_blocks`]) ⇒ Syncing.
+///
+/// A chain WITHOUT checkpoints keeps the bootstrap behavior: a solo/seed node waits
+/// out the grace and then mines, because a brand-new network has no one to wait for.
+/// A standalone node (no P2P attached at all, `p2p_active == false`) also mines.
+fn decide_mine_phase(
+    pinned_chain: bool,
+    unpinned: bool,
+    p2p_active: bool,
+    peers: usize,
+    behind: bool,
+    within_connect_grace: bool,
+) -> MinePhase {
+    if unpinned {
+        return MinePhase::Syncing;
+    }
+    if p2p_active && peers == 0 {
+        if pinned_chain || within_connect_grace {
+            return MinePhase::Connecting;
+        }
+        return MinePhase::Mining; // solo/seed bootstrap on an un-checkpointed chain
+    }
+    if behind {
+        MinePhase::Syncing
+    } else {
+        MinePhase::Mining
+    }
 }
 
 /// A random 64-bit nonce start, so independent miners search different regions of the
@@ -2164,6 +2211,9 @@ impl Daemon {
             // Track the mining phase so each transition (connecting → syncing → mining) is
             // logged once. `start_at` bounds the connect-before-mining grace window.
             let mut last_phase: Option<MinePhase> = None;
+            // Whether the "checkpointed chain + zero peers ⇒ waiting, not solo-mining"
+            // explanation has been logged (once per run).
+            let mut pinned_wait_logged = false;
             let start_at = Instant::now();
             // Hashrate meter: hashes attempted since the last publish, and when. Published
             // to the shared telemetry ~1×/s so the UI can show this node's H/s (and an
@@ -2269,14 +2319,19 @@ impl Daemon {
                     continue;
                 }
 
-                // CONNECT-then-SYNC-then-MINE. Decide the phase:
-                //   • Connecting — startup grace, no peer yet: wait so handshakes get full
-                //     CPU and we never mine ahead of the network. (Past the grace with no
-                //     peers, a solo/seed node falls through to Mining to bootstrap.)
-                //   • Syncing — connected but behind a heavier peer chain: download first
-                //     (the IBD gate; only a real >1-block deficit, never a 1-block race, so
-                //     two miners at the tip both keep mining and share rewards).
-                //   • Mining — at the tip: grind.
+                // CONNECT-then-SYNC-then-MINE. Decide the phase (see
+                // `decide_mine_phase` — the gate is a pure, unit-tested function):
+                //   • Connecting — no peer yet: wait so handshakes get full CPU and we
+                //     never mine ahead of the network. On a CHECKPOINTED chain this
+                //     holds for as long as there are zero peers (fail closed — with no
+                //     peers we have no evidence about the network tip); only an
+                //     un-checkpointed (dev/seed-bootstrap) chain falls through to
+                //     Mining after the grace.
+                //   • Syncing — behind a heavier peer chain, the peer height is still
+                //     unknown, or the newest checkpoint is not yet matched: download
+                //     first (the IBD gate; only a real >1-block deficit, never a
+                //     1-block race, so two miners at the tip both keep mining).
+                //   • Mining — demonstrably at the tip: grind.
                 let peers = sync_status.as_ref().map(|s| s.authed_peers()).unwrap_or(0);
                 let behind = sync_status
                     .as_ref()
@@ -2297,23 +2352,46 @@ impl Daemon {
                 // sync artefact into work published to the network. So mining waits until
                 // the checkpoint is satisfied. Chains with no checkpoints (dev/test) are
                 // unaffected — `checkpoint_satisfied()` is true for them.
-                let unpinned = node
+                // Fail CLOSED on a poisoned lock: treat the chain as checkpointed and
+                // unmatched, so a wounded node can never conclude "free to mine".
+                let (pinned_chain, unpinned) = node
                     .lock()
-                    .map(|n| !n.chain().checkpoint_satisfied())
-                    .unwrap_or(false);
-                let phase = if unpinned {
-                    MinePhase::Syncing
-                } else if sync_status.is_some() && peers == 0 && start_at.elapsed() < CONNECT_GRACE
+                    .map(|n| {
+                        (
+                            n.chain().newest_checkpoint().is_some(),
+                            !n.chain().checkpoint_satisfied(),
+                        )
+                    })
+                    .unwrap_or((true, true));
+                let phase = decide_mine_phase(
+                    pinned_chain,
+                    unpinned,
+                    sync_status.is_some(),
+                    peers,
+                    behind,
+                    start_at.elapsed() < CONNECT_GRACE,
+                );
+                // Surface the fail-closed wait ONCE: with checkpoints configured and no
+                // peer connected past the grace, the node deliberately does NOT fall
+                // back to solo mining (that is what forked a fresh node off mainnet).
+                // Say so, or the operator sees an idle miner with no explanation.
+                if peers > 0 {
+                    // Re-arm the explanation: if every peer drops again later, the
+                    // renewed wait is re-explained rather than silent.
+                    pinned_wait_logged = false;
+                } else if phase == MinePhase::Connecting
+                    && pinned_chain
+                    && start_at.elapsed() >= CONNECT_GRACE
+                    && !pinned_wait_logged
                 {
-                    // P2P is active but no peer has connected yet — wait (grace), so the
-                    // handshake gets full CPU and we don't mine ahead of the network. With
-                    // no P2P at all (standalone), there is nothing to wait for, so mine.
-                    MinePhase::Connecting
-                } else if behind {
-                    MinePhase::Syncing
-                } else {
-                    MinePhase::Mining
-                };
+                    pinned_wait_logged = true;
+                    daemon_log(
+                        &log,
+                        "⏳ no peers connected — this chain has trusted checkpoints (a live \
+                         network exists), so mining stays PAUSED until a peer connects; this \
+                         node will never mine blind",
+                    );
+                }
                 if last_phase != Some(phase) {
                     match phase {
                         MinePhase::Connecting => {
@@ -4080,6 +4158,123 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(mined, "a solo node with no heavier peer mines normally");
+        handle.shutdown();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mining_gate_fails_closed() {
+        // THE MAINNET FORK REGRESSION, at the decision itself. A fresh node whose
+        // sync stalled at a batch boundary lost its only peer and, 15 s later,
+        // started mining "solo" thousands of blocks below the live tip. On a
+        // checkpointed chain (i.e. a chain a live network exists for) the gate must
+        // fail CLOSED: no peers ⇒ wait, unknown peer height ⇒ sync, newest pin not
+        // matched ⇒ sync. Un-checkpointed dev/bootstrap chains keep solo mining.
+        use MinePhase::*;
+        let pinned = true;
+        let unpinned_active = true; // newest pin NOT matched on our chain
+        let grace = true;
+
+        // Below/short of the newest checkpoint: NEVER mine, whatever else holds.
+        assert_eq!(
+            decide_mine_phase(pinned, unpinned_active, true, 5, false, !grace),
+            Syncing
+        );
+        assert_eq!(
+            decide_mine_phase(pinned, unpinned_active, true, 0, false, !grace),
+            Syncing
+        );
+
+        // Checkpointed chain with ZERO peers: wait for a peer — even long past the
+        // startup grace (this is the exact fail-open that produced the fork).
+        assert_eq!(
+            decide_mine_phase(pinned, false, true, 0, false, !grace),
+            Connecting,
+            "a checkpointed node with no peers must never conclude it is the tip"
+        );
+        assert_eq!(
+            decide_mine_phase(pinned, false, true, 0, false, grace),
+            Connecting
+        );
+
+        // Behind — or peer height UNKNOWN (telemetry publishes u64::MAX behind,
+        // which reads as behind=true here): download, don't mine.
+        assert_eq!(
+            decide_mine_phase(pinned, false, true, 1, true, !grace),
+            Syncing
+        );
+
+        // Demonstrably at the tip of a checkpointed chain with live peers: mine.
+        assert_eq!(
+            decide_mine_phase(pinned, false, true, 1, false, !grace),
+            Mining
+        );
+
+        // Un-checkpointed (dev/test/bootstrap) chain: grace then solo mining, as before.
+        assert_eq!(
+            decide_mine_phase(false, false, true, 0, false, grace),
+            Connecting
+        );
+        assert_eq!(
+            decide_mine_phase(false, false, true, 0, false, !grace),
+            Mining
+        );
+        // Standalone (no P2P attached): mining is unconditional on peers.
+        assert_eq!(
+            decide_mine_phase(false, false, false, 0, false, !grace),
+            Mining
+        );
+    }
+
+    #[test]
+    fn a_checkpointed_node_with_zero_peers_never_falls_back_to_solo_mining() {
+        // End-to-end wiring for the fail-closed gate: a daemon on a chain WITH a
+        // (satisfied) trusted checkpoint, P2P telemetry attached, mining enabled and
+        // ZERO peers must still be at height 0 well after CONNECT_GRACE (15 s) has
+        // lapsed — the old code started mining "solo" at that point, which is
+        // precisely how a peer-starved fresh node forked off mainnet.
+        let genesis = gate_test_genesis();
+        let dir = std::env::temp_dir().join(format!(
+            "sov-failclosed-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sync = Arc::new(SyncShared::new()); // no peers, ever
+        let daemon = Daemon::new(
+            &genesis,
+            &dir,
+            1024,
+            256,
+            vec![(
+                AccountId::new("val01.node.sov").unwrap(),
+                Keypair::from_seed([7; 32]),
+            )],
+        )
+        .unwrap()
+        .with_sync_status(Arc::clone(&sync));
+        // Pin genesis itself: the chain is checkpointed AND the pin is already
+        // matched, so the old code would have reached Mining the moment the grace
+        // lapsed — isolating exactly the zero-peer rule.
+        let genesis_hash = daemon.genesis_hash();
+        let daemon = daemon.with_checkpoints([(0, genesis_hash)]);
+        let _serial = crate::NET_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let handle = daemon.run("127.0.0.1:0", 1, 20, true, 25).unwrap();
+
+        // Watch it across the grace boundary (15 s) and beyond.
+        let deadline = Instant::now() + Duration::from_secs(17);
+        while Instant::now() < deadline {
+            assert_eq!(
+                handle.node().lock().unwrap().chain().height(),
+                0,
+                "a checkpointed node with zero peers must never mine — not even \
+                 after the connect grace"
+            );
+            thread::sleep(Duration::from_millis(500));
+        }
         handle.shutdown();
         let _ = fs::remove_dir_all(&dir);
     }
