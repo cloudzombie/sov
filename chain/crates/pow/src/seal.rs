@@ -56,14 +56,53 @@ thread_local! {
     static RANDOMX_VM_FAST: RefCell<Option<(Vec<u8>, RandomXVM)>> = const { RefCell::new(None) };
 }
 
+/// Bytes the FLAG_FULL_MEM RandomX dataset needs (~2080 MiB), plus headroom for the
+/// node process itself, before we dare allocate it. Below this much *available* RAM we
+/// use the light VM instead.
+const FAST_DATASET_MIN_AVAIL_BYTES: u64 = 2_600 * 1024 * 1024; // ~2.6 GiB
+
+/// True if the host has enough *available* memory to hold the ~2 GiB fast-mode dataset
+/// without inviting the OOM killer. Reads `/proc/meminfo`'s `MemAvailable` on Linux; on
+/// any platform without it (macOS/dev, or an unreadable/garbled file) it returns `true`
+/// so those hosts keep the fast path — the guard only ever *demotes* a genuinely
+/// RAM-starved Linux box to light mode.
+fn host_has_ram_for_fast_dataset() -> bool {
+    let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") else {
+        return true; // not Linux (e.g. macOS dev) → don't interfere
+    };
+    match parse_mem_available_kb(&meminfo) {
+        Some(kb) => kb.saturating_mul(1024) >= FAST_DATASET_MIN_AVAIL_BYTES,
+        None => true, // MemAvailable missing/garbled → don't block the fast path
+    }
+}
+
+/// Parse the `MemAvailable` value (in kB) out of a `/proc/meminfo` body. Pure and
+/// testable; returns `None` if the field is absent or unparseable.
+fn parse_mem_available_kb(meminfo: &str) -> Option<u64> {
+    meminfo.lines().find_map(|line| {
+        let rest = line.strip_prefix("MemAvailable:")?;
+        rest.trim()
+            .trim_end_matches("kB")
+            .trim()
+            .parse::<u64>()
+            .ok()
+    })
+}
+
 /// Build a RandomX VM for `key`. In `fast` mode it allocates the full ~2 GiB dataset
-/// (`FLAG_FULL_MEM`) for ~10× the hash rate — used by the mining hot loop. If the
-/// dataset can't be allocated (not enough RAM — e.g. a small seed VPS), it transparently
-/// falls back to the light (cache-only) VM, so mining still works, just slower. `fast =
-/// false` always builds the light VM. RandomX guarantees fast and light produce the
-/// IDENTICAL hash, so a fast miner and a light verifier always agree (consensus-safe).
+/// (`FLAG_FULL_MEM`) for ~10× the hash rate — used by the mining hot loop. On a
+/// RAM-constrained host (e.g. a small seed VPS) it transparently uses the light
+/// (cache-only) VM instead, so mining still works, just slower. `fast = false` always
+/// builds the light VM. RandomX guarantees fast and light produce the IDENTICAL hash, so
+/// a fast miner and a light verifier always agree — this choice is purely local and
+/// performance-only, never consensus-affecting.
+///
+/// The demotion is decided PROACTIVELY by [`host_has_ram_for_fast_dataset`] rather than by
+/// catching an allocation failure: on Linux the dataset alloc overcommits and the OOM
+/// killer SIGKILLs the process mid-population, so the `Err` fallback below never fires on
+/// a starved box. The `Ok`/`Err` chain is still kept as a second line of defense.
 fn build_randomx_vm(key: &[u8], fast: bool) -> RandomXVM {
-    if fast {
+    if fast && host_has_ram_for_fast_dataset() {
         let flags = RandomXFlag::get_recommended_flags() | RandomXFlag::FLAG_FULL_MEM;
         // Each step can fail on a RAM-constrained host; on ANY failure fall through to
         // the light VM below rather than aborting the miner.
@@ -157,6 +196,38 @@ mod tests {
         assert_ne!(a, pow_seal(PowAlgo::RandomX, b"other-key", b"header-bytes"));
         // And RandomX is not SHA-256d.
         assert_ne!(a, pow_seal(PowAlgo::Sha256d, key, b"header-bytes"));
+    }
+
+    #[test]
+    fn mem_available_is_parsed_from_a_real_meminfo() {
+        let meminfo = "MemTotal:        1998255 kB\n\
+                       MemFree:          103244 kB\n\
+                       MemAvailable:    1500123 kB\n\
+                       Buffers:            2048 kB\n";
+        assert_eq!(parse_mem_available_kb(meminfo), Some(1_500_123));
+        // Absent field → None (caller then keeps the fast path).
+        assert_eq!(parse_mem_available_kb("MemTotal: 4096 kB\n"), None);
+        // Garbled value → None, not a panic.
+        assert_eq!(
+            parse_mem_available_kb("MemAvailable: not-a-number kB\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn low_ram_demotes_to_light_high_ram_keeps_fast() {
+        // The 1.9 GiB seed VPS that OOM-killed: ~1.5 GiB available < 2.6 GiB threshold.
+        let low = parse_mem_available_kb("MemAvailable: 1500000 kB\n").unwrap();
+        assert!(
+            low.saturating_mul(1024) < FAST_DATASET_MIN_AVAIL_BYTES,
+            "1.5 GiB → light"
+        );
+        // A 4 GiB box with ~3.5 GiB available clears the bar → fast mode.
+        let ok = parse_mem_available_kb("MemAvailable: 3670016 kB\n").unwrap();
+        assert!(
+            ok.saturating_mul(1024) >= FAST_DATASET_MIN_AVAIL_BYTES,
+            "3.5 GiB → fast"
+        );
     }
 
     // CONSENSUS-CRITICAL: the mining (fast/dataset) VM and the verify (light/cache) VM
