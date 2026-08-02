@@ -2635,9 +2635,20 @@ struct V2Guard {
     balance_grains: u128,
     /// The node's live per-window de-shield budget, if it reports one.
     window_budget: Option<u128>,
+    /// This wallet's TRANSPARENT balance in grains, when known. `None` means the
+    /// station could not read it — which is NOT the same as zero, so an unknown
+    /// balance never manufactures a refusal; the node stays the backstop.
+    transparent_grains: Option<u128>,
 }
 
 impl V2Guard {
+    /// Attach the wallet's known transparent balance, so a shield larger than the
+    /// balance is refused HERE rather than ~25 s later at the node.
+    fn with_transparent(mut self, grains: Option<u128>) -> Self {
+        self.transparent_grains = grains;
+        self
+    }
+
     /// The most that may leave the pool right now: balance, capped by the
     /// window budget when the node reports one.
     fn deshield_cap(&self) -> u128 {
@@ -2718,6 +2729,21 @@ fn v2_allows(g: &V2Guard, intent: V2Intent<'_>) -> Result<(), &'static str> {
             let a = amount.ok_or("enter an amount")?;
             if a == 0 {
                 return Err("enter an amount greater than zero");
+            }
+            // AFFORDABILITY. A shield spends TRANSPARENT value, so it is bounded by
+            // the transparent balance — not by anything in the pool. Without this
+            // an over-balance shield passed every check here and was only refused
+            // by the node, AFTER ~25 s of STARK proving. An unknown balance
+            // (`None`) is not treated as zero: it authorises nothing extra, it
+            // simply declines to manufacture a refusal from an absence.
+            if let Some(bal) = g.transparent_grains {
+                if a > bal {
+                    return Err(
+                        "that is more than this wallet's transparent balance — a shield \
+                         spends transparent value, and the fee comes off the same balance \
+                         on top of the amount",
+                    );
+                }
             }
             Ok(())
         }
@@ -2850,6 +2876,9 @@ impl ShieldedV2View {
             busy: busy || self.scanning,
             balance_grains: if mine { self.balance as u128 } else { 0 },
             window_budget,
+            // Filled in by `with_transparent` at the paint site, which is the only
+            // place that has read the transparent balance.
+            transparent_grains: None,
         }
     }
 }
@@ -3584,6 +3613,11 @@ pub struct Station {
     ofl_broadcast_in: String, // pasted signed-tx JSON to broadcast
     ofl_msg: String,          // offline-tools status line
     send_to: String,
+    /// What `send_to` held before "Shield to my pool" replaced it, so an accidental
+    /// click is reversible. A silent overwrite of a pasted recipient is exactly how
+    /// value reaches the wrong address. Cleared once used, or as soon as the
+    /// operator edits the field themselves.
+    send_to_undo: Option<String>,
     send_amount: String,
     /// Which shielded pool the private-send form spends from, and the wallet
     /// that choice was made for. A deliberate, visible choice rather than an
@@ -3881,6 +3915,7 @@ impl Station {
             ofl_broadcast_in: String::new(),
             ofl_msg: String::new(),
             send_to: String::new(),
+            send_to_undo: None,
             send_amount: String::new(),
             // NOTHING is armed until the operator picks. There is no default,
             // because a default here is a privacy property chosen for them.
@@ -5038,27 +5073,31 @@ impl Station {
     }
 
     /// Shield transparent value INTO pool v2 (post-quantum).
-    fn shield_v2(&self, ctx: &egui::Context) {
-        self.run_v2_action(ctx, V2Action::Shield);
+    fn shield_v2(&self, ctx: &egui::Context) -> bool {
+        self.run_v2_action(ctx, V2Action::Shield)
     }
 
     /// De-shield value OUT of pool v2 to this wallet's transparent account.
-    fn deshield_v2(&self, ctx: &egui::Context) {
-        self.run_v2_action(ctx, V2Action::Deshield);
+    fn deshield_v2(&self, ctx: &egui::Context) -> bool {
+        self.run_v2_action(ctx, V2Action::Deshield)
     }
 
     /// Fully-private pool-v2 transfer to another `xusq1…` address.
-    fn send_private_v2(&self, ctx: &egui::Context) {
-        self.run_v2_action(ctx, V2Action::Send);
+    fn send_private_v2(&self, ctx: &egui::Context) -> bool {
+        self.run_v2_action(ctx, V2Action::Send)
     }
 
     /// The one worker behind all three pool-v2 actions. They differ only in
     /// which builder runs and what the log line says, so they share a single
     /// spawn/action/rescan path — one place for the locking discipline rather
     /// than three that can drift.
-    fn run_v2_action(&self, ctx: &egui::Context, what: V2Action) {
+    /// Returns TRUE only when a worker was actually spawned — i.e. the action
+    /// passed every guard and is now in flight. The caller uses that to clear the
+    /// amount field, so a second click cannot re-fire the SAME amount, while a
+    /// validation refusal leaves what was typed intact.
+    fn run_v2_action(&self, ctx: &egui::Context, what: V2Action) -> bool {
         if !self.require_signing() {
-            return;
+            return false;
         }
         // Dormancy is re-checked HERE, at submit, against the state observed at
         // this instant — not inherited from whatever the last paint decided. A
@@ -5073,10 +5112,10 @@ impl Station {
             .unwrap_or(PoolState::Unavailable);
         if let Err(why) = private_send_dispatch(Pool::V2, v2_state) {
             finish(&self.action, why);
-            return;
+            return false;
         }
         let Some(w) = self.wallets.get(self.selected) else {
-            return;
+            return false;
         };
         let seed = w.seed;
         let account = w.effective_account();
@@ -5092,7 +5131,7 @@ impl Station {
         };
         let Some(grains) = parse_xus(field).filter(|g| *g > 0) else {
             finish(&self.action, "enter an amount");
-            return;
+            return false;
         };
         let shield_to = self.shield_v2_to.trim().to_string();
         let to = self.private_v2_to.trim().to_string();
@@ -5103,7 +5142,7 @@ impl Station {
         if matches!(what, V2Action::Send) {
             if let Err(why) = pool_recipient_check(Pool::V2, &to) {
                 finish(&self.action, why);
-                return;
+                return false;
             }
         }
         let rpc = self
@@ -5234,6 +5273,7 @@ impl Station {
             }
             ctx.request_repaint();
         });
+        true
     }
 
     /// Fully-private send (shielded → shielded): spend this wallet's scanned
@@ -10749,10 +10789,42 @@ impl Station {
                 .show(ui, |ui| {
                     ui.label(egui::RichText::new("To").weak());
                     ui.horizontal(|ui| {
-                        ui.add(egui::TextEdit::singleline(&mut self.send_to).desired_width(420.0));
-                        if ui.button("Shield to my pool").clicked() {
-                            self.send_to = shielded.clone();
+                        let edited = ui
+                            .add(egui::TextEdit::singleline(&mut self.send_to).desired_width(420.0))
+                            .changed();
+                        // Typing is the operator asserting the recipient themselves;
+                        // the stale undo from an earlier click must not linger and
+                        // offer to overwrite it.
+                        if edited {
+                            self.send_to_undo = None;
+                        }
+                        if ui
+                            .button("Shield to my pool")
+                            .on_hover_text(
+                                "Replace the recipient with this wallet's own shielded \
+                                 address. Reversible — an Undo appears if it replaced \
+                                 something.",
+                            )
+                            .clicked()
+                        {
+                            // REVERSIBLE. This used to overwrite a pasted recipient
+                            // silently and irrecoverably — one stray click on a filled
+                            // field and the intended address was simply gone.
+                            let prev = std::mem::replace(&mut self.send_to, shielded.clone());
+                            if !prev.is_empty() && prev != self.send_to {
+                                self.send_to_undo = Some(prev);
+                            }
                             self.receive_kind = ReceiveKind::Shielded;
+                        }
+                        if let Some(prev) = self.send_to_undo.clone() {
+                            if ui
+                                .button("↩ Undo")
+                                .on_hover_text(format!("restore {}", truncate_middle(&prev, 14, 8)))
+                                .clicked()
+                            {
+                                self.send_to = prev;
+                                self.send_to_undo = None;
+                            }
                         }
                     });
                     ui.end_row();
@@ -11219,12 +11291,23 @@ impl Station {
             // hard-coded `true` — so a selector left on v2 when the pool is not
             // Active is refused by the same pure function that gates shield and
             // de-shield, rather than by a second rule written here.
-            let v2_guard = v2v.guard(
-                &account,
-                v2_state == PoolState::Active,
-                busy,
-                snap.shielded_v2.as_ref().map(|i| i.deshieldable_now),
-            );
+            let v2_guard = v2v
+                .guard(
+                    &account,
+                    v2_state == PoolState::Active,
+                    busy,
+                    snap.shielded_v2.as_ref().map(|i| i.deshieldable_now),
+                )
+                // A shield spends TRANSPARENT value, so the guard needs the
+                // transparent balance to refuse an unaffordable one here rather
+                // than after ~25 s of proving. Absent (node unread) stays `None`
+                // — unknown is not zero.
+                .with_transparent(
+                    snap.accounts
+                        .iter()
+                        .find(|a| a.account == account)
+                        .and_then(|a| a.balance.parse::<u128>().ok()),
+                );
             // The operator's choice FOR THIS WALLET. `chosen_for` drops a choice
             // made for a different wallet before a single control is drawn, so a
             // wallet switch can never leave someone else's pool armed.
@@ -12325,14 +12408,18 @@ impl Station {
         if do_scan_v2 {
             self.scan_shielded_v2(&ctx);
         }
-        if do_shield_v2 {
-            self.shield_v2(&ctx);
+        // Clear the amount ONLY when the action actually went in flight, so a
+        // second click cannot re-fire the same amount at an already-submitted
+        // action — while a refusal (bad amount, guard veto) leaves what was typed
+        // alone instead of eating it.
+        if do_shield_v2 && self.shield_v2(&ctx) {
+            self.shield_v2_amount_in.clear();
         }
-        if do_deshield_v2 {
-            self.deshield_v2(&ctx);
+        if do_deshield_v2 && self.deshield_v2(&ctx) {
+            self.deshield_v2_amount_in.clear();
         }
-        if do_send_v2 {
-            self.send_private_v2(&ctx);
+        if do_send_v2 && self.send_private_v2(&ctx) {
+            self.private_v2_amount.clear();
         }
         if do_rescan {
             self.rescan_shielded(&ctx);
@@ -17656,6 +17743,68 @@ mod v2_guard_tests {
 
     use super::{v2_not_broadcast_line, v2_status_line, ReceiptStatus, V2Action};
 
+    /// A shield spends TRANSPARENT value. Before this, an over-balance shield
+    /// passed every check here and was refused only by the node — AFTER ~25 s of
+    /// STARK proving, which reads as the app wasting your time then failing.
+    #[test]
+    fn a_shield_larger_than_the_transparent_balance_is_refused_up_front() {
+        let g = permissive().with_transparent(Some(10_000));
+        // Over balance → refused, and the reason names the actual constraint.
+        let err = v2_allows(
+            &g,
+            V2Intent::Shield {
+                to: "",
+                amount: Some(10_001),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("transparent balance"), "{err}");
+        // Exactly the balance and below are allowed here (the node still prices
+        // the fee; the guard does not invent a second refusal it cannot compute).
+        assert!(v2_allows(
+            &g,
+            V2Intent::Shield {
+                to: "",
+                amount: Some(10_000)
+            }
+        )
+        .is_ok());
+        assert!(v2_allows(
+            &g,
+            V2Intent::Shield {
+                to: "",
+                amount: Some(1)
+            }
+        )
+        .is_ok());
+    }
+
+    /// An UNKNOWN transparent balance is not zero. If the station could not read
+    /// it, that absence must not manufacture a refusal — the node stays the
+    /// backstop, exactly as with an unscanned pool balance.
+    #[test]
+    fn an_unknown_transparent_balance_never_manufactures_a_refusal() {
+        let g = permissive().with_transparent(None);
+        assert!(v2_allows(
+            &g,
+            V2Intent::Shield {
+                to: "",
+                amount: Some(u128::MAX)
+            }
+        )
+        .is_ok());
+    }
+
+    /// The affordability rule is about the TRANSPARENT balance and must not leak
+    /// into the pool-spending intents, which are bounded by scanned notes and the
+    /// de-shield window instead.
+    #[test]
+    fn affordability_bounds_shield_only_not_pool_spends() {
+        let g = permissive().with_transparent(Some(1));
+        // A de-shield is bounded by the POOL balance, not the transparent one.
+        assert!(v2_allows(&g, V2Intent::Deshield { amount: Some(500) }).is_ok());
+    }
+
     /// THE REGRESSION. A pool-v2 shield/de-shield that is sitting in the mempool
     /// used to be reported as "shield failed: still pending (not yet mined)" —
     /// a sentence that is both self-contradictory and dangerous: it tells an
@@ -17760,6 +17909,7 @@ mod v2_guard_tests {
             busy: false,
             balance_grains: 1_000_000_000,
             window_budget: None,
+            transparent_grains: None,
         }
     }
 
@@ -17798,6 +17948,7 @@ mod v2_guard_tests {
                             busy,
                             balance_grains: balance,
                             window_budget: None,
+                            transparent_grains: None,
                         };
                         for intent in all_intents(&addr) {
                             assert!(
@@ -17940,6 +18091,7 @@ mod v2_guard_tests {
         let g = V2Guard {
             balance_grains: 1_000,
             window_budget: Some(100),
+            transparent_grains: None,
             ..permissive()
         };
         assert_eq!(g.deshield_cap(), 100, "the cap is the tighter of the two");
@@ -17959,6 +18111,7 @@ mod v2_guard_tests {
         // A zero budget stops de-shielding entirely, but not private sends.
         let g0 = V2Guard {
             window_budget: Some(0),
+            transparent_grains: None,
             ..g
         };
         assert_eq!(g0.deshield_cap(), 0);
@@ -18194,6 +18347,10 @@ mod v2_guard_tests {
                                         busy,
                                         balance_grains: balance,
                                         window_budget: budget,
+                                        // This exhaustive matrix predates the
+                                        // affordability check; `None` keeps it
+                                        // testing exactly what it always did.
+                                        transparent_grains: None,
                                     };
                                     // Independent spec of the common preconditions.
                                     let base = pool_active && for_this_wallet && !busy;
@@ -18275,6 +18432,7 @@ mod v2_guard_tests {
                             busy,
                             balance_grains: 10,
                             window_budget: Some(5),
+                            transparent_grains: None,
                         };
                         for intent in [
                             V2Intent::Shield {
@@ -18342,6 +18500,7 @@ mod pool_selector_tests {
             busy: false,
             balance_grains: 1_000_000_000,
             window_budget: None,
+            transparent_grains: None,
         }
     }
 
