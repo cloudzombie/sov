@@ -2767,7 +2767,7 @@ fn v2_allows(g: &V2Guard, intent: V2Intent<'_>) -> Result<(), &'static str> {
 }
 
 /// Which pool-v2 action a worker is running. The three share one worker.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum V2Action {
     Shield,
     Deshield,
@@ -5114,6 +5114,9 @@ impl Station {
         let action = self.action.clone();
         let view = self.shielded_v2.clone();
         let activity = self.activity.clone();
+        // Tracked to a real terminal state by the receipt poller, exactly like a
+        // transparent send — pool v2 is no longer the one path that forgets.
+        let outbox = self.outbox.clone();
         let ctx = ctx.clone();
         begin(&action, what.starting());
         std::thread::spawn(move || {
@@ -5125,41 +5128,106 @@ impl Station {
                 V2Action::Send => zsend_v2_amount(&rpc, seed, &account, &to, grains, &action),
             };
             match result {
-                Ok(id) => {
-                    // A completed private send names the POOL it left and
-                    // whether that pool is post-quantum — the durable record of
-                    // which value space actually moved.
-                    let line = match what {
-                        V2Action::Send => pool_send_receipt(Pool::V2, grains, &id),
-                        _ => format!("{} (tx {})", what.done(), &id[..id.len().min(14)]),
+                // ON THE NETWORK. Register it in the outbox FIRST — before any
+                // message is chosen — so a pool-v2 transaction is tracked to a real
+                // terminal state by the same receipt poller that tracks transparent
+                // sends. Previously nothing here was tracked at all: past the inline
+                // wait the station simply forgot the transaction existed.
+                Ok(sub) => {
+                    let short_tx = sub.txid[..sub.txid.len().min(14)].to_string();
+                    // The counterparty, ELIDED. A xusq1… address carries an
+                    // ML-KEM-768 key (~1.2 KiB) and would otherwise blow out every
+                    // row it appears in.
+                    let counterparty = match what {
+                        V2Action::Shield => {
+                            if shield_to.is_empty() {
+                                format!("{} (own address)", Pool::V2.name())
+                            } else {
+                                truncate_middle(&shield_to, 14, 8)
+                            }
+                        }
+                        V2Action::Deshield => account.clone(),
+                        V2Action::Send => truncate_middle(&to, 14, 8),
                     };
-                    finish(&action, &format!("{line} — updating pool-v2 balance…"));
-                    record(&activity, &line);
-                    ctx.request_repaint();
-                    // Re-scan so the spent note drops and change appears; a stale
-                    // view after a confirmed spend reads as value gone missing.
-                    if let Ok(store) = scan_store_v2(&rpc, seed) {
-                        if let Ok(mut m) = view.lock() {
-                            let v = m.entry_mut(&scan_key);
-                            v.account = scan_key.clone();
-                            v.balance = store.balance();
-                            v.notes = store.unspent_count();
-                            v.scanned_height = store.scanned_height();
-                            v.message = format!("scanned to height {}", store.scanned_height());
+                    if let Ok(mut o) = outbox.lock() {
+                        o.push(SentTx {
+                            txid: sub.txid.clone(),
+                            from_account: account.clone(),
+                            to: counterparty.clone(),
+                            amount_grains: grains,
+                            nonce: sub.nonce,
+                            tip_grains: 0,
+                            shielded_route: true,
+                            submitted_ms: now_ms(),
+                            state: match &sub.status {
+                                ReceiptStatus::Confirmed => SendState::Confirmed,
+                                ReceiptStatus::Pending => SendState::Pending,
+                                ReceiptStatus::Rejected(_) => SendState::Failed,
+                            },
+                            note: match &sub.status {
+                                ReceiptStatus::Rejected(why) => why.clone(),
+                                _ => String::new(),
+                            },
+                        });
+                    }
+                    match &sub.status {
+                        ReceiptStatus::Confirmed => {
+                            let line = match what {
+                                V2Action::Send => pool_send_receipt(Pool::V2, grains, &sub.txid),
+                                _ => format!("{} (tx {short_tx})", what.done()),
+                            };
+                            finish(&action, &format!("{line} — updating pool-v2 balance…"));
+                            record(&activity, &line);
+                            ctx.request_repaint();
+                            // Re-scan so the spent note drops and change appears; a
+                            // stale view after a confirmed spend reads as value gone.
+                            if let Ok(store) = scan_store_v2(&rpc, seed) {
+                                if let Ok(mut m) = view.lock() {
+                                    // Per-wallet slot (PR #44): a rescan must land in
+                                    // THIS wallet's entry, never a shared one.
+                                    let v = m.entry_mut(&scan_key);
+                                    v.account = scan_key.clone();
+                                    v.balance = store.balance();
+                                    v.notes = store.unspent_count();
+                                    v.scanned_height = store.scanned_height();
+                                    v.message =
+                                        format!("scanned to height {}", store.scanned_height());
+                                }
+                            }
+                            finish(
+                                &action,
+                                &format!(
+                                    "CONFIRMED on-chain — {} · {} · {} · balance updated (tx {short_tx})",
+                                    Pool::V2.name(),
+                                    Pool::V2.crypto(),
+                                    Pool::V2.pq_claim()
+                                ),
+                            );
+                        }
+                        // THE FIX. This is not a failure and must never read as one:
+                        // the transaction is in the mempool and may be mined at any
+                        // time. Saying "failed" here invited a resend — a second
+                        // transaction for one intended action.
+                        ReceiptStatus::Pending => {
+                            let line = v2_status_line(what, &sub.status, &short_tx);
+                            finish(&action, &line);
+                            record(&activity, &line);
+                        }
+                        // A receipt exists and says rejected: a real, terminal failure,
+                        // reported with the chain's own reason.
+                        ReceiptStatus::Rejected(_) => {
+                            let line = v2_status_line(what, &sub.status, &short_tx);
+                            finish(&action, &line);
+                            record(&activity, &line);
                         }
                     }
-                    finish(
-                        &action,
-                        &format!(
-                            "confirmed — {} · {} · {} balance updated",
-                            Pool::V2.name(),
-                            Pool::V2.crypto(),
-                            Pool::V2.pq_claim()
-                        ),
-                    );
                 }
+                // NEVER BROADCAST. The nonce is untouched and nothing exists on the
+                // network, so this is the one case where retrying is correct — and
+                // the wording says so, instead of leaving the operator guessing
+                // whether value is in flight.
                 Err(e) => {
-                    let msg = format!("{} failed: {e}", what.noun());
+                    let msg = v2_not_broadcast_line(what, &e);
                     finish(&action, &msg);
                     record(&activity, &msg);
                 }
@@ -13010,6 +13078,52 @@ fn receipt_succeeded(v: &Value) -> bool {
 /// but rejected (e.g. the de-shield drain limit). This is what stops the GUI from
 /// reporting "confirmed" for a transaction that silently failed on-chain — the
 /// exact failure mode that made de-shielded funds look stuck.
+/// Where a submitted transaction stands, as the CHAIN reports it — with the one
+/// distinction the old `Result` collapsed and must never collapse again:
+/// "not yet mined" is **not** a failure.
+///
+/// A transaction that reached the mempool is on the network. It may still be mined
+/// minutes later (a pool-v2 bundle is ~11 KiB and blocks stall). Reporting that as
+/// "FAILED" invites the operator to send it again — burning a second nonce, or
+/// worse, believing value vanished. Only a receipt may declare failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReceiptStatus {
+    /// A receipt says mined and applied.
+    Confirmed,
+    /// Accepted, no receipt yet. In the mempool, outcome still open. NOT a failure.
+    Pending,
+    /// A receipt says mined and REJECTED — terminal, carrying the chain's reason.
+    Rejected(String),
+}
+
+/// Poll for `txid`'s receipt up to `secs`, returning what the chain actually says.
+/// Unlike [`await_receipt`], a timeout yields [`ReceiptStatus::Pending`] rather than
+/// an error, so a caller cannot accidentally render "still pending" as "failed".
+fn await_receipt_status(client: &RpcClient, txid: &Hash, secs: u64) -> ReceiptStatus {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Ok(v) = client.call("sov_getReceipt", json!({ "txId": txid.to_hex() })) {
+            let status = v.get("status");
+            match status.and_then(|s| s.get("status")).and_then(Value::as_str) {
+                Some("success") => return ReceiptStatus::Confirmed,
+                Some("failed") => {
+                    let reason = status
+                        .and_then(|s| s.get("reason"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("rejected on-chain")
+                        .to_string();
+                    return ReceiptStatus::Rejected(reason);
+                }
+                _ => {} // not mined yet
+            }
+        }
+        if Instant::now() >= deadline {
+            return ReceiptStatus::Pending;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
 fn await_receipt(client: &RpcClient, txid: &Hash, secs: u64) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
@@ -13159,7 +13273,7 @@ fn submit_v2_bundle(
     account: &str,
     mut bundle: SpendBundle,
     action: &Arc<Mutex<ActionState>>,
-) -> Result<String, String> {
+) -> Result<V2Submitted, String> {
     let key = PqShieldedKey::from_leaf_seed(&seed);
     let kp = Keypair::hybrid_from_seed(seed);
     let from = AccountId::new(account).map_err(|e| e.to_string())?;
@@ -13189,10 +13303,71 @@ fn submit_v2_bundle(
         },
     };
     let stx = SignedTransaction::sign_in(tx, &kp, domain.as_ref()).map_err(|e| e.to_string())?;
+    // PAST THIS LINE THE TRANSACTION IS ON THE NETWORK. Everything above can fail
+    // safely (nothing was broadcast, the nonce is untouched, a retry is correct);
+    // everything below must never be reported as a failure, because a retry would
+    // then be a SECOND transaction for one intended action.
     let txid = client.submit_transaction(&stx).map_err(|e| e.to_string())?;
-    begin(action, "submitted — waiting for on-chain confirmation…");
-    await_receipt(client, &txid, 120)?;
-    Ok(txid.to_hex())
+    begin(action, "submitted — in the mempool, waiting to be mined…");
+    // A short opportunistic wait so the common fast case still confirms inline;
+    // on timeout this reports PENDING, never failure, and the outbox poller keeps
+    // tracking the receipt to a real terminal state.
+    let status = await_receipt_status(client, &txid, V2_INLINE_WAIT_SECS);
+    Ok(V2Submitted {
+        txid: txid.to_hex(),
+        nonce,
+        status,
+    })
+}
+
+/// How long a pool-v2 submit waits inline for a receipt before handing the
+/// transaction off to the outbox poller. Short on purpose: the poller tracks it to a
+/// real terminal state either way, so blocking longer only delays honest feedback.
+const V2_INLINE_WAIT_SECS: u64 = 45;
+
+/// The sentence shown for a pool-v2 transaction that IS ON THE NETWORK, given what
+/// the chain says about it. Pure, so the one rule that matters can be tested rather
+/// than trusted: **a pending transaction is never described as a failure.**
+///
+/// The bug this replaces read "shield failed: still pending (not yet mined)" — an
+/// outright contradiction that told an operator their value had not moved when it
+/// was sitting in the mempool, inviting a resend of an action already in flight.
+fn v2_status_line(what: V2Action, status: &ReceiptStatus, short_tx: &str) -> String {
+    match status {
+        ReceiptStatus::Confirmed => {
+            format!("{} CONFIRMED on-chain (tx {short_tx})", what.noun())
+        }
+        ReceiptStatus::Pending => format!(
+            "{} SUBMITTED — in the mempool, not yet mined (tx {short_tx}) · do NOT \
+             resend; Station is tracking it to confirmation",
+            what.noun()
+        ),
+        ReceiptStatus::Rejected(why) => {
+            format!("{} REJECTED on-chain: {why} (tx {short_tx})", what.noun())
+        }
+    }
+}
+
+/// The sentence shown when a pool-v2 action NEVER REACHED the network. Separated
+/// from [`v2_status_line`] because the operator's next move differs entirely: here,
+/// and only here, retrying is correct.
+fn v2_not_broadcast_line(what: V2Action, err: &str) -> String {
+    format!(
+        "{} could not be sent — nothing was broadcast, no nonce used, safe to \
+         retry: {err}",
+        what.noun()
+    )
+}
+
+/// A pool-v2 bundle that REACHED THE NETWORK, and where it stands. Returned only
+/// once `submit_transaction` succeeded — so holding one of these means a retry
+/// would double-submit. An `Err` from [`submit_v2_bundle`] means the opposite:
+/// nothing was broadcast and retrying is safe.
+struct V2Submitted {
+    txid: String,
+    /// The nonce slot it occupies, so the outbox can resolve supersession.
+    nonce: u64,
+    status: ReceiptStatus,
 }
 
 /// Refuse before spending ~25 s proving if pool v2 is not live on this chain.
@@ -13219,7 +13394,7 @@ fn shield_v2_amount(
     to: &str,
     amount_grains: u128,
     action: &Arc<Mutex<ActionState>>,
-) -> Result<String, String> {
+) -> Result<V2Submitted, String> {
     let amount = u64::try_from(amount_grains).map_err(|_| "amount too large".to_string())?;
     let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(180));
     require_v2_live(&client)?;
@@ -13244,7 +13419,7 @@ fn deshield_v2_amount(
     account: &str,
     amount_grains: u128,
     action: &Arc<Mutex<ActionState>>,
-) -> Result<String, String> {
+) -> Result<V2Submitted, String> {
     let amount = u64::try_from(amount_grains).map_err(|_| "amount too large".to_string())?;
     let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(180));
     require_v2_live(&client)?;
@@ -13278,7 +13453,7 @@ fn zsend_v2_amount(
     to: &str,
     amount_grains: u128,
     action: &Arc<Mutex<ActionState>>,
-) -> Result<String, String> {
+) -> Result<V2Submitted, String> {
     let amount = u64::try_from(amount_grains).map_err(|_| "amount too large".to_string())?;
     // A pool-v1 address here would pay the wrong recipient in the wrong value
     // space, so it is REFUSED rather than coerced.
@@ -17224,6 +17399,89 @@ mod tests {
 /// set may return Ok", not as a list of examples.
 #[cfg(test)]
 mod v2_guard_tests {
+
+    use super::{v2_not_broadcast_line, v2_status_line, ReceiptStatus, V2Action};
+
+    /// THE REGRESSION. A pool-v2 shield/de-shield that is sitting in the mempool
+    /// used to be reported as "shield failed: still pending (not yet mined)" —
+    /// a sentence that is both self-contradictory and dangerous: it tells an
+    /// operator their value did not move while the transaction is live on the
+    /// network, and the obvious response (send it again) spends a second nonce on
+    /// an action already in flight.
+    ///
+    /// A pending transaction must never be describable as a failure.
+    #[test]
+    fn a_pending_pool_v2_transaction_is_never_reported_as_a_failure() {
+        for what in [V2Action::Shield, V2Action::Deshield, V2Action::Send] {
+            let line = v2_status_line(what, &ReceiptStatus::Pending, "abc123def456");
+            let lower = line.to_lowercase();
+            assert!(
+                !lower.contains("fail"),
+                "a pending {what:?} must never read as a failure, got: {line}"
+            );
+            assert!(
+                !lower.contains("reject"),
+                "a pending {what:?} must never read as rejected, got: {line}"
+            );
+            // It must say the thing that stops a double-send.
+            assert!(
+                lower.contains("mempool") && lower.contains("not yet mined"),
+                "a pending {what:?} must say where it actually is, got: {line}"
+            );
+            assert!(
+                lower.contains("do not resend"),
+                "a pending {what:?} must warn against resending, got: {line}"
+            );
+            assert!(line.contains("abc123def456"), "must carry the txid: {line}");
+        }
+    }
+
+    /// Only a receipt may declare failure — and when it does, it carries the
+    /// chain's own reason rather than a generic message.
+    #[test]
+    fn only_a_receipt_declares_a_pool_v2_failure_and_it_names_the_reason() {
+        let line = v2_status_line(
+            V2Action::Deshield,
+            &ReceiptStatus::Rejected("de-shield rate limit exceeded".into()),
+            "deadbeef1234",
+        );
+        assert!(line.contains("REJECTED on-chain"), "{line}");
+        assert!(line.contains("de-shield rate limit exceeded"), "{line}");
+        assert!(line.contains("deadbeef1234"), "{line}");
+    }
+
+    /// A confirmation must be a REAL one — stated only for a receipt that says
+    /// the transaction was mined and applied.
+    #[test]
+    fn a_pool_v2_confirmation_is_stated_only_for_a_real_receipt() {
+        let line = v2_status_line(V2Action::Shield, &ReceiptStatus::Confirmed, "feedface0001");
+        assert!(line.contains("CONFIRMED on-chain"), "{line}");
+        assert!(line.contains("feedface0001"), "{line}");
+        // The three outcomes must be mutually unmistakable.
+        let pending = v2_status_line(V2Action::Shield, &ReceiptStatus::Pending, "feedface0001");
+        let rejected = v2_status_line(
+            V2Action::Shield,
+            &ReceiptStatus::Rejected("bad proof".into()),
+            "feedface0001",
+        );
+        assert_ne!(line, pending);
+        assert_ne!(line, rejected);
+        assert_ne!(pending, rejected);
+    }
+
+    /// The one case where retrying is CORRECT is the one case that says so: the
+    /// transaction never reached the network, so no nonce was consumed.
+    #[test]
+    fn a_never_broadcast_pool_v2_action_says_it_is_safe_to_retry() {
+        let line = v2_not_broadcast_line(V2Action::Shield, "node unreachable");
+        let lower = line.to_lowercase();
+        assert!(lower.contains("nothing was broadcast"), "{line}");
+        assert!(lower.contains("safe to retry"), "{line}");
+        assert!(lower.contains("no nonce used"), "{line}");
+        assert!(line.contains("node unreachable"), "{line}");
+        // And it must NOT be confusable with an on-network pending state.
+        assert!(!lower.contains("mempool"), "{line}");
+    }
     use super::*;
 
     /// A real, checksum-valid pool-v2 address (derived, never hardcoded, so it
