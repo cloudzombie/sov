@@ -2548,6 +2548,15 @@ impl LoadedWallet {
             .clone()
             .unwrap_or_else(|| self.account.clone())
     }
+
+    /// The key under which this wallet's SCANNED POOL VIEWS are stored (see
+    /// [`ScannedPools`]). It is the wallet's own implicit id — the fingerprint of
+    /// the key that decrypts those notes — deliberately NOT `effective_account()`:
+    /// linking or unlinking a named account changes who signs, never which notes
+    /// the seed controls, so a scan must not be filed under a name that can move.
+    fn scan_key(&self) -> String {
+        self.account.clone()
+    }
 }
 
 /// Memory hygiene: when a wallet is dropped (removed, replaced, or on shutdown)
@@ -2584,6 +2593,24 @@ struct ShieldedView {
     notes: usize, // unspent note count
     scanned_height: u64,
     message: String,
+}
+
+impl ShieldedView {
+    /// What this view may CLAIM for `account`: `Some((balance_grains, notes,
+    /// scanned_height))` only when it was scanned FOR that wallet and a scan has
+    /// actually completed. `None` is UNKNOWN — which every caller renders as
+    /// unknown, never as a zero balance (a wallet nobody scanned is not empty;
+    /// it is unexamined).
+    ///
+    /// A pure function so the "whose figures are these?" decision is testable
+    /// rather than re-derived inside paint code.
+    fn own_figures(&self, account: &str) -> Option<(u128, usize, u64)> {
+        (self.account == account && self.scanned_height > 0).then_some((
+            self.balance as u128,
+            self.notes,
+            self.scanned_height,
+        ))
+    }
 }
 
 /// Everything the UI knows when deciding whether a pool-v2 action may proceed.
@@ -2782,6 +2809,95 @@ struct ShieldedV2View {
     notes: usize, // unspent v2 note count
     scanned_height: u64,
     message: String,
+}
+
+impl ShieldedV2View {
+    /// As [`ShieldedView::own_figures`], for pool v2. Deliberately a second
+    /// method on a second type rather than a shared one: the pools are separate
+    /// value spaces, and no code path should be able to hand v1 figures to a v2
+    /// caller by accident.
+    fn own_figures(&self, account: &str) -> Option<(u128, usize, u64)> {
+        (self.account == account && self.scanned_height > 0).then_some((
+            self.balance as u128,
+            self.notes,
+            self.scanned_height,
+        ))
+    }
+
+    /// Build the pool-v2 permission guard from THIS view, for `account`.
+    ///
+    /// The guard is assembled here, from a view that was looked up by account,
+    /// rather than in a paint closure — so the facts a money-moving decision rests
+    /// on are produced by one pure function that tests can sweep. A view scanned
+    /// for a different wallet can only ever produce `for_this_wallet: false` and
+    /// `scanned: false`, i.e. a guard that refuses every spend.
+    fn guard(
+        &self,
+        account: &str,
+        pool_active: bool,
+        busy: bool,
+        window_budget: Option<u128>,
+    ) -> V2Guard {
+        let mine = self.account == account;
+        V2Guard {
+            pool_active,
+            // An untouched view (no scan yet, anywhere) belongs to nobody and so
+            // is not "a different wallet's" — but it is not `scanned`, so it can
+            // still authorise nothing that spends notes.
+            for_this_wallet: self.account.is_empty() || mine,
+            scanned: mine && self.scanned_height > 0,
+            notes: if mine { self.notes } else { 0 },
+            busy: busy || self.scanning,
+            balance_grains: if mine { self.balance as u128 } else { 0 },
+            window_budget,
+        }
+    }
+}
+
+/// Every wallet's scanned pool view, held SIDE BY SIDE and keyed by the wallet
+/// the scan was run for.
+///
+/// There used to be exactly one slot per pool, so scanning wallet B overwrote
+/// wallet A's scanned view: switching back to A showed "unknown" until a full
+/// re-scan, and the only thing standing between A's figures and B's screen was a
+/// single equality check written by hand at each paint site. Keyed storage makes
+/// that mistake unrepresentable — a view is looked up BY the account it belongs
+/// to, so there is no way to read a figure without naming whose it is.
+///
+/// The key is the wallet's own IMPLICIT ACCOUNT ID (see
+/// [`LoadedWallet::scan_key`]): the fingerprint of the key that can actually
+/// decrypt those notes. Never the display label (renameable, duplicable), and
+/// never `effective_account()` — a linked named account can be attached or
+/// detached without changing which notes the seed controls.
+///
+/// An account with no entry is UNSCANNED. [`Self::view_for`] returns the default
+/// view, whose `scanned_height` is 0, which every caller renders as an UNKNOWN
+/// balance — never as zero.
+#[derive(Default)]
+struct ScannedPools<V> {
+    by_account: HashMap<String, V>,
+}
+
+impl<V: Clone + Default> ScannedPools<V> {
+    /// This account's scanned view, or the default (= unscanned) view when it has
+    /// never been scanned. Never another wallet's view.
+    fn view_for(&self, account: &str) -> V {
+        self.by_account.get(account).cloned().unwrap_or_default()
+    }
+
+    /// This account's entry, created unscanned if absent. Every writer names the
+    /// account it is writing for, so a background scan that finishes while a
+    /// DIFFERENT wallet is selected lands in its own entry and cannot paint into
+    /// the selected one.
+    fn entry_mut(&mut self, account: &str) -> &mut V {
+        self.by_account.entry(account.to_string()).or_default()
+    }
+
+    /// Drop a forgotten wallet's view, so the map cannot accumulate entries for
+    /// wallets nothing can select any more.
+    fn forget(&mut self, account: &str) {
+        self.by_account.remove(account);
+    }
 }
 
 /// Cumulative coinbase your wallets have earned, summed from the chain's per-block
@@ -3508,8 +3624,13 @@ pub struct Station {
     rescan_armed: bool, // "Rescan from scratch" confirmation is open (destructive cache wipe)
     action: Arc<Mutex<ActionState>>,
     params: Arc<Mutex<Option<Arc<ShieldedParams>>>>,
-    shielded: Arc<Mutex<ShieldedView>>,
-    shielded_v2: Arc<Mutex<ShieldedV2View>>,
+    /// Scanned pool-v1 views, one per wallet (keyed by `LoadedWallet::scan_key`),
+    /// so switching wallets shows THAT wallet's own scanned figures — or its
+    /// honest unscanned state — instead of whatever was scanned last.
+    shielded: Arc<Mutex<ScannedPools<ShieldedView>>>,
+    /// Scanned pool-v2 views, one per wallet. Same keying, separate map: the two
+    /// pools are separate value spaces and their figures must never be mixed.
+    shielded_v2: Arc<Mutex<ScannedPools<ShieldedV2View>>>,
     shield_v2_amount_in: String,
     shield_v2_to: String,
     deshield_v2_amount_in: String,
@@ -3793,8 +3914,8 @@ impl Station {
             rescan_armed: false,
             action: Arc::new(Mutex::new(ActionState::default())),
             params: Arc::new(Mutex::new(None)),
-            shielded: Arc::new(Mutex::new(ShieldedView::default())),
-            shielded_v2: Arc::new(Mutex::new(ShieldedV2View::default())),
+            shielded: Arc::new(Mutex::new(ScannedPools::default())),
+            shielded_v2: Arc::new(Mutex::new(ScannedPools::default())),
             shield_v2_amount_in: String::new(),
             shield_v2_to: String::new(),
             deshield_v2_amount_in: String::new(),
@@ -4229,6 +4350,15 @@ impl Station {
             }
             if self.mining_account.as_deref() == Some(gone.account.as_str()) {
                 self.mining_account = None;
+            }
+            // Drop its scanned pool views. They describe notes only that seed can
+            // decrypt, and the seed is gone — keeping them would leave figures in
+            // memory for a wallet nothing can select.
+            if let Ok(mut m) = self.shielded.lock() {
+                m.forget(&gone.account);
+            }
+            if let Ok(mut m) = self.shielded_v2.lock() {
+                m.forget(&gone.account);
             }
         }
         self.selected = self.selected.min(self.wallets.len().saturating_sub(1));
@@ -4721,7 +4851,10 @@ impl Station {
             return;
         };
         let seed = w.seed;
-        let account = w.account.clone();
+        // The wallet this scan is FOR. Both the "scanning" mark and the result are
+        // filed under it, so a scan that finishes after the operator has switched
+        // wallets updates its own entry and never the selected one.
+        let account = w.scan_key();
         let rpc = self
             .config
             .lock()
@@ -4729,18 +4862,20 @@ impl Station {
             .unwrap_or_default();
         let view = self.shielded.clone();
         let ctx = ctx.clone();
-        if let Ok(mut v) = view.lock() {
+        if let Ok(mut m) = view.lock() {
+            let v = m.entry_mut(&account);
             v.scanning = true;
             v.account = account.clone();
             v.message = "scanning the shielded pool…".to_string();
         }
         std::thread::spawn(move || {
             let result = scan_store(&rpc, seed);
-            if let Ok(mut v) = view.lock() {
+            if let Ok(mut m) = view.lock() {
+                let v = m.entry_mut(&account);
                 v.scanning = false;
                 match result {
                     Ok(store) => {
-                        v.account = account;
+                        v.account = account.clone();
                         v.balance = store.balance();
                         v.notes = store.unspent_count();
                         v.scanned_height = store.scanned_height();
@@ -4764,7 +4899,8 @@ impl Station {
             return;
         };
         let seed = w.seed;
-        let account = w.account.clone();
+        // Filed under the wallet being scanned — see [`Self::scan_shielded`].
+        let account = w.scan_key();
         let rpc = self
             .config
             .lock()
@@ -4772,18 +4908,20 @@ impl Station {
             .unwrap_or_default();
         let view = self.shielded_v2.clone();
         let ctx = ctx.clone();
-        if let Ok(mut v) = view.lock() {
+        if let Ok(mut m) = view.lock() {
+            let v = m.entry_mut(&account);
             v.scanning = true;
             v.account = account.clone();
             v.message = "scanning pool v2 (trial decapsulation)…".to_string();
         }
         std::thread::spawn(move || {
             let result = scan_store_v2(&rpc, seed);
-            if let Ok(mut v) = view.lock() {
+            if let Ok(mut m) = view.lock() {
+                let v = m.entry_mut(&account);
                 v.scanning = false;
                 match result {
                     Ok(store) => {
-                        v.account = account;
+                        v.account = account.clone();
                         v.balance = store.balance();
                         v.notes = store.unspent_count();
                         v.scanned_height = store.scanned_height();
@@ -4811,6 +4949,7 @@ impl Station {
         };
         // Delete this wallet's cache file (keyed by its stable implicit id), matching the
         // path `scan_store` writes. A missing file just forces a fresh full scan.
+        let scan_key = w.scan_key();
         let store_id = Keypair::hybrid_from_seed(w.seed)
             .public_key()
             .implicit_account_id()
@@ -4821,18 +4960,22 @@ impl Station {
                 // Already gone ⇒ nothing to wipe; a fresh scan rebuilds it anyway.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    if let Ok(mut v) = self.shielded.lock() {
-                        v.message = format!("could not delete note cache: {e}");
+                    if let Ok(mut m) = self.shielded.lock() {
+                        m.entry_mut(&scan_key).message =
+                            format!("could not delete note cache: {e}");
                     }
                     return;
                 }
             }
         }
-        // Reset the in-memory view + the debounce so the auto-scan does not race, then
-        // kick off a full scan (now starting from an empty store on disk).
+        // Reset THIS wallet's in-memory view + the debounce so the auto-scan does not
+        // race, then kick off a full scan (now starting from an empty store on disk).
+        // Other wallets' scanned views are untouched — nothing about them changed.
         self.shielded_scan_for.clear();
-        if let Ok(mut v) = self.shielded.lock() {
+        if let Ok(mut m) = self.shielded.lock() {
+            let v = m.entry_mut(&scan_key);
             *v = ShieldedView::default();
+            v.account = scan_key.clone();
             v.scanning = true;
             v.message = "rescanning from scratch…".to_string();
         }
@@ -4854,6 +4997,9 @@ impl Station {
         // fee and receives the de-shielded funds. Using the implicit id would be
         // rejected ("unauthorized") because it has no key bound on-chain.
         let account = w.effective_account();
+        // The wallet whose scanned view this spend changes — its own implicit id,
+        // not the account it signs as.
+        let scan_key = w.scan_key();
         // The variable amount to de-shield (XUS → grains). Must be a positive
         // amount; the UI only enables the button when it is within budget.
         let Some(grains) = parse_xus(&self.deshield_amount).filter(|g| *g > 0) else {
@@ -4878,7 +5024,7 @@ impl Station {
                     finish(&action, &format!("{line} — updating balance…"));
                     record(&activity, &line);
                     ctx.request_repaint();
-                    refresh_shielded_view(&rpc, seed, &account, &shielded, &ctx);
+                    refresh_shielded_view(&rpc, seed, &scan_key, &shielded, &ctx);
                     finish(&action, "de-shield confirmed — shielded balance updated");
                 }
                 Err(e) => {
@@ -4934,6 +5080,11 @@ impl Station {
         };
         let seed = w.seed;
         let account = w.effective_account();
+        // The wallet whose pool-v2 view this spend changes. Keyed by its own
+        // implicit id: the notes belong to the SEED, so filing the post-spend
+        // re-scan under a linked named account would strand the result where no
+        // wallet's view can find it.
+        let scan_key = w.scan_key();
         let field = match what {
             V2Action::Shield => &self.shield_v2_amount_in,
             V2Action::Deshield => &self.deshield_v2_amount_in,
@@ -4988,8 +5139,9 @@ impl Station {
                     // Re-scan so the spent note drops and change appears; a stale
                     // view after a confirmed spend reads as value gone missing.
                     if let Ok(store) = scan_store_v2(&rpc, seed) {
-                        if let Ok(mut v) = view.lock() {
-                            v.account = account.clone();
+                        if let Ok(mut m) = view.lock() {
+                            let v = m.entry_mut(&scan_key);
+                            v.account = scan_key.clone();
                             v.balance = store.balance();
                             v.notes = store.unspent_count();
                             v.scanned_height = store.scanned_height();
@@ -5044,10 +5196,11 @@ impl Station {
             .lock()
             .map(|c| c.rpc.clone())
             .unwrap_or_default();
-        let account = self
+        // The wallet whose scanned view this spend changes (its own implicit id).
+        let scan_key = self
             .wallets
             .get(self.selected)
-            .map(|w| w.account.clone())
+            .map(|w| w.scan_key())
             .unwrap_or_default();
         let action = self.action.clone();
         let params = self.params.clone();
@@ -5067,7 +5220,7 @@ impl Station {
                     ctx.request_repaint();
                     // The spend's nullifier lands when the tx is mined; re-scan so
                     // the shielded view drops the spent note (no stale balance).
-                    refresh_shielded_view(&rpc, seed, &account, &shielded, &ctx);
+                    refresh_shielded_view(&rpc, seed, &scan_key, &shielded, &ctx);
                     finish(
                         &action,
                         &format!(
@@ -9379,12 +9532,15 @@ impl Station {
             .unwrap_or_else(|| "—".to_string());
         let named = is_named_account(&effective);
         let is_miner = self.mining_account.as_deref() == Some(account.as_str());
-        // Shielded (private) balance for this wallet, if it has been scanned.
+        // Shielded (private) balance FOR THIS WALLET, if it has been scanned —
+        // looked up by the wallet's own account, so it is this wallet's figure or
+        // nothing at all. Unscanned shows no shielded line rather than a zero.
         let shielded = self
             .shielded
             .lock()
             .ok()
-            .filter(|v| v.account == effective && v.balance > 0)
+            .map(|m| m.view_for(&account))
+            .filter(|v| v.account == account && v.balance > 0)
             .map(|v| grains_to_xus_plain(u128::from(v.balance)));
 
         egui::Frame::group(ui.style())
@@ -10622,7 +10778,18 @@ impl Station {
             ui.add_space(sp::L);
             ui.separator();
             ui.add_space(sp::M);
-            let sv = self.shielded.lock().map(|v| v.clone()).unwrap_or_default();
+            // THIS wallet's scanned view, looked up by its own account — never
+            // whatever was scanned last. An unscanned wallet yields the default
+            // view (scanned_height 0), which renders as UNKNOWN, not zero.
+            let sv = self
+                .shielded
+                .lock()
+                .map(|m| m.view_for(&account))
+                .unwrap_or_default();
+            // Belt AND braces: the lookup already guarantees this entry is this
+            // wallet's, and the stored account is re-checked before a single
+            // figure is shown. Unscanned leaves it empty ⇒ not "for this wallet"
+            // ⇒ nothing is claimed about a balance nobody has scanned.
             let for_this = sv.account == account;
             let snap = self.snapshot.lock().map(|s| s.clone()).unwrap_or_default();
 
@@ -10633,21 +10800,15 @@ impl Station {
             // `v1_own` is `Some` only when THIS wallet has actually been scanned; a
             // scan that has not run yields `None`, which the view renders as "unknown",
             // never as a zero balance.
-            let v1_own = (for_this && sv.scanned_height > 0).then_some((
-                sv.balance as u128,
-                sv.notes,
-                sv.scanned_height,
-            ));
+            let v1_own = sv.own_figures(&account);
+            // Likewise for pool v2: this wallet's own scanned v2 view, retained
+            // across wallet switches, or its unscanned default.
             let v2v = self
                 .shielded_v2
                 .lock()
-                .map(|v| v.clone())
+                .map(|m| m.view_for(&account))
                 .unwrap_or_default();
-            let v2_own = (v2v.account == account && v2v.scanned_height > 0).then_some((
-                v2v.balance as u128,
-                v2v.notes,
-                v2v.scanned_height,
-            ));
+            let v2_own = v2v.own_figures(&account);
             shielded_pools_view(ui, &snap, v1_own, v2_own);
             if sv.scanning {
                 ui.add_space(sp::S);
@@ -10882,15 +11043,12 @@ impl Station {
             // hard-coded `true` — so a selector left on v2 when the pool is not
             // Active is refused by the same pure function that gates shield and
             // de-shield, rather than by a second rule written here.
-            let v2_guard = V2Guard {
-                pool_active: v2_state == PoolState::Active,
-                for_this_wallet: v2v.account.is_empty() || v2v.account == account,
-                scanned: v2v.account == account && v2v.scanned_height > 0,
-                notes: v2v.notes,
-                busy: busy || v2v.scanning,
-                balance_grains: v2v.balance as u128,
-                window_budget: snap.shielded_v2.as_ref().map(|i| i.deshieldable_now),
-            };
+            let v2_guard = v2v.guard(
+                &account,
+                v2_state == PoolState::Active,
+                busy,
+                snap.shielded_v2.as_ref().map(|i| i.deshieldable_now),
+            );
             // The operator's choice FOR THIS WALLET. `chosen_for` drops a choice
             // made for a different wallet before a single control is drawn, so a
             // wallet switch can never leave someone else's pool armed.
@@ -11863,12 +12021,18 @@ impl Station {
         // de-shield to send). Debounced to once per account; skipped for watch-only
         // (no seed → no viewing key) and while a scan is already running.
         if !do_scan {
-            if let Some((acct, watch)) = self
+            if let Some((acct, key, watch)) = self
                 .wallets
                 .get(self.selected)
-                .map(|w| (w.effective_account(), w.watch_only))
+                .map(|w| (w.effective_account(), w.scan_key(), w.watch_only))
             {
-                let scanning = self.shielded.lock().map(|v| v.scanning).unwrap_or(false);
+                // Busy is per WALLET: another wallet's scan still running must not
+                // stop this one from starting, and must not be mistaken for it.
+                let scanning = self
+                    .shielded
+                    .lock()
+                    .map(|m| m.view_for(&key).scanning)
+                    .unwrap_or(false);
                 if !watch && self.shielded_scan_for != acct && !scanning {
                     self.shielded_scan_for = acct;
                     self.scan_shielded(&ctx);
@@ -13151,11 +13315,15 @@ fn deshieldable_v2_now(client: &RpcClient) -> Option<u128> {
 /// the shielded view reflects the spend (the spent note drops, change appears) —
 /// no stale "note stayed behind". Polls for ~30s (a spend confirms within a block
 /// or two); each rescan updates the shared view and repaints.
+///
+/// `scan_key` is the WALLET the re-scan belongs to (its own implicit id) — the
+/// entry updated here — so a spend that confirms after the operator switched
+/// wallets updates that wallet's view and never the one on screen.
 fn refresh_shielded_view(
     rpc: &str,
     seed: [u8; 32],
-    account: &str,
-    shielded: &Arc<Mutex<ShieldedView>>,
+    scan_key: &str,
+    shielded: &Arc<Mutex<ScannedPools<ShieldedView>>>,
     ctx: &egui::Context,
 ) {
     let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(5));
@@ -13166,9 +13334,10 @@ fn refresh_shielded_view(
             continue;
         };
         let scanned = store.scanned_height();
-        if let Ok(mut v) = shielded.lock() {
+        if let Ok(mut m) = shielded.lock() {
+            let v = m.entry_mut(scan_key);
             v.scanning = false;
-            v.account = account.to_string();
+            v.account = scan_key.to_string();
             v.balance = store.balance();
             v.notes = store.unspent_count();
             v.scanned_height = scanned;
@@ -18301,5 +18470,280 @@ mod pool_selector_explicit_tests {
             "v1 arms in all three chain states, v2 only when Active — and an unchosen \
              pool never arms"
         );
+    }
+}
+
+/// PER-WALLET scanned pool views.
+///
+/// The failure this closes: one global slot per pool meant scanning wallet B
+/// destroyed wallet A's scanned view — "I can only view one wallet's v2 pool at a
+/// time" — and left A's figures sitting in the slot where only a hand-written
+/// equality check kept them off B's screen.
+///
+/// Every assertion below is on pure functions ([`ScannedPools`],
+/// [`ShieldedV2View::own_figures`], [`ShieldedV2View::guard`]) — the same ones the
+/// paint code calls — so the guarantees are proven rather than read off UI code.
+#[cfg(test)]
+mod scanned_pools_tests {
+    use super::*;
+
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    /// Record a completed v2 scan for `account`, exactly as the worker thread does.
+    fn record_v2(pools: &mut ScannedPools<ShieldedV2View>, account: &str, bal: u64, notes: usize) {
+        let v = pools.entry_mut(account);
+        v.scanning = false;
+        v.account = account.to_string();
+        v.balance = bal;
+        v.notes = notes;
+        v.scanned_height = 900 + bal;
+        v.message = format!("scanned to height {}", 900 + bal);
+    }
+
+    /// (a) RETENTION. Scan A, then scan B, then look at A again: A's own figures
+    /// come back exactly — no re-scan, no "unknown". This is the reported bug.
+    #[test]
+    fn each_wallets_scanned_view_survives_scanning_another_wallet() {
+        let mut pools: ScannedPools<ShieldedV2View> = ScannedPools::default();
+        record_v2(&mut pools, A, 700, 3);
+        record_v2(&mut pools, B, 42, 1);
+
+        let a = pools.view_for(A);
+        assert_eq!(
+            a.own_figures(A),
+            Some((700, 3, 1600)),
+            "wallet A's scanned figures must survive a scan of wallet B"
+        );
+        let b = pools.view_for(B);
+        assert_eq!(b.own_figures(B), Some((42, 1, 942)));
+        assert_eq!(pools.by_account.len(), 2, "one entry per scanned wallet");
+    }
+
+    /// (b) ISOLATION. While B is selected, NOTHING of A's is reachable: not the
+    /// balance, not the note count, not the height, not the guard.
+    #[test]
+    fn a_selected_wallet_can_never_see_another_wallets_figures() {
+        let mut pools: ScannedPools<ShieldedV2View> = ScannedPools::default();
+        // A is rich and scanned; B has never been scanned.
+        record_v2(&mut pools, A, 700, 3);
+        // B's view is its OWN, empty one.
+        let b = pools.view_for(B);
+        assert_eq!(b.account, "", "B has no scanned view of its own");
+        assert_eq!(b.balance, 0);
+        assert_eq!(b.own_figures(B), None, "B is UNKNOWN, not 700, not 0");
+
+        // Defence in depth: even if A's view were handed to B's paint (it cannot
+        // be — the lookup is by account), it claims nothing for B.
+        let a = pools.view_for(A);
+        assert_eq!(a.own_figures(B), None, "A's view may claim nothing for B");
+
+        // And the guard built for B out of A's view refuses every spend.
+        let g = a.guard(B, true, false, None);
+        assert!(!g.for_this_wallet, "a foreign view is not this wallet's");
+        assert_eq!(g.balance_grains, 0, "no foreign balance may leak in");
+        assert_eq!(g.notes, 0);
+        for intent in [
+            V2Intent::Shield {
+                to: "",
+                amount: Some(1),
+            },
+            V2Intent::Deshield { amount: Some(1) },
+            V2Intent::Send {
+                to: "",
+                amount: Some(1),
+            },
+        ] {
+            assert_eq!(
+                v2_allows(&g, intent),
+                Err("this pool-v2 view belongs to a different wallet"),
+                "a foreign view must authorise nothing"
+            );
+        }
+    }
+
+    /// (c) UNSCANNED IS UNKNOWN, NOT ZERO. An unscanned wallet reports no figures
+    /// at all; a wallet actually scanned and found empty reports a real zero. The
+    /// two must stay distinguishable — that is the whole point.
+    #[test]
+    fn unscanned_is_unknown_and_a_scanned_zero_is_a_real_zero() {
+        let mut pools: ScannedPools<ShieldedV2View> = ScannedPools::default();
+        assert_eq!(
+            pools.view_for(C).own_figures(C),
+            None,
+            "never scanned ⇒ UNKNOWN"
+        );
+
+        record_v2(&mut pools, C, 0, 0); // scanned; genuinely empty
+        assert_eq!(
+            pools.view_for(C).own_figures(C),
+            Some((0, 0, 900)),
+            "a completed scan that found nothing is a KNOWN zero"
+        );
+
+        // An unscanned wallet may not spend, and is told why in those words.
+        let unscanned = ShieldedV2View::default();
+        let g = unscanned.guard(A, true, false, None);
+        assert!(
+            g.for_this_wallet,
+            "an untouched view belongs to nobody, so it is not a foreign one"
+        );
+        assert!(!g.scanned, "…but it is not scanned");
+        assert_eq!(
+            v2_allows(&g, V2Intent::Deshield { amount: Some(1) }),
+            Err("scan pool v2 first — its balance is unknown until then")
+        );
+    }
+
+    /// (d) A BACKGROUND SCAN THAT FINISHES FOR A NON-SELECTED WALLET lands in its
+    /// own entry and cannot touch the selected wallet's view — the concurrency
+    /// case the single slot got wrong.
+    #[test]
+    fn a_scan_completing_for_a_hidden_wallet_updates_only_that_wallet() {
+        let pools: Arc<Mutex<ScannedPools<ShieldedV2View>>> =
+            Arc::new(Mutex::new(ScannedPools::default()));
+        // B is on screen and already scanned.
+        record_v2(&mut pools.lock().unwrap(), B, 42, 1);
+
+        // A's scan (started before the switch) completes now, off-thread.
+        let bg = pools.clone();
+        std::thread::spawn(move || record_v2(&mut bg.lock().unwrap(), A, 700, 3))
+            .join()
+            .expect("scan thread");
+
+        let m = pools.lock().unwrap();
+        assert_eq!(
+            m.view_for(B).own_figures(B),
+            Some((42, 1, 942)),
+            "the selected wallet's view is untouched by another wallet's scan"
+        );
+        assert_eq!(
+            m.view_for(A).own_figures(A),
+            Some((700, 3, 1600)),
+            "…and the completed scan is retained for the wallet it was run for"
+        );
+    }
+
+    /// Two scans running at once, for different wallets, do not corrupt each
+    /// other: each writes only its own entry, and both survive intact.
+    #[test]
+    fn concurrent_scans_for_different_wallets_do_not_corrupt_each_other() {
+        let pools: Arc<Mutex<ScannedPools<ShieldedV2View>>> =
+            Arc::new(Mutex::new(ScannedPools::default()));
+        let mut threads = Vec::new();
+        for (acct, bal, notes) in [(A, 700u64, 3usize), (B, 42, 1), (C, 5, 9)] {
+            let p = pools.clone();
+            threads.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    record_v2(&mut p.lock().unwrap(), acct, bal, notes);
+                }
+            }));
+        }
+        for t in threads {
+            t.join().expect("scan thread");
+        }
+        let m = pools.lock().unwrap();
+        assert_eq!(m.view_for(A).own_figures(A), Some((700, 3, 1600)));
+        assert_eq!(m.view_for(B).own_figures(B), Some((42, 1, 942)));
+        assert_eq!(m.view_for(C).own_figures(C), Some((5, 9, 905)));
+        assert_eq!(m.by_account.len(), 3);
+    }
+
+    /// Busy is PER WALLET: a scan running for A must not read as A's spinner on
+    /// B's screen, nor stop B from scanning.
+    #[test]
+    fn scanning_is_tracked_per_wallet() {
+        let mut pools: ScannedPools<ShieldedV2View> = ScannedPools::default();
+        {
+            let a = pools.entry_mut(A);
+            a.scanning = true;
+            a.account = A.to_string();
+        }
+        assert!(pools.view_for(A).scanning, "A is scanning");
+        assert!(
+            !pools.view_for(B).scanning,
+            "B is not scanning just because A is"
+        );
+    }
+
+    /// Forgetting a wallet drops its scanned view: no figures for a wallet that no
+    /// longer exists, and no unbounded growth from stale keys.
+    #[test]
+    fn forgetting_a_wallet_drops_its_scanned_view() {
+        let mut pools: ScannedPools<ShieldedV2View> = ScannedPools::default();
+        record_v2(&mut pools, A, 700, 3);
+        record_v2(&mut pools, B, 42, 1);
+        pools.forget(A);
+        assert_eq!(
+            pools.by_account.len(),
+            1,
+            "the forgotten wallet's entry is gone"
+        );
+        assert_eq!(
+            pools.view_for(A).own_figures(A),
+            None,
+            "a forgotten wallet is UNKNOWN again"
+        );
+        assert_eq!(
+            pools.view_for(B).own_figures(B),
+            Some((42, 1, 942)),
+            "…and the wallets that remain are untouched"
+        );
+    }
+
+    /// POOL V1 gets the identical treatment — the same single-slot defect existed
+    /// there, and a v1 balance belonging to another wallet is exactly as wrong as
+    /// a v2 one.
+    #[test]
+    fn pool_v1_views_are_per_wallet_too() {
+        let mut pools: ScannedPools<ShieldedView> = ScannedPools::default();
+        {
+            let v = pools.entry_mut(A);
+            v.account = A.to_string();
+            v.balance = 1234;
+            v.notes = 2;
+            v.scanned_height = 77;
+        }
+        {
+            let v = pools.entry_mut(B);
+            v.account = B.to_string();
+            v.balance = 1;
+            v.notes = 1;
+            v.scanned_height = 78;
+        }
+        assert_eq!(pools.view_for(A).own_figures(A), Some((1234, 2, 77)));
+        assert_eq!(pools.view_for(B).own_figures(B), Some((1, 1, 78)));
+        assert_eq!(
+            pools.view_for(A).own_figures(B),
+            None,
+            "A's v1 view may claim nothing for B"
+        );
+        assert_eq!(
+            pools.view_for(C).own_figures(C),
+            None,
+            "an unscanned v1 wallet is UNKNOWN, not zero"
+        );
+    }
+
+    /// The guard built from a wallet's OWN scanned view still authorises what it
+    /// should — the fix must not turn every wallet into a permanently refused one.
+    #[test]
+    fn a_wallets_own_scanned_view_still_authorises_its_own_spends() {
+        let mut pools: ScannedPools<ShieldedV2View> = ScannedPools::default();
+        record_v2(&mut pools, A, 700, 3);
+        let g = pools.view_for(A).guard(A, true, false, None);
+        assert!(g.for_this_wallet && g.scanned);
+        assert_eq!(g.balance_grains, 700);
+        assert_eq!(g.notes, 3);
+        assert_eq!(g.deshield_cap(), 700);
+        assert_eq!(
+            v2_allows(&g, V2Intent::Deshield { amount: Some(700) }),
+            Ok(())
+        );
+        // …and the window budget still binds.
+        let capped = pools.view_for(A).guard(A, true, false, Some(100));
+        assert_eq!(capped.deshield_cap(), 100);
+        assert!(v2_allows(&capped, V2Intent::Deshield { amount: Some(700) }).is_err());
     }
 }
