@@ -10244,8 +10244,9 @@ impl Station {
 
         // ── Wallet switcher: every wallet, one click to make active. Each row is
         // tagged NAMED (green) or unnamed (amber) so the distinction is obvious.
-        ui.add_space(6.0);
+        ui.add_space(sp::M);
         ui.label(egui::RichText::new("Switch wallet").strong());
+        ui.add_space(sp::XS);
         // Snapshot the per-account SNS name cache once, so each row's badge reflects
         // its registered name (not just an operate-as named account).
         let names_map: HashMap<String, Vec<String>> = self
@@ -10253,46 +10254,117 @@ impl Station {
             .lock()
             .map(|m| m.clone())
             .unwrap_or_default();
+        // Fixed column widths, so the ids, badges, and balances line up down the
+        // list no matter how long each wallet's label runs — the old single
+        // concatenated string left every column ragged. Hierarchy: the NAME is
+        // primary; the id and badge are secondary and dim; the balance is
+        // right-aligned in tabular figures so its digits stack. The WHOLE row is
+        // one hit target: the badge and the ⛏ marker select the wallet too,
+        // instead of being dead zones beside the only clickable text.
+        const WROW_NAME_W: f32 = 170.0;
+        const WROW_ID_W: f32 = 110.0;
+        const WROW_H: f32 = 18.0;
         for (i, w) in self.wallets.iter().enumerate() {
             let active = i == self.selected;
-            let marker = if active { "● " } else { "○ " };
+            let marker = if active { "●" } else { "○" };
             let is_miner = self.mining_account.as_deref() == Some(w.account.as_str());
             let effective = w.effective_account();
             let operating_named = is_named_account(&effective);
             let sns = names_map.get(&effective).cloned().unwrap_or_default();
             let named = operating_named || !sns.is_empty();
-            ui.horizontal(|ui| {
-                // Show the balance of the account this wallet OPERATES (its named
-                // account when attached, else its own implicit id) — so a tax
-                // wallet shows its real balance, not its empty implicit address.
-                let text = format!(
-                    "{marker}{}   {}   {} XUS",
-                    w.label,
-                    short_id(&w.account),
-                    balance_of(&effective)
-                );
-                let rich = if active {
-                    egui::RichText::new(text).strong()
-                } else {
-                    egui::RichText::new(text)
-                };
-                if ui.selectable_label(active, rich).clicked() {
-                    select = Some(i);
-                }
-                // Name-state badge — operate-as named account, else SNS name(s),
-                // else unnamed. Hooked to the same SNS cache as the header.
-                let badge = if operating_named {
-                    egui::RichText::new(format!("named · {effective}")).small()
-                } else if !sns.is_empty() {
-                    egui::RichText::new(format!("SNS · {}", sns.join(", "))).small()
-                } else {
-                    egui::RichText::new("unnamed").small()
-                };
-                ui.label(badge.color(named_color(named)));
-                if is_miner {
-                    ui.label(egui::RichText::new("⛏").small().color(palette::success()));
-                }
-            });
+            let fill = if active {
+                palette::tint(palette::link(), 26)
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            let row = egui::Frame::none()
+                .fill(fill)
+                .rounding(6.0)
+                .inner_margin(egui::Margin::symmetric(sp::M, sp::S))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        // NAME — the primary fact, first and strongest.
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(WROW_NAME_W, WROW_H),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(egui::RichText::new(marker).color(if active {
+                                    palette::accent_hi()
+                                } else {
+                                    palette::text_dim()
+                                }));
+                                let name = if active {
+                                    egui::RichText::new(&w.label).strong()
+                                } else {
+                                    egui::RichText::new(&w.label)
+                                };
+                                ui.add(egui::Label::new(name).truncate());
+                                if is_miner {
+                                    ui.label(
+                                        egui::RichText::new("⛏").small().color(palette::success()),
+                                    );
+                                }
+                            },
+                        );
+                        // ID — secondary: dim monospace in its own column.
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(WROW_ID_W, WROW_H),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    num(short_id(&w.account))
+                                        .size(ty::SMALL)
+                                        .color(palette::text_dim()),
+                                );
+                            },
+                        );
+                        // BALANCE — right-aligned tabular figures so digits stack
+                        // down the column. Shows the balance of the account this
+                        // wallet OPERATES (its named account when attached, else
+                        // its own implicit id) — so a tax wallet shows its real
+                        // balance, not its empty implicit address.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new("XUS")
+                                    .size(ty::MICRO)
+                                    .color(palette::text_dim()),
+                            );
+                            ui.label(num(balance_of(&effective)));
+                            // Name-state badge — operate-as named account, else
+                            // SNS name(s), else unnamed. Same SNS cache as the
+                            // header. Fills the slack between id and balance,
+                            // truncated so a long name never shoves the figures.
+                            let badge = if operating_named {
+                                format!("named · {effective}")
+                            } else if !sns.is_empty() {
+                                format!("SNS · {}", sns.join(", "))
+                            } else {
+                                "unnamed".to_string()
+                            };
+                            ui.add_space(sp::L);
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(badge)
+                                                .size(ty::SMALL)
+                                                .color(named_color(named)),
+                                        )
+                                        .truncate(),
+                                    );
+                                },
+                            );
+                        });
+                    });
+                })
+                .response
+                .interact(egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if row.clicked() {
+                select = Some(i);
+            }
         }
 
         // Selected wallet detail + actions (decoupled from the borrow via a clone).
@@ -10663,17 +10735,28 @@ impl Station {
 
             // ── Send ──
             ui.separator();
-            ui.label(egui::RichText::new("Send").strong());
+            ui.label(egui::RichText::new("Send").strong().size(ty::SECTION));
+            // One label-column width shared by every form row in the send flow
+            // (transparent AND private), so the To / Amount fields start on the
+            // same x even across the auction panel that sits between them.
+            const SEND_LABEL_W: f32 = 84.0;
             // Spendable balance of the account we're sending FROM (the effective).
             let spendable: u128 = onchain.map(|a| a.balance.parse().unwrap_or(0)).unwrap_or(0);
-            ui.horizontal(|ui| {
-                ui.label("To");
-                ui.add(egui::TextEdit::singleline(&mut self.send_to).desired_width(420.0));
-                if ui.button("Shield to my pool").clicked() {
-                    self.send_to = shielded.clone();
-                    self.receive_kind = ReceiveKind::Shielded;
-                }
-            });
+            egui::Grid::new("send_to_form")
+                .num_columns(2)
+                .min_col_width(SEND_LABEL_W)
+                .spacing([sp::L, sp::M])
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("To").weak());
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.send_to).desired_width(420.0));
+                        if ui.button("Shield to my pool").clicked() {
+                            self.send_to = shielded.clone();
+                            self.receive_kind = ReceiveKind::Shielded;
+                        }
+                    });
+                    ui.end_row();
+                });
             // Live route detection + self-send labelling.
             let route = SendRoute::detect(&self.send_to);
             // Owned, not a borrow of `self.send_to`: the auction panel below takes
@@ -10725,36 +10808,47 @@ impl Station {
             // The most you can send while still covering the fee AND the tip.
             let sendable = auction::max_sendable_grains(spendable, fee, tip);
             let amount_grains = parse_xus(&self.send_amount);
-            let amount_resp = ui
-                .horizontal(|ui| {
-                    ui.label("Amount XUS");
-                    let r = ui.add(
-                        egui::TextEdit::singleline(&mut self.send_amount).desired_width(160.0),
-                    );
-                    if ui
-                        .button("Max")
-                        .on_hover_text(
-                            "send the most that still leaves room for the network fee and the tip",
-                        )
-                        .clicked()
-                    {
-                        self.send_amount = grains_to_xus_plain(sendable);
-                    }
-                    let note = match (fee, tip) {
-                        (0, 0) => format!("balance {} XUS", xus(&spendable.to_string())),
-                        (f, 0) => format!(
-                            "balance {} XUS · fee ~{} XUS",
-                            xus(&spendable.to_string()),
-                            xus(&f.to_string())
-                        ),
-                        (f, t) => format!(
-                            "balance {} XUS · fee ~{} + tip {} XUS",
-                            xus(&spendable.to_string()),
-                            xus(&f.to_string()),
-                            xus(&t.to_string())
-                        ),
-                    };
-                    ui.label(egui::RichText::new(note).weak());
+            let amount_resp = egui::Grid::new("send_amount_form")
+                .num_columns(2)
+                .min_col_width(SEND_LABEL_W)
+                .spacing([sp::L, sp::M])
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("Amount XUS").weak());
+                    let r = ui
+                        .horizontal(|ui| {
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut self.send_amount)
+                                    .desired_width(160.0),
+                            );
+                            if ui
+                                .button("Max")
+                                .on_hover_text(
+                                    "send the most that still leaves room for the network fee \
+                                     and the tip",
+                                )
+                                .clicked()
+                            {
+                                self.send_amount = grains_to_xus_plain(sendable);
+                            }
+                            let note = match (fee, tip) {
+                                (0, 0) => format!("balance {} XUS", xus(&spendable.to_string())),
+                                (f, 0) => format!(
+                                    "balance {} XUS · fee ~{} XUS",
+                                    xus(&spendable.to_string()),
+                                    xus(&f.to_string())
+                                ),
+                                (f, t) => format!(
+                                    "balance {} XUS · fee ~{} + tip {} XUS",
+                                    xus(&spendable.to_string()),
+                                    xus(&f.to_string()),
+                                    xus(&t.to_string())
+                                ),
+                            };
+                            ui.label(egui::RichText::new(note).weak());
+                            r
+                        })
+                        .inner;
+                    ui.end_row();
                     r
                 })
                 .inner;
@@ -10814,8 +10908,22 @@ impl Station {
             let submit_enter =
                 amount_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let mut review_clicked = false;
+            ui.add_space(sp::S);
+            // The one step forward, styled as THE primary action — the same filled
+            // treatment as the modal's "Confirm & send", so the path reads as two
+            // matching green steps: review, then confirm. Nothing is sent here.
             ui.add_enabled_ui(can_send, |ui| {
-                if ui.button("Review send →").clicked() {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Review send →")
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(palette::accent()),
+                    )
+                    .clicked()
+                {
                     review_clicked = true;
                 }
             });
@@ -11238,14 +11346,25 @@ impl Station {
                     Pool::V1 => &mut self.private_to,
                     Pool::V2 => &mut self.private_v2_to,
                 };
-                ui.horizontal(|ui| {
-                    ui.label("To");
-                    ui.add(
-                        egui::TextEdit::singleline(priv_to_field)
-                            .hint_text(format!("{} (recipient stays private)", sel.address_hint()))
-                            .desired_width(420.0),
-                    );
-                });
+                // The same aligned label column as the transparent form above, so
+                // the private To / Amount fields sit on the identical x — one form
+                // language for the whole send flow.
+                egui::Grid::new("priv_send_form")
+                    .num_columns(2)
+                    .min_col_width(SEND_LABEL_W)
+                    .spacing([sp::L, sp::M])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("To").weak());
+                        ui.add(
+                            egui::TextEdit::singleline(priv_to_field)
+                                .hint_text(format!(
+                                    "{} (recipient stays private)",
+                                    sel.address_hint()
+                                ))
+                                .desired_width(420.0),
+                        );
+                        ui.end_row();
+                    });
                 let priv_to_text = match sel {
                     Pool::V1 => self.private_to.clone(),
                     Pool::V2 => self.private_v2_to.clone(),
@@ -11266,17 +11385,35 @@ impl Station {
                     Pool::V2 => &mut self.private_v2_amount,
                 };
                 let mut set_max = false;
-                ui.horizontal(|ui| {
-                    ui.label("Amount XUS");
-                    ui.add(egui::TextEdit::singleline(priv_amount_field).desired_width(160.0));
-                    if ui
-                        .button("Max")
-                        .on_hover_text("send your full scanned balance in the selected pool")
-                        .clicked()
-                    {
-                        set_max = true;
-                    }
-                });
+                egui::Grid::new("priv_amount_form")
+                    .num_columns(2)
+                    .min_col_width(SEND_LABEL_W)
+                    .spacing([sp::L, sp::M])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Amount XUS").weak());
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(priv_amount_field).desired_width(160.0),
+                            );
+                            if ui
+                                .button("Max")
+                                .on_hover_text(
+                                    "send your full scanned balance in the selected pool",
+                                )
+                                .clicked()
+                            {
+                                set_max = true;
+                            }
+                            // The scanned balance of the ARMED pool, beside the field
+                            // that spends it — the figure the decision is made against.
+                            ui.label(
+                                egui::RichText::new(sel_balance_text.clone())
+                                    .size(ty::SMALL)
+                                    .color(palette::text_dim()),
+                            );
+                        });
+                        ui.end_row();
+                    });
                 if set_max {
                     match sel {
                         Pool::V1 => self.private_amount = grains_to_xus_plain(sel_balance),
@@ -11366,7 +11503,19 @@ impl Station {
                 ui.add_space(sp::S);
                 arm_banner(ui, armed);
                 ui.add_enabled_ui(priv_ok, |ui| {
-                    if ui.button("Review private send →").clicked() {
+                    // Primary-styled like the transparent "Review send →" and the
+                    // modal's confirm — one visual language for "the step forward".
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Review private send →")
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(palette::accent()),
+                        )
+                        .clicked()
+                    {
                         // EVERY condition re-decided at click time, not inherited from
                         // paint: what is armed, and whether the recipient belongs to
                         // the armed pool. Both can go stale between the two.
@@ -11428,6 +11577,18 @@ impl Station {
                         .size(ty::SECTION)
                         .strong(),
                 );
+                // The cost of a v2 move, stated IN the panel rather than buried in a
+                // hover tooltip: every shield/de-shield builds a real STARK proof, and
+                // ~25 s of silence after a click reads as a frozen app to anyone who
+                // was not told to expect it.
+                ui.label(
+                    egui::RichText::new(
+                        "⏱ Each move builds a real STARK proof — expect ~25 s of proving \
+                         before it broadcasts.",
+                    )
+                    .size(ty::SMALL)
+                    .color(palette::text_dim()),
+                );
                 ui.add_space(sp::S);
                 // Every decision below comes from ONE pure function, through the
                 // SAME guard the private-send selector uses. The UI gathers facts
@@ -11446,40 +11607,6 @@ impl Station {
                         amount: parse_xus(&self.shield_v2_amount_in),
                     },
                 );
-                ui.horizontal(|ui| {
-                    ui.label("Shield XUS into pool v2");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.shield_v2_amount_in)
-                            .hint_text("amount")
-                            .desired_width(140.0),
-                    );
-                    ui.add_enabled_ui(shield_v.is_ok(), |ui| {
-                        if ui
-                            .button("Shield →")
-                            .on_hover_text(
-                                "Move transparent value into the post-quantum pool. Builds a \
-                                 real STARK proof (~25s).",
-                            )
-                            .clicked()
-                        {
-                            do_shield_v2 = true;
-                        }
-                    });
-                });
-                ui.horizontal(|ui| {
-                    ui.label("  to");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.shield_v2_to)
-                            .hint_text("xusq1… (blank = yourself)")
-                            .desired_width(360.0),
-                    );
-                });
-                if let Err(r) = shield_v {
-                    if !self.shield_v2_amount_in.trim().is_empty() {
-                        verdicts.push(r);
-                    }
-                }
-
                 // DE-SHIELD OUT — bounded by balance AND the window budget.
                 let deshield_v = v2_allows(
                     &guard,
@@ -11488,32 +11615,142 @@ impl Station {
                     },
                 );
                 let v2_cap = guard.deshield_cap();
-                ui.horizontal(|ui| {
-                    ui.label("De-shield XUS from pool v2");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.deshield_v2_amount_in)
-                            .hint_text("amount")
-                            .desired_width(140.0),
-                    );
-                    ui.add_enabled_ui(v2_cap > 0, |ui| {
-                        if ui
-                            .button("Max")
-                            .on_hover_text(
-                                "the most allowed right now (balance, capped by the window budget)",
-                            )
-                            .clicked()
-                        {
-                            self.deshield_v2_amount_in = grains_to_xus_plain(v2_cap);
-                        }
+
+                // ONE aligned two-column form — label column, control column — so
+                // every input and button lands on a shared x whatever its label says.
+                // This replaces a stack of ad-hoc horizontals whose fields drifted
+                // with their label widths (one row was literally indented with a
+                // "  to" spaces-as-layout label). The balance each row draws on is
+                // shown BESIDE its field: the decision is made here, so the fact
+                // that informs it lives here too.
+                egui::Grid::new("v2_move_form")
+                    .num_columns(2)
+                    .spacing([sp::L, sp::M])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Shield in").weak());
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.shield_v2_amount_in)
+                                    .hint_text("amount")
+                                    .desired_width(140.0),
+                            );
+                            ui.add_enabled_ui(shield_v.is_ok(), |ui| {
+                                if ui
+                                    .button("Shield →")
+                                    .on_hover_text(
+                                        "Move transparent value into the post-quantum pool. \
+                                         Builds a real STARK proof (~25 s).",
+                                    )
+                                    .clicked()
+                                {
+                                    do_shield_v2 = true;
+                                }
+                            });
+                            // What a shield can draw on. No Max here on purpose: the
+                            // network fee comes out of the same transparent balance on
+                            // top of the amount, so "all of it" is not a buildable
+                            // transaction — an honest figure beats a misleading button.
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "from transparent balance {} XUS",
+                                    xus(&spendable.to_string())
+                                ))
+                                .size(ty::SMALL)
+                                .color(palette::text_dim()),
+                            );
+                        });
+                        ui.end_row();
+
+                        ui.label(egui::RichText::new("Recipient").weak());
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.shield_v2_to)
+                                .hint_text("xusq1… (blank = yourself)")
+                                .desired_width(360.0),
+                        );
+                        ui.end_row();
+
+                        ui.label(egui::RichText::new("De-shield out").weak());
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.deshield_v2_amount_in)
+                                    .hint_text("amount")
+                                    .desired_width(140.0),
+                            );
+                            ui.add_enabled_ui(v2_cap > 0, |ui| {
+                                if ui
+                                    .button("Max")
+                                    .on_hover_text(
+                                        "the most allowed right now (balance, capped by the window budget)",
+                                    )
+                                    .clicked()
+                                {
+                                    self.deshield_v2_amount_in = grains_to_xus_plain(v2_cap);
+                                }
+                            });
+                            ui.add_enabled_ui(deshield_v.is_ok(), |ui| {
+                                if ui.button("De-shield").clicked() {
+                                    do_deshield_v2 = true;
+                                }
+                            });
+                            // The pool balance this spends — or an honest "unknown"
+                            // when this wallet's v2 notes have not been scanned. A
+                            // bare zero beside the field is exactly how an operator
+                            // concludes their funds are gone.
+                            let ctx_text = if guard.scanned {
+                                if v2_cap < guard.balance_grains {
+                                    format!(
+                                        "up to {} XUS now (window cap) of {} XUS in pool",
+                                        grains_to_xus_plain(v2_cap),
+                                        xus(&guard.balance_grains.to_string())
+                                    )
+                                } else {
+                                    format!(
+                                        "pool balance {} XUS",
+                                        xus(&guard.balance_grains.to_string())
+                                    )
+                                }
+                            } else {
+                                "pool balance unknown — scan pool v2 first".to_string()
+                            };
+                            ui.label(
+                                egui::RichText::new(ctx_text)
+                                    .size(ty::SMALL)
+                                    .color(palette::text_dim()),
+                            );
+                        });
+                        ui.end_row();
                     });
-                    ui.add_enabled_ui(deshield_v.is_ok(), |ui| {
-                        if ui.button("De-shield").clicked() {
-                            do_deshield_v2 = true;
-                        }
-                    });
-                });
+                if let Err(r) = shield_v {
+                    if !self.shield_v2_amount_in.trim().is_empty() {
+                        verdicts.push(r);
+                    }
+                }
                 if let Err(r) = deshield_v {
                     verdicts.push(r);
+                }
+
+                // The in-progress state, IN the panel: while a proof is being built
+                // the spinner and the worker's own message sit beside the buttons
+                // that started it, so ~25 s of proving never reads as a hang.
+                if guard.busy {
+                    let act_msg = self
+                        .action
+                        .lock()
+                        .map(|a| a.message.clone())
+                        .unwrap_or_default();
+                    ui.add_space(sp::S);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new(if act_msg.is_empty() {
+                                "working…".to_string()
+                            } else {
+                                act_msg
+                            })
+                            .size(ty::SMALL)
+                            .color(palette::text_dim()),
+                        );
+                    });
                 }
 
                 // PRIVATE SEND lives in the pool selector above — see the note at
@@ -11640,17 +11877,18 @@ impl Station {
                 .show(&ctx, |ui| {
                     ui.set_max_width(450.0);
                     // Hero amount + privacy state — the two things that matter most.
-                    ui.add_space(2.0);
+                    // The amount is the modal's ONE hero figure, on the type ladder.
+                    ui.add_space(sp::XS);
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new(xus(&p.amount_grains.to_string()))
-                                .size(28.0)
+                            num(xus(&p.amount_grains.to_string()))
+                                .size(ty::HERO)
                                 .strong()
                                 .color(palette::text()),
                         );
                         ui.label(
                             egui::RichText::new("XUS")
-                                .size(14.0)
+                                .size(ty::SECTION)
                                 .color(palette::text_dim()),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -11679,7 +11917,7 @@ impl Station {
                     // that decide the durability of this payment's privacy. Read
                     // straight off `SendSource`, which is total — every reachable
                     // confirm screen carries this line, pool or transparent.
-                    ui.add_space(6.0);
+                    ui.add_space(sp::M);
                     ui.label(
                         egui::RichText::new(p.source.confirm_line())
                             .strong()
@@ -11690,7 +11928,7 @@ impl Station {
                                 None => palette::warning(),
                             }),
                     );
-                    ui.add_space(10.0);
+                    ui.add_space(sp::L);
                     egui::Grid::new("confirm_grid")
                         .num_columns(2)
                         .spacing([16.0, 8.0])
@@ -11700,11 +11938,21 @@ impl Station {
                                 "From",
                                 &format!("{} · {}", p.from_label, short_id(&p.from_account)),
                             );
-                            // Full recipient address, monospace + wrapped so it never overflows.
+                            // Recipient, monospace + wrapped so it never overflows. A
+                            // pool-v2 xusq1… address carries an ML-KEM key (~1.2 KiB)
+                            // and is NEVER rendered raw — head…tail elision, the same
+                            // rule as everywhere else it appears.
+                            let to_display = if p.to.starts_with("xusq1") {
+                                truncate_middle(&p.to, 22, 12)
+                            } else {
+                                p.to.clone()
+                            };
                             ui.label(egui::RichText::new("To").weak());
                             ui.add(
-                                egui::Label::new(egui::RichText::new(&p.to).monospace().size(11.0))
-                                    .wrap(),
+                                egui::Label::new(
+                                    egui::RichText::new(to_display).monospace().size(ty::SMALL),
+                                )
+                                .wrap(),
                             );
                             ui.end_row();
                             kv(ui, "Route", &p.route_label);
@@ -11756,21 +12004,27 @@ impl Station {
                                 )
                             };
                             kv(ui, "Blockspace tip", &tip_str);
-                            kv(
-                                ui,
-                                "Total cost",
-                                &format!("{} XUS", xus(&cost.total_grains().to_string())),
+                            // The bottom line, WEIGHTED as the bottom line: total
+                            // cost and the balance it leaves are the two figures a
+                            // spender confirms against, so they carry the emphasis
+                            // the per-part rows above them do not.
+                            ui.label(egui::RichText::new("Total cost").weak());
+                            ui.label(
+                                num(format!("{} XUS", xus(&cost.total_grains().to_string())))
+                                    .strong(),
                             );
-                            kv(
-                                ui,
-                                "Balance after",
-                                &format!(
+                            ui.end_row();
+                            ui.label(egui::RichText::new("Balance after").weak());
+                            ui.label(
+                                num(format!(
                                     "{} XUS",
                                     xus(&cost.balance_after(p.from_balance_grains).to_string())
-                                ),
+                                ))
+                                .strong(),
                             );
+                            ui.end_row();
                         });
-                    ui.add_space(8.0);
+                    ui.add_space(sp::M);
                     // Privacy + self-send context.
                     if p.links_public {
                         ui.colored_label(
@@ -11790,9 +12044,9 @@ impl Station {
                             "↩ This is one of your own addresses.",
                         );
                     }
-                    ui.add_space(10.0);
+                    ui.add_space(sp::L);
                     ui.separator();
-                    ui.add_space(4.0);
+                    ui.add_space(sp::S);
                     ui.horizontal(|ui| {
                         if ui
                             .add(
