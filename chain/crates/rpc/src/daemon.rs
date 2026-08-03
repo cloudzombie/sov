@@ -1028,6 +1028,30 @@ const MAINNET_CHECKPOINTS: &[(u64, &str)] = &[
         14336,
         "685294af86208f8495cce21d3ae2b19fc0c80d0285d8ee92cbff76b66124e2e5",
     ),
+    // Pinned 2026-08-02 at tip 16570 (this block is ~698 deep — far past finality).
+    // The 14336 anchor had gone STALE at lag 2233 (> the 2000 the release gate allows),
+    // so a fresh node re-ran RandomX for ~2,200 blocks before reaching the tip. Since
+    // v0.2.7 that is SLOWNESS rather than an outage (verification moved off the P2P
+    // worker), but it is still needless work on exactly the low-RAM machines that can
+    // least afford it — and those are now light-mode by design (see the RandomX
+    // MemAvailable guard in `sov-pow`), which makes each re-verified block costlier.
+    //
+    // CROSS-CHECK NOTE: `scripts/refresh-checkpoint.sh` could not confirm this itself.
+    // Its relay list still names the DESTROYED sgp1 droplet (143.198.219.31) and, under
+    // `set -euo pipefail`, curl's exit 7 aborts the script. It also assumes every relay
+    // exposes RPC publicly, but fra1 binds RPC to localhost — correct posture, so only
+    // sfo3 answers from outside and the required "two independent confirmations" can
+    // never be met over public RPC alone. The hash below was therefore confirmed
+    // IDENTICAL on two independent relays by hand, over two different transports:
+    // sfo3 (137.184.83.91) via public RPC and fra1 (164.92.141.24) via SSH to its
+    // loopback RPC. Same safety property the script enforces, obtained a different way.
+    //
+    // Weak-subjectivity anchor, genesis-safe, additive — a chain reaching 15872 with a
+    // different hash is still rejected by the hash pin.
+    (
+        15872,
+        "c5ce1b62deeb9af012731c5c4c430e4bdb08e41e4acde0cd0e3992f4474b4bc1",
+    ),
 ];
 
 /// How far the newest baked checkpoint may fall behind the live tip before the

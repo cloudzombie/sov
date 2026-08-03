@@ -27,7 +27,21 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 DAEMON=chain/crates/rpc/src/daemon.rs
-RELAYS=(137.184.83.91 143.198.219.31 164.92.141.24)
+# Relays that answer RPC FROM OUTSIDE. sgp1 (143.198.219.31) was destroyed on
+# 2026-07-31 (it had drifted onto a minority fork and was poisoning every fresh
+# sync); leaving it here made curl exit 7 abort this whole script under
+# `set -euo pipefail`, so the refresh failed SILENTLY and the anchor went stale.
+#
+# CAUTION: fra1 (164.92.141.24) binds its RPC to LOOPBACK — correct posture, but it
+# means only ONE relay answers publicly, so the two-independent-confirmations rule
+# below can no longer be satisfied from outside and this script will (honestly)
+# refuse. Until a second public relay exists, confirm the second opinion by hand:
+#   ssh root@164.92.141.24 "curl -s --max-time 8 -X POST http://127.0.0.1:8645 \
+#     -H 'content-type: application/json' \
+#     --data '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"sov_getBlockByHeight\",\"params\":{\"height\":<CAND>}}'"
+# and pin only if that hash is IDENTICAL to sfo3's. That is how the 15872 anchor
+# was cross-checked.
+RELAYS=(137.184.83.91 164.92.141.24)
 # How far below the live tip to pin. Two orders of magnitude past the
 # 6-confirmation finality bar — roughly a day of blocks at the 2.5-minute target.
 MIN_DEPTH=512
@@ -39,9 +53,14 @@ WRITE=0
 [ "${1:-}" = "--write" ] && WRITE=1
 
 rpc() { # rpc <relay> <method> <params-json>
+  # `|| true`: an unreachable relay is an ORDINARY outcome here (a droplet is down,
+  # or binds RPC to loopback) and must not abort the script via `set -e`. The caller
+  # already treats an empty reply as "no answer" and the two-confirmation rule below
+  # is what actually decides whether anything gets pinned. Without this, one dead
+  # relay turned a refresh into a silent exit 7 and the anchor rotted unnoticed.
   curl -s --max-time 10 -X POST "http://$1:8645" \
     -H 'content-type: application/json' \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":$3}" 2>/dev/null
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":$3}" 2>/dev/null || true
 }
 
 # 1. Live tip, from whichever relay answers first.
