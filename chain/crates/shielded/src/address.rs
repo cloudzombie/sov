@@ -33,6 +33,14 @@ const HRP_UNIFIED: &str = "uxus";
 /// Human-readable part of a post-quantum (pool v2) shielded address
 /// (`xusq1…`) — decision D8.
 const HRP_SHIELDED_V2: &str = "xusq";
+/// Human-readable part of a CHECKSUMMED transparent address (`xust1…`) — the
+/// presentation form of an implicit (key-derived) 32-byte account id.
+///
+/// This is a wallet-boundary encoding only: decoding yields the identical raw
+/// 64-hex [`AccountId`] that goes on the wire, so the chain sees byte-identical
+/// transactions and no node needs to understand the form. Raw 64-hex input
+/// stays accepted forever — this is strictly additive.
+const HRP_TRANSPARENT: &str = "xust";
 
 /// Unified-address TLV typecode: a transparent account id (UTF-8).
 const UA_TYPE_TRANSPARENT: u8 = 0x00;
@@ -173,6 +181,85 @@ pub fn decode_shielded_v2(s: &str) -> Result<PqAddress, AddressError> {
         });
     }
     PqAddress::from_bytes(&payload).ok_or(AddressError::Payload("shielded-v2"))
+}
+
+/// Character length of a full `xusq1…` pool-v2 address: HRP + the `1`
+/// separator + the bech32 data characters for [`PQ_ADDRESS_LEN`] bytes + the
+/// 6-character checksum. Exposed so a UI can tell a TRUNCATED paste (clipped
+/// by a chat client, terminal wrap, or spreadsheet cell) apart from a checksum
+/// failure — the operator's next action differs completely.
+pub const SHIELDED_V2_ADDRESS_CHARS: usize =
+    HRP_SHIELDED_V2.len() + 1 + (PQ_ADDRESS_LEN * 8).div_ceil(5) + 6;
+
+/// The 32 bech32 data-part characters. `1`, `b`, `i`, and `o` are excluded by
+/// the spec (BIP-173), which is what lets a clipped-but-otherwise-clean paste
+/// be recognized as truncation rather than corruption.
+const BECH32_CHARSET: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+/// Whether `s` looks like a pool-v2 (`xusq1…`) address that was TRUNCATED:
+/// the right prefix, only valid bech32 data characters after it, but shorter
+/// than the one legal length ([`SHIELDED_V2_ADDRESS_CHARS`]). Case-insensitive,
+/// like bech32m itself.
+///
+/// A full-length string with a bad checksum is NOT truncated (it is corrupted),
+/// and a short string containing characters outside the bech32 charset is NOT
+/// truncated (it is garbage) — both should surface their real decode error.
+pub fn shielded_v2_looks_truncated(s: &str) -> bool {
+    let lower = s.trim().to_lowercase();
+    let Some(data) = lower.strip_prefix("xusq1") else {
+        return false;
+    };
+    lower.len() < SHIELDED_V2_ADDRESS_CHARS && data.chars().all(|c| BECH32_CHARSET.contains(c))
+}
+
+/// Encode an implicit (key-derived, 64-hex) transparent account id as a
+/// checksummed `xust1…` address — the same audited bech32m engine the shielded
+/// tiers use, under its own HRP. `None` for a named account (`alice.sov`): a
+/// name is already human-checkable and is not a 32-byte id.
+///
+/// Presentation-layer ONLY: `decode_transparent(encode_transparent(id)) == id`,
+/// and the on-wire transaction is byte-identical whether the recipient was
+/// entered as raw hex or as `xust1…` (pinned by test). Consensus never sees
+/// this form.
+pub fn encode_transparent(account: &AccountId) -> Option<String> {
+    if !account.is_implicit() {
+        return None;
+    }
+    // 64 lowercase hex chars -> 32 bytes. Guaranteed well-formed by
+    // `is_implicit`; this is plain radix conversion, not a checksum.
+    let s = account.as_str().as_bytes();
+    let nibble = |b: u8| match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        _ => unreachable!("is_implicit guarantees lowercase hex"),
+    };
+    let bytes: Vec<u8> = s
+        .chunks(2)
+        .map(|p| (nibble(p[0]) << 4) | nibble(p[1]))
+        .collect();
+    Some(encode(HRP_TRANSPARENT, &bytes))
+}
+
+/// Decode a checksummed `xust1…` transparent address back to the identical raw
+/// 64-hex [`AccountId`] that goes on the wire.
+pub fn decode_transparent(s: &str) -> Result<AccountId, AddressError> {
+    let (hrp, payload) = decode(s)?;
+    if hrp != HRP_TRANSPARENT {
+        return Err(AddressError::WrongKind {
+            expected: HRP_TRANSPARENT,
+            got: hrp,
+        });
+    }
+    let bytes: [u8; 32] = payload
+        .try_into()
+        .map_err(|_| AddressError::Payload("transparent"))?;
+    let mut hex = String::with_capacity(64);
+    for b in bytes {
+        use core::fmt::Write;
+        write!(hex, "{b:02x}").expect("writing to a String cannot fail");
+    }
+    // 64 lowercase hex characters always form a valid implicit AccountId.
+    AccountId::new(hex).map_err(|_| AddressError::Payload("transparent"))
 }
 
 /// Encode a shielded receiver as `xus1…`.
@@ -432,17 +519,25 @@ pub enum AnyAddress {
 }
 
 impl AnyAddress {
-    /// Parse a recipient string of any tier. The three bech32m prefixes are
-    /// unambiguous — `xusq1…` is tested before `xus1…` (`xus` is a prefix of
-    /// `xusq`, but `xus1` is not a prefix of `xusq1`, and testing the longer
-    /// HRP first makes that independent of the reader's care), `uxus` starts
-    /// with a different letter, and a named account can never contain the
-    /// `…1` HRP separator in those positions. Anything else must be a valid
-    /// named account.
+    /// Parse a recipient string of any tier. The four bech32m prefixes are
+    /// unambiguous — `xusq1…`/`xust1…` are tested before `xus1…` (`xus` is a
+    /// prefix of `xusq`/`xust`, but `xus1` is not a prefix of `xusq1` or
+    /// `xust1`, and testing the longer HRPs first makes that independent of
+    /// the reader's care), `uxus` starts with a different letter, and a named
+    /// account can never contain the `…1` HRP separator in those positions.
+    /// Anything else must be a valid named account.
     pub fn parse(s: &str) -> Result<AnyAddress, AddressError> {
         let lower = s.to_lowercase();
         if lower.starts_with("xusq1") {
             return decode_shielded_v2(s).map(AnyAddress::ShieldedV2);
+        }
+        // `xust1…` — the checksummed presentation of an implicit transparent
+        // account. Decodes to the identical raw-hex AccountId, so everything
+        // downstream (routing, signing, the wire) is byte-identical to a
+        // raw-hex paste. Like `xusq`, the longer HRP cannot collide with
+        // `xus1…` ("xust1" does not start with "xus1").
+        if lower.starts_with("xust1") {
+            return decode_transparent(s).map(AnyAddress::Transparent);
         }
         if lower.starts_with("xus1") {
             return decode_shielded(s).map(AnyAddress::Shielded);
@@ -560,6 +655,174 @@ mod tests {
         // Garbage is rejected, not guessed at.
         assert!(AnyAddress::parse("not an address!").is_err());
         assert!(AnyAddress::parse("xus1garbage").is_err());
+    }
+
+    /// A deterministic corpus of implicit (64-hex) account ids covering edge
+    /// byte patterns and a spread of pseudo-random ones.
+    fn implicit_corpus() -> Vec<AccountId> {
+        let mut ids = Vec::new();
+        for pattern in [[0u8; 32], [0xff; 32], [0x0f; 32], [0xf0; 32]] {
+            ids.push(hex_id(&pattern));
+        }
+        // Pseudo-random but fixed: a keyed BLAKE3 stream, no wall-clock input.
+        for i in 0u8..32 {
+            ids.push(hex_id(blake3::hash(&[i]).as_bytes()));
+        }
+        ids
+    }
+
+    fn hex_id(bytes: &[u8; 32]) -> AccountId {
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        AccountId::new(hex).unwrap()
+    }
+
+    #[test]
+    fn transparent_checksummed_form_roundtrips_and_is_canonical_lowercase() {
+        for id in implicit_corpus() {
+            let s = encode_transparent(&id).expect("implicit ids always encode");
+            assert!(s.starts_with("xust1"), "got {s}");
+            assert_eq!(s, s.to_lowercase(), "canonical lowercase output");
+            assert_eq!(
+                decode_transparent(&s).unwrap(),
+                id,
+                "decode(encode(id)) == id"
+            );
+            // bech32m case-insensitivity: the fully-uppercase form decodes too.
+            assert_eq!(decode_transparent(&s.to_uppercase()).unwrap(), id);
+            // And it parses as a first-class recipient tier.
+            assert_eq!(AnyAddress::parse(&s), Ok(AnyAddress::Transparent(id)));
+        }
+    }
+
+    #[test]
+    fn transparent_named_accounts_have_no_checksummed_form() {
+        // A named account is not a 32-byte id; it has no xust1 form, and raw
+        // input keeps working through AnyAddress::parse exactly as before.
+        assert_eq!(encode_transparent(&t()), None);
+        let raw = implicit_corpus()[0].clone();
+        assert_eq!(
+            AnyAddress::parse(raw.as_str()),
+            Ok(AnyAddress::Transparent(raw)),
+            "raw 64-hex input stays accepted forever"
+        );
+    }
+
+    #[test]
+    fn transparent_every_single_character_substitution_is_rejected() {
+        let id = hex_id(blake3::hash(b"substitution-sweep").as_bytes());
+        let s = encode_transparent(&id).unwrap();
+        for pos in 0..s.len() {
+            for c in BECH32_CHARSET.chars() {
+                if s.as_bytes()[pos] as char == c {
+                    continue;
+                }
+                let mut mutated: Vec<char> = s.chars().collect();
+                mutated[pos] = c;
+                let mutated: String = mutated.into_iter().collect();
+                assert!(
+                    decode_transparent(&mutated).is_err(),
+                    "substituting {c:?} at {pos} must be rejected: {mutated}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transparent_deletions_insertions_and_transpositions_are_rejected() {
+        let id = hex_id(blake3::hash(b"edit-distance-sweep").as_bytes());
+        let s = encode_transparent(&id).unwrap();
+        // Every single-character deletion.
+        for pos in 0..s.len() {
+            let mut m = s.clone();
+            m.remove(pos);
+            assert!(decode_transparent(&m).is_err(), "deletion at {pos}");
+        }
+        // Every single-character insertion of a data-charset character.
+        for pos in 0..=s.len() {
+            for c in ['q', 'p', 'l'] {
+                let mut m = s.clone();
+                m.insert(pos, c);
+                assert!(
+                    decode_transparent(&m).is_err(),
+                    "insertion of {c:?} at {pos}"
+                );
+            }
+        }
+        // Every adjacent transposition of two DIFFERENT characters.
+        let chars: Vec<char> = s.chars().collect();
+        for pos in 0..chars.len() - 1 {
+            if chars[pos] == chars[pos + 1] {
+                continue;
+            }
+            let mut m = chars.clone();
+            m.swap(pos, pos + 1);
+            let m: String = m.into_iter().collect();
+            assert!(decode_transparent(&m).is_err(), "transposition at {pos}");
+        }
+    }
+
+    #[test]
+    fn transparent_wrong_kind_and_bad_payload_are_named_errors() {
+        // A pool-v1 address in a transparent decoder: WrongKind, naming both.
+        assert_eq!(
+            decode_transparent(&encode_shielded(&z())),
+            Err(AddressError::WrongKind {
+                expected: "xust",
+                got: "xus".into(),
+            })
+        );
+        // The right HRP with a payload that is not 32 bytes: Payload.
+        assert_eq!(
+            decode_transparent(&encode("xust", &[0u8; 10])),
+            Err(AddressError::Payload("transparent"))
+        );
+    }
+
+    #[test]
+    fn v2_truncation_is_classified_distinctly_from_checksum_failure() {
+        use sov_shielded_pq::hd::PqShieldedKey;
+        let addr = PqShieldedKey::from_leaf_seed(&[9u8; 32]).address();
+        let s = encode_shielded_v2(&addr);
+        assert_eq!(
+            s.len(),
+            SHIELDED_V2_ADDRESS_CHARS,
+            "a full v2 address has exactly one legal length"
+        );
+        // Every truncation length (keeping at least the xusq1 prefix) is
+        // classified as TRUNCATED — and none of them decodes.
+        for len in 5..s.len() {
+            let clipped = &s[..len];
+            assert!(
+                shielded_v2_looks_truncated(clipped),
+                "length {len} must classify as truncated"
+            );
+        }
+        for len in [5, 6, s.len() / 2, s.len() - 1] {
+            assert!(decode_shielded_v2(&s[..len]).is_err());
+        }
+        // The full-length address is NOT "truncated" — it decodes.
+        assert!(!shielded_v2_looks_truncated(&s));
+        assert_eq!(decode_shielded_v2(&s).unwrap(), addr);
+        // A full-length address with one corrupted character is CORRUPTED,
+        // not truncated: it must surface the checksum failure instead.
+        let mut corrupted: Vec<char> = s.chars().collect();
+        let mid = corrupted.len() / 2;
+        corrupted[mid] = if corrupted[mid] == 'q' { 'p' } else { 'q' };
+        let corrupted: String = corrupted.into_iter().collect();
+        assert!(!shielded_v2_looks_truncated(&corrupted));
+        assert!(matches!(
+            decode_shielded_v2(&corrupted),
+            Err(AddressError::Encoding(_))
+        ));
+        // A short string with a NON-charset character ('b' is excluded from
+        // bech32) is garbage, not truncation.
+        let garbage = format!("xusq1b{}", &s[6..40]);
+        assert!(!shielded_v2_looks_truncated(&garbage));
+        // Uppercase truncation still classifies (bech32m is case-insensitive).
+        assert!(shielded_v2_looks_truncated(&s[..100].to_uppercase()));
+        // Other kinds never classify as v2 truncation.
+        assert!(!shielded_v2_looks_truncated(&encode_shielded(&z())[..20]));
+        assert!(!shielded_v2_looks_truncated("treasury.sov"));
     }
 
     #[test]
