@@ -46,7 +46,13 @@
 //! NFTs: `sov_getNftClass`, `sov_getNft`, `sov_nftsOf`, `sov_listNfts` (paged).
 //! `sov_getSupply` also reports shielded value + shielded % of supply.
 //! Receipts (the recorded outcome of a transaction, incl. the exact failure
-//! reason for an included-but-rejected tx): `sov_getReceipt` (by `txId`),
+//! reason for an included-but-rejected tx): `sov_getReceipt` (by `txId` —
+//! note the exact camelCase spelling: a lowercase `txid` key is NOT matched
+//! and returns `missing string param 'txId'`, which is easy to misread as
+//! "the method doesn't exist"). A receipt's `gas_used` prices the fee the
+//! sender was charged: **fee = `gas_used` × the chain's `gas_price`** (10
+//! grains per gas unit on mainnet — e.g. a plain transfer's 165,176 gas costs
+//! 1,651,760 grains = 0.0165176 XUS).
 //! `sov_getBlockReceipts` (by `height`), and `sov_getReceiptProof` (by `txId`,
 //! or by `height` + `index`) — a receipt plus its Merkle inclusion proof against
 //! the block's `receiptsRoot`, so a light client can verify a receipt (including
@@ -630,6 +636,9 @@ fn param_hash(params: &Value) -> Result<Hash, RpcError> {
     Hash::from_hex(s).map_err(|e| RpcError::invalid_params(format!("invalid hash: {e}")))
 }
 
+/// Extract the `txId` parameter. The key is EXACTLY `txId` (camelCase) — a
+/// lowercase `txid` is not matched, and the resulting `missing string param
+/// 'txId'` error names the spelling the caller must use.
 fn param_tx_id(params: &Value) -> Result<Hash, RpcError> {
     let s = params
         .get("txId")
