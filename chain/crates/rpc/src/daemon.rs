@@ -1052,6 +1052,27 @@ const MAINNET_CHECKPOINTS: &[(u64, &str)] = &[
         15872,
         "c5ce1b62deeb9af012731c5c4c430e4bdb08e41e4acde0cd0e3992f4474b4bc1",
     ),
+    // Pinned 2026-08-09 at tip 20509 (this block is 541 deep — far past finality).
+    // The prior anchor 15872 had rotted to a lag of 4,610, more than double the
+    // 2,000 the release gate allows, so the gate refused the v0.2.11 cut exactly as
+    // it refused v0.2.10 on 2026-08-02. That guard is the only reason this was
+    // caught both times.
+    //
+    // `scripts/refresh-checkpoint.sh` correctly REFUSED to write this on its own
+    // ("only 1 relay(s) confirmed ... need 2 independent confirmations"): fra1 binds
+    // its RPC to loopback and sgp1 was destroyed 2026-07-31, so only ONE relay
+    // answers publicly. The second confirmation was therefore completed by hand, as
+    // the script's own comments prescribe — sfo3 over its public RPC and fra1 over
+    // SSH to 127.0.0.1:8645, two independent hosts over two transports, both
+    // returning e8ce24cf…fb33 for height 19968. Standing up a second PUBLIC relay
+    // is what makes this unattended again.
+    //
+    // Weak-subjectivity anchor, genesis-safe, additive — a chain reaching 19968 with
+    // a different hash is still rejected by the hash pin.
+    (
+        19968,
+        "e8ce24cf36d029576e030aecd324ab2b2b482e1f7b7e15f629e614fd99c3fb33",
+    ),
 ];
 
 /// How far the newest baked checkpoint may fall behind the live tip before the

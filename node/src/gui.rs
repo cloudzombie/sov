@@ -3005,19 +3005,68 @@ fn grains_to_xus_plain(grains: u128) -> String {
     }
 }
 
+/// The text + hover for one private-balance chip on the wallet hero card, from
+/// one pool's [`ShieldedView::own_figures`]/[`ShieldedV2View::own_figures`]
+/// result. Pure, so the three honest states are pinned by tests rather than
+/// reasoned about in paint code:
+///
+/// - `None` (UNSCANNED / another wallet's view) → an em-dash and "scan to
+///   view" — NEVER a zero, because a wallet nobody scanned is not empty, it is
+///   unexamined;
+/// - `Some((0, ..))` (scanned and empty) → a real `0`;
+/// - `Some((n, ..))` → the figure, with the scan height in the hover so a
+///   stale scan reads as stale rather than as current truth.
+fn private_chip(pool: &str, own: Option<(u128, usize, u64)>) -> (String, String) {
+    match own {
+        None => (
+            format!("🛡 {pool} — private"),
+            format!("pool {pool}: not scanned for this wallet — scan to view (unknown, not zero)"),
+        ),
+        Some((grains, notes, height)) => (
+            format!("🛡 {} {pool} private", grains_to_xus_plain(grains)),
+            format!("pool {pool}: {notes} unspent note(s), scanned to height {height}"),
+        ),
+    }
+}
+
+/// How a TRANSPARENT recipient was spelled — the difference between an address
+/// that carries a checksum and one that does not is exactly the difference
+/// between a typo that is caught and value that is permanently unspendable, so
+/// the form is first-class and every label names it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TransparentForm {
+    /// A human-readable named account (`alice.sov`) — checkable by eye.
+    Named,
+    /// A raw 64-hex implicit id. NO checksum anywhere in the path: one
+    /// mistyped character is still a perfectly valid account nobody holds a
+    /// key for, and value sent there is gone. Marked UNCHECKED in the UI.
+    RawHexUnchecked,
+    /// A `xust1…` checksummed spelling — the bech32m checksum verified, so a
+    /// corrupted paste is accepted with probability ~2^-30.
+    Checksummed,
+}
+
 /// The detected destination tier for a "To" string, used to validate and label
 /// a send before it is broadcast.
 enum SendRoute {
     Empty,
-    Invalid,
-    Transparent(String), // a named account (public)
-    Shielded,            // xus1… (private)
-    Unified,             // uxus1… (routes shielded when possible)
+    /// Not a recognizable address of any tier. Carries the EXACT reason (the
+    /// real decode error), never a bare "invalid".
+    Invalid(String),
+    /// A well-formed `xusq1…` PREFIX that is shorter than the one legal
+    /// pool-v2 address length (~1,950 chars — the address most likely to be
+    /// clipped by a chat client, terminal wrap, or spreadsheet cell). Kept
+    /// distinct from `Invalid` because the operator's next action differs
+    /// completely: re-copy the whole address, don't hunt for a typo.
+    TruncatedV2,
+    Transparent(String, TransparentForm), // resolved account id (public)
+    Shielded,                             // xus1… (private)
+    Unified,                              // uxus1… (routes shielded when possible)
     // A post-quantum pool-v2 receiver. The address PARSES — it is well-formed,
-    // not garbage — but signal bit 2 is defined and NOT armed, so no v2 spend
-    // can execute on any chain. Kept distinct from `Invalid` on purpose: telling
-    // an operator a valid address is "unrecognized" would send them hunting for
-    // a typo that is not there.
+    // not garbage — but this transparent-send form cannot build a v2 spend
+    // (the pool-v2 private-send tab is the path that can). Kept distinct from
+    // `Invalid` on purpose: telling an operator a valid address is
+    // "unrecognized" would send them hunting for a typo that is not there.
     ShieldedV2Unsupported,
 }
 
@@ -3027,43 +3076,85 @@ impl SendRoute {
         if to.is_empty() {
             return SendRoute::Empty;
         }
+        // Truncation before decode: a clipped xusq1… fails the checksum too,
+        // but "re-copy the full address" and "you have a typo" are different
+        // instructions and conflating them wastes the operator's time.
+        if sov_shielded::shielded_v2_looks_truncated(to) {
+            return SendRoute::TruncatedV2;
+        }
         match AnyAddress::parse(to) {
-            Ok(AnyAddress::Transparent(id)) => SendRoute::Transparent(id.to_string()),
+            Ok(AnyAddress::Transparent(id)) => {
+                // How was it spelled? The parser accepts raw hex, a name, and
+                // the checksummed xust1… form — same id, different assurance.
+                let form = if to.to_lowercase().starts_with("xust1") {
+                    TransparentForm::Checksummed
+                } else if id.is_implicit() {
+                    TransparentForm::RawHexUnchecked
+                } else {
+                    TransparentForm::Named
+                };
+                SendRoute::Transparent(id.to_string(), form)
+            }
             Ok(AnyAddress::Shielded(_)) => SendRoute::Shielded,
             Ok(AnyAddress::Unified(_)) => SendRoute::Unified,
             Ok(AnyAddress::ShieldedV2(_)) => SendRoute::ShieldedV2Unsupported,
-            Err(_) => SendRoute::Invalid,
+            // Surface the real decode error — `AddressError` names encoding
+            // (checksum) failures, wrong-kind, bad payloads, and unified
+            // receiver problems distinctly, and each is actionable.
+            Err(e) => SendRoute::Invalid(e.to_string()),
         }
     }
     fn is_valid(&self) -> bool {
-        // `ShieldedV2Unsupported` is deliberately NOT valid: the address is
-        // well-formed but unspendable while bit 2 is unarmed, so the Send
-        // control must stay disabled rather than let an operator broadcast a
-        // transaction the chain will hard-reject.
+        // `ShieldedV2Unsupported` is deliberately NOT valid: this form cannot
+        // build a v2 spend, so the Send control must stay disabled rather than
+        // let an operator broadcast a transaction the chain will hard-reject.
         !matches!(
             self,
-            SendRoute::Empty | SendRoute::Invalid | SendRoute::ShieldedV2Unsupported
+            SendRoute::Empty
+                | SendRoute::Invalid(_)
+                | SendRoute::TruncatedV2
+                | SendRoute::ShieldedV2Unsupported
         )
     }
     /// True when the route keeps the amount/recipient private.
     fn private(&self) -> bool {
         matches!(self, SendRoute::Shielded | SendRoute::Unified)
     }
-    /// A short human label + color for inline display.
+    /// A short human label + color for inline display. Success names the KIND
+    /// that was pasted; failure names the EXACT reason.
     fn label(&self) -> (String, egui::Color32) {
         match self {
             SendRoute::Empty => (String::new(), palette::text_dim()),
-            SendRoute::Invalid => ("✗ unrecognized address".into(), palette::error()),
-            SendRoute::Transparent(a) => {
-                (format!("→ transparent · {a} (public)"), palette::warning())
-            }
-            SendRoute::Shielded => ("→ shielded (private)".into(), palette::success()),
+            SendRoute::Invalid(why) => (format!("✗ INVALID: {why}"), palette::error()),
+            SendRoute::TruncatedV2 => (
+                "✗ this looks like a pool-v2 (xusq1…) address that has been TRUNCATED — \
+                 re-copy the FULL ~1,950-character address (this is not a typo)"
+                    .into(),
+                palette::error(),
+            ),
+            SendRoute::Transparent(a, TransparentForm::Named) => (
+                format!("✔ VALID · transparent named account · {a} (public)"),
+                palette::warning(),
+            ),
+            SendRoute::Transparent(a, TransparentForm::Checksummed) => (
+                format!("✔ VALID · transparent, checksum OK · {a} (public)"),
+                palette::warning(),
+            ),
+            SendRoute::Transparent(_, TransparentForm::RawHexUnchecked) => (
+                "⚠ VALID FORM · transparent raw hex — NO CHECKSUM: this address cannot be \
+                 verified, check it character by character (public)"
+                    .into(),
+                palette::warning(),
+            ),
+            SendRoute::Shielded => ("✔ VALID · shielded v1 (private)".into(), palette::success()),
             SendRoute::Unified => (
-                "→ unified (routes shielded — private)".into(),
+                "✔ VALID · unified (routes shielded — private)".into(),
                 palette::success(),
             ),
             SendRoute::ShieldedV2Unsupported => (
-                "✗ post-quantum (v2) address — that pool is not active yet".into(),
+                "✗ post-quantum pool-v2 (xusq1…) address — use the pool-v2 private send \
+                 (Shielded tab), not this transparent form"
+                    .into(),
                 palette::error(),
             ),
         }
@@ -3110,21 +3201,30 @@ fn pool_recipient_check(pool: Pool, to: &str) -> Result<(), &'static str> {
              pool-v2 xusq1… address; the two pools are separate value spaces",
         ),
 
+        // A TRUNCATED pool-v2 address is its own failure: "re-copy the full
+        // address" is a different instruction than "you have a typo", and a
+        // ~1,950-character string is the one a chat client or terminal wrap
+        // clips most often.
+        (Pool::V1 | Pool::V2, SendRoute::TruncatedV2) => Err(
+            "this looks like a pool-v2 (xusq1…) address that has been TRUNCATED — re-copy \
+             the FULL ~1,950-character address (this is not a typo or checksum failure)",
+        ),
+
         // Transparent: a real account, but paying it would publish the amount
         // and the recipient — the opposite of what this form is for.
-        (Pool::V1, SendRoute::Transparent(_)) => Err(
+        (Pool::V1, SendRoute::Transparent(..)) => Err(
             "that is a transparent account — a private send needs a shielded xus1…/uxus1… \
              address (use the Send form above to pay an account publicly)",
         ),
-        (Pool::V2, SendRoute::Transparent(_)) => Err(
+        (Pool::V2, SendRoute::Transparent(..)) => Err(
             "that is a transparent account — a pool-v2 private send needs a xusq1… address \
              (use the Send form above to pay an account publicly)",
         ),
 
-        (Pool::V1, SendRoute::Invalid) => {
+        (Pool::V1, SendRoute::Invalid(_)) => {
             Err("unrecognized address — a pool-v1 private send needs a xus1…/uxus1… address")
         }
-        (Pool::V2, SendRoute::Invalid) => {
+        (Pool::V2, SendRoute::Invalid(_)) => {
             Err("unrecognized address — a pool-v2 private send needs a xusq1… address")
         }
     }
@@ -9640,16 +9740,23 @@ impl Station {
             .unwrap_or_else(|| "—".to_string());
         let named = is_named_account(&effective);
         let is_miner = self.mining_account.as_deref() == Some(account.as_str());
-        // Shielded (private) balance FOR THIS WALLET, if it has been scanned —
-        // looked up by the wallet's own account, so it is this wallet's figure or
-        // nothing at all. Unscanned shows no shielded line rather than a zero.
-        let shielded = self
+        // PRIVATE balances FOR THIS WALLET — BOTH pools, via the same
+        // `own_figures` accessor the pool panels use: the keyed lookup plus the
+        // account/scanned re-check means each figure is this wallet's own or
+        // `None` (= UNKNOWN, rendered as "—", never as a zero). The two pools
+        // are separate value spaces, so two separate chips — never a sum.
+        let v1_own = self
             .shielded
             .lock()
             .ok()
             .map(|m| m.view_for(&account))
-            .filter(|v| v.account == account && v.balance > 0)
-            .map(|v| grains_to_xus_plain(u128::from(v.balance)));
+            .and_then(|v| v.own_figures(&account));
+        let v2_own = self
+            .shielded_v2
+            .lock()
+            .ok()
+            .map(|m| m.view_for(&account))
+            .and_then(|v| v.own_figures(&account));
 
         egui::Frame::group(ui.style())
             .fill(palette::panel())
@@ -9694,12 +9801,18 @@ impl Station {
                             .size(15.0)
                             .color(palette::text_dim()),
                     );
-                    if let Some(sh) = &shielded {
+                    // One chip per pool, three honest states each (established
+                    // in v0.2.9): unscanned → "—" (never 0), scanned-and-empty
+                    // → a real 0, scanned-with-value → the figure.
+                    for (pool, own) in [("v1", v1_own), ("v2", v2_own)] {
                         ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(format!("🛡 {sh} private"))
-                                .color(palette::accent_hi()),
-                        );
+                        let (text, hover) = private_chip(pool, own);
+                        let color = match own {
+                            Some((g, _, _)) if g > 0 => palette::accent_hi(),
+                            _ => palette::text_dim(),
+                        };
+                        ui.label(egui::RichText::new(text).color(color))
+                            .on_hover_text(hover);
                     }
                 });
                 ui.add_space(2.0);
@@ -10768,6 +10881,38 @@ impl Station {
                         if ui.button("Copy address").clicked() {
                             ui.output_mut(|o| o.copied_text = recv_addr.clone());
                             did_copy = true;
+                        }
+                        // The transparent account's CHECKSUMMED spelling. Raw
+                        // hex has no checksum — one mistyped character is still
+                        // a valid account nobody holds a key for — so offer the
+                        // xust1… form, which any v0.2.11+ sender verifies and
+                        // which decodes to the identical on-wire account.
+                        if self.receive_kind == ReceiveKind::Account {
+                            if let Some(xust) = AccountId::new(recv_addr.as_str())
+                                .ok()
+                                .as_ref()
+                                .and_then(sov_shielded::encode_transparent)
+                            {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "⚠ raw hex has NO checksum — prefer the checksummed \
+                                         form below (same account, typo-proof):",
+                                    )
+                                    .size(ty::SMALL)
+                                    .color(palette::warning()),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&xust).monospace().size(ty::SMALL),
+                                    )
+                                    .wrap(),
+                                );
+                                if ui.button("Copy checksummed (xust1…)").clicked() {
+                                    ui.output_mut(|o| o.copied_text = xust.clone());
+                                    did_copy = true;
+                                }
+                            }
                         }
                     });
                 });
@@ -16076,12 +16221,154 @@ mod tests {
         assert!(matches!(SendRoute::detect(""), SendRoute::Empty));
         assert!(matches!(
             SendRoute::detect("treasury.sov"),
-            SendRoute::Transparent(_)
+            SendRoute::Transparent(_, TransparentForm::Named)
         ));
-        assert!(matches!(SendRoute::detect("!!bad!!"), SendRoute::Invalid));
+        assert!(matches!(
+            SendRoute::detect("!!bad!!"),
+            SendRoute::Invalid(_)
+        ));
         // A transparent route is public; the others are private.
         assert!(!SendRoute::detect("treasury.sov").private());
         assert!(SendRoute::detect("treasury.sov").is_valid());
+    }
+
+    #[test]
+    fn send_route_names_the_transparent_form_and_surfaces_real_errors() {
+        // Raw 64-hex: valid FORM, but explicitly UNCHECKED — no checksum exists.
+        let raw = "0123456789abcdef".repeat(4);
+        let route = SendRoute::detect(&raw);
+        assert!(matches!(
+            route,
+            SendRoute::Transparent(_, TransparentForm::RawHexUnchecked)
+        ));
+        assert!(route.is_valid());
+        let (label, _) = route.label();
+        assert!(
+            label.contains("NO CHECKSUM"),
+            "raw hex must be marked unchecked: {label}"
+        );
+
+        // The xust1… spelling of the SAME id: valid, checksum verified, and it
+        // resolves to the identical account string (zero consensus surface).
+        let id = AccountId::new(raw.as_str()).unwrap();
+        let xust = sov_shielded::encode_transparent(&id).unwrap();
+        let route = SendRoute::detect(&xust);
+        match &route {
+            SendRoute::Transparent(a, TransparentForm::Checksummed) => {
+                assert_eq!(a, &raw, "xust1… resolves to the identical raw-hex account")
+            }
+            other => panic!(
+                "expected checksummed transparent, got {:?}",
+                other.label().0
+            ),
+        }
+        assert!(route.is_valid());
+        let (label, _) = route.label();
+        assert!(label.contains("checksum OK"), "{label}");
+
+        // A CORRUPTED xust1… paste: rejected with the REAL decode reason (a
+        // bech32m encoding/checksum failure), never a bare "invalid".
+        let mut corrupted = xust.clone();
+        let last = corrupted.pop().unwrap();
+        corrupted.push(if last == 'q' { 'p' } else { 'q' });
+        let route = SendRoute::detect(&corrupted);
+        match &route {
+            SendRoute::Invalid(why) => assert!(
+                why.contains("bech32m"),
+                "the exact decode error must be surfaced: {why}"
+            ),
+            other => panic!("expected Invalid, got {:?}", other.label().0),
+        }
+        assert!(!route.is_valid());
+    }
+
+    #[test]
+    fn send_route_classifies_v2_truncation_distinctly_from_checksum_failure() {
+        let v2 = encode_shielded_v2(&PqShieldedKey::from_leaf_seed(&[3u8; 32]).address());
+        // A clipped paste (chat client / terminal wrap): TRUNCATED, its own
+        // instruction — not "unrecognized", not a checksum failure.
+        let clipped = &v2[..600];
+        assert!(matches!(SendRoute::detect(clipped), SendRoute::TruncatedV2));
+        assert!(!SendRoute::detect(clipped).is_valid());
+        let (label, _) = SendRoute::detect(clipped).label();
+        assert!(label.contains("TRUNCATED"), "{label}");
+        // The private-send recipient check names it too, for both pools.
+        for pool in [Pool::V1, Pool::V2] {
+            let why = pool_recipient_check(pool, clipped).unwrap_err();
+            assert!(why.contains("TRUNCATED"), "{why}");
+        }
+        // The FULL address is not truncated — it is a well-formed v2 receiver
+        // (routed to the v2 form, unspendable from the transparent form).
+        assert!(matches!(
+            SendRoute::detect(&v2),
+            SendRoute::ShieldedV2Unsupported
+        ));
+    }
+
+    /// THE §3 regression pin: the hero-card private chips must render another
+    /// wallet's figures NEVER, an unscanned wallet as "—" (unknown, not zero),
+    /// a scanned-empty wallet as a real 0, and a scanned balance as itself.
+    #[test]
+    fn private_chip_never_shows_another_wallets_figure_and_never_fakes_a_zero() {
+        const A: &str = "wallet-a-implicit-id";
+        const B: &str = "wallet-b-implicit-id";
+        // B scanned both pools and holds value; A was never scanned.
+        let mut v1: ScannedPools<ShieldedView> = ScannedPools::default();
+        let e = v1.entry_mut(B);
+        e.account = B.into();
+        e.balance = 999_00000000;
+        e.notes = 2;
+        e.scanned_height = 1234;
+        let mut v2: ScannedPools<ShieldedV2View> = ScannedPools::default();
+        let e = v2.entry_mut(B);
+        e.account = B.into();
+        e.balance = 500_00000000;
+        e.notes = 1;
+        e.scanned_height = 1234;
+
+        // A's chips — driven exactly as the balance card drives them.
+        for own in [v1.view_for(A).own_figures(A), v2.view_for(A).own_figures(A)] {
+            assert_eq!(own, None, "A is UNSCANNED — nothing may be claimed");
+        }
+        let (a_v1, _) = private_chip("v1", v1.view_for(A).own_figures(A));
+        let (a_v2, _) = private_chip("v2", v2.view_for(A).own_figures(A));
+        for chip in [&a_v1, &a_v2] {
+            assert!(chip.contains('—'), "unscanned renders as unknown: {chip}");
+            assert!(
+                !chip.contains("999"),
+                "B's v1 figure must never reach A: {chip}"
+            );
+            assert!(
+                !chip.contains("500"),
+                "B's v2 figure must never reach A: {chip}"
+            );
+            assert!(
+                !chip.contains(" 0 "),
+                "unscanned must NEVER render as zero: {chip}"
+            );
+        }
+
+        // B's own chips show B's figures — both pools, never summed.
+        let (b_v1, hover) = private_chip("v1", v1.view_for(B).own_figures(B));
+        assert!(b_v1.contains("999"), "{b_v1}");
+        assert!(hover.contains("1234"), "scan height is visible: {hover}");
+        let (b_v2, _) = private_chip("v2", v2.view_for(B).own_figures(B));
+        assert!(b_v2.contains("500"), "{b_v2}");
+        assert!(
+            !b_v1.contains("1499") && !b_v2.contains("1499"),
+            "never a sum"
+        );
+
+        // Scanned-and-EMPTY is a real zero — distinct from unscanned.
+        let mut empty: ScannedPools<ShieldedV2View> = ScannedPools::default();
+        let e = empty.entry_mut(A);
+        e.account = A.into();
+        e.scanned_height = 77;
+        let (chip, _) = private_chip("v2", empty.view_for(A).own_figures(A));
+        assert!(
+            chip.contains("🛡 0 v2 private"),
+            "scanned-empty is a real 0: {chip}"
+        );
     }
 
     #[test]

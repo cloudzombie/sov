@@ -1,9 +1,13 @@
 //! `sov-wallet` — query balances and submit transfers over JSON-RPC, and derive
 //! or restore account keys offline.
 //!
+//! `<rpc_addr>` is `host:port` (e.g. `127.0.0.1:8645`). A pasted URL prefix
+//! (`http://host:port/`) is stripped automatically. Amounts are WHOLE XUS
+//! (integers) — fractional amounts are not accepted by this CLI.
+//!
 //! ```text
 //! sov-wallet <rpc_addr> balance  <account>
-//! sov-wallet <rpc_addr> transfer <seed_hex> <from> <to> <sov>
+//! sov-wallet <rpc_addr> transfer <seed_hex> <from> <to> <whole_xus>
 //! sov-wallet <rpc_addr> shield2 <seed_hex> <xus> [--fee <xus>]
 //!     # transparent ledger -> POOL V2 (post-quantum). No input notes, so no
 //!     # scan: the value enters through the transparent leg.
@@ -159,7 +163,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let addr = args.get(1).ok_or(
-        "usage: sov-wallet <rpc_addr> \
+        "usage: sov-wallet <rpc_addr (host:port, e.g. 127.0.0.1:8645 — NOT a http:// URL)> \
          <balance|transfer|z-balance|unshield|z-send\
          |z2-info|z2-address|z2-balance|shield2|unshield2|z2-send|keygen> ...",
     )?;
@@ -167,7 +171,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         "expected a command: balance | transfer | z-balance | unshield | z-send \
              | z2-info | z2-address | z2-balance | shield2 | unshield2 | z2-send",
     )?;
-    let client = RpcClient::new(addr.clone());
+    // Accept a pasted URL gracefully: the transport is raw host:port, and a
+    // `http://` prefix used to surface as a baffling DNS failure.
+    let client = RpcClient::new(normalize_rpc_addr(addr));
 
     match command.as_str() {
         "balance" => {
@@ -176,7 +182,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         "transfer" => {
             let seed_hex = args.get(3).ok_or(
-                "usage: transfer <seed_hex> <from> <to: name|xus1…|uxus1…> <xus> [--ed25519]",
+                "usage: transfer <seed_hex> <from> <to: name|xus1…|uxus1…> \
+                 <whole_xus (integer — fractions are not accepted)> [--ed25519]",
             )?;
             let seed: [u8; 32] = hex::decode(seed_hex)?
                 .try_into()
@@ -192,7 +199,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             // shielded address, or a uxus1… unified address (routed
             // privacy-first — shielded when the address carries a receiver).
             let to = args.get(5).ok_or("missing <to> address")?;
-            let sov: u128 = args.get(6).ok_or("missing <xus> amount")?.parse()?;
+            let raw = args.get(6).ok_or("missing <whole_xus> amount")?;
+            let sov: u128 = raw.parse().map_err(|_| {
+                format!(
+                    "amount `{raw}` is not a whole number — `transfer` takes WHOLE XUS only \
+                     (e.g. 3, not 3.5)"
+                )
+            })?;
             let amount = Balance::from_sov(sov)?;
 
             let parsed = sov_shielded::AnyAddress::parse(to)
@@ -640,6 +653,25 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Normalize a pasted RPC address to the raw `host:port` the transport needs.
+///
+/// The client speaks HTTP over a plain TCP socket and resolves its address
+/// with `to_socket_addrs`, so a pasted URL (`http://164.92.141.24:8645/`) used
+/// to die with an unrelated-looking DNS error. Strip a `http://`/`https://`
+/// scheme and any trailing path so the natural paste Just Works; a bare
+/// `host:port` passes through untouched.
+fn normalize_rpc_addr(addr: &str) -> String {
+    let trimmed = addr.trim();
+    let without_scheme = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed);
+    without_scheme
+        .split_once('/')
+        .map_or(without_scheme, |(host, _)| host)
+        .to_string()
+}
+
 /// Parse the 32-byte hex seed at positional `idx` (seeds only ever travel via
 /// argv and are never echoed back).
 fn seed_arg(args: &[String], idx: usize, usage: &str) -> Result<[u8; 32], Box<dyn Error>> {
@@ -1018,5 +1050,35 @@ fn flag_u32(args: &[String], flag: &str) -> Result<Option<u32>, Box<dyn Error>> 
     match flag_value(args, flag) {
         Some(v) => Ok(Some(v.parse().map_err(|e| format!("{flag}: {e}"))?)),
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_rpc_addr;
+
+    #[test]
+    fn rpc_addr_accepts_a_pasted_url_and_leaves_host_port_alone() {
+        // Bare host:port passes through untouched.
+        assert_eq!(normalize_rpc_addr("127.0.0.1:8645"), "127.0.0.1:8645");
+        assert_eq!(
+            normalize_rpc_addr("relay.sovxus.org:8645"),
+            "relay.sovxus.org:8645"
+        );
+        // A pasted URL — the 2026-08-06 failure mode — is stripped to host:port.
+        assert_eq!(
+            normalize_rpc_addr("http://164.92.141.24:8645"),
+            "164.92.141.24:8645"
+        );
+        assert_eq!(
+            normalize_rpc_addr("http://164.92.141.24:8645/"),
+            "164.92.141.24:8645"
+        );
+        assert_eq!(
+            normalize_rpc_addr("https://relay.sovxus.org:8645/rpc"),
+            "relay.sovxus.org:8645"
+        );
+        // Whitespace from a sloppy paste is trimmed.
+        assert_eq!(normalize_rpc_addr("  127.0.0.1:8645 "), "127.0.0.1:8645");
     }
 }

@@ -35,4 +35,6 @@ how we do not lose our place.
 - [release-version-contract.md](release-version-contract.md) — how releases are versioned, cut, and proven
 - [activation-tx-domain.md](activation-tx-domain.md) — cross-network replay hard fork runbook
 - [activation-pool-mining.md](activation-pool-mining.md) — stratum + `getBlockTemplate` pool rollout runbook
-- Daily logs: `2026-07-19.md`, …
+- [consensus-open-list.md](consensus-open-list.md) — the compiled open consensus list (partly superseded; STATUS §A3 says which parts)
+- [fresh-sync-p2p-starvation.md](fresh-sync-p2p-starvation.md) — the recurring fresh-node outage and the v0.2.7 structural fix
+- Daily logs: `2026-07-19.md`, `2026-07-25.md`, `2026-08-02.md`, `2026-08-06.md`, …
