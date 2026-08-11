@@ -3173,6 +3173,101 @@ const V2_DORMANT_REASON: &str =
     "Pool v2 is not active on this chain yet — signal bit 2 activates no earlier than block \
      15,552 on mainnet, and consensus REJECTS every pool-v2 spend until then";
 
+/// The port a SOV node listens for PEERS on. The operator-typed seed peer is a
+/// P2P address, never an RPC one.
+const P2P_DEFAULT_PORT: &str = "9645";
+
+/// The outcome of normalizing the operator-typed seed peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PeerAddr {
+    /// No peer was typed.
+    Empty,
+    /// Usable as typed.
+    Ok(String),
+    /// Usable after a correction the operator should be told about.
+    Corrected {
+        /// The address actually dialed.
+        addr: String,
+        /// Why it was changed, in words an operator can act on.
+        why: String,
+    },
+    /// Not dialable at all; dropped with a reason rather than retried forever.
+    Unusable(String),
+}
+
+/// Normalize the operator-typed seed peer into something a P2P dial can succeed
+/// against.
+///
+/// **Why this exists.** The field used to be taken verbatim. Typing this
+/// machine's *RPC* address — the number the operator sees everywhere else in
+/// Station and in every `curl` example — produced a TCP connection that
+/// SUCCEEDED (the RPC server is listening) and then failed the Noise/ML-KEM
+/// handshake with `failed to fill whole buffer`, forever, at the dial interval.
+/// The node reported "no peers" while doing exactly what it was told. An
+/// operator has no way to deduce the port mix-up from that, so the software has
+/// to know it.
+///
+/// Rules, in order:
+/// * empty → [`PeerAddr::Empty`];
+/// * a pasted `http://…` / `https://…` prefix and any trailing path are stripped
+///   (that string is what Station shows for the RPC endpoint, so it WILL be
+///   pasted here);
+/// * no port → the P2P port is appended rather than guessed at dial time;
+/// * the RPC port → rewritten to the P2P port, because there is no legitimate
+///   reason to dial a peer's RPC port and the failure it causes is silent;
+/// * anything with no host left → [`PeerAddr::Unusable`], dropped with a reason.
+///
+/// Deliberately NOT done here: DNS resolution or reachability probing. This is a
+/// pure string rule so it is testable and cannot block startup.
+fn normalize_peer_addr(raw: &str, rpc_port: &str) -> PeerAddr {
+    let mut s = raw.trim();
+    if s.is_empty() {
+        return PeerAddr::Empty;
+    }
+    for scheme in ["http://", "https://", "tcp://"] {
+        if let Some(rest) = s.strip_prefix(scheme) {
+            s = rest;
+        }
+    }
+    // Drop any path/query a pasted URL carried (`host:port/` → `host:port`).
+    let s = s.split(['/', '?', '#']).next().unwrap_or("").trim();
+    if s.is_empty() {
+        return PeerAddr::Unusable(format!("`{raw}` has no host"));
+    }
+    // IPv6 literals are bracketed (`[::1]:9645`); only split a port off the last
+    // colon when it is not inside brackets.
+    let (host, port) = match s.rfind(':') {
+        Some(i) if !s[i..].contains(']') => (&s[..i], Some(&s[i + 1..])),
+        _ => (s, None),
+    };
+    if host.is_empty() {
+        return PeerAddr::Unusable(format!("`{raw}` has no host"));
+    }
+    match port {
+        None => PeerAddr::Corrected {
+            addr: format!("{host}:{P2P_DEFAULT_PORT}"),
+            why: format!("`{raw}` has no port; peers listen on {P2P_DEFAULT_PORT}"),
+        },
+        Some("") => PeerAddr::Corrected {
+            addr: format!("{host}:{P2P_DEFAULT_PORT}"),
+            why: format!("`{raw}` has no port; peers listen on {P2P_DEFAULT_PORT}"),
+        },
+        Some(p) if p.parse::<u16>().is_err() => {
+            PeerAddr::Unusable(format!("`{raw}` has a non-numeric port `{p}`"))
+        }
+        // THE TRAP: the RPC port. TCP connects, the handshake cannot, and the
+        // node retries silently forever.
+        Some(p) if p == rpc_port && p != P2P_DEFAULT_PORT => PeerAddr::Corrected {
+            addr: format!("{host}:{P2P_DEFAULT_PORT}"),
+            why: format!(
+                "`{raw}` is the RPC port ({p}) — peers listen on {P2P_DEFAULT_PORT}, \
+                 and dialing RPC only ever fails the handshake"
+            ),
+        },
+        Some(p) => PeerAddr::Ok(format!("{host}:{p}")),
+    }
+}
+
 /// Validate a private-send recipient **against the pool the operator selected**.
 ///
 /// The two pools are separate value spaces, so the same string is right in one
@@ -15026,6 +15121,7 @@ fn build_and_run_node(
     let _ = std::fs::write(&marker, account);
 
     // ── Run the node IN-PROCESS via the library (mirrors `sov-rpcd`'s `run`). ──
+    // (helpers for the operator-typed seed peer live at `normalize_peer_addr`)
     let read = |p: &Path| std::fs::read_to_string(p).map_err(|e| format!("read {p:?}: {e}"));
     let mut config: NodeConfig =
         serde_json::from_str(&read(&node_dir.join("node-1/node-config.json"))?)
@@ -15061,10 +15157,17 @@ fn build_and_run_node(
     // peer can never survive in the mainnet node config. Stable spec seeds are merged
     // into the in-memory list below.
     let peer = peer.trim();
-    config.bootstrap_peers = if peer.is_empty() {
-        Vec::new()
-    } else {
-        vec![peer.to_string()]
+    config.bootstrap_peers = match normalize_peer_addr(peer, &rpc_port) {
+        PeerAddr::Empty => Vec::new(),
+        PeerAddr::Ok(addr) => vec![addr],
+        PeerAddr::Corrected { addr, why } => {
+            push_log(logs, format!("seed peer: {why} — dialing {addr} instead"));
+            vec![addr]
+        }
+        PeerAddr::Unusable(why) => {
+            push_log(logs, format!("seed peer IGNORED: {why}"));
+            Vec::new()
+        }
     };
     let cfg_path = node_dir.join("node-1/node-config.json");
     let mut persisted: Value = serde_json::from_str(&read(&cfg_path)?)
@@ -19703,5 +19806,91 @@ mod scanned_pools_tests {
         let capped = pools.view_for(A).guard(A, true, false, Some(100));
         assert_eq!(capped.deshield_cap(), 100);
         assert!(v2_allows(&capped, V2Intent::Deshield { amount: Some(700) }).is_err());
+    }
+
+    // ── seed-peer normalization (the "no peers" trap) ───────────────────────
+
+    #[test]
+    fn the_rpc_port_is_corrected_to_the_p2p_port() {
+        // THE REGRESSION. `192.168.0.197:8645` TCP-connects (the RPC server is
+        // listening) and then fails the Noise handshake forever, so the node
+        // reports "no peers" while doing exactly what it was told.
+        match normalize_peer_addr("192.168.0.197:8645", "8645") {
+            PeerAddr::Corrected { addr, why } => {
+                assert_eq!(addr, "192.168.0.197:9645");
+                assert!(why.contains("RPC port"), "why was: {why}");
+            }
+            other => panic!("expected a correction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bare_host_gets_the_p2p_port_rather_than_failing_at_dial_time() {
+        match normalize_peer_addr("192.168.0.197", "8645") {
+            PeerAddr::Corrected { addr, .. } => assert_eq!(addr, "192.168.0.197:9645"),
+            other => panic!("expected a correction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pasted_rpc_url_is_stripped_and_corrected() {
+        // Station shows the RPC endpoint as `http://127.0.0.1:8645`, so that exact
+        // string WILL be pasted into the peer box.
+        match normalize_peer_addr("http://192.168.0.197:8645/", "8645") {
+            PeerAddr::Corrected { addr, .. } => assert_eq!(addr, "192.168.0.197:9645"),
+            other => panic!("expected a correction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_correct_p2p_address_is_left_exactly_alone() {
+        assert_eq!(
+            normalize_peer_addr("192.168.0.197:9645", "8645"),
+            PeerAddr::Ok("192.168.0.197:9645".to_string())
+        );
+        assert_eq!(
+            normalize_peer_addr("137.184.83.91:9645", "8645"),
+            PeerAddr::Ok("137.184.83.91:9645".to_string())
+        );
+    }
+
+    #[test]
+    fn a_deliberate_non_default_port_is_respected() {
+        // An operator running a peer on a custom port must not be overridden.
+        assert_eq!(
+            normalize_peer_addr("10.0.0.5:19645", "8645"),
+            PeerAddr::Ok("10.0.0.5:19645".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_is_empty_and_junk_is_dropped_with_a_reason() {
+        assert_eq!(normalize_peer_addr("", "8645"), PeerAddr::Empty);
+        assert_eq!(normalize_peer_addr("   ", "8645"), PeerAddr::Empty);
+        assert!(matches!(
+            normalize_peer_addr("host:notaport", "8645"),
+            PeerAddr::Unusable(_)
+        ));
+        assert!(matches!(
+            normalize_peer_addr("http://", "8645"),
+            PeerAddr::Unusable(_)
+        ));
+    }
+
+    #[test]
+    fn an_ipv6_literal_keeps_its_bracketed_host() {
+        assert_eq!(
+            normalize_peer_addr("[::1]:9645", "8645"),
+            PeerAddr::Ok("[::1]:9645".to_string())
+        );
+    }
+
+    #[test]
+    fn a_node_whose_rpc_port_is_also_9645_is_never_self_corrected() {
+        // Guard against a rewrite loop when the operator runs RPC on the P2P port.
+        assert_eq!(
+            normalize_peer_addr("10.0.0.5:9645", "9645"),
+            PeerAddr::Ok("10.0.0.5:9645".to_string())
+        );
     }
 }
