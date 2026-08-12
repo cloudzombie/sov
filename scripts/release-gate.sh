@@ -192,11 +192,19 @@ if [ -z "${CP_NEWEST:-}" ]; then
   fail "could not read the newest MAINNET_CHECKPOINTS height from daemon.rs"
 fi
 CP_TIP=""
-for relay in 137.184.83.91 143.198.219.31 164.92.141.24; do
-  CP_TIP="$(curl -s --max-time 8 -X POST "http://$relay:8645" \
+# A relay being DOWN must be an ordinary outcome, not a fatal one. Under this
+# script's `set -euo pipefail`, a `curl` that times out (exit 28) inside a
+# `CP_TIP="$(...)"` assignment would abort the WHOLE gate before the graceful
+# "no relay answered" path below is ever reached — silently turning someone
+# else's downtime into a failed release. `|| true` on the pipeline is the same
+# fix already applied to `scripts/refresh-checkpoint.sh` (2026-08-02) after the
+# identical trap there. The relay list is only the two SURVIVING hosts: sgp1
+# (143.198.219.31) was destroyed 2026-07-31 and must not be dialed.
+for relay in 137.184.83.91 164.92.141.24; do
+  CP_TIP="$( { curl -s --max-time 8 -X POST "http://$relay:8645" \
     -H 'content-type: application/json' \
     -d '{"jsonrpc":"2.0","id":1,"method":"sov_getHeight","params":{}}' 2>/dev/null \
-    | sed -n 's/.*"result":[[:space:]]*\([0-9]*\).*/\1/p')"
+    || true; } | sed -n 's/.*"result":[[:space:]]*\([0-9]*\).*/\1/p')"
   [ -n "$CP_TIP" ] && break
 done
 if [ -z "$CP_TIP" ]; then
