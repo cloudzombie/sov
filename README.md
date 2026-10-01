@@ -132,6 +132,9 @@ correct nodes on any platform compute identical block hashes and state roots.
 - **`sov-station`** ([`node/`](node)) — the native desktop wallet + mining node
   (eframe/egui). Generate/import wallets, run an in-process node, and mine to your
   wallet on testnet or mainnet, all from one window.
+  The [Station operation map](notes/station-ui-feature-map.md) lists every existing
+  GUI workflow, its current screen, and the corresponding code handlers, including
+  both shielded pools, offline signing, assets, swaps, vaults, and node controls.
 - **Block explorer** ([cloudzombie/sov-explorer](https://github.com/cloudzombie/sov-explorer)) —
   its own project. Indexes a live node's RPC (with a seamless testnet/mainnet switch) and
   serves REST + GraphQL + a WebSocket feed + a web UI; nothing is simulated.

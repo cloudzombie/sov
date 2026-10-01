@@ -37,25 +37,34 @@ cargo run --manifest-path node/Cargo.toml -- watch  [rpc_addr] [account]... [--i
 
 ### What the GUI does today
 
-- **Node / Mining / Blocks** — live chain id, height, head, state root, supply,
-  difficulty, mempool, block reward, the miner registry, and each block's
-  **coinbase** with its 93% / 5% / 2% miner / founder / dev split.
-- **Wallet** — real keys, held in-session (and encryptable to disk):
-  - **generate** a fresh wallet (BIP-39 24-word mnemonic + hybrid post-quantum
-    key; shown once for backup) or **import** one;
-  - **activate** an account (binds the key on-chain via `RotateKey`) so it can spend;
-  - **send** — one box, auto-routed: a named account → transparent, a
-    `xus1…`/`uxus1…` address → shielded (real Halo2 proof);
-  - **shield** value into your own pool;
-  - **shielded balance** — scan the chain by trial-decryption for your unspent
-    notes and total them (the pool is private; only the holder can);
-  - **de-shield** — spend your largest note back to transparent (real Halo2
-    spend, witnessed against a chain-held anchor);
-  - **encrypted keystore** — save/load all wallets under a passphrase (Argon2id +
-    ChaCha20-Poly1305) so they survive restart;
-  - copy account / shielded / unified addresses.
-- **Run a node** — Start/Stop a local testnet-1 node the app supervises; it mines
-  to the selected wallet, so the wallet self-funds from coinbase.
+- **Wallet / Overview** — public balance and separate wallet-owned pool-v1 and
+  pool-v2 balances, scan heights, note counts, account details, and recent activity.
+- **Wallet / Send** — transparent and pool-v1 auto-routing, amount/Max, fee auction
+  and priority tips, cost review, pending sends, and replacement-by-fee. Offline
+  unsigned build, signing, and broadcasting remain available here and in Backup.
+- **Wallet / Receive** — account/checksummed, shielded, unified, and post-quantum
+  pool-v2 addresses. Copy, QR where appropriate, and full v2 address file export.
+- **Wallet / Privacy** — independent v1/v2 scans and balances, v1 rescan, variable
+  de-shield amounts bounded by wallet funds and network drain windows, explicitly
+  chosen private-send source, and v2 shield/de-shield controls. V1 uses Orchard/Halo2;
+  v2 uses ML-KEM-768/STARK. Activation comes from the node, never a UI assumption.
+- **Wallet / Identity and Backup** — BIP-39 wallet generation, mnemonic/raw-seed import,
+  watch-only wallets, selection/rename/remove, SNS names, operating a controlled
+  named account, recovery phrase reveal/export, and encrypted all-wallet keystore
+  save/load (Argon2id + ChaCha20-Poly1305), with the recovery acknowledgement gate.
+- **Assets** — token holdings, issue/transfer and registry, plus existing collectible,
+  NFT, and SNS-name transfer controls. **Swaps** — HTLC secret generation, lock,
+  lookup, claim, and refund. **Vaults** — membership, creation, proposals, approval,
+  cancellation, and inbox refresh.
+- **Node / Mining / Blocks / Activity** — real chain and miner data, block details,
+  receipts and logs, wallet earnings, local node lifecycle, peer/LAN controls, and
+  explicit mining enable/disable. The existing chain pays the entire coinbase to
+  miners. Mainnet/testnet selection, RPC connection, and theme remain accessible.
+
+The [complete operation map](../notes/station-ui-feature-map.md) gives searchable
+handler names, screen locations, guards, and verification coverage for the v0.2.14
+UI refactor. The separately labeled visual preview uses disposable sample data and
+cannot sign, broadcast, mine, or alter a real node or keystore.
 
 The roadmap below is the broader product vision; the list above is what ships now.
 

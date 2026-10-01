@@ -296,8 +296,8 @@ enum Pool {
     /// discrete-log based, so a future quantum adversary who recorded the chain could
     /// break the privacy of transactions made today ("harvest now, decrypt later").
     V1,
-    /// Pool v2 — ML-KEM-768 note carriers with a STARK spend proof. Post-quantum, and
-    /// dormant: consensus signal bit 2 is not armed.
+    /// Pool v2 — ML-KEM-768 note carriers with a STARK spend proof. Its activation
+    /// state is reported by the node, independently of pool v1.
     V2,
 }
 
@@ -735,280 +735,12 @@ fn is_named_account(account: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// SOV Station palette — one cohesive, bank-grade theme in two MODES (a GitHub dark
-/// family and a clean "retail bank" light family): a slate/white base, restrained
-/// hairline borders, a confident SOV-green accent, and unambiguous success / error /
-/// warning signal colors. All UI color flows from here through mode-aware accessors,
-/// so flipping [`set_dark`] re-skins every panel, card, banner, pill and badge at once
-/// (not just egui's base visuals) — no dark islands on a light background.
-mod palette {
-    use eframe::egui::Color32;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    /// The active mode (dark by default). A process-wide atomic so every free-function
-    /// panel can read it without threading state through; flipped by the ☀/🌙 toggle.
-    static DARK: AtomicBool = AtomicBool::new(true);
-    pub fn set_dark(dark: bool) {
-        DARK.store(dark, Ordering::Relaxed);
-    }
-    pub fn is_dark() -> bool {
-        DARK.load(Ordering::Relaxed)
-    }
-    /// Pick the dark or light value for the current mode.
-    fn pick(dark: Color32, light: Color32) -> Color32 {
-        if is_dark() {
-            dark
-        } else {
-            light
-        }
-    }
-
-    const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
-        Color32::from_rgb(r, g, b)
-    }
-
-    // Each accessor returns the dark value / the calibrated light value.
-    pub fn bg() -> Color32 {
-        pick(rgb(13, 17, 23), rgb(246, 248, 250))
-    } // app background
-    pub fn panel() -> Color32 {
-        pick(rgb(22, 27, 34), rgb(255, 255, 255))
-    } // cards / windows
-    pub fn surface() -> Color32 {
-        pick(rgb(33, 38, 45), rgb(240, 242, 245))
-    } // buttons / inputs at rest
-    pub fn surface_hi() -> Color32 {
-        pick(rgb(48, 54, 61), rgb(225, 228, 232))
-    } // hovered
-    pub fn field() -> Color32 {
-        pick(rgb(9, 12, 17), rgb(255, 255, 255))
-    } // recessed input wells
-    pub fn border() -> Color32 {
-        pick(rgb(48, 54, 61), rgb(208, 215, 222))
-    } // hairline borders
-    pub fn text() -> Color32 {
-        pick(rgb(230, 237, 243), rgb(31, 35, 40))
-    } // primary text
-    pub fn text_dim() -> Color32 {
-        pick(rgb(139, 148, 158), rgb(101, 109, 118))
-    } // secondary text
-    pub fn accent() -> Color32 {
-        pick(rgb(46, 160, 67), rgb(31, 136, 61))
-    } // SOV green — primary action
-    pub fn accent_hi() -> Color32 {
-        pick(rgb(63, 185, 80), rgb(46, 160, 67))
-    }
-    pub fn success() -> Color32 {
-        pick(rgb(63, 185, 80), rgb(26, 127, 55))
-    } // a transaction landed
-    pub fn error() -> Color32 {
-        pick(rgb(248, 81, 73), rgb(207, 34, 46))
-    } // a transaction failed
-    pub fn warning() -> Color32 {
-        pick(rgb(210, 153, 34), rgb(154, 103, 0))
-    }
-    pub fn link() -> Color32 {
-        pick(rgb(88, 166, 255), rgb(9, 105, 218))
-    }
-    /// "Actively mining" — a warm GOLD, deliberately its own hue so the MINING state on
-    /// the heartbeat never reads as SYNCED green or SYNCING amber. Gold ≙ freshly minted.
-    pub fn mining() -> Color32 {
-        pick(rgb(240, 185, 66), rgb(214, 158, 40))
-    }
-    /// A faint translucent tint of `c` (for status-banner fills/strokes).
-    pub fn tint(c: Color32, alpha: u8) -> Color32 {
-        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
-    }
-
-    /// "Armed but not yet in force" — a deployment that is defined in consensus and
-    /// waiting on activation. Deliberately NOT `warning` (nothing is wrong) and NOT
-    /// `error` (nothing failed): a dormant pool is the system working as designed.
-    /// A cool slate-blue, distinguishable from the green/amber/red signal family for
-    /// the common red-green deficiencies — and never used without a word beside it.
-    pub fn dormant() -> Color32 {
-        pick(rgb(125, 148, 176), rgb(85, 105, 133))
-    }
-
-    /// "We do not know" — the node did not answer. Deliberately the dimmest thing on
-    /// screen: absent knowledge must never look like a measured value.
-    pub fn unknown() -> Color32 {
-        pick(rgb(110, 118, 129), rgb(130, 138, 148))
-    }
-}
-
-/// The type scale, in points. ONE ladder, adhered to — the codebase had a scatter of
-/// ad-hoc `.size(11.0) / .size(15.0) / .size(26.0)` calls with no relationship between
-/// them. Ratios are ~1.2 (minor third), which keeps the steps distinguishable without
-/// the jump to a consumer-app "hero" scale. An operator console earns attention with
-/// weight and position, not size.
-mod ty {
-    /// The single largest number on a screen (a hero metric). At most one per panel.
-    pub const HERO: f32 = 24.0;
-    /// Panel headings.
-    pub const TITLE: f32 = 16.0;
-    /// Section headings inside a panel.
-    pub const SECTION: f32 = 13.5;
-    /// Default body text.
-    pub const BODY: f32 = 13.0;
-    /// Secondary/explanatory text and dense table cells.
-    pub const SMALL: f32 = 11.5;
-    /// The uppercase micro-label above a statistic.
-    pub const MICRO: f32 = 10.5;
-}
-
-/// The spacing scale, in points — a 4pt grid. Every `add_space` in code this agent
-/// touches uses one of these, so vertical rhythm is consistent instead of a drift of
-/// 2.0/4.0/6.0/8.0/10.0/28.0 magic numbers.
-mod sp {
-    pub const XS: f32 = 2.0;
-    pub const S: f32 = 4.0;
-    pub const M: f32 = 8.0;
-    pub const L: f32 = 12.0;
-    pub const XL: f32 = 20.0;
-}
-
-/// A NUMBER that changes: rendered in the monospace face so its digits are tabular
-/// and the value does not jitter horizontally as it ticks. Every live figure in this
-/// app — heights, balances, hashrate, counters, anchors — goes through here.
-///
-/// This is not decoration. On a proportional face `1` is narrower than `8`, so a
-/// height counting 11111 → 11112 visibly shifts every column to its right once a
-/// second, which is exactly the motion an operator's eye is drawn to. Tabular figures
-/// make a changing number readable at a glance.
-fn num(text: impl Into<String>) -> egui::RichText {
-    egui::RichText::new(text).monospace()
-}
-
-/// A number that is UNKNOWN — the node did not supply it. An em-dash in the dimmest
-/// colour, never a zero. The whole honesty posture of this app in one function: a
-/// value we do not have must not be renderable as a value we do.
-fn num_unknown() -> egui::RichText {
-    egui::RichText::new("—")
-        .monospace()
-        .color(palette::unknown())
-}
-
-/// One statistic: a dim uppercase micro-label with the value in tabular figures
-/// beneath it. `unit` is rendered small and dim beside the value so the magnitude
-/// reads first and the unit second. `value` of `None` renders as explicitly unknown.
-fn stat(ui: &mut egui::Ui, label: &str, value: Option<&str>, unit: &str, size: f32) {
-    ui.vertical(|ui| {
-        ui.label(
-            egui::RichText::new(label.to_uppercase())
-                .size(ty::MICRO)
-                .color(palette::text_dim()),
-        );
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = sp::S;
-            match value {
-                Some(v) => ui.label(num(v).size(size).strong().color(palette::text())),
-                None => ui.label(num_unknown().size(size)),
-            };
-            if !unit.is_empty() && value.is_some() {
-                ui.label(
-                    egui::RichText::new(unit)
-                        .size(ty::SMALL)
-                        .color(palette::text_dim()),
-                );
-            }
-        });
-    });
-}
-
-/// A status chip that encodes state with a SHAPE GLYPH + a WORD + a colour — never
-/// colour alone. `glyph` must differ per state (not just hue): this is a financial
-/// tool and a colourblind operator has to read it correctly in greyscale.
-fn state_chip(ui: &mut egui::Ui, glyph: &str, word: &str, col: egui::Color32) {
-    egui::Frame::none()
-        .fill(palette::tint(col, 28))
-        .stroke(egui::Stroke::new(1.0, palette::tint(col, 140)))
-        .rounding(egui::Rounding::same(4.0))
-        .inner_margin(egui::Margin::symmetric(7.0, 2.0))
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = sp::S;
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(glyph).size(ty::SMALL).color(col));
-                ui.label(
-                    egui::RichText::new(word)
-                        .size(ty::MICRO)
-                        .strong()
-                        .color(col),
-                );
-            });
-        });
-}
-
-/// Install the cohesive theme in the requested mode (dark or light). Sets the active
-/// `palette` mode FIRST (so every accessor returns the right family), then the whole
-/// widget palette (rest / hover / press), recessed input wells, accent selection, link
-/// color, and a little more breathing room — so every panel inherits one consistent
-/// look. Called at startup and again whenever the ☀/🌙 toggle flips the mode.
-fn install_theme(ctx: &egui::Context, dark: bool) {
-    use egui::{Rounding, Stroke};
-    palette::set_dark(dark);
-    let mut style = (*ctx.style()).clone();
-    let mut v = if dark {
-        egui::Visuals::dark()
-    } else {
-        egui::Visuals::light()
-    };
-    let r = Rounding::same(6.0);
-
-    v.widgets.noninteractive.bg_fill = palette::panel();
-    v.widgets.noninteractive.weak_bg_fill = palette::panel();
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette::border());
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, palette::text());
-    v.widgets.noninteractive.rounding = r;
-
-    v.widgets.inactive.bg_fill = palette::surface();
-    v.widgets.inactive.weak_bg_fill = palette::surface();
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, palette::border());
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, palette::text());
-    v.widgets.inactive.rounding = r;
-
-    v.widgets.hovered.bg_fill = palette::surface_hi();
-    v.widgets.hovered.weak_bg_fill = palette::surface_hi();
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, palette::accent());
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, palette::text());
-    v.widgets.hovered.rounding = r;
-
-    v.widgets.active.bg_fill = palette::accent();
-    v.widgets.active.weak_bg_fill = palette::accent();
-    v.widgets.active.bg_stroke = Stroke::new(1.0, palette::accent_hi());
-    v.widgets.active.fg_stroke = Stroke::new(1.0, egui::Color32::WHITE);
-    v.widgets.active.rounding = r;
-
-    v.widgets.open = v.widgets.inactive;
-
-    v.selection.bg_fill = palette::tint(palette::accent(), 90);
-    v.selection.stroke = Stroke::new(1.0, palette::accent_hi());
-    v.hyperlink_color = palette::link();
-    v.warn_fg_color = palette::warning();
-    v.error_fg_color = palette::error();
-    v.window_fill = palette::panel();
-    v.window_stroke = Stroke::new(1.0, palette::border());
-    v.window_rounding = Rounding::same(10.0);
-    v.panel_fill = palette::bg();
-    v.extreme_bg_color = palette::field(); // text-edit / code wells
-                                           // Striped rows + code wells, mode-aware (a faint stripe on whichever base).
-    v.faint_bg_color = if dark {
-        egui::Color32::from_rgb(26, 31, 38)
-    } else {
-        egui::Color32::from_rgb(244, 246, 249)
-    };
-    v.code_bg_color = if dark {
-        egui::Color32::from_rgb(28, 33, 40)
-    } else {
-        egui::Color32::from_rgb(235, 238, 242)
-    };
-
-    style.visuals = v;
-    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.button_padding = egui::vec2(10.0, 6.0);
-    style.spacing.interact_size.y = 24.0;
-    style.spacing.indent = 18.0;
-    ctx.set_style(style);
-}
+// Shared presentation primitives are isolated from wallet and node behavior.
+mod design;
+use design::{
+    card_frame, install_theme, num, num_unknown, palette, primary_button, section_heading, sp,
+    stat, state_chip, ty,
+};
 
 /// The outcome of an action/transaction, for at-a-glance green/red coloring.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1137,8 +869,9 @@ fn network_badge(ui: &mut egui::Ui, net: Network) {
         .rounding(egui::Rounding::same(10.0))
         .inner_margin(egui::Margin::symmetric(9.0, 3.0))
         .show(ui, |ui| {
+            ui.spacing_mut().interact_size.y = 0.0;
             ui.label(
-                egui::RichText::new(format!("● {} · {}", net.label(), net.pow_algo()))
+                egui::RichText::new(format!("{} · {}", net.label(), net.pow_algo()))
                     .small()
                     .strong()
                     .color(col),
@@ -1154,6 +887,7 @@ fn pill(ui: &mut egui::Ui, text: &str, col: egui::Color32) {
         .rounding(egui::Rounding::same(10.0))
         .inner_margin(egui::Margin::symmetric(9.0, 3.0))
         .show(ui, |ui| {
+            ui.spacing_mut().interact_size.y = 0.0;
             ui.label(egui::RichText::new(text).small().strong().color(col));
         });
 }
@@ -1226,30 +960,27 @@ fn token_avatar(ui: &mut egui::Ui, key: &str, symbol: &str, diameter: f32) {
     );
 }
 
-/// One token holding as a Phantom-style row: colored badge, symbol + short asset
-/// id, and the balance right-aligned. Fills the available width.
+/// One holding: stable asset identity and a tabular, right-aligned balance.
 fn token_card(ui: &mut egui::Ui, asset: &str, symbol: &str, balance_grains: &str) {
-    egui::Frame::none()
-        .fill(palette::surface())
-        .rounding(10.0)
-        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+    card_frame()
+        .inner_margin(egui::Margin::symmetric(16.0, 12.0))
         .show(ui, |ui| {
             let w = ui.available_width();
             ui.set_width(w);
             ui.horizontal(|ui| {
-                token_avatar(ui, asset, symbol, 34.0);
-                ui.add_space(10.0);
+                token_avatar(ui, asset, symbol, 38.0);
+                ui.add_space(sp::M);
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new(symbol).strong().size(15.0));
+                    ui.spacing_mut().item_spacing.y = sp::XS;
+                    ui.label(egui::RichText::new(symbol).strong().size(ty::SECTION));
                     ui.label(
-                        egui::RichText::new(short_id(asset))
+                        num(short_id(asset))
                             .color(palette::text_dim())
-                            .monospace()
-                            .small(),
+                            .size(ty::SMALL),
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(xus(balance_grains)).strong().size(15.0));
+                    ui.label(num(xus(balance_grains)).strong().size(ty::SECTION));
                 });
             });
         });
@@ -1257,27 +988,29 @@ fn token_card(ui: &mut egui::Ui, asset: &str, symbol: &str, balance_grains: &str
 
 /// One registry entry as a row: badge, symbol + issuer, total supply right-aligned.
 fn registry_card(ui: &mut egui::Ui, asset: &str, symbol: &str, issuer: &str, supply: &str) {
-    egui::Frame::none()
-        .fill(palette::surface())
-        .rounding(10.0)
-        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+    card_frame()
+        .inner_margin(egui::Margin::symmetric(16.0, 12.0))
         .show(ui, |ui| {
             let w = ui.available_width();
             ui.set_width(w);
             ui.horizontal(|ui| {
-                token_avatar(ui, asset, symbol, 30.0);
-                ui.add_space(10.0);
+                token_avatar(ui, asset, symbol, 34.0);
+                ui.add_space(sp::M);
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new(symbol).strong());
+                    ui.spacing_mut().item_spacing.y = sp::XS;
+                    ui.label(egui::RichText::new(symbol).strong().size(ty::BODY));
                     ui.label(
-                        egui::RichText::new(format!("issuer {}", short_id(issuer)))
+                        num(format!("issuer {}", short_id(issuer)))
                             .color(palette::text_dim())
-                            .monospace()
-                            .small(),
+                            .size(ty::SMALL),
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(format!("{} supply", xus(supply))).strong());
+                    ui.label(
+                        num(format!("{} supply", xus(supply)))
+                            .strong()
+                            .size(ty::BODY),
+                    );
                 });
             });
         });
@@ -1287,10 +1020,8 @@ fn registry_card(ui: &mut egui::Ui, asset: &str, symbol: &str, issuer: &str, sup
 /// caption. Returns a click response so the grid can wire "send".
 fn nft_tile(ui: &mut egui::Ui, display: &str, is_sns: bool, coll: &str) -> egui::Response {
     let tile = 132.0;
-    let resp = egui::Frame::none()
-        .fill(palette::surface())
-        .rounding(10.0)
-        .inner_margin(egui::Margin::same(10.0))
+    let resp = card_frame()
+        .inner_margin(egui::Margin::same(sp::L))
         .show(ui, |ui| {
             ui.set_width(tile);
             ui.vertical_centered(|ui| {
@@ -1299,47 +1030,63 @@ fn nft_tile(ui: &mut egui::Ui, display: &str, is_sns: bool, coll: &str) -> egui:
                     ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
                 let color = avatar_color(if is_sns { display } else { coll });
                 let painter = ui.painter();
-                painter.rect_filled(rect, 8.0, color);
+                painter.rect_filled(rect, 10.0, palette::tint(color, 30));
+                painter.rect_stroke(rect, 10.0, egui::Stroke::new(1.0, palette::tint(color, 90)));
                 painter.text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
                     initials_of(display),
                     egui::FontId::proportional(28.0),
-                    egui::Color32::WHITE,
+                    color,
                 );
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(short_id(display)).strong().small());
+                ui.add_space(sp::M);
+                ui.label(
+                    egui::RichText::new(short_id(display))
+                        .strong()
+                        .size(ty::SMALL),
+                );
                 if is_sns {
                     ui.label(
                         egui::RichText::new("SNS name")
                             .color(palette::success())
-                            .small(),
+                            .size(ty::MICRO),
                     );
                 } else {
                     ui.label(
                         egui::RichText::new("NFT")
                             .color(palette::text_dim())
-                            .small(),
+                            .size(ty::MICRO),
                     );
                 }
             });
         })
         .response;
-    resp.interact(egui::Sense::click())
+    let resp = resp
+        .interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if resp.hovered() {
+        ui.painter()
+            .rect_stroke(resp.rect, 14.0, egui::Stroke::new(1.0, palette::accent()));
+    }
+    resp
 }
 
 /// A soft empty-state card: a bold title and a dim one-line explanation.
 fn empty_hint(ui: &mut egui::Ui, title: &str, body: &str) {
-    egui::Frame::none()
-        .fill(palette::surface())
-        .rounding(10.0)
-        .inner_margin(egui::Margin::same(14.0))
+    card_frame()
+        .fill(palette::field())
+        .inner_margin(egui::Margin::same(sp::XL))
         .show(ui, |ui| {
             let w = ui.available_width();
             ui.set_width(w);
             ui.vertical(|ui| {
-                ui.label(egui::RichText::new(title).strong());
-                ui.label(egui::RichText::new(body).color(palette::text_dim()).small());
+                ui.spacing_mut().item_spacing.y = sp::S;
+                ui.label(egui::RichText::new(title).strong().size(ty::BODY));
+                ui.label(
+                    egui::RichText::new(body)
+                        .color(palette::text_dim())
+                        .size(ty::SMALL),
+                );
             });
         });
 }
@@ -1662,6 +1409,61 @@ fn pool_note(ui: &mut egui::Ui, pool: Pool, state: PoolState, extra: &str) {
     }
 }
 
+/// A wallet-owned pool summary. An unavailable or unscanned amount is never zero.
+fn pool_balance_card(
+    ui: &mut egui::Ui,
+    pool: Pool,
+    state: PoolState,
+    own: Option<(u128, usize, u64)>,
+    show_controls: bool,
+) -> bool {
+    let mut open = false;
+    card_frame().show(ui, |ui| {
+        ui.set_min_width((ui.available_width() - 1.0).max(0.0));
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(pool.name()).size(ty::SECTION).strong());
+            state_chip(ui, state.glyph(), state.word(), state.color());
+        });
+        ui.label(
+            egui::RichText::new(pool.crypto())
+                .small()
+                .color(palette::text_dim()),
+        );
+        ui.add_space(sp::L);
+        let amount = match (state, own) {
+            (PoolState::Active, Some((grains, _, _))) => {
+                format!("{} XUS", xus(&grains.to_string()))
+            }
+            (PoolState::Dormant, _) => "Not active yet".into(),
+            _ => "— Unknown".into(),
+        };
+        let (_, hover) = private_chip(if pool == Pool::V1 { "v1" } else { "v2" }, own);
+        ui.label(num(amount).size(24.0).strong().color(palette::text()))
+            .on_hover_text(hover);
+        let note = match (state, own) {
+            (PoolState::Active, Some((_, notes, height))) => format!(
+                "{} unspent notes · scanned to #{}",
+                group_thousands(notes as u128),
+                group_thousands(height as u128)
+            ),
+            (PoolState::Active, None) => "Scan this wallet to discover its shielded amount.".into(),
+            (PoolState::Dormant, _) => "Consensus has not activated this pool.".into(),
+            _ => "Connect to a node that reports this pool.".into(),
+        };
+        ui.label(egui::RichText::new(note).small().color(palette::text_dim()));
+        ui.label(
+            egui::RichText::new(pool.pq_claim())
+                .small()
+                .color(palette::text_dim()),
+        );
+        ui.add_space(sp::M);
+        if show_controls {
+            open = ui.button("Open shielded controls").clicked();
+        }
+    });
+    open
+}
+
 /// **The two-pool view.** SOV has two shielded pools, and the single most dangerous
 /// thing this app can do is let an operator confuse them — or confuse "not active yet"
 /// with "your money is gone".
@@ -1891,25 +1693,31 @@ fn pool_panel(
 
 /// The address is PUBLIC key material — a receiving address, not a secret — so it is
 /// written with normal permissions, unlike the keystore.
-fn export_v2_address(addr: &str, owner_tag: &str) -> Result<String, String> {
+fn v2_address_document(addr: &str, owner_tag: &str, state: PoolState) -> String {
+    format!(
+        "SOV pool-v2 (post-quantum shielded) receiving address\n\
+         owner tag : {owner_tag}\n\
+         length    : {} characters\n\
+         pool state: {} at export time\n\
+         \n\
+         {}\n\
+         Verify the current pool state with your node before sending.\n\
+         \n\
+         {addr}\n",
+        addr.chars().count(),
+        state.word(),
+        state.explanation(Pool::V2),
+    )
+}
+
+fn export_v2_address(addr: &str, owner_tag: &str, state: PoolState) -> Result<String, String> {
     // Through `station_dir`, NOT `home_dir().join(".sov-station")` — otherwise a dev
     // build with `SOV_STATION_DIR` set would still write into the operator's live
     // wallet directory, which is the entire thing that override exists to prevent.
     let dir = station_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(v2_address_filename(owner_tag));
-    let body = format!(
-        "SOV pool-v2 (post-quantum shielded) receiving address\n\
-         owner tag : {owner_tag}\n\
-         length    : {} characters\n\
-         \n\
-         POOL V2 IS NOT ACTIVE. Its consensus activation signal (bit 2) is not armed,\n\
-         so every pool-v2 spend is rejected by every node. Nothing can be sent to this\n\
-         address yet. It is derived from your seed and is safe to record now.\n\
-         \n\
-         {addr}\n",
-        addr.chars().count()
-    );
+    let body = v2_address_document(addr, owner_tag, state);
     std::fs::write(&path, body).map_err(|e| e.to_string())?;
     Ok(path.display().to_string())
 }
@@ -1966,7 +1774,7 @@ fn v2_address_block(
                 .size(ty::SMALL)
                 .color(palette::text()),
         );
-        if state != PoolState::Active {
+        if state == PoolState::Dormant {
             ui.add_space(sp::XS);
             ui.label(
                 egui::RichText::new(
@@ -2059,12 +1867,12 @@ fn v2_address_block(
             if ui
                 .button("Export to file…")
                 .on_hover_text(
-                    "Write the address to a text file under ~/.sov-station/, with a header \
-                     recording that the pool is not active yet.",
+                    "Write the address to a text file in the Station data folder, with a header \
+                     recording the node's reported pool state at export time.",
                 )
                 .clicked()
             {
-                let msg = match export_v2_address(addr, owner_tag) {
+                let msg = match export_v2_address(addr, owner_tag, state) {
                     Ok(p) => format!("✓ v2 address written to {p}"),
                     Err(e) => format!("✗ could not write the v2 address file: {e}"),
                 };
@@ -3152,8 +2960,8 @@ impl SendRoute {
                 palette::success(),
             ),
             SendRoute::ShieldedV2Unsupported => (
-                "✗ post-quantum pool-v2 (xusq1…) address — use the pool-v2 private send \
-                 (Shielded tab), not this transparent form"
+                "Pool-v2 address — open Privacy: use Shield in for public funds, or \
+                 choose Pool v2 in Send privately to spend shielded funds."
                     .into(),
                 palette::error(),
             ),
@@ -3526,12 +3334,17 @@ enum ReceiveKind {
 #[derive(Clone)]
 struct PendingSend {
     from_label: String,
+    /// The seed-derived wallet identity, separate from a linked signing account.
+    wallet_account: String,
     from_account: String,
+    network: Network,
+    rpc: String,
     to: String,
     amount_grains: u128,
     /// The spendable balance (grains) of the source the amount is drawn from — the
     /// transparent account for a normal send, the shielded pool for a pool spend —
-    /// so the review modal can show the resulting balance after amount + fee.
+    /// so the review modal can show the resulting balance. Pool-send fees come
+    /// from the public signing account, independently of the shielded amount.
     from_balance_grains: u128,
     route_label: String,
     self_send: bool,
@@ -3545,8 +3358,8 @@ struct PendingSend {
     /// point: a pool spend cannot be constructed without naming its pool, so the
     /// confirm screen can never omit which pool moves.
     source: SendSource,
-    /// The exact network fee consensus charges for this route (`sov_estimateFee`),
-    /// captured at review time.
+    /// The public/v1 fee estimate captured at review time. Pool-v2 fees depend
+    /// on the completed STARK bundle and are shown as unknown in its review.
     fee_grains: u128,
     /// The blockspace-auction bid this send will carry, captured at review time so
     /// the modal shows the SAME number that gets signed — not a figure that could
@@ -3555,6 +3368,47 @@ struct PendingSend {
 }
 
 impl PendingSend {
+    fn source_debit_grains(&self) -> u128 {
+        match self.source {
+            SendSource::Transparent => SendCost {
+                amount_grains: self.amount_grains,
+                fee_grains: self.fee_grains,
+                tip_grains: self.tip_grains,
+            }
+            .total_grains(),
+            SendSource::Pool(_) => self.amount_grains,
+        }
+    }
+
+    /// A review authorizes these terms in this exact wallet/network context.
+    /// If any editable value changed behind the window, require a fresh review.
+    fn validate(&self, current: &SendReviewContext<'_>) -> Result<(), &'static str> {
+        if self.wallet_account != current.wallet_account
+            || self.from_account != current.from_account
+            || !current.can_sign
+        {
+            return Err("the signing wallet or account changed — review the send again");
+        }
+        if self.network != current.network || self.rpc != current.rpc {
+            return Err("the network or node connection changed — review the send again");
+        }
+        if self.to != current.to.trim()
+            || Some(self.amount_grains) != current.amount_grains
+            || self.source != current.source
+        {
+            return Err("the recipient, amount, or source pool changed — review the send again");
+        }
+        if self.fee_grains != current.fee_grains
+            || (self.tip_grains > 0 && !current.fee_auction_active)
+        {
+            return Err("the network fee or fee-auction state changed — review the send again");
+        }
+        if current.busy {
+            return Err("another wallet action is running — wait, then review the send again");
+        }
+        Ok(())
+    }
+
     /// The pool this send leaves, if any. Reads straight off [`SendSource`], so
     /// there is no second place where "which pool" could be recorded wrongly.
     fn pool(&self) -> Option<Pool> {
@@ -3564,6 +3418,83 @@ impl PendingSend {
     /// True for a fully-private spend out of a shielded pool.
     fn is_pool_spend(&self) -> bool {
         self.source.is_pool_spend()
+    }
+}
+
+struct SendReviewContext<'a> {
+    wallet_account: &'a str,
+    from_account: &'a str,
+    network: Network,
+    rpc: &'a str,
+    to: &'a str,
+    amount_grains: Option<u128>,
+    source: SendSource,
+    fee_grains: u128,
+    fee_auction_active: bool,
+    can_sign: bool,
+    busy: bool,
+}
+
+fn transaction_review_width(ctx: &egui::Context) -> f32 {
+    (ctx.screen_rect().width() - 64.0).clamp(240.0, 460.0)
+}
+
+/// Keep long transaction facts scrollable inside the smallest supported window.
+/// The controls remain in order at the end of the same scrollable content.
+fn transaction_review_scroll<R>(
+    ui: &mut egui::Ui,
+    id: &str,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let body_height = (ui.ctx().screen_rect().height() - 128.0).max(120.0);
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+    egui::ScrollArea::vertical()
+        .id_salt(id)
+        .max_height(body_height)
+        .auto_shrink([false, true])
+        .show(ui, add)
+        .inner
+}
+
+/// A replacement review pins the node, signer, and bid as well as the original
+/// transaction. A changed auction must never silently raise the approved tip.
+#[derive(Clone)]
+struct PendingBump {
+    sent: SentTx,
+    wallet_account: String,
+    network: Network,
+    rpc: String,
+    tip_grains: u128,
+}
+
+impl PendingBump {
+    fn validate(
+        &self,
+        current: &SendReviewContext<'_>,
+        auction: &Auction,
+    ) -> Result<(), &'static str> {
+        if self.wallet_account != current.wallet_account
+            || self.sent.from_account != current.from_account
+            || !current.can_sign
+            || self.network != current.network
+            || self.rpc != current.rpc
+        {
+            return Err("the wallet, account, or node changed — review the replacement again");
+        }
+        if !self.sent.on_chain(current.network.chain_id()) {
+            return Err("that send belongs to another network — return to its original network");
+        }
+        if current.busy {
+            return Err("another wallet action is running — wait before replacing this send");
+        }
+        if !self.sent.bumpable(auction)
+            || self.tip_grains < auction::bump_tip_grains(self.sent.tip_grains, auction)
+        {
+            return Err(
+                "the pending transaction or auction changed — review the replacement again",
+            );
+        }
+        Ok(())
     }
 }
 
@@ -3773,6 +3704,7 @@ pub struct Station {
     forget_confirm: String,         // typed text that must match the label to remove
     reveal_phrase: bool,            // show the active wallet's recovery phrase (export)
     receive_kind: ReceiveKind,      // which address the Receive view shows
+    wallet_view: WalletView,        // presentation only; transaction state stays independent
     pending_send: Option<PendingSend>, // a send awaiting confirmation (review modal)
     // ── Blockspace auction (v0.1.98) ────────────────────────────────────────
     // Every send this session, with the nonce and recipient needed to REBUILD it
@@ -3788,7 +3720,7 @@ pub struct Station {
     send_tip_edited: bool,
     // A bump awaiting explicit confirmation. The modal exists because "bump"
     // must never be mistaken for "send again" — see [`Self::bump_send`].
-    pending_bump: Option<SentTx>,
+    pending_bump: Option<PendingBump>,
     block_detail: Option<u64>, // height of the block open in the detail view
     vault_ui: VaultUi,         // all state for the Vault (multisig) tab; isolated
     wallets_dirty: bool,       // wallets exist that aren't saved to the keystore
@@ -3916,6 +3848,100 @@ enum Tab {
     Vault,
     Blocks,
     Activity,
+}
+
+/// Task navigation for the wallet. These views never own signing or scan state:
+/// leaving a view changes presentation, while the existing review and dispatch
+/// paths continue to run for the selected wallet.
+#[derive(PartialEq, Eq, Clone, Copy, Hash)]
+enum WalletView {
+    Overview,
+    Send,
+    Receive,
+    Privacy,
+    Identity,
+    Backup,
+}
+
+impl WalletView {
+    const ALL: [Self; 6] = [
+        Self::Overview,
+        Self::Send,
+        Self::Receive,
+        Self::Privacy,
+        Self::Identity,
+        Self::Backup,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Send => "Send",
+            Self::Receive => "Receive",
+            Self::Privacy => "Privacy",
+            Self::Identity => "Identity",
+            Self::Backup => "Backup",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Overview => "Your balances, account, and recent activity in one place.",
+            Self::Send => "Choose a recipient, review the cost, then confirm your payment.",
+            Self::Receive => "Share the right address for the payment you want to receive.",
+            Self::Privacy => "See each pool separately. Scan notes, move value, or send privately.",
+            Self::Identity => "Your names, controlled accounts, and wallets.",
+            Self::Backup => "Keep a recovery phrase and an encrypted backup you can restore.",
+        }
+    }
+}
+
+impl Tab {
+    const WALLET: [Self; 5] = [
+        Self::Wallet,
+        Self::Tokens,
+        Self::Swaps,
+        Self::Vault,
+        Self::Activity,
+    ];
+    const NETWORK: [Self; 3] = [Self::Node, Self::Mining, Self::Blocks];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Wallet => "Wallet",
+            Self::Tokens => "Assets",
+            Self::Swaps => "Swaps",
+            Self::Vault => "Vaults",
+            Self::Activity => "Activity",
+            Self::Node => "Node",
+            Self::Mining => "Mining",
+            Self::Blocks => "Blocks",
+        }
+    }
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::Wallet => "◇",
+            Self::Tokens => "⬡",
+            Self::Swaps => "⇄",
+            Self::Vault => "▣",
+            Self::Activity => "◷",
+            Self::Node => "◉",
+            Self::Mining => "⛏",
+            Self::Blocks => "▤",
+        }
+    }
+    fn description(self) -> &'static str {
+        match self {
+            Self::Wallet => "Your funds. Your keys.",
+            Self::Tokens => "Tokens, collectibles and native assets.",
+            Self::Swaps => "Atomic settlement, from lock to claim.",
+            Self::Vault => "Shared control. Explicit approvals.",
+            Self::Activity => "A record of this session's actions.",
+            Self::Node => "Chain health and peer connections.",
+            Self::Mining => "Your compute. Your rewards.",
+            Self::Blocks => "Inspect the chain, block by block.",
+        }
+    }
 }
 
 /// All transient UI state for the Vault (treasury multisig) tab — grouped in ONE
@@ -4066,7 +4092,7 @@ impl Station {
             send_tip: String::new(),
             send_tip_edited: false,
             pending_bump: None,
-            tab: Tab::Node,
+            tab: Tab::Wallet,
             rpc_field,
             node_run: Arc::new(Mutex::new(NodeRun::Stopped)),
             node_status: String::new(),
@@ -4092,6 +4118,7 @@ impl Station {
             forget_confirm: String::new(),
             reveal_phrase: false,
             receive_kind: ReceiveKind::Shielded,
+            wallet_view: WalletView::Overview,
             pending_send: None,
             block_detail: None,
             vault_ui: VaultUi::default(),
@@ -4660,7 +4687,7 @@ impl Station {
     fn auction_controls(&mut self, ui: &mut egui::Ui, a: &Auction) -> u128 {
         ui.add_space(sp::M);
         card(ui, |ui| {
-            auction_readout(ui, a);
+            ui.label(egui::RichText::new("Fees & priority").strong());
             // The bid. Kept in sync with the live suggestion until the spender
             // touches the field — after that it is theirs, and Station never
             // rewrites a number under their cursor.
@@ -4670,11 +4697,11 @@ impl Station {
             }
             if a.fee_auction_active {
                 ui.add_space(sp::M);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Tip XUS");
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut self.send_tip)
-                            .desired_width(140.0)
+                            .desired_width(140.0_f32.min(ui.available_width()))
                             .hint_text("0"),
                     );
                     if r.changed() {
@@ -4718,7 +4745,13 @@ impl Station {
                     .color(palette::error()),
                 );
             }
-            bid_outlook_view(ui, a, tip);
+            ui.add_space(sp::S);
+            egui::CollapsingHeader::new("Live auction & inclusion details")
+                .id_salt("send_auction_details")
+                .show(ui, |ui| {
+                    auction_readout(ui, a);
+                    bid_outlook_view(ui, a, tip);
+                });
             tip
         })
     }
@@ -4737,28 +4770,177 @@ impl Station {
         }
     }
 
-    /// This session's sends, with a one-click BUMP for anything still pooled.
-    ///
-    /// This is the lever the wallet did not have: a send that lands below the floor
-    /// used to sit in the mempool with nothing the user could do about it.
-    fn pending_sends_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, a: &Auction) {
+    /// Require unchanged reviewed terms before the existing signing path runs.
+    fn validate_reviewed_send(&self, review: &PendingSend) -> Result<(), &'static str> {
+        let w = self
+            .wallets
+            .get(self.selected)
+            .ok_or("the signing wallet was removed — review the send again")?;
+        let effective = w.effective_account();
+        let rpc = self
+            .config
+            .lock()
+            .map(|c| c.rpc.clone())
+            .unwrap_or_default();
+        let snap = self.snapshot.lock().map(|s| s.clone()).unwrap_or_default();
+        if !snap.chain_id.is_empty() && snap.chain_id != self.network.chain_id() {
+            return Err(
+                "the connected node is on another network — connect to the selected network",
+            );
+        }
+        let (to, amount, source, fee) = match review.source {
+            SendSource::Transparent => {
+                let base_fee = if SendRoute::detect(&self.send_to).private() {
+                    snap.fee_shielded_grains
+                } else {
+                    snap.fee_transfer_grains
+                };
+                (
+                    self.send_to.as_str(),
+                    parse_xus(&self.send_amount),
+                    SendSource::Transparent,
+                    auction::route_fee_grains(base_fee, snap.gas_price_grains, review.tip_grains),
+                )
+            }
+            SendSource::Pool(pool) => {
+                if self.pool_selection.for_account != w.account {
+                    return Err(
+                        "the source wallet changed — choose a pool and review the send again",
+                    );
+                }
+                let selected = self
+                    .pool_selection
+                    .pool
+                    .ok_or("no source pool is selected — choose one and review the send again")?;
+                if pool == Pool::V2 {
+                    private_send_dispatch(
+                        pool,
+                        PoolState::classify_v2(snap.online, snap.shielded_v2.as_ref()),
+                    )?;
+                }
+                let (to, amount) = match pool {
+                    Pool::V1 => (self.private_to.as_str(), parse_xus(&self.private_amount)),
+                    Pool::V2 => (
+                        self.private_v2_to.as_str(),
+                        parse_xus(&self.private_v2_amount),
+                    ),
+                };
+                (
+                    to,
+                    amount,
+                    SendSource::Pool(selected),
+                    snap.fee_shielded_grains,
+                )
+            }
+        };
+        review.validate(&SendReviewContext {
+            wallet_account: &w.account,
+            from_account: &effective,
+            network: self.network,
+            rpc: &rpc,
+            to,
+            amount_grains: amount,
+            source,
+            fee_grains: fee,
+            fee_auction_active: snap.auction.fee_auction_active,
+            can_sign: !w.watch_only,
+            busy: self.action.lock().map(|a| a.busy).unwrap_or(true),
+        })
+    }
+
+    fn clear_transaction_reviews(&mut self) {
+        self.pending_send = None;
+        self.pending_bump = None;
+        self.pool_selection.clear();
+    }
+
+    fn expired_review(&mut self, why: &str) {
+        self.clear_transaction_reviews();
+        // Do not reset ActionState::busy: another proof/submission may be running.
+        self.toast = Some((format!("⚠ {why}"), now_ms()));
+    }
+
+    fn validate_reviewed_bump(&self, review: &PendingBump) -> Result<(), &'static str> {
+        let w = self
+            .wallets
+            .get(self.selected)
+            .ok_or("the signing wallet was removed — review the replacement again")?;
+        let effective = w.effective_account();
+        let rpc = self
+            .config
+            .lock()
+            .map(|c| c.rpc.clone())
+            .unwrap_or_default();
+        let snap = self.snapshot.lock().map(|s| s.clone()).unwrap_or_default();
+        if !snap.chain_id.is_empty() && snap.chain_id != self.network.chain_id() {
+            return Err(
+                "the connected node is on another network — connect to the selected network",
+            );
+        }
+        let pending = self
+            .outbox
+            .lock()
+            .map(|o| {
+                o.iter().any(|t| {
+                    t.txid == review.sent.txid
+                        && t.state.is_pending()
+                        && t.on_origin(&review.sent.chain_id, &review.sent.rpc)
+                })
+            })
+            .unwrap_or(false);
+        if !pending {
+            return Err("that transaction is no longer pending — its replacement review expired");
+        }
+        review.validate(
+            &SendReviewContext {
+                wallet_account: &w.account,
+                from_account: &effective,
+                network: self.network,
+                rpc: &rpc,
+                to: &review.sent.to,
+                amount_grains: Some(review.sent.amount_grains),
+                source: SendSource::Transparent,
+                fee_grains: 0,
+                fee_auction_active: snap.auction.fee_auction_active,
+                can_sign: !w.watch_only,
+                busy: self.action.lock().map(|a| a.busy).unwrap_or(true),
+            },
+            &snap.auction,
+        )
+    }
+
+    /// This session's sends, with a reviewed replacement for anything still pooled.
+    fn pending_sends_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        a: &Auction,
+    ) -> Option<PendingBump> {
         // Only THIS wallet's sends: a bump re-signs with the selected wallet's key,
         // so showing another wallet's pending transaction here would offer a lever
         // that cannot work.
-        let Some(me) = self
+        let me = self
             .wallets
             .get(self.selected)
-            .map(|w| w.effective_account())
-        else {
-            return;
-        };
+            .map(|w| w.effective_account())?;
+        let rpc = self
+            .config
+            .lock()
+            .map(|c| c.rpc.clone())
+            .unwrap_or_default();
+        let chain_id = self.network.chain_id();
         let entries: Vec<SentTx> = self
             .outbox
             .lock()
-            .map(|o| o.iter().filter(|t| t.from_account == me).cloned().collect())
+            .map(|o| {
+                o.iter()
+                    .filter(|t| t.from_account == me && t.on_chain(chain_id))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         if entries.is_empty() {
-            return;
+            return None;
         }
         let now = now_ms();
         let mut bump_target: Option<SentTx> = None;
@@ -4768,7 +4950,7 @@ impl Station {
         card(ui, |ui| {
             // Newest first — the one you are worried about is the one you just sent.
             for t in entries.iter().rev() {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = sp::M;
                     let (glyph, col) = match t.state {
                         SendState::Pending => ("⏳", palette::warning()),
@@ -4787,7 +4969,8 @@ impl Station {
                         egui::RichText::new(format!("→ {}", short_id(&t.to)))
                             .size(ty::SMALL)
                             .color(palette::text_dim()),
-                    );
+                    )
+                    .on_hover_text(&t.to);
                     ui.label(
                         num(format!("nonce {}", t.nonce))
                             .size(ty::MICRO)
@@ -4808,26 +4991,26 @@ impl Station {
                             .color(palette::text_dim()),
                         );
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if t.bumpable(a) {
-                            if ui
-                                .button("Bump fee →")
-                                .on_hover_text(
-                                    "REPLACE this pending transaction with the same payment at a \
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if t.bumpable(a) {
+                        if ui
+                            .button("Bump fee →")
+                            .on_hover_text(
+                                "REPLACE this pending transaction with the same payment at a \
                                      higher tip. It does not send a second payment.",
-                                )
-                                .clicked()
-                            {
-                                bump_target = Some(t.clone());
-                            }
-                        } else if t.state.is_pending() && !a.fee_auction_active {
-                            ui.label(
-                                egui::RichText::new("no bump — tips dormant on this chain")
-                                    .size(ty::MICRO)
-                                    .color(palette::text_dim()),
-                            );
+                            )
+                            .clicked()
+                        {
+                            bump_target = Some(t.clone());
                         }
-                    });
+                    } else if t.state.is_pending() && !a.fee_auction_active {
+                        ui.label(
+                            egui::RichText::new("no bump — tips dormant on this chain")
+                                .size(ty::MICRO)
+                                .color(palette::text_dim()),
+                        );
+                    }
                 });
                 if !t.note.is_empty() {
                     ui.label(
@@ -4839,7 +5022,13 @@ impl Station {
             }
         });
         if let Some(t) = bump_target {
-            self.pending_bump = Some(t);
+            self.pending_bump = self.wallets.get(self.selected).map(|w| PendingBump {
+                tip_grains: auction::bump_tip_grains(t.tip_grains, a),
+                rpc: rpc.clone(),
+                sent: t,
+                wallet_account: w.account.clone(),
+                network: self.network,
+            });
         }
 
         // ── Bump confirmation ────────────────────────────────────────────────
@@ -4848,47 +5037,60 @@ impl Station {
         // impossible to believe: it names the ONE payment, the ONE nonce slot the
         // two transactions contest, and states outright that the original can no
         // longer confirm.
-        let Some(p) = self.pending_bump.clone() else {
-            return;
-        };
-        let new_tip = auction::bump_tip_grains(p.tip_grains, a);
+        let review = self.pending_bump.clone()?;
+        if let Err(why) = self.validate_reviewed_bump(&review) {
+            self.expired_review(why);
+            return None;
+        }
+        let p = &review.sent;
+        let new_tip = review.tip_grains;
         let mut do_bump = false;
-        let modal_ctx = ui.ctx().clone();
+        let modal_ctx = ctx.clone();
+        let modal_width = transaction_review_width(&modal_ctx);
         egui::Window::new(egui::RichText::new("Replace this transaction").strong())
             .collapsible(false)
             .resizable(false)
-            .default_width(460.0)
+            .default_width(modal_width)
+            .max_width(modal_width)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(&modal_ctx, |ui| {
-                ui.set_max_width(460.0);
-                ui.add_space(sp::XS);
-                bump_explainer(ui, &p, new_tip);
-                ui.add_space(sp::M);
-                ui.separator();
-                ui.add_space(sp::S);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("⇄ Replace & raise tip")
-                                    .strong()
-                                    .color(egui::Color32::WHITE),
+                ui.set_max_width(modal_width);
+                transaction_review_scroll(ui, "replacement_review_scroll", |ui| {
+                    ui.add_space(sp::XS);
+                    bump_explainer(ui, p, new_tip);
+                    ui.add_space(sp::M);
+                    ui.separator();
+                    ui.add_space(sp::S);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("⇄ Replace & raise tip")
+                                        .strong()
+                                        .color(palette::accent_text()),
+                                )
+                                .fill(palette::accent()),
                             )
-                            .fill(palette::accent()),
-                        )
-                        .clicked()
-                    {
-                        do_bump = true;
-                    }
-                    if ui.button("Keep waiting").clicked() {
-                        self.pending_bump = None;
-                    }
+                            .clicked()
+                        {
+                            do_bump = true;
+                        }
+                        if ui.button("Keep waiting").clicked() {
+                            self.pending_bump = None;
+                        }
+                    });
                 });
             });
         if do_bump {
             self.pending_bump = None;
-            self.bump_send(&p, ctx);
+            if let Err(why) = self.validate_reviewed_bump(&review) {
+                self.expired_review(why);
+            } else {
+                // Apply any collected wallet/account changes before dispatch.
+                return Some(review);
+            }
         }
+        None
     }
 
     /// Broadcast the send the spender just confirmed, at exactly `tip_grains` —
@@ -4921,18 +5123,18 @@ impl Station {
         let activity = self.activity.clone();
         let outbox = self.outbox.clone();
         // The bid the spender confirmed. Re-gated on the deployment here as well
-        // as at capture: below its activation height a tipped transaction is a HARD
-        // consensus rejection, so an unarmed chain must get the bare, legal form
-        // even if a stale tip somehow reached this point.
-        let tip = if self.fee_auction_active() {
-            tip_grains
-        } else {
-            0
-        };
+        // as at capture: if activation changed, require another review rather
+        // than silently signing a different bid than the spender approved.
+        if tip_grains > 0 && !self.fee_auction_active() {
+            return self.set_action("the fee-auction state changed — review the send again");
+        }
+        let tip = tip_grains;
+        let chain_id = self.network.chain_id();
         let ctx = ctx.clone();
         begin(&action, "sending…");
         std::thread::spawn(move || {
             let terms = SendTerms {
+                chain_id,
                 amount_grains: grains,
                 tip_grains: tip,
                 replace_nonce: None,
@@ -4988,7 +5190,7 @@ impl Station {
     /// mempool's `new_tip >= old_tip + MIN_RBF_BUMP_GRAINS` admission rule and
     /// the live next-block floor — read from the mempool crate, not restated, so
     /// it cannot drift out of agreement with the node that judges it.
-    fn bump_send(&mut self, sent: &SentTx, ctx: &egui::Context) {
+    fn bump_send(&mut self, sent: &SentTx, ctx: &egui::Context, new_tip: u128) {
         if !self.require_signing() {
             return;
         }
@@ -5016,7 +5218,9 @@ impl Station {
                 "the fee auction is not active on this chain — a tip would be rejected",
             );
         }
-        let new_tip = auction::bump_tip_grains(sent.tip_grains, &auction);
+        if new_tip < auction::bump_tip_grains(sent.tip_grains, &auction) {
+            return self.set_action("the auction changed — review the replacement again");
+        }
         let rpc = self
             .config
             .lock()
@@ -5027,6 +5231,12 @@ impl Station {
         let activity = self.activity.clone();
         let outbox = self.outbox.clone();
         let old = sent.clone();
+        if !sent.on_chain(self.network.chain_id()) {
+            return self.set_action(
+                "that send belongs to another network — return to its original network",
+            );
+        }
+        let chain_id = self.network.chain_id();
         let ctx = ctx.clone();
         begin(
             &action,
@@ -5034,6 +5244,7 @@ impl Station {
         );
         std::thread::spawn(move || {
             let terms = SendTerms {
+                chain_id,
                 amount_grains: old.amount_grains,
                 tip_grains: new_tip,
                 // THE replacement bit: reuse the original's slot.
@@ -5047,7 +5258,7 @@ impl Station {
                     // original can no longer confirm: its slot now belongs to the
                     // higher bid, and the pool swapped them atomically.
                     for entry in o.iter_mut() {
-                        if entry.txid == old.txid {
+                        if entry.txid == old.txid && entry.on_origin(&old.chain_id, &old.rpc) {
                             entry.state = SendState::Replaced;
                             entry.note = format!("replaced by {}", &id[..id.len().min(14)]);
                         }
@@ -5352,15 +5563,32 @@ impl Station {
         // transparent send — pool v2 is no longer the one path that forgets.
         let outbox = self.outbox.clone();
         let ctx = ctx.clone();
+        let chain_id = self.network.chain_id();
         begin(&action, what.starting());
         std::thread::spawn(move || {
-            let result = match what {
-                V2Action::Shield => {
-                    shield_v2_amount(&rpc, seed, &account, &shield_to, grains, &action)
-                }
-                V2Action::Deshield => deshield_v2_amount(&rpc, seed, &account, grains, &action),
-                V2Action::Send => zsend_v2_amount(&rpc, seed, &account, &to, grains, &action),
-            };
+            let result = RpcClient::new(rpc.clone())
+                .with_timeout(Duration::from_secs(8))
+                .chain_id()
+                .map_err(|e| e.to_string())
+                .and_then(|reported| {
+                    if reported != chain_id {
+                        return Err(
+                            "the node changed networks — reconnect and review the send again"
+                                .into(),
+                        );
+                    }
+                    match what {
+                        V2Action::Shield => {
+                            shield_v2_amount(&rpc, seed, &account, &shield_to, grains, &action)
+                        }
+                        V2Action::Deshield => {
+                            deshield_v2_amount(&rpc, seed, &account, grains, &action)
+                        }
+                        V2Action::Send => {
+                            zsend_v2_amount(&rpc, seed, &account, &to, grains, &action)
+                        }
+                    }
+                });
             match result {
                 // ON THE NETWORK. Register it in the outbox FIRST — before any
                 // message is chosen — so a pool-v2 transaction is tracked to a real
@@ -5386,6 +5614,8 @@ impl Station {
                     if let Ok(mut o) = outbox.lock() {
                         o.push(SentTx {
                             txid: sub.txid.clone(),
+                            chain_id: chain_id.into(),
+                            rpc: rpc.clone(),
                             from_account: account.clone(),
                             to: counterparty.clone(),
                             amount_grains: grains,
@@ -5715,97 +5945,203 @@ impl Station {
     /// The full-window unlock screen shown while [`locked`](Self#structfield.locked).
     /// Nothing else renders until the passphrase decrypts the store.
     fn show_unlock_screen(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(60.0);
-            ui.vertical_centered(|ui| {
-                ui.heading("🔒  Wallet locked");
-                ui.add_space(8.0);
-                ui.label(
-                    "Enter your passphrase to decrypt this device's wallets. The key is \
-                     derived from your passphrase and is never stored — so it's required \
-                     every launch.",
-                );
-                // The wallet's own recognition code, read straight from the envelope
-                // (a stored hash — no passphrase or KDF needed, so this is cheap). Seeing
-                // the SAME code you memorized confirms it's your store; a wrong file shows
-                // a different one. Absent for a store sealed before codes existed.
-                if let Some(code) = autosave_path()
-                    .ok()
-                    .and_then(|p| std::fs::read_to_string(p).ok())
-                    .and_then(|t| sov_rpc::keystore_stored_fingerprint(&t))
-                {
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(format!("this wallet's code: {code}"))
-                            .small()
-                            .weak(),
-                    );
-                }
-                ui.add_space(16.0);
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.passphrase)
-                        .password(true)
-                        .hint_text("passphrase")
-                        .desired_width(280.0),
-                );
-                ui.add_space(10.0);
-                let submit = ui.button("Unlock").clicked()
-                    || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                if submit {
-                    self.try_unlock();
-                }
-                if !self.unlock_error.is_empty() {
-                    ui.add_space(8.0);
-                    ui.colored_label(egui::Color32::from_rgb(220, 80, 80), &self.unlock_error);
-                }
-                ui.add_space(20.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Forgot it? Re-import each wallet from its 24-word recovery phrase. \
-                         An older wallet from a previous version is upgraded automatically on \
-                         first unlock.",
-                    )
-                    .small()
-                    .weak(),
-                );
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(palette::bg())
+                    .inner_margin(egui::Margin::symmetric(24.0, 12.0)),
+            )
+            .show(ctx, |ui| {
+                let card_width = ui.available_width().min(440.0);
+                let top_space = ((ui.available_height() - 420.0) * 0.5).max(sp::M);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(top_space);
+                    ui.vertical_centered(|ui| {
+                        card_frame().show(ui, |ui| {
+                            ui.set_width((card_width - 36.0).max(0.0));
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                ui.spacing_mut().item_spacing.y = sp::S;
+                                ui.horizontal(|ui| {
+                                    egui::Frame::none()
+                                        .fill(palette::tint(palette::accent(), 24))
+                                        .rounding(egui::Rounding::same(8.0))
+                                        .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                num("S")
+                                                    .size(20.0)
+                                                    .strong()
+                                                    .color(palette::accent()),
+                                            );
+                                        });
+                                    ui.label(
+                                        egui::RichText::new("SOV STATION")
+                                            .size(ty::SMALL)
+                                            .strong()
+                                            .color(palette::text_dim()),
+                                    );
+                                });
+                                ui.add_space(sp::L);
+                                ui.label(
+                                    egui::RichText::new("Welcome back")
+                                        .size(ty::HERO)
+                                        .strong()
+                                        .color(palette::text()),
+                                );
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Unlock your wallets with your device passphrase.",
+                                    )
+                                    .size(ty::BODY)
+                                    .color(palette::text_dim()),
+                                );
+                                // This recognition code is read from the stored envelope,
+                                // without a passphrase or KDF; it identifies the wallet store.
+                                if let Some(code) = autosave_path()
+                                    .ok()
+                                    .and_then(|p| std::fs::read_to_string(p).ok())
+                                    .and_then(|t| sov_rpc::keystore_stored_fingerprint(&t))
+                                {
+                                    ui.add_space(sp::M);
+                                    ui.label(
+                                        num(format!("Wallet recognition code  {code}"))
+                                            .size(ty::SMALL)
+                                            .color(palette::text_dim()),
+                                    );
+                                }
+                                ui.add_space(sp::L);
+                                ui.label(
+                                    egui::RichText::new("Passphrase").size(ty::SMALL).strong(),
+                                );
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut self.passphrase)
+                                        .password(true)
+                                        .hint_text("Enter your passphrase")
+                                        .font(egui::TextStyle::Body)
+                                        .margin(egui::Margin::symmetric(12.0, 10.0))
+                                        .desired_width(ui.available_width()),
+                                );
+                                ui.add_space(sp::M);
+                                let submit = ui
+                                    .vertical_centered_justified(|ui| {
+                                        primary_button(ui, "Unlock", true)
+                                    })
+                                    .inner
+                                    .clicked()
+                                    || (resp.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                                if submit {
+                                    self.try_unlock();
+                                }
+                                if !self.unlock_error.is_empty() {
+                                    ui.add_space(sp::S);
+                                    ui.colored_label(palette::error(), &self.unlock_error);
+                                }
+                                ui.add_space(sp::L);
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Your encryption key is derived from this passphrase and \
+                                     is never stored. You need it each time you open Station.",
+                                    )
+                                    .size(ty::SMALL)
+                                    .color(palette::text_dim()),
+                                );
+                                ui.label(
+                                egui::RichText::new(
+                                    "Forgot it? Re-import each wallet from its 24-word recovery \
+                                     phrase. Older wallets upgrade automatically on first unlock.",
+                                )
+                                .size(ty::SMALL)
+                                .color(palette::text_dim()),
+                            );
+                            });
+                        });
+                    });
+                });
             });
-        });
     }
 
     /// The first-run passphrase CREATION screen — two inputs that must match before
     /// the master passphrase is set, so a typo can't become the encryption key and
     /// lock you out. Shown when a wallet action needs a passphrase and none is set.
     fn show_setup_screen(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(50.0);
-            let action = ui
-                .vertical_centered(|ui| {
-                    render_passphrase_setup(ui, &mut self.setup_pw, &mut self.setup_pw2).0
-                })
-                .inner;
-            match action {
-                SetupAction::Set => {
-                    // Committed only because the two inputs matched (button was enabled).
-                    self.passphrase.zeroize();
-                    self.passphrase = self.setup_pw.clone();
-                    self.passphrase_set = true;
-                    self.setup_pw.zeroize();
-                    self.setup_pw.clear();
-                    self.setup_pw2.zeroize();
-                    self.setup_pw2.clear();
-                    self.show_setup = false;
-                    self.set_action("passphrase set — now create or import a wallet");
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(palette::bg())
+                    .inner_margin(egui::Margin::symmetric(24.0, 12.0)),
+            )
+            .show(ctx, |ui| {
+                let card_width = ui.available_width().min(440.0);
+                let top_space = ((ui.available_height() - 440.0) * 0.5).max(sp::M);
+                let action = egui::ScrollArea::vertical()
+                    .show(ui, |ui| {
+                        ui.add_space(top_space);
+                        ui.vertical_centered(|ui| {
+                            card_frame()
+                                .show(ui, |ui| {
+                                    ui.set_width((card_width - 36.0).max(0.0));
+                                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                        ui.spacing_mut().item_spacing.y = sp::S;
+                                        ui.horizontal(|ui| {
+                                            egui::Frame::none()
+                                                .fill(palette::tint(palette::accent(), 24))
+                                                .rounding(egui::Rounding::same(8.0))
+                                                .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+                                                .show(ui, |ui| {
+                                                    ui.label(
+                                                        num("S")
+                                                            .size(20.0)
+                                                            .strong()
+                                                            .color(palette::accent()),
+                                                    );
+                                                });
+                                            ui.label(
+                                                egui::RichText::new("SOV STATION")
+                                                    .size(ty::SMALL)
+                                                    .strong()
+                                                    .color(palette::text_dim()),
+                                            );
+                                        });
+                                        ui.add_space(sp::L);
+                                        render_passphrase_setup(
+                                            ui,
+                                            &mut self.setup_pw,
+                                            &mut self.setup_pw2,
+                                        )
+                                        .0
+                                    })
+                                    .inner
+                                })
+                                .inner
+                        })
+                        .inner
+                    })
+                    .inner;
+                match action {
+                    SetupAction::Set => {
+                        // Committed only because the two inputs matched (button was enabled).
+                        self.passphrase.zeroize();
+                        self.passphrase = self.setup_pw.clone();
+                        self.passphrase_set = true;
+                        self.setup_pw.zeroize();
+                        self.setup_pw.clear();
+                        self.setup_pw2.zeroize();
+                        self.setup_pw2.clear();
+                        self.show_setup = false;
+                        self.set_action("passphrase set — now create or import a wallet");
+                    }
+                    SetupAction::Cancel => {
+                        self.setup_pw.zeroize();
+                        self.setup_pw.clear();
+                        self.setup_pw2.zeroize();
+                        self.setup_pw2.clear();
+                        self.show_setup = false;
+                    }
+                    SetupAction::None => {}
                 }
-                SetupAction::Cancel => {
-                    self.setup_pw.zeroize();
-                    self.setup_pw.clear();
-                    self.setup_pw2.zeroize();
-                    self.setup_pw2.clear();
-                    self.show_setup = false;
-                }
-                SetupAction::None => {}
-            }
-        });
+            });
     }
 
     /// The Vault tab — easy-mode treasury multisig (M-of-N). Drives the already-shipped
@@ -5899,7 +6235,7 @@ impl Station {
                                 .small()
                                 .weak(),
                         );
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             let dots: String = (0..p.threshold as usize)
                                 .map(|i| if i < p.approved { '✓' } else { '○' })
                                 .collect();
@@ -5931,7 +6267,7 @@ impl Station {
                 }
                 let mut forget: Option<usize> = None;
                 for (i, v) in self.vault_ui.vaults.iter().enumerate() {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(format!(
                             "“{}” — {}  ({} of {})",
                             v.name,
@@ -5954,29 +6290,35 @@ impl Station {
         egui::CollapsingHeader::new(egui::RichText::new("Create a vault").strong()).show(
             ui,
             |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Vault name");
-                    ui.text_edit_singleline(&mut self.vault_ui.new_name);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vault_ui.new_name)
+                            .desired_width(ui.available_width().min(280.0)),
+                    );
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Account to secure");
-                    ui.text_edit_singleline(&mut self.vault_ui.new_account);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vault_ui.new_account)
+                            .desired_width(ui.available_width().min(280.0)),
+                    );
                     if !my_account.is_empty() && ui.button("Use selected wallet").clicked() {
                         self.vault_ui.new_account = my_account.clone();
                     }
                 });
                 ui.add_space(4.0);
                 ui.label("Members — each holder's name + public key:");
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.vault_ui.new_member_name)
                             .hint_text("name")
-                            .desired_width(110.0),
+                            .desired_width(ui.available_width().min(110.0)),
                     );
                     ui.add(
                         egui::TextEdit::singleline(&mut self.vault_ui.new_member_key)
                             .hint_text("hybrid65:0x…")
-                            .desired_width(260.0),
+                            .desired_width(ui.available_width().min(260.0)),
                     );
                     if ui.button("Add").clicked() {
                         match vault::parse_pubkey(&self.vault_ui.new_member_key) {
@@ -6009,7 +6351,7 @@ impl Station {
                 });
                 let mut drop_member: Option<usize> = None;
                 for (i, m) in self.vault_ui.new_members.iter().enumerate() {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(format!("• {} — {}", m.name, short_pubkey(&m.pubkey)));
                         if ui.small_button("✕").clicked() {
                             drop_member = Some(i);
@@ -6020,7 +6362,7 @@ impl Station {
                     self.vault_ui.new_members.remove(i);
                 }
                 let n = self.vault_ui.new_members.len().max(1) as u16;
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Approvals required");
                     ui.add(egui::DragValue::new(&mut self.vault_ui.new_threshold).range(1..=n));
                     ui.label(format!("of {}", self.vault_ui.new_members.len()));
@@ -6071,15 +6413,18 @@ impl Station {
                             ui.selectable_value(&mut self.vault_ui.send_vault, i, n);
                         }
                     });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Send to");
-                    ui.text_edit_singleline(&mut self.vault_ui.send_to);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.vault_ui.send_to)
+                            .desired_width(ui.available_width().min(280.0)),
+                    );
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Amount (XUS)");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.vault_ui.send_amount)
-                            .desired_width(120.0),
+                            .desired_width(ui.available_width().min(120.0)),
                     );
                 });
                 if ui
@@ -6562,6 +6907,42 @@ impl Station {
     /// left of the bottom bar so a result is never missed from any tab, and never
     /// floats over the top-bar node-status line. Returns `true` while a toast is live
     /// (the caller then suppresses the staleness indicator for its brief lifetime).
+    fn footer_reserved_width(&self, ui: &egui::Ui) -> f32 {
+        let version = format!(
+            "SOV Station v{} · {}",
+            env!("CARGO_PKG_VERSION"),
+            self.network.label()
+        );
+        let mut width = ui
+            .painter()
+            .layout_no_wrap(
+                version,
+                egui::TextStyle::Monospace.resolve(ui.style()),
+                palette::text_dim(),
+            )
+            .size()
+            .x
+            + 20.0;
+        let last_copy = self
+            .copied_at
+            .into_iter()
+            .chain(copied_recent(ui.ctx()))
+            .max();
+        if last_copy.is_some_and(|at| now_ms().saturating_sub(at) < 1500) {
+            width += ui
+                .painter()
+                .layout_no_wrap(
+                    "copied ✓".into(),
+                    egui::TextStyle::Body.resolve(ui.style()),
+                    palette::success(),
+                )
+                .size()
+                .x
+                + 24.0;
+        }
+        width
+    }
+
     fn show_bottom_toast(&mut self, ui: &mut egui::Ui) -> bool {
         const TOAST_MS: u64 = 5_000;
         let Some((msg, at)) = self.toast.clone() else {
@@ -6581,31 +6962,118 @@ impl Station {
         // The status bar is a single line shared with the version label — cap the
         // message so a long error can never blow out the layout.
         let shown = toast_chip_text(&msg, 96);
-        ui.label(
-            egui::RichText::new(format!("{glyph}  {shown}"))
-                .color(col)
-                .strong(),
-        );
+        ui.add_sized(
+            egui::vec2(
+                (ui.available_width() - self.footer_reserved_width(ui)).max(0.0),
+                20.0,
+            ),
+            egui::Label::new(
+                egui::RichText::new(format!("{glyph}  {shown}"))
+                    .color(col)
+                    .strong(),
+            )
+            .truncate(),
+        )
+        .on_hover_text(&msg);
         // Keep repainting so the toast dismisses on time even if nothing else changes.
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(200));
         true
     }
 
-    /// One tab in the top toolbar: a leading glyph + label, a clear active state
-    /// (accent-filled pill via the selectable's selection styling), and built-in hover
-    /// feedback. Replaces the plain text `selectable_value` row.
-    fn tab_button(&mut self, ui: &mut egui::Ui, tab: Tab, glyph: &str, label: &str) {
-        let selected = self.tab == tab;
-        let text = egui::RichText::new(format!("{glyph}  {label}"));
-        let text = if selected {
-            text.strong().color(palette::text())
+    fn navigation_sidebar(&mut self, ctx: &egui::Context) {
+        let width = if ctx.screen_rect().width() < 1000.0 {
+            138.0
         } else {
-            text.color(palette::text_dim())
+            188.0
         };
-        if ui.selectable_label(selected, text).clicked() {
+        egui::SidePanel::left("station_navigation")
+            .resizable(false)
+            .exact_width(width)
+            .frame(
+                egui::Frame::none()
+                    .fill(palette::panel())
+                    .stroke(egui::Stroke::new(1.0, palette::border()))
+                    .inner_margin(egui::Margin::symmetric(12.0, 24.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(30.0, 34.0), egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(rect, egui::Rounding::same(10.0), palette::accent());
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "S",
+                        egui::FontId::proportional(22.0),
+                        palette::accent_text(),
+                    );
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("SOV").strong().size(18.0));
+                        ui.label(
+                            egui::RichText::new("STATION")
+                                .size(ty::MICRO)
+                                .color(palette::text_dim()),
+                        );
+                    });
+                });
+                ui.add_space(28.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("station_navigation_scroll")
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("WORKSPACE")
+                                .size(ty::MICRO)
+                                .color(palette::text_dim()),
+                        );
+                        ui.add_space(sp::M);
+                        for tab in Tab::WALLET {
+                            self.tab_button(ui, tab, tab.glyph(), tab.title());
+                        }
+                        ui.add_space(sp::XL);
+                        ui.label(
+                            egui::RichText::new("NETWORK")
+                                .size(ty::MICRO)
+                                .color(palette::text_dim()),
+                        );
+                        ui.add_space(sp::M);
+                        for tab in Tab::NETWORK {
+                            self.tab_button(ui, tab, tab.glyph(), tab.title());
+                        }
+                    });
+            });
+    }
+
+    fn tab_button(&mut self, ui: &mut egui::Ui, tab: Tab, _glyph: &str, label: &str) {
+        let selected = self.tab == tab;
+        let color = if selected {
+            palette::accent_hi()
+        } else {
+            palette::text_dim()
+        };
+        let text = egui::RichText::new(label).size(ty::BODY).color(color);
+        let text = if selected { text.strong() } else { text };
+        let button = egui::Button::new(text)
+            .fill(if selected {
+                palette::tint(palette::accent(), 25)
+            } else {
+                egui::Color32::TRANSPARENT
+            })
+            .stroke(egui::Stroke::NONE)
+            .rounding(egui::Rounding::same(9.0));
+        let response = ui.add_sized([ui.available_width(), 40.0], button);
+        if selected {
+            ui.painter().circle_filled(
+                egui::pos2(response.rect.left() + 13.0, response.rect.center().y),
+                3.0,
+                color,
+            );
+        }
+        if response.clicked() {
             self.tab = tab;
         }
+        ui.add_space(sp::S);
     }
 
     /// Append a node-log line whenever a watched observable changes — the live peer
@@ -6750,12 +7218,12 @@ impl Station {
         };
         ui.label(egui::RichText::new(help).weak());
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Seed peer");
             ui.add(
                 egui::TextEdit::singleline(&mut self.peer_addr)
                     .hint_text("other machine's IP — port optional (e.g. 192.168.0.244)")
-                    .desired_width(320.0),
+                    .desired_width(ui.available_width().min(280.0)),
             );
             if ui
                 .button("Connect")
@@ -6920,6 +7388,7 @@ impl Station {
         if to == self.network {
             return;
         }
+        self.clear_transaction_reviews();
         self.stop_local_node();
         self.network = to;
         self.peer_addr = read_saved_peer(to);
@@ -7019,88 +7488,55 @@ impl eframe::App for Station {
             self.network.label()
         )));
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.heading("SOV Station");
-                ui.separator();
-                // Network selector — one colored chip that IS the switcher (no more
-                // redundant "TESTNET TESTNET"); you ALWAYS know which network you're on,
-                // and switching keeps every wallet (keys are network-agnostic).
-                let mut chosen = self.network;
-                egui::ComboBox::from_id_salt("network")
-                    .selected_text(
-                        egui::RichText::new(format!("● {}", self.network.label()))
-                            .strong()
-                            .color(self.network.color()),
-                    )
-                    .width(120.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut chosen, Network::Testnet, "Testnet");
-                        ui.selectable_value(&mut chosen, Network::Mainnet, "Mainnet");
+        self.navigation_sidebar(ctx);
+
+        egui::TopBottomPanel::top("station_header")
+            .frame(egui::Frame::none().fill(palette::bg()).inner_margin(egui::Margin::symmetric(24.0, 10.0)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        let title = if self.tab == Tab::Wallet && self.wallet_view != WalletView::Overview {
+                            self.wallet_view.label()
+                        } else {
+                            self.tab.title()
+                        };
+                        ui.label(egui::RichText::new(title).size(ty::TITLE).strong());
+                        if self.tab != Tab::Wallet {
+                            ui.label(egui::RichText::new(self.tab.description()).size(ty::SMALL).color(palette::text_dim()));
+                        }
                     });
-                if chosen != self.network {
-                    // Switching TO mainnet is consequential (real value) — confirm
-                    // first. Switching back to testnet is harmless, so do it now.
-                    match chosen {
-                        Network::Mainnet => self.pending_network = Some(Network::Mainnet),
-                        Network::Testnet => self.switch_network(Network::Testnet),
-                    }
-                }
-                // PoW algorithm for the selected network (fixed by its chain-spec, not a
-                // separate choice): SHA-256d on testnet, RandomX on mainnet. Shown so the
-                // operator always knows exactly what their CPU is mining.
-                ui.label(
-                    egui::RichText::new(format!("⛏ {}", self.network.pow_algo()))
-                        .strong()
-                        .color(palette::link()),
-                )
-                .on_hover_text(
-                    "Proof-of-work algorithm for this network. Testnet: SHA-256d (fast). \
-                     Mainnet: RandomX (Monero's memory-hard, ASIC-resistant CPU PoW). \
-                     Reward rate is proportional to your hashpower.",
-                );
-                ui.separator();
-                let (dot, label) = if snap.online {
-                    (palette::success(), "online")
-                } else {
-                    (palette::error(), "offline")
-                };
-                ui.colored_label(dot, "●");
-                ui.label(label);
-                if !snap.chain_id.is_empty() {
-                    ui.separator();
-                    ui.label(egui::RichText::new(&snap.chain_id).monospace());
-                    // SAFETY GUARD: the connected node must be on the selected
-                    // network. A mismatch (e.g. a testnet node while "Mainnet" is
-                    // chosen) is flagged loudly so no action lands on the wrong chain.
-                    if snap.online && snap.chain_id != self.network.chain_id() {
-                        ui.colored_label(
-                            palette::error(),
-                            format!(
-                                "⚠ not {} — expected {}",
-                                self.network.label(),
-                                self.network.chain_id()
-                            ),
-                        );
-                    }
-                }
-                // Theme toggle (right-aligned): flip dark/light live + persist the choice.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (glyph, hint) = if self.dark_mode {
-                        ("☀", "Switch to light mode")
-                    } else {
-                        ("🌙", "Switch to dark mode")
-                    };
-                    if ui.button(glyph).on_hover_text(hint).clicked() {
-                        self.dark_mode = !self.dark_mode;
-                        install_theme(ui.ctx(), self.dark_mode);
-                        save_theme(self.dark_mode);
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (glyph, hint) = if self.dark_mode { ("☀", "Switch to light mode") } else { ("☾", "Switch to dark mode") };
+                        if ui.button(glyph).on_hover_text(hint).clicked() {
+                            self.dark_mode = !self.dark_mode;
+                            install_theme(ui.ctx(), self.dark_mode);
+                            save_theme(self.dark_mode);
+                        }
+                        let mut chosen = self.network;
+                        egui::ComboBox::from_id_salt("network")
+                            .selected_text(egui::RichText::new(self.network.label()).strong().color(self.network.color()))
+                            .width(112.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut chosen, Network::Mainnet, "Mainnet");
+                                ui.selectable_value(&mut chosen, Network::Testnet, "Testnet");
+                            });
+                        if chosen != self.network {
+                            match chosen {
+                                Network::Mainnet => self.pending_network = Some(Network::Mainnet),
+                                Network::Testnet => self.switch_network(Network::Testnet),
+                            }
+                        }
+                    });
                 });
-            });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
+                ui.add_space(sp::S);
+                self.draw_heartbeat(ui, &snap);
+                if snap.online && !snap.chain_id.is_empty() && snap.chain_id != self.network.chain_id() {
+                    ui.colored_label(palette::error(), format!("⚠ Wrong network: connected to {}. Expected {}.", snap.chain_id, self.network.chain_id()));
+                }
+                egui::CollapsingHeader::new("Connection & node controls")
+                    .id_salt("station_connection_controls")
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
                 ui.label("RPC");
                 ui.add(egui::TextEdit::singleline(&mut self.rpc_field).desired_width(220.0));
                 if ui.button("Connect").clicked() {
@@ -7109,24 +7545,21 @@ impl eframe::App for Station {
                     }
                 }
                 ui.separator();
-                // A local node runs IN-STATION on BOTH networks: tap Start and it mines
-                // this network's chain (testnet sandbox OR the real mainnet genesis) to
-                // the active wallet — same flow either way. (Reset wipes only THIS
-                // machine's local copy; on mainnet it simply re-syncs/re-mines.)
+                // A local node connects and syncs this network's chain. Mining
+                // remains an explicit action in the Mining section.
                 if self.local_node_running() {
                     if ui.button("Stop local node").clicked() {
                         self.stop_local_node();
                     }
                 } else {
-                    // Mining is bound to a wallet: disable until one is active,
-                    // and name the target so it's unmistakable which earns.
+                    // Node setup binds its payout identity to an active wallet.
                     let target = self.wallets.get(self.selected).map(|w| w.label.clone());
                     let enabled = target.is_some();
                     let label = format!("Start local node ({})", self.network.label());
                     let btn = ui.add_enabled(enabled, egui::Button::new(label));
                     let btn = match &target {
                         Some(l) => btn.on_hover_text(format!(
-                            "mines the {} chain to “{l}” (the active wallet)",
+                            "connects and syncs the {} chain; mining remains off until enabled for “{l}”",
                             self.network.label()
                         )),
                         None => btn.on_hover_text("create or open a wallet first"),
@@ -7147,12 +7580,11 @@ impl eframe::App for Station {
                     }
                     // VISIBLE guidance (not just a hover) for the most common
                     // first-run confusion: a greyed "Start" because there is no
-                    // wallet yet. A node must mine to a wallet you control.
+                    // wallet yet. The node needs a payout identity for later mining.
                     if !enabled {
                         ui.label(
                             egui::RichText::new(
-                                "← create or import a wallet in the Wallet tab first \
-                                 (a node mines to a wallet you control)",
+                                "Create or restore a wallet first to start a local node.",
                             )
                             .color(palette::warning()),
                         );
@@ -7167,7 +7599,7 @@ impl eframe::App for Station {
                         Some("● starting node — replaying chain, RPC up shortly…".to_string())
                     }
                     NodeRun::Running(n) => Some(format!(
-                        "● node running in-process — mining to {} on 127.0.0.1:8645",
+                        "● local node running — payout account {} · RPC 127.0.0.1:8645",
                         short_id(&n.account)
                     )),
                     NodeRun::Failed(e) => Some(format!("✗ node failed to start: {e}")),
@@ -7181,23 +7613,10 @@ impl eframe::App for Station {
                     }
                     None => {}
                 }
+
+                        });
+                    });
             });
-            ui.add_space(6.0);
-            // A real toolbar: a glyph per tab, a clear active state, and a hairline
-            // separating it from the content below.
-            ui.horizontal(|ui| {
-                self.tab_button(ui, Tab::Node, "◧", "Node");
-                self.tab_button(ui, Tab::Mining, "⛏", "Mining");
-                self.tab_button(ui, Tab::Wallet, "👛", "Wallet");
-                self.tab_button(ui, Tab::Tokens, "⬡", "Tokens");
-                self.tab_button(ui, Tab::Swaps, "⇄", "Swaps");
-                self.tab_button(ui, Tab::Vault, "🛡", "Vault");
-                self.tab_button(ui, Tab::Blocks, "▦", "Blocks");
-                self.tab_button(ui, Tab::Activity, "◷", "Activity");
-            });
-            ui.add_space(4.0);
-            ui.separator();
-        });
 
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
             ui.add_space(3.0);
@@ -7207,7 +7626,17 @@ impl eframe::App for Station {
                 // node error, and it can never collide with the top-bar node status here.
                 if !self.show_bottom_toast(ui) {
                     if let Some(err) = &snap.error {
-                        ui.colored_label(palette::error(), format!("⚠ {err}"));
+                        ui.add_sized(
+                            egui::vec2(
+                                (ui.available_width() - self.footer_reserved_width(ui)).max(0.0),
+                                20.0,
+                            ),
+                            egui::Label::new(
+                                egui::RichText::new(format!("⚠ {err}")).color(palette::error()),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(err);
                     } else if snap.updated_ms > 0 {
                         let age = now_ms().saturating_sub(snap.updated_ms);
                         ui.label(egui::RichText::new(format!("updated {age} ms ago")).weak());
@@ -7241,60 +7670,63 @@ impl eframe::App for Station {
             ui.add_space(3.0);
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Every tab scrolls — the wallet in particular has many sections and
-            // must never clip below the window. (Blocks scrolls its own table.)
-            match self.tab {
-                Tab::Node => {
-                    let logs = self.node_logs.lock().map(|v| v.clone()).unwrap_or_default();
-                    egui::ScrollArea::vertical()
-                        .id_salt("scroll_node")
-                        .show(ui, |ui| {
-                            node_panel(ui, &snap);
-                            self.node_peering_ui(ui);
-                            node_log_panel(ui, &logs);
-                        });
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(palette::bg())
+                    .inner_margin(egui::Margin::symmetric(24.0, 12.0)),
+            )
+            .show(ctx, |ui| {
+                // Every tab scrolls — the wallet in particular has many sections and
+                // must never clip below the window. (Blocks scrolls its own table.)
+                match self.tab {
+                    Tab::Node => {
+                        let logs = self.node_logs.lock().map(|v| v.clone()).unwrap_or_default();
+                        egui::ScrollArea::vertical()
+                            .id_salt("scroll_node")
+                            .show(ui, |ui| {
+                                node_panel(ui, &snap);
+                                self.node_peering_ui(ui);
+                                node_log_panel(ui, &logs);
+                            });
+                    }
+                    Tab::Mining => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("scroll_mining")
+                            .show(ui, |ui| {
+                                self.mining_control_ui(ui);
+                                self.mining_earnings_section(ui);
+                                mining_panel(ui, &snap);
+                            });
+                    }
+                    Tab::Wallet => {
+                        egui::ScrollArea::vertical()
+                            .id_salt(("scroll_wallet", self.selected, self.wallet_view))
+                            .show(ui, |ui| self.wallet_panel(ui, &snap));
+                    }
+                    Tab::Tokens => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("scroll_tokens")
+                            .show(ui, |ui| self.tokens_panel(ui));
+                    }
+                    Tab::Swaps => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("scroll_swaps")
+                            .show(ui, |ui| self.swaps_panel(ui));
+                    }
+                    Tab::Vault => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("scroll_vault")
+                            .show(ui, |ui| self.vault_panel(ui));
+                    }
+                    Tab::Blocks => blocks_panel(ui, &snap, &mut self.block_detail),
+                    Tab::Activity => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("scroll_activity")
+                            .show(ui, |ui| self.activity_panel(ui));
+                    }
                 }
-                Tab::Mining => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("scroll_mining")
-                        .show(ui, |ui| {
-                            self.mining_control_ui(ui);
-                            self.mining_earnings_section(ui);
-                            mining_panel(ui, &snap);
-                        });
-                }
-                Tab::Wallet => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("scroll_wallet")
-                        .show(ui, |ui| self.wallet_panel(ui, &snap));
-                }
-                Tab::Tokens => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("scroll_tokens")
-                        .show(ui, |ui| self.tokens_panel(ui));
-                }
-                Tab::Swaps => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("scroll_swaps")
-                        .show(ui, |ui| self.swaps_panel(ui));
-                }
-                Tab::Vault => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("scroll_vault")
-                        .show(ui, |ui| self.vault_panel(ui));
-                }
-                Tab::Blocks => blocks_panel(ui, &snap, &mut self.block_detail),
-                Tab::Activity => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("scroll_activity")
-                        .show(ui, |ui| self.activity_panel(ui));
-                }
-            }
-        });
-
-        // ── Live node HEARTBEAT — floats bottom-right over every tab. ──
-        self.draw_heartbeat(ctx, &snap);
+            });
 
         // ── Warn on quit if wallets aren't saved ──
         if ctx.input(|i| i.viewport().close_requested())
@@ -8143,13 +8575,7 @@ fn fee_histogram(ui: &mut egui::Ui, buckets: &[auction::FeeBucket], bid_grains: 
 }
 
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::Frame::group(ui.style())
-        .fill(palette::panel())
-        .stroke(egui::Stroke::new(1.0, palette::border()))
-        .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::same(12.0))
-        .show(ui, add)
-        .inner
+    card_frame().show(ui, add).inner
 }
 
 /// Draw a small bar sparkline of recent block intervals (oldest→newest, left→right),
@@ -8612,205 +9038,44 @@ fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
 }
 
 impl Station {
-    /// The live node **HEARTBEAT** — floated bottom-right over every tab. A colored
-    /// "lub-dub" orb with an expanding sonar ring, the peer count, sync state, and
-    /// height. Everything is driven by REAL node telemetry:
-    ///   • colour = health — green SYNCED · cyan SOLO · amber SYNCING · red OFFLINE
-    ///   • beat RATE = how alive it is — calm 60bpm synced, racing while syncing,
-    ///     flatlined when there is no node
-    ///   • a bright thump on every beat, a sonar ring rippling outward, a mining spark.
-    fn draw_heartbeat(&self, ctx: &egui::Context, snap: &Snapshot) {
-        use egui::{Align2, Color32, Id, Order, Sense, Shadow, Stroke, Vec2};
-
-        let peers = snap.peers.unwrap_or(0);
-        let online = snap.online;
-        // Mining — external (registry) OR in-process — is now its own PRIMARY state,
-        // but OFFLINE/SYNCING still dominate (mining is gated on being synced).
+    /// A compact, inline heartbeat leaves forms unobstructed while keeping the
+    /// same witnessed mining, sync and peer telemetry visible in every workspace.
+    fn draw_heartbeat(&self, ui: &mut egui::Ui, snap: &Snapshot) {
         let state = BeatState::of(snap);
-        let mining = state == BeatState::Mining;
-        let (color, label, bpm) = (state.color(), state.word(), state.bpm());
-        // When mining we still want to show WHETHER we are at the tip: a small secondary
-        // chip carries the link word (SYNCED / SOLO) so the headline says "MINING" while
-        // the chip beside it says the node is also at the tip on the network. A peerless
-        // miner may be mining a FORK, so its SOLO chip is coloured for ATTENTION, never
-        // success green — an isolated miner must not look healthy.
-        let (tip_word, tip_color) = if peers == 0 {
-            ("SOLO", palette::warning())
+        let color = state.color();
+        let t = ui.input(|i| i.time);
+        let bpm = state.bpm();
+        let pulse = if bpm > 0.0 {
+            let phase = (t % (60.0 / bpm)) / (60.0 / bpm);
+            (-((phase / 0.08).powi(2))).exp() as f32
         } else {
-            ("SYNCED", palette::success())
+            0.0
         };
-
-        // Heartbeat waveform: a "lub-dub" double-thump each period, then a rest — the
-        // sum of two narrow Gaussians. `ring_phase` sweeps 0→1 over the period to drive
-        // the outward sonar ripple.
-        let t = ctx.input(|i| i.time);
-        let (pulse, ring_phase) = if bpm <= 0.0 {
-            (0.0f32, 1.0f32)
-        } else {
-            let period = 60.0 / bpm;
-            let p = (t % period) / period;
-            let g = |c: f64, w: f64| (-(((p - c) / w).powi(2))).exp() as f32;
-            ((g(0.0, 0.045) + 0.6 * g(0.17, 0.045)).min(1.0), p as f32)
-        };
-
-        let panel = palette::panel();
-        let chip_fill = Color32::from_rgba_unmultiplied(
-            panel.r(),
-            panel.g(),
-            panel.b(),
-            if palette::is_dark() { 246 } else { 252 },
-        );
-        let shadow = Shadow {
-            offset: Vec2::new(0.0, 4.0),
-            blur: 14.0,
-            spread: 0.0,
-            color: Color32::from_black_alpha(if palette::is_dark() { 105 } else { 42 }),
-        };
-
-        egui::Area::new(Id::new("node_heartbeat"))
-            // Clear the footer instead of covering its version/network text.
-            .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-18.0, -42.0))
-            .order(Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(chip_fill)
-                    .rounding(egui::Rounding::same(12.0))
-                    .shadow(shadow)
-                    .stroke(Stroke::new(1.0, palette::tint(color, 92)))
-                    .inner_margin(egui::Margin::symmetric(11.0, 8.0))
-                    .show(ui, |ui| {
-                        ui.set_min_width(164.0);
-                        ui.spacing_mut().item_spacing.x = 10.0;
-                        ui.horizontal(|ui| {
-                            // A contained heartbeat sits first, so the chip reads like a
-                            // status instrument instead of a label with a loose decoration.
-                            let (rect, resp) =
-                                ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
-                            let painter = ui.painter();
-                            let center = rect.center();
-                            let base_r = 5.0;
-
-                            if bpm > 0.0 {
-                                // The ripple stays within its allocation, avoiding the
-                                // clipped/overhanging ring from the previous treatment.
-                                let rr = base_r + ring_phase * 8.0;
-                                let a = ((1.0 - ring_phase) * 88.0) as u8;
-                                painter.circle_stroke(
-                                    center,
-                                    rr,
-                                    Stroke::new(1.25, palette::tint(color, a)),
-                                );
-                                let glow_r = base_r + 2.5 + pulse * 3.5;
-                                painter.circle_filled(
-                                    center,
-                                    glow_r,
-                                    palette::tint(color, (24.0 + pulse * 46.0) as u8),
-                                );
-                            }
-                            painter.circle_filled(center, base_r + pulse * 1.6, color);
-                            painter.circle_filled(
-                                center + Vec2::new(-1.4, -1.4),
-                                1.5 + pulse * 0.6,
-                                palette::tint(Color32::WHITE, (105.0 + pulse * 105.0) as u8),
-                            );
-                            if mining {
-                                painter.circle_filled(
-                                    center + Vec2::new(base_r + 2.5, -(base_r + 2.5)),
-                                    2.0,
-                                    palette::mining(),
-                                );
-                            }
-
-                            ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(label)
-                                            .strong()
-                                            .size(11.5)
-                                            .color(color),
-                                    );
-                                    // Headline is already "MINING" here; the secondary
-                                    // chip says we are ALSO at the tip, so the operator
-                                    // reads both facts at once.
-                                    if mining {
-                                        ui.label(
-                                            egui::RichText::new(tip_word)
-                                                .strong()
-                                                .size(8.5)
-                                                .color(tip_color),
-                                        );
-                                    }
-                                });
-                                let sub = if online {
-                                    let h = snap
-                                        .height
-                                        .map(|h| format!("#{}", group_thousands(h as u128)))
-                                        .unwrap_or_else(|| "#—".into());
-                                    let mut sub = format!(
-                                        "{h}  ·  {peers} PEER{}",
-                                        if peers == 1 { "" } else { "S" }
-                                    );
-                                    // When we are NOT mining but the operator has an owner
-                                    // registry row, state the honest FACT — how long since
-                                    // that account last won — instead of silently implying
-                                    // nothing is theirs. This is the cold-start / restart
-                                    // display: "last won N ago" under a neutral SYNCED/SOLO
-                                    // headline, never the gold MINING claim.
-                                    if !mining {
-                                        if let Some(m) =
-                                            snap.external_miner.as_ref().filter(|m| !m.active)
-                                        {
-                                            let behind = m.head.saturating_sub(m.last_seen);
-                                            sub.push_str(&if behind == 0 {
-                                                "  ·  MINER LAST WON AT HEAD".to_string()
-                                            } else {
-                                                format!(
-                                                    "  ·  MINER LAST WON {} AGO",
-                                                    group_thousands(behind as u128)
-                                                )
-                                            });
-                                        }
-                                    }
-                                    sub
-                                } else {
-                                    "LOCAL NODE UNAVAILABLE".to_string()
-                                };
-                                ui.label(
-                                    egui::RichText::new(sub)
-                                        .monospace()
-                                        .size(9.5)
-                                        .color(palette::text_dim()),
-                                );
-                            });
-
-                            // Distinguish the two ways we can be mining: this node's own
-                            // in-process miner (a measured H/s) versus an external miner
-                            // seen only through the on-chain registry (no local H/s).
-                            let mining_line = if snap.local_hashrate > 0 {
-                                "  ⛏ mining (this node)".to_string()
-                            } else if let Some(m) = snap.external_miner.as_ref().filter(|m| m.active)
-                            {
-                                format!("  ⛏ external miner → {}", short_id(&m.account))
-                            } else {
-                                String::new()
-                            };
-                            resp.on_hover_text(format!(
-                                "{label}\npeers: {peers}\nheight: {}\nbest peer: {}\nhashrate: {} H/s{}\nchain: {}\nbuild: v{}",
-                                snap.height.map(|h| h.to_string()).unwrap_or_else(|| "—".into()),
-                                snap.best_peer_height
-                                    .map(|h| h.to_string())
-                                    .unwrap_or_else(|| "—".into()),
-                                snap.local_hashrate,
-                                mining_line,
-                                snap.chain_id,
-                                env!("CARGO_PKG_VERSION"),
-                            ));
-                        });
-                    });
-            });
-
-        // Keep the beat animating smoothly even when the app is otherwise idle.
-        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().interact_size.y = 0.0;
+            let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 22.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 4.0 + pulse * 2.0, color);
+            response.on_hover_text("Live node state. Mining is shown only when observed, never inferred from a stale registry entry.");
+            ui.label(egui::RichText::new(state.word()).strong().size(ty::SMALL).color(color));
+            if state == BeatState::Mining {
+                state_chip(ui, "◉", if snap.peers.unwrap_or(0) == 0 { "SOLO" } else { "SYNCED" },
+                    if snap.peers.unwrap_or(0) == 0 { palette::warning() } else { palette::success() });
+            }
+            if snap.online {
+                if let Some(height) = snap.height { ui.label(num(format!("#{}", group_thousands(height as u128))).size(ty::SMALL)); }
+                if let Some(peers) = snap.peers { ui.label(egui::RichText::new(format!("{peers} peers")).size(ty::SMALL).color(palette::text_dim())); }
+                if let Some(miner) = &snap.external_miner {
+                    ui.label(egui::RichText::new(format!("last won {} blocks ago", miner.head.saturating_sub(miner.last_seen))).size(ty::SMALL).color(palette::text_dim()));
+                }
+            } else {
+                ui.label(egui::RichText::new("Connect a node to see live balances.").size(ty::SMALL).color(palette::text_dim()));
+            }
+            ui.label(egui::RichText::new(self.network.pow_algo()).size(ty::MICRO).color(palette::text_dim()))
+                .on_hover_text("Proof-of-work algorithm fixed by this network's chain specification.");
+        });
+        if bpm > 0.0 {
+            ui.ctx().request_repaint_after(Duration::from_millis(160));
+        }
     }
 
     // ── Tokens tab: view / issue / transfer native SOV tokens (real on-chain). ──
@@ -8899,12 +9164,12 @@ impl Station {
                 }
             });
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("send to").color(palette::text_dim()));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.nft_send_to)
                         .hint_text("recipient account id or a .sov name")
-                        .desired_width(280.0),
+                        .desired_width(ui.available_width().min(260.0)),
                 );
                 ui.label(
                     egui::RichText::new("then click a collectible")
@@ -8935,22 +9200,23 @@ impl Station {
                         .color(palette::text_dim())
                         .small(),
                 );
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Symbol");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.tok_symbol)
                             .hint_text("USD1")
-                            .desired_width(90.0),
+                            .desired_width(ui.available_width().min(90.0)),
                     );
                     ui.label("Amount");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.tok_issue_amount).desired_width(110.0),
+                        egui::TextEdit::singleline(&mut self.tok_issue_amount)
+                            .desired_width(ui.available_width().min(110.0)),
                     );
                     ui.label("To");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.tok_issue_to)
                             .hint_text("recipient (default: you)")
-                            .desired_width(160.0),
+                            .desired_width(ui.available_width().min(160.0)),
                     );
                     if ui.button("Issue").clicked() {
                         do_issue = true;
@@ -8962,20 +9228,24 @@ impl Station {
                         .color(palette::text_dim())
                         .small(),
                 );
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Asset");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.tok_xfer_asset)
                             .hint_text("asset id (hex)")
-                            .desired_width(200.0),
+                            .desired_width(ui.available_width().min(200.0)),
                     );
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("To");
-                    ui.add(egui::TextEdit::singleline(&mut self.tok_xfer_to).desired_width(200.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.tok_xfer_to)
+                            .desired_width(ui.available_width().min(200.0)),
+                    );
                     ui.label("Amount");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.tok_xfer_amount).desired_width(110.0),
+                        egui::TextEdit::singleline(&mut self.tok_xfer_amount)
+                            .desired_width(ui.available_width().min(110.0)),
                     );
                     if ui.button("Send token").clicked() {
                         do_transfer = true;
@@ -8986,7 +9256,7 @@ impl Station {
         egui::CollapsingHeader::new(egui::RichText::new("Token registry").strong())
             .default_open(false)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.add_enabled_ui(tv.offset > 0, |ui| {
                         if ui.button("‹ Prev").clicked() {
                             do_prev = true;
@@ -9299,13 +9569,19 @@ impl Station {
         // Lock.
         ui.separator();
         ui.label(egui::RichText::new("Lock (open an HTLC)").strong());
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Recipient");
-            ui.add(egui::TextEdit::singleline(&mut self.htlc_recipient).desired_width(200.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.htlc_recipient)
+                    .desired_width(ui.available_width().min(200.0)),
+            );
             ui.label("Amount XUS");
-            ui.add(egui::TextEdit::singleline(&mut self.htlc_amount).desired_width(110.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.htlc_amount)
+                    .desired_width(ui.available_width().min(110.0)),
+            );
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Secret");
             // Masked: the preimage is a secret until it is revealed by a claim. Generate
             // fills it with 32 bytes of OS entropy (hex) — the safe default.
@@ -9313,7 +9589,7 @@ impl Station {
                 egui::TextEdit::singleline(&mut self.htlc_preimage)
                     .hint_text("shared secret (≥16 bytes) — or Generate")
                     .password(true)
-                    .desired_width(220.0),
+                    .desired_width(ui.available_width().min(220.0)),
             );
             if ui
                 .button("Generate")
@@ -9327,14 +9603,14 @@ impl Station {
                 );
             }
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             // Relative timeout: blocks past the CURRENT tip (resolved at lock time), with an
             // enforced floor — an absolute height is a foot-gun (easy to set in the past).
             ui.label("Timeout (+blocks)");
             ui.add(
                 egui::TextEdit::singleline(&mut self.htlc_timeout)
                     .hint_text(format!("≥ {HTLC_MIN_TIMEOUT_BLOCKS}"))
-                    .desired_width(90.0),
+                    .desired_width(ui.available_width().min(90.0)),
             );
             if ui.button("Lock").clicked() {
                 do_lock = true;
@@ -9354,12 +9630,12 @@ impl Station {
         // Lookup / claim / refund by id.
         ui.separator();
         ui.label(egui::RichText::new("Find / claim / refund").strong());
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("HTLC id");
             ui.add(
                 egui::TextEdit::singleline(&mut self.htlc_lookup_id)
                     .hint_text("the lock tx id (hex)")
-                    .desired_width(360.0),
+                    .desired_width(ui.available_width().min(280.0)),
             );
             if ui.button("Look up").clicked() {
                 do_lookup = true;
@@ -9381,7 +9657,7 @@ impl Station {
                 status_label(ui, &sv.message);
             }
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .button("Claim (reveal secret above)")
                 .on_hover_text("claims the HTLC with the Secret field, revealing it on-chain")
@@ -9620,7 +9896,7 @@ impl Station {
         };
 
         card(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(
                     egui::RichText::new("MINING")
                         .small()
@@ -9720,7 +9996,7 @@ impl Station {
         egui::Frame::group(ui.style())
             .fill(palette::tint(palette::success(), 30))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("TOTAL EARNED").small().weak());
                     ui.label(
                         egui::RichText::new(format!("{} XUS", xus(&ev.total_grains.to_string())))
@@ -9755,7 +10031,7 @@ impl Station {
                         });
                 }
             });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ev.computing {
                 ui.spinner();
                 ui.label("scanning the chain for your coinbase…");
@@ -9819,7 +10095,7 @@ impl Station {
     /// wallet's spendable balance in large type, its label + account, the network
     /// badge, and live miner / watch-only / shielded-pool context. The at-a-glance
     /// "how much do I have, and where" that a bank app leads with.
-    fn balance_card(&self, ui: &mut egui::Ui, s: &Snapshot) {
+    fn balance_card(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
         let Some(w) = self.wallets.get(self.selected) else {
             return;
         };
@@ -9833,7 +10109,13 @@ impl Station {
             .find(|a| a.account == effective)
             .map(|a| xus(&a.balance))
             .unwrap_or_else(|| "—".to_string());
-        let named = is_named_account(&effective);
+        let named = is_named_account(&effective)
+            || self
+                .names_by_account
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&effective).map(|names| !names.is_empty()))
+                .unwrap_or(false);
         let is_miner = self.mining_account.as_deref() == Some(account.as_str());
         // PRIVATE balances FOR THIS WALLET — BOTH pools, via the same
         // `own_figures` accessor the pool panels use: the keyed lookup plus the
@@ -9855,13 +10137,18 @@ impl Station {
 
         egui::Frame::group(ui.style())
             .fill(palette::panel())
-            .stroke(egui::Stroke::new(1.0, palette::border()))
-            .rounding(egui::Rounding::same(10.0))
-            .inner_margin(egui::Margin::same(16.0))
+            .stroke(egui::Stroke::new(
+                1.0,
+                palette::tint(palette::accent_hi(), 70),
+            ))
+            .rounding(egui::Rounding::same(18.0))
+            .inner_margin(egui::Margin::same(18.0))
             .show(ui, |ui| {
+                ui.set_min_width((ui.available_width() - 1.0).max(0.0));
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().interact_size.y = 22.0;
                     ui.label(
-                        egui::RichText::new("ACTIVE WALLET")
+                        egui::RichText::new("CONFIRMED BALANCE")
                             .small()
                             .color(palette::text_dim()),
                     );
@@ -9869,7 +10156,7 @@ impl Station {
                         network_badge(ui, self.network);
                         if is_miner {
                             ui.label(
-                                egui::RichText::new("⛏ mining")
+                                egui::RichText::new("⛏ mining payout")
                                     .small()
                                     .color(palette::success()),
                             );
@@ -9883,36 +10170,19 @@ impl Station {
                         }
                     });
                 });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(&bal)
-                            .size(34.0)
-                            .strong()
-                            .color(palette::text()),
-                    );
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(num(&bal).size(38.0).strong().color(palette::text()));
                     ui.label(
                         egui::RichText::new("XUS")
                             .size(15.0)
                             .color(palette::text_dim()),
                     );
-                    // One chip per pool, three honest states each (established
-                    // in v0.2.9): unscanned → "—" (never 0), scanned-and-empty
-                    // → a real 0, scanned-with-value → the figure.
-                    for (pool, own) in [("v1", v1_own), ("v2", v2_own)] {
-                        ui.add_space(10.0);
-                        let (text, hover) = private_chip(pool, own);
-                        let color = match own {
-                            Some((g, _, _)) if g > 0 => palette::accent_hi(),
-                            _ => palette::text_dim(),
-                        };
-                        ui.label(egui::RichText::new(text).color(color))
-                            .on_hover_text(hover);
-                    }
                 });
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(&label).strong().color(palette::link()));
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().interact_size.y = 18.0;
+                    ui.label(egui::RichText::new(&label).strong().color(palette::text()));
                     ui.label(egui::RichText::new("·").color(palette::text_dim()));
                     ui.label(
                         egui::RichText::new(short_id(&effective))
@@ -9921,10 +10191,47 @@ impl Station {
                     );
                     if named {
                         ui.label(
-                            egui::RichText::new("✓ named")
+                            egui::RichText::new("named")
                                 .small()
                                 .color(palette::success()),
                         );
+                    }
+                    if !s.online {
+                        ui.label(
+                            egui::RichText::new("· node offline")
+                                .small()
+                                .color(palette::warning()),
+                        );
+                    }
+                });
+                ui.add_space(12.0);
+                ui.horizontal_wrapped(|ui| {
+                    for (view, text, primary) in [
+                        (WalletView::Send, "Send XUS", true),
+                        (WalletView::Receive, "Receive", false),
+                        (WalletView::Privacy, "Privacy pools", false),
+                    ] {
+                        let fill = if primary {
+                            palette::accent()
+                        } else {
+                            palette::surface()
+                        };
+                        let color = if primary {
+                            palette::accent_text()
+                        } else {
+                            palette::text()
+                        };
+                        if ui
+                            .add_sized(
+                                [128.0, 38.0],
+                                egui::Button::new(egui::RichText::new(text).strong().color(color))
+                                    .fill(fill)
+                                    .rounding(9.0),
+                            )
+                            .clicked()
+                        {
+                            self.wallet_view = view;
+                        }
                     }
                 });
                 // In-flight transactions: anything in the node's mempool is waiting to be
@@ -9936,14 +10243,49 @@ impl Station {
                     ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new(format!(
-                            "⏳ {n} transaction(s) in the mempool — confirming in the next block"
+                            "Network mempool · {n} transaction(s) awaiting a block"
                         ))
                         .small()
                         .color(palette::warning()),
                     );
                 }
             });
-        ui.add_space(10.0);
+        ui.add_space(16.0);
+        ui.label(
+            egui::RichText::new("YOUR SHIELDED BALANCES")
+                .small()
+                .color(palette::text_dim()),
+        );
+        ui.add_space(sp::M);
+        let pools = [
+            (
+                Pool::V1,
+                PoolState::classify_v1(s.online, s.shielded_v1_available),
+                v1_own,
+            ),
+            (
+                Pool::V2,
+                PoolState::classify_v2(s.online, s.shielded_v2.as_ref()),
+                v2_own,
+            ),
+        ];
+        let mut open_privacy = false;
+        if ui.available_width() >= 720.0 {
+            ui.columns(2, |columns| {
+                for (column, (pool, state, own)) in columns.iter_mut().zip(pools) {
+                    open_privacy |= pool_balance_card(column, pool, state, own, true);
+                }
+            });
+        } else {
+            for (pool, state, own) in pools {
+                open_privacy |= pool_balance_card(ui, pool, state, own, true);
+                ui.add_space(sp::M);
+            }
+        }
+        if open_privacy {
+            self.wallet_view = WalletView::Privacy;
+        }
+        ui.add_space(16.0);
     }
 
     /// The dedicated Activity tab — the full session history of submitted actions,
@@ -9995,12 +10337,11 @@ impl Station {
         });
     }
 
-    /// A compact onboarding checklist — the create-wallet → start-node → mine → send
-    /// journey — shown atop the Wallet tab until the user is up and running, so a
-    /// first-time user always knows the next step. Auto-hides once fully set up.
+    /// A compact readiness checklist. Wallet users may connect to a node and
+    /// receive funds without running a miner on this device.
     fn first_run_checklist(&self, ui: &mut egui::Ui, s: &Snapshot) {
         let has_wallet = !self.wallets.is_empty();
-        let node_running = matches!(&*self.node_run.lock().unwrap(), NodeRun::Running(_));
+        let node_running = s.online;
         let acct = self
             .wallets
             .get(self.selected)
@@ -10017,7 +10358,7 @@ impl Station {
             .map(|n| n > 0)
             .unwrap_or(false);
         // Fully set up — the checklist has served its purpose, so get out of the way.
-        if has_wallet && node_running && has_funds && has_sent {
+        if has_wallet && node_running && has_funds {
             return;
         }
         fn step(ui: &mut egui::Ui, done: bool, current: bool, text: &str) {
@@ -10042,7 +10383,7 @@ impl Station {
         }
         card(ui, |ui| {
             ui.label(
-                egui::RichText::new("GET STARTED")
+                egui::RichText::new("NEXT STEPS")
                     .small()
                     .color(palette::text_dim()),
             );
@@ -10053,19 +10394,19 @@ impl Station {
                 ui,
                 node_running,
                 has_wallet && !node_running,
-                "Start the local node (it mines to your wallet)",
+                "Connect or start a node from the Node workspace",
             );
             step(
                 ui,
                 has_funds,
                 node_running && !has_funds,
-                "Mine your first block (wait for a coinbase)",
+                "Receive XUS or earn a mining reward",
             );
             step(
                 ui,
                 has_sent,
                 has_funds && !has_sent,
-                "Send your first transaction",
+                "Review and confirm your first payment",
             );
         });
         ui.add_space(8.0);
@@ -10073,70 +10414,109 @@ impl Station {
 
     fn wallet_panel(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
         let ctx = ui.ctx().clone();
-        ui.heading("Wallet");
-        self.first_run_checklist(ui, s);
 
         // ── STATE 1 — Onboarding ──
         // Like every real wallet, you must create or restore a recovery phrase
         // before ANY other action. Nothing else in the wallet (and no node mining)
         // is reachable until a wallet exists.
         if self.wallets.is_empty() {
+            ui.add_space(12.0);
+            ui.label(
+                egui::RichText::new("WELCOME TO SOV STATION")
+                    .small()
+                    .color(palette::accent_hi()),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Your keys. Your control.")
+                    .size(30.0)
+                    .strong(),
+            );
+            ui.add_space(8.0);
             ui.label(
                 egui::RichText::new(
-                    "Create or restore a wallet to begin. A recovery phrase is required before any \
-                     action — and the local node mines to the wallet you select. Your on-chain \
-                     account id is derived from your key (not the label), so it can never collide \
-                     with — or inherit the funds of — another account.",
+                    "Create a wallet, restore your recovery phrase, or open an encrypted backup. \
+                     Your label stays on this device; your on-chain account comes from your key.",
                 )
                 .weak(),
             );
-            ui.add_space(10.0);
+            ui.add_space(24.0);
             let mut do_generate = false;
             let mut do_import = false;
             let mut do_load = false;
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label(egui::RichText::new("Create a new wallet").strong());
-                ui.horizontal(|ui| {
-                    ui.label("Label (display only)");
-                    ui.add(egui::TextEdit::singleline(&mut self.gen_name).desired_width(220.0));
-                    if ui.button("Generate recovery phrase").clicked() {
-                        do_generate = true;
-                    }
-                });
+            card_frame().show(ui, |ui| {
+                section_heading(
+                    ui,
+                    "Create a wallet",
+                    "Start with a new recovery phrase that only you control.",
+                );
+                ui.label(
+                    egui::RichText::new("Wallet label · only shown on this device")
+                        .small()
+                        .color(palette::text_dim()),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.gen_name)
+                        .desired_width(ui.available_width().min(420.0)),
+                );
+                ui.add_space(12.0);
+                if primary_button(ui, "Generate recovery phrase →", true).clicked() {
+                    do_generate = true;
+                }
             });
-            ui.add_space(6.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label(egui::RichText::new("Restore from a recovery phrase").strong());
-                ui.horizontal(|ui| {
-                    ui.label("Label (display only)");
-                    ui.add(egui::TextEdit::singleline(&mut self.import_name).desired_width(220.0));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Mnemonic / seed");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.import_mnemonic)
-                            .desired_width(420.0)
-                            .hint_text("24-word phrase OR 64-hex seed"),
-                    );
-                    if ui.button("Restore").clicked() {
-                        do_import = true;
-                    }
-                });
+            ui.add_space(12.0);
+            card_frame().show(ui, |ui| {
+                section_heading(
+                    ui,
+                    "Restore an existing wallet",
+                    "Bring your recovery phrase or raw seed to this device.",
+                );
+                ui.label(
+                    egui::RichText::new("Wallet label")
+                        .small()
+                        .color(palette::text_dim()),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.import_name)
+                        .desired_width(ui.available_width().min(420.0)),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("Recovery phrase or seed")
+                        .small()
+                        .color(palette::text_dim()),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.import_mnemonic)
+                        .desired_width(ui.available_width().min(420.0))
+                        .hint_text("24-word phrase OR 64-hex seed"),
+                );
+                ui.add_space(12.0);
+                if primary_button(ui, "Restore wallet →", true).clicked() {
+                    do_import = true;
+                }
             });
-            ui.add_space(6.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label(egui::RichText::new("Open an encrypted keystore").strong());
-                ui.horizontal(|ui| {
-                    ui.label("Passphrase");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.keystore_pass)
-                            .password(true)
-                            .desired_width(200.0),
-                    );
-                    if ui.button("Unlock").clicked() {
-                        do_load = true;
-                    }
-                });
+            ui.add_space(12.0);
+            card_frame().show(ui, |ui| {
+                section_heading(
+                    ui,
+                    "Open an encrypted backup",
+                    "Restore the wallets saved in your portable keystore.",
+                );
+                ui.label(
+                    egui::RichText::new("Backup passphrase")
+                        .small()
+                        .color(palette::text_dim()),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.keystore_pass)
+                        .password(true)
+                        .desired_width(ui.available_width().min(420.0)),
+                );
+                ui.add_space(12.0);
+                if primary_button(ui, "Unlock backup →", true).clicked() {
+                    do_load = true;
+                }
             });
             let err = self
                 .action
@@ -10239,8 +10619,74 @@ impl Station {
             }
         }
 
-        // The hero balance card — prominent spendable balance + network badge, up top.
-        self.balance_card(ui, s);
+        let balance_of = |acct: &str| {
+            s.accounts
+                .iter()
+                .find(|a| a.account == acct)
+                .map(|a| xus(&a.balance))
+                .unwrap_or_else(|| "—".to_string())
+        };
+
+        // Always reachable, above every task: switch wallets without hunting
+        // through a management screen. The existing end-of-frame selection path
+        // still performs the actual transition and clears sensitive UI state.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("WALLET")
+                    .small()
+                    .color(palette::text_dim()),
+            );
+            let active_label = self
+                .wallets
+                .get(self.selected)
+                .map(|w| w.label.as_str())
+                .unwrap_or("Choose a wallet");
+            egui::ComboBox::from_id_salt("active_wallet_switcher")
+                .selected_text(egui::RichText::new(active_label).strong())
+                .width(240.0)
+                .show_ui(ui, |ui| {
+                    for (i, w) in self.wallets.iter().enumerate() {
+                        let text = if w.watch_only {
+                            format!("{} · watch-only", w.label)
+                        } else {
+                            w.label.clone()
+                        };
+                        if ui
+                            .selectable_label(i == self.selected, text)
+                            .on_hover_text(short_id(&w.effective_account()))
+                            .clicked()
+                        {
+                            select = Some(i);
+                        }
+                    }
+                });
+            if ui.button("Manage wallets").clicked() {
+                self.wallet_view = WalletView::Identity;
+            }
+            if ui.button("Backup").clicked() {
+                self.wallet_view = WalletView::Backup;
+            }
+            if self.wallet_view != WalletView::Overview {
+                if let Some(w) = self.wallets.get(self.selected) {
+                    ui.label(
+                        num(format!(
+                            "{} XUS · public",
+                            balance_of(&w.effective_account())
+                        ))
+                        .size(ty::BODY)
+                        .strong()
+                        .color(palette::text()),
+                    )
+                    .on_hover_text(
+                        "Confirmed public balance. Shielded balances remain in their own pools.",
+                    );
+                    if w.watch_only {
+                        pill(ui, "WATCH-ONLY", palette::link());
+                    }
+                }
+            }
+        });
+        ui.add_space(12.0);
 
         // ── Unsaved-wallets banner — nudge to persist before they can be lost ──
         if self.wallets_dirty && !self.wallets.is_empty() {
@@ -10248,23 +10694,17 @@ impl Station {
                 .fill(palette::tint(palette::warning(), 30))
                 .stroke(egui::Stroke::new(1.0, palette::warning()))
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(
-                            egui::RichText::new(format!(
-                                "⚠ {} wallet(s) not saved to disk — back them up so they survive a \
-                                 restart.",
-                                self.wallets.len()
-                            ))
+                            egui::RichText::new(
+                                "Wallet changes need an encrypted backup to survive a restart.",
+                            )
                             .color(palette::warning()),
                         );
                         if self.keystore_pass.is_empty() {
-                            ui.label(
-                                egui::RichText::new(
-                                    "enter a backup passphrase in “Wallet file” below, then Save",
-                                )
-                                .small()
-                                .weak(),
-                            );
+                            if ui.button("Create encrypted backup").clicked() {
+                                self.wallet_view = WalletView::Backup;
+                            }
                         } else if ui.button("Save now").clicked() {
                             do_save = true;
                         }
@@ -10273,35 +10713,109 @@ impl Station {
             ui.add_space(4.0);
         }
 
-        // ── Add / import a wallet (at the top — the first thing you reach for) ──
-        ui.collapsing("➕ Add or import a wallet", |ui| {
-            let enter = |r: &egui::Response, ui: &egui::Ui| {
-                r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
-            };
-            ui.horizontal(|ui| {
-                ui.label("New wallet label");
-                let r = ui.add(egui::TextEdit::singleline(&mut self.gen_name).desired_width(200.0));
-                if ui.button("Generate").clicked() || enter(&r, ui) {
-                    do_generate = true;
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            for view in WalletView::ALL {
+                let active = self.wallet_view == view;
+                let text = egui::RichText::new(view.label()).strong().color(if active {
+                    palette::accent_hi()
+                } else {
+                    palette::text_dim()
+                });
+                if ui
+                    .add_sized(
+                        [88.0, 36.0],
+                        egui::Button::new(text)
+                            .fill(if active {
+                                palette::tint(palette::accent_hi(), 24)
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            })
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                if active {
+                                    palette::tint(palette::accent_hi(), 90)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                },
+                            ))
+                            .rounding(8.0),
+                    )
+                    .clicked()
+                {
+                    self.wallet_view = view;
                 }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Import label");
-                ui.add(egui::TextEdit::singleline(&mut self.import_name).desired_width(200.0));
-            });
-            ui.horizontal(|ui| {
-                ui.label("mnemonic / seed");
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut self.import_mnemonic)
-                        .desired_width(420.0)
-                        .hint_text("24-word phrase OR 64-hex seed"),
-                );
-                if ui.button("Import").clicked() || enter(&r, ui) {
-                    do_import = true;
-                }
-            });
-            ui.separator();
+            }
+        });
+        if self.wallet_view != WalletView::Backup {
+            self.reveal_phrase = false;
+        }
+        if self.wallet_view == WalletView::Overview {
+            ui.add_space(sp::M);
             ui.label(
+                egui::RichText::new(self.wallet_view.description())
+                    .small()
+                    .color(palette::text_dim()),
+            );
+            ui.add_space(sp::M);
+        } else {
+            ui.add_space(sp::M);
+            ui.scope(|ui| {
+                ui.spacing_mut().interact_size.y = 0.0;
+                ui.label(
+                    egui::RichText::new(self.wallet_view.description())
+                        .small()
+                        .color(palette::text_dim()),
+                );
+            });
+            ui.add_space(sp::M);
+        }
+        // Overview owns the hero and shortcuts. Task views keep context compact
+        // so the form starts near the top even on a small desktop window.
+        if self.wallet_view == WalletView::Overview {
+            self.balance_card(ui, s);
+        }
+
+        if self.wallet_view == WalletView::Overview {
+            self.first_run_checklist(ui, s);
+        }
+
+        // ── Add / import a wallet (at the top — the first thing you reach for) ──
+        if self.wallet_view == WalletView::Identity {
+            ui.collapsing("➕ Add or import a wallet", |ui| {
+                let enter = |r: &egui::Response, ui: &egui::Ui| {
+                    r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("New wallet label");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.gen_name)
+                            .desired_width(ui.available_width().min(200.0)),
+                    );
+                    if ui.button("Generate").clicked() || enter(&r, ui) {
+                        do_generate = true;
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Import label");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.import_name)
+                            .desired_width(ui.available_width().min(200.0)),
+                    );
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("mnemonic / seed");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.import_mnemonic)
+                            .desired_width(ui.available_width().min(420.0))
+                            .hint_text("24-word phrase OR 64-hex seed"),
+                    );
+                    if ui.button("Import").clicked() || enter(&r, ui) {
+                        do_import = true;
+                    }
+                });
+                ui.separator();
+                ui.label(
                 egui::RichText::new(
                     "👁 Watch-only: monitor an account from its public key — no private key here, \
                      so it can't sign. Spend it via the offline-signing tools (build unsigned here \
@@ -10310,127 +10824,130 @@ impl Station {
                 .weak()
                 .small(),
             );
-            ui.horizontal(|ui| {
-                ui.label("Watch label");
-                ui.add(egui::TextEdit::singleline(&mut self.watch_label).desired_width(150.0));
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut self.watch_pubkey)
-                        .hint_text("public key — hybrid65:0x…")
-                        .desired_width(320.0),
-                );
-                if ui.button("Add watch-only").clicked() || enter(&r, ui) {
-                    do_add_watch = true;
-                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Watch label");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.watch_label)
+                            .desired_width(ui.available_width().min(150.0)),
+                    );
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.watch_pubkey)
+                            .hint_text("public key — hybrid65:0x…")
+                            .desired_width(ui.available_width().min(320.0)),
+                    );
+                    if ui.button("Add watch-only").clicked() || enter(&r, ui) {
+                        do_add_watch = true;
+                    }
+                });
             });
-        });
-        ui.add_space(4.0);
-        ui.separator();
+            ui.add_space(4.0);
+            ui.separator();
 
-        // ── Active-wallet banner: the unmistakable "who am I acting as" strip ──
-        let balance_of = |acct: &str| {
-            s.accounts
-                .iter()
-                .find(|a| a.account == acct)
-                .map(|a| xus(&a.balance))
-                .unwrap_or_else(|| "—".to_string())
-        };
-        if let Some(w) = self.wallets.get(self.selected) {
-            let label = w.label.clone();
-            let account = w.account.clone();
-            let effective = w.effective_account();
-            let is_miner = self.mining_account.as_deref() == Some(account.as_str());
-            // Name state, shown CONSISTENTLY for both kinds of name: a wallet
-            // operating AS a named account (e.g. name.reserve.sov) and a wallet
-            // with an SNS alias resolving to it (e.g. claude.sov) are BOTH "named".
-            // SNS names are trusted only when the cache is for THIS account (avoids
-            // a one-frame flash of the previous wallet's names after switching).
-            let operating_named = is_named_account(&effective);
-            let sns_names: Vec<String> = self
-                .names_by_account
-                .lock()
-                .ok()
-                .and_then(|m| m.get(&effective).cloned())
-                .unwrap_or_default();
-            let has_sns = !sns_names.is_empty();
-            let named = operating_named || has_sns;
-            // A green border for a named wallet (operate-as OR SNS), amber for an
-            // unnamed (implicit) one — the name-state is unmistakable at a glance.
-            egui::Frame::group(ui.style())
-                .fill(palette::tint(palette::link(), 30))
-                .stroke(egui::Stroke::new(1.5, named_color(named)))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("ACTIVE WALLET").small().weak());
-                        ui.label(
-                            egui::RichText::new(&label)
-                                .strong()
-                                .size(16.0)
-                                .color(palette::link()),
-                        );
-                        ui.label(egui::RichText::new(short_id(&account)).monospace().weak());
-                        if is_miner {
+            // ── Active-wallet banner: the unmistakable "who am I acting as" strip ──
+            if let Some(w) = self.wallets.get(self.selected) {
+                let label = w.label.clone();
+                let account = w.account.clone();
+                let effective = w.effective_account();
+                let is_miner = self.mining_account.as_deref() == Some(account.as_str());
+                // Name state, shown CONSISTENTLY for both kinds of name: a wallet
+                // operating AS a named account (e.g. name.reserve.sov) and a wallet
+                // with an SNS alias resolving to it (e.g. claude.sov) are BOTH "named".
+                // SNS names are trusted only when the cache is for THIS account (avoids
+                // a one-frame flash of the previous wallet's names after switching).
+                let operating_named = is_named_account(&effective);
+                let sns_names: Vec<String> = self
+                    .names_by_account
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&effective).cloned())
+                    .unwrap_or_default();
+                let has_sns = !sns_names.is_empty();
+                let named = operating_named || has_sns;
+                // A green border for a named wallet (operate-as OR SNS), amber for an
+                // unnamed (implicit) one — the name-state is unmistakable at a glance.
+                egui::Frame::group(ui.style())
+                    .fill(palette::panel())
+                    .stroke(egui::Stroke::new(1.5, named_color(named)))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new("ACTIVE WALLET").small().weak());
                             ui.label(
-                                egui::RichText::new("⛏ mining")
-                                    .small()
-                                    .color(palette::success()),
+                                egui::RichText::new(&label)
+                                    .strong()
+                                    .size(16.0)
+                                    .color(palette::text()),
                             );
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                egui::RichText::new(format!("{} XUS", balance_of(&effective)))
-                                    .strong(),
+                            ui.label(egui::RichText::new(short_id(&account)).monospace().weak());
+                            if is_miner {
+                                ui.label(
+                                    egui::RichText::new("⛏ mining payout")
+                                        .small()
+                                        .color(palette::success()),
+                                );
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} XUS",
+                                            balance_of(&effective)
+                                        ))
+                                        .strong(),
+                                    );
+                                },
                             );
                         });
-                    });
-                    // Name-state line — consistent for both kinds of name.
-                    if w.watch_only {
-                        ui.label(
-                            egui::RichText::new(
-                                "👁 WATCH-ONLY  ·  no private key here — monitor only",
-                            )
-                            .strong()
-                            .color(palette::link()),
-                        );
-                    } else if operating_named {
-                        ui.label(
-                            egui::RichText::new(format!("✓ NAMED ACCOUNT  ·  {effective}"))
+                        // Name-state line — consistent for both kinds of name.
+                        if w.watch_only {
+                            ui.label(
+                                egui::RichText::new(
+                                    "👁 WATCH-ONLY  ·  no private key here — monitor only",
+                                )
                                 .strong()
-                                .color(named_color(true)),
-                        );
-                    } else if has_sns {
-                        ui.label(
-                            egui::RichText::new(format!("✓ SNS  ·  {}", sns_names.join(", ")))
-                                .strong()
-                                .color(named_color(true)),
-                        );
-                    } else {
-                        ui.label(
+                                .color(palette::link()),
+                            );
+                        } else if operating_named {
+                            ui.label(
+                                egui::RichText::new(format!("✓ NAMED ACCOUNT  ·  {effective}"))
+                                    .strong()
+                                    .color(named_color(true)),
+                            );
+                        } else if has_sns {
+                            ui.label(
+                                egui::RichText::new(format!("✓ SNS  ·  {}", sns_names.join(", ")))
+                                    .strong()
+                                    .color(named_color(true)),
+                            );
+                        } else {
+                            ui.label(
                             egui::RichText::new(
                                 "○ UNNAMED  ·  implicit address only — register an SNS name below \
                                  for a human-readable account",
                             )
                             .color(named_color(false)),
                         );
-                    }
-                    // Rename + remove the active wallet. Remove opens a deliberate
-                    // type-to-confirm modal (handled below) — no one-click delete.
-                    ui.horizontal(|ui| {
-                        ui.label("Label");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.rename_field)
-                                .desired_width(180.0)
-                                .hint_text(&label),
-                        );
-                        if ui.button("Rename").clicked() {
-                            do_rename = true;
                         }
-                        ui.separator();
-                        if ui.button("🗑 Remove wallet").clicked() {
-                            self.forget_armed = true;
-                            self.forget_confirm.clear();
-                        }
+                        // Rename + remove the active wallet. Remove opens a deliberate
+                        // type-to-confirm modal (handled below) — no one-click delete.
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Label");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.rename_field)
+                                    .desired_width(ui.available_width().min(180.0))
+                                    .hint_text(&label),
+                            );
+                            if ui.button("Rename").clicked() {
+                                do_rename = true;
+                            }
+                            ui.separator();
+                            if ui.button("🗑 Remove wallet").clicked() {
+                                self.forget_armed = true;
+                                self.forget_confirm.clear();
+                            }
+                        });
                     });
-                });
+            }
         }
 
         // ── Remove-wallet confirmation modal: type the label to enable removal,
@@ -10458,10 +10975,10 @@ impl Station {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.forget_confirm)
                             .hint_text(&target_label)
-                            .desired_width(220.0),
+                            .desired_width(ui.available_width().min(220.0)),
                     );
                     ui.add_space(6.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.add_enabled_ui(matches, |ui| {
                             if ui
                                 .button(
@@ -10492,126 +11009,133 @@ impl Station {
 
         // ── Wallet switcher: every wallet, one click to make active. Each row is
         // tagged NAMED (green) or unnamed (amber) so the distinction is obvious.
-        ui.add_space(sp::M);
-        ui.label(egui::RichText::new("Switch wallet").strong());
-        ui.add_space(sp::XS);
-        // Snapshot the per-account SNS name cache once, so each row's badge reflects
-        // its registered name (not just an operate-as named account).
-        let names_map: HashMap<String, Vec<String>> = self
-            .names_by_account
-            .lock()
-            .map(|m| m.clone())
-            .unwrap_or_default();
-        // Fixed column widths, so the ids, badges, and balances line up down the
-        // list no matter how long each wallet's label runs — the old single
-        // concatenated string left every column ragged. Hierarchy: the NAME is
-        // primary; the id and badge are secondary and dim; the balance is
-        // right-aligned in tabular figures so its digits stack. The WHOLE row is
-        // one hit target: the badge and the ⛏ marker select the wallet too,
-        // instead of being dead zones beside the only clickable text.
-        const WROW_NAME_W: f32 = 170.0;
-        const WROW_ID_W: f32 = 110.0;
-        const WROW_H: f32 = 18.0;
-        for (i, w) in self.wallets.iter().enumerate() {
-            let active = i == self.selected;
-            let marker = if active { "●" } else { "○" };
-            let is_miner = self.mining_account.as_deref() == Some(w.account.as_str());
-            let effective = w.effective_account();
-            let operating_named = is_named_account(&effective);
-            let sns = names_map.get(&effective).cloned().unwrap_or_default();
-            let named = operating_named || !sns.is_empty();
-            let fill = if active {
-                palette::tint(palette::link(), 26)
-            } else {
-                egui::Color32::TRANSPARENT
-            };
-            let row = egui::Frame::none()
-                .fill(fill)
-                .rounding(6.0)
-                .inner_margin(egui::Margin::symmetric(sp::M, sp::S))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        // NAME — the primary fact, first and strongest.
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(WROW_NAME_W, WROW_H),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.label(egui::RichText::new(marker).color(if active {
-                                    palette::accent_hi()
-                                } else {
-                                    palette::text_dim()
-                                }));
-                                let name = if active {
-                                    egui::RichText::new(&w.label).strong()
-                                } else {
-                                    egui::RichText::new(&w.label)
-                                };
-                                ui.add(egui::Label::new(name).truncate());
-                                if is_miner {
-                                    ui.label(
-                                        egui::RichText::new("⛏").small().color(palette::success()),
-                                    );
-                                }
-                            },
-                        );
-                        // ID — secondary: dim monospace in its own column.
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(WROW_ID_W, WROW_H),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.label(
-                                    num(short_id(&w.account))
-                                        .size(ty::SMALL)
-                                        .color(palette::text_dim()),
-                                );
-                            },
-                        );
-                        // BALANCE — right-aligned tabular figures so digits stack
-                        // down the column. Shows the balance of the account this
-                        // wallet OPERATES (its named account when attached, else
-                        // its own implicit id) — so a tax wallet shows its real
-                        // balance, not its empty implicit address.
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                egui::RichText::new("XUS")
-                                    .size(ty::MICRO)
-                                    .color(palette::text_dim()),
-                            );
-                            ui.label(num(balance_of(&effective)));
-                            // Name-state badge — operate-as named account, else
-                            // SNS name(s), else unnamed. Same SNS cache as the
-                            // header. Fills the slack between id and balance,
-                            // truncated so a long name never shoves the figures.
-                            let badge = if operating_named {
-                                format!("named · {effective}")
-                            } else if !sns.is_empty() {
-                                format!("SNS · {}", sns.join(", "))
-                            } else {
-                                "unnamed".to_string()
-                            };
-                            ui.add_space(sp::L);
-                            ui.with_layout(
+        if self.wallet_view == WalletView::Identity {
+            ui.add_space(sp::M);
+            ui.label(egui::RichText::new("Switch wallet").strong());
+            ui.add_space(sp::XS);
+            // Snapshot the per-account SNS name cache once, so each row's badge reflects
+            // its registered name (not just an operate-as named account).
+            let names_map: HashMap<String, Vec<String>> = self
+                .names_by_account
+                .lock()
+                .map(|m| m.clone())
+                .unwrap_or_default();
+            // Fixed column widths, so the ids, badges, and balances line up down the
+            // list no matter how long each wallet's label runs — the old single
+            // concatenated string left every column ragged. Hierarchy: the NAME is
+            // primary; the id and badge are secondary and dim; the balance is
+            // right-aligned in tabular figures so its digits stack. The WHOLE row is
+            // one hit target: the badge and the ⛏ marker select the wallet too,
+            // instead of being dead zones beside the only clickable text.
+            const WROW_NAME_W: f32 = 170.0;
+            const WROW_ID_W: f32 = 110.0;
+            const WROW_H: f32 = 18.0;
+            for (i, w) in self.wallets.iter().enumerate() {
+                let active = i == self.selected;
+                let marker = if active { "●" } else { "○" };
+                let is_miner = self.mining_account.as_deref() == Some(w.account.as_str());
+                let effective = w.effective_account();
+                let operating_named = is_named_account(&effective);
+                let sns = names_map.get(&effective).cloned().unwrap_or_default();
+                let named = operating_named || !sns.is_empty();
+                let fill = if active {
+                    palette::tint(palette::accent(), 18)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                let row = egui::Frame::none()
+                    .fill(fill)
+                    .rounding(6.0)
+                    .inner_margin(egui::Margin::symmetric(sp::M, sp::S))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal_wrapped(|ui| {
+                            // NAME — the primary fact, first and strongest.
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(WROW_NAME_W, WROW_H),
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(badge)
-                                                .size(ty::SMALL)
-                                                .color(named_color(named)),
-                                        )
-                                        .truncate(),
+                                    ui.label(egui::RichText::new(marker).color(if active {
+                                        palette::accent_hi()
+                                    } else {
+                                        palette::text_dim()
+                                    }));
+                                    let name = if active {
+                                        egui::RichText::new(&w.label).strong()
+                                    } else {
+                                        egui::RichText::new(&w.label)
+                                    };
+                                    ui.add(egui::Label::new(name).truncate());
+                                    if is_miner {
+                                        ui.label(
+                                            egui::RichText::new("⛏")
+                                                .small()
+                                                .color(palette::success()),
+                                        );
+                                    }
+                                },
+                            );
+                            // ID — secondary: dim monospace in its own column.
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(WROW_ID_W, WROW_H),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        num(short_id(&w.account))
+                                            .size(ty::SMALL)
+                                            .color(palette::text_dim()),
+                                    );
+                                },
+                            );
+                            // BALANCE — right-aligned tabular figures so digits stack
+                            // down the column. Shows the balance of the account this
+                            // wallet OPERATES (its named account when attached, else
+                            // its own implicit id) — so a tax wallet shows its real
+                            // balance, not its empty implicit address.
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new("XUS")
+                                            .size(ty::MICRO)
+                                            .color(palette::text_dim()),
+                                    );
+                                    ui.label(num(balance_of(&effective)));
+                                    // Name-state badge — operate-as named account, else
+                                    // SNS name(s), else unnamed. Same SNS cache as the
+                                    // header. Fills the slack between id and balance,
+                                    // truncated so a long name never shoves the figures.
+                                    let badge = if operating_named {
+                                        format!("named · {effective}")
+                                    } else if !sns.is_empty() {
+                                        format!("SNS · {}", sns.join(", "))
+                                    } else {
+                                        "unnamed".to_string()
+                                    };
+                                    ui.add_space(sp::L);
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(badge)
+                                                        .size(ty::SMALL)
+                                                        .color(named_color(named)),
+                                                )
+                                                .truncate(),
+                                            );
+                                        },
                                     );
                                 },
                             );
                         });
-                    });
-                })
-                .response
-                .interact(egui::Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
-            if row.clicked() {
-                select = Some(i);
+                    })
+                    .response
+                    .interact(egui::Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if row.clicked() {
+                    select = Some(i);
+                }
             }
         }
 
@@ -10641,17 +11165,13 @@ impl Station {
         let mut do_register_named = false;
         let mut new_pending: Option<PendingSend> = None;
         let mut did_copy = false;
-        let mut do_send = false;
-        // The tip the spender CONFIRMED, carried from the review modal to the
-        // dispatch below. Re-reading the live suggestion at send time would sign a
-        // different bid than the one they approved — the pool moves every second.
-        let mut confirmed_tip_grains = 0u128;
-        let mut do_private_send = false;
+        // Keep the reviewed terms through the final dispatch check, after any
+        // wallet/account mutation collected elsewhere in this frame.
+        let mut confirmed_send: Option<PendingSend> = None;
         let mut do_scan = false;
         let mut do_scan_v2 = false;
         let mut do_shield_v2 = false;
         let mut do_deshield_v2 = false;
-        let mut do_send_v2 = false;
         let mut do_rescan = false;
         let mut do_deshield = false;
         let mut do_build_unsigned = false;
@@ -10672,73 +11192,150 @@ impl Station {
             // own implicit id. Balances/nonce/actions follow this.
             let effective = operate_as.clone().unwrap_or_else(|| account.clone());
             let onchain = s.accounts.iter().find(|a| a.account == effective);
-            ui.add_space(6.0);
-            egui::Grid::new("wdetail")
-                .num_columns(2)
-                .spacing([16.0, 4.0])
-                .show(ui, |ui| {
-                    kv(ui, "Label", &label);
-                    kv(ui, "Your account", &account);
-                    kv(ui, "Public key", &short_pubkey(&public_key));
-                    if let Some(named) = &operate_as {
-                        kv(ui, "▶ Operating as", named);
-                    }
-                    kv(
-                        ui,
-                        "Balance",
-                        &format!(
-                            "{} XUS",
+            // Shared facts are evaluated independently of the selected view.
+            // Privacy and send use the same balances and busy state as before.
+            const SEND_LABEL_W: f32 = 84.0;
+            let spendable: u128 = onchain.map(|a| a.balance.parse().unwrap_or(0)).unwrap_or(0);
+            let busy = self.action.lock().map(|a| a.busy).unwrap_or(false);
+
+            if self.wallet_view == WalletView::Overview {
+                egui::Frame::group(ui.style())
+                    .fill(palette::panel())
+                    .rounding(12.0)
+                    .inner_margin(egui::Margin::same(18.0))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new("YOUR ACCOUNT")
+                                    .small()
+                                    .color(palette::text_dim()),
+                            );
+                            if w_watch_only {
+                                pill(ui, "WATCH-ONLY", palette::link());
+                            } else {
+                                pill(ui, "KEYS ON THIS DEVICE", palette::accent_hi());
+                            }
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(short_id(&effective))
+                                    .monospace()
+                                    .strong(),
+                            );
+                            if ui.button("Copy account").clicked() {
+                                ui.output_mut(|o| o.copied_text = effective.clone());
+                                did_copy = true;
+                            }
+                            if ui.button("Account details").clicked() {
+                                self.wallet_view = WalletView::Identity;
+                            }
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new("Key state")
+                                    .small()
+                                    .color(palette::text_dim()),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    onchain
+                                        .map(|a| a.key_state.as_str())
+                                        .unwrap_or("not yet on-chain"),
+                                )
+                                .small(),
+                            );
+                            ui.add_space(12.0);
+                            ui.label(
+                                egui::RichText::new("Nonce")
+                                    .small()
+                                    .color(palette::text_dim()),
+                            );
+                            ui.label(num(onchain.map(|a| a.nonce.as_str()).unwrap_or("—")).small());
+                        });
+                        if let Some(named) = &operate_as {
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(format!("Operating as {named}"))
+                                    .small()
+                                    .color(palette::success()),
+                            );
+                        }
+                    });
+                ui.add_space(14.0);
+            }
+
+            if self.wallet_view == WalletView::Identity {
+                ui.add_space(6.0);
+                egui::Grid::new("wdetail")
+                    .num_columns(2)
+                    .spacing([16.0, 4.0])
+                    .show(ui, |ui| {
+                        kv(ui, "Label", &label);
+                        kv_copy(ui, "Your account", &account);
+                        kv_copy(ui, "Public key", &public_key);
+                        if let Some(named) = &operate_as {
+                            kv(ui, "▶ Operating as", named);
+                        }
+                        kv(
+                            ui,
+                            "Balance",
+                            &format!(
+                                "{} XUS",
+                                onchain
+                                    .map(|a| xus(&a.balance))
+                                    .unwrap_or_else(|| "—".into())
+                            ),
+                        );
+                        kv(
+                            ui,
+                            "On-chain",
                             onchain
-                                .map(|a| xus(&a.balance))
-                                .unwrap_or_else(|| "—".into())
-                        ),
-                    );
-                    kv(
-                        ui,
-                        "On-chain",
-                        onchain
-                            .map(|a| a.key_state.as_str())
-                            .unwrap_or("not yet on-chain"),
-                    );
-                    kv(
-                        ui,
-                        "Nonce",
-                        onchain.map(|a| a.nonce.as_str()).unwrap_or("—"),
-                    );
-                    kv(ui, "Shielded", &shielded);
-                    kv(ui, "Unified", &unified);
+                                .map(|a| a.key_state.as_str())
+                                .unwrap_or("not yet on-chain"),
+                        );
+                        kv(
+                            ui,
+                            "Nonce",
+                            onchain.map(|a| a.nonce.as_str()).unwrap_or("—"),
+                        );
+                        kv_copy(ui, "Shielded", &shielded);
+                        kv_copy(ui, "Unified", &unified);
+                    });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("copy:").weak());
+                    if ui.button("account").clicked() {
+                        ui.output_mut(|o| o.copied_text = account.clone());
+                        did_copy = true;
+                    }
+                    if ui.button("public key").clicked() {
+                        ui.output_mut(|o| o.copied_text = public_key.clone());
+                        did_copy = true;
+                    }
+                    if ui.button("shielded addr").clicked() {
+                        ui.output_mut(|o| o.copied_text = shielded.clone());
+                        did_copy = true;
+                    }
+                    if ui.button("unified addr").clicked() {
+                        ui.output_mut(|o| o.copied_text = unified.clone());
+                        did_copy = true;
+                    }
                 });
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("copy:").weak());
-                if ui.button("account").clicked() {
-                    ui.output_mut(|o| o.copied_text = account.clone());
-                    did_copy = true;
-                }
-                if ui.button("public key").clicked() {
-                    ui.output_mut(|o| o.copied_text = public_key.clone());
-                    did_copy = true;
-                }
-                if ui.button("shielded addr").clicked() {
-                    ui.output_mut(|o| o.copied_text = shielded.clone());
-                    did_copy = true;
-                }
-                if ui.button("unified addr").clicked() {
-                    ui.output_mut(|o| o.copied_text = unified.clone());
-                    did_copy = true;
-                }
-            });
-            ui.label(
-                egui::RichText::new(
-                    "“public key” is the hybrid65:0x… line to hand over for binding a named \
+                ui.label(
+                    egui::RichText::new(
+                        "“public key” is the hybrid65:0x… line to hand over for binding a named \
                      genesis account (e.g. a tax account). Safe to share; never share the phrase.",
-                )
-                .weak(),
-            );
+                    )
+                    .weak(),
+                );
+            }
 
             // Export / reveal the recovery phrase — re-displayable any time (not
             // just at generation), so the wallet can be backed up or moved.
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
+            if self.wallet_view == WalletView::Backup {
+                card_frame().show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("Recovery phrase").strong());
                 match &mnemonic {
                     Some(_) if !self.reveal_phrase => {
@@ -10754,6 +11351,12 @@ impl Station {
                             ui.output_mut(|o| o.copied_text = phrase.clone());
                             did_copy = true;
                         }
+                    }
+                    None if w_watch_only => {
+                        ui.label(
+                            egui::RichText::new("watch-only · no recovery phrase or private key on this device")
+                                .small().color(palette::text_dim()),
+                        );
                     }
                     None => {
                         ui.label(
@@ -10780,33 +11383,37 @@ impl Station {
                         });
                 }
             }
+            });
+                ui.add_space(14.0);
+            }
 
             // ── Name (ENS/SNS-style) ──────────────────────────────────────
             // Register a *.sov name that RESOLVES to this wallet's account. The
             // name is a pure alias — funds never leave the account.
-            let typed_name = self.name_field.trim().to_string();
-            let (name_ok, name_msg, name_busy) = self
-                .name_check
-                .lock()
-                .ok()
-                .map(|c| {
-                    if c.name == typed_name {
-                        (c.ok, c.message.clone(), c.checking)
-                    } else {
-                        (false, String::new(), !typed_name.is_empty())
-                    }
-                })
-                .unwrap_or((false, String::new(), false));
-            let my_names_list: Vec<String> = self
-                .names_by_account
-                .lock()
-                .ok()
-                .and_then(|m| m.get(&effective).cloned())
-                .unwrap_or_default();
-            ui.add_space(8.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label(egui::RichText::new("Sovereign Name Service (SNS)").strong());
-                ui.label(
+            if self.wallet_view == WalletView::Identity {
+                let typed_name = self.name_field.trim().to_string();
+                let (name_ok, name_msg, name_busy) = self
+                    .name_check
+                    .lock()
+                    .ok()
+                    .map(|c| {
+                        if c.name == typed_name {
+                            (c.ok, c.message.clone(), c.checking)
+                        } else {
+                            (false, String::new(), !typed_name.is_empty())
+                        }
+                    })
+                    .unwrap_or((false, String::new(), false));
+                let my_names_list: Vec<String> = self
+                    .names_by_account
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&effective).cloned())
+                    .unwrap_or_default();
+                ui.add_space(8.0);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.label(egui::RichText::new("Sovereign Name Service (SNS)").strong());
+                    ui.label(
                     egui::RichText::new(
                         "Your address is a key fingerprint. Register a “.sov” name so people can \
                          pay you by name — it resolves to THIS account and your funds never move. \
@@ -10814,18 +11421,18 @@ impl Station {
                     )
                     .weak(),
                 );
-                ui.horizontal(|ui| {
-                    ui.label("Name");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.name_field)
-                            .hint_text("alice.sov")
-                            .desired_width(220.0),
-                    );
-                    let busy = self.action.lock().map(|a| a.busy).unwrap_or(false);
-                    // The validation gate: enabled only once the name is well-
-                    // formed AND confirmed available on-chain (so it WILL resolve).
-                    let can = name_ok && !busy && !typed_name.is_empty();
-                    if ui
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Name");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.name_field)
+                                .hint_text("alice.sov")
+                                .desired_width(ui.available_width().min(220.0)),
+                        );
+                        let busy = self.action.lock().map(|a| a.busy).unwrap_or(false);
+                        // The validation gate: enabled only once the name is well-
+                        // formed AND confirmed available on-chain (so it WILL resolve).
+                        let can = name_ok && !busy && !typed_name.is_empty();
+                        if ui
                         .add_enabled(can, egui::Button::new("Register on-chain"))
                         .on_hover_text(
                             "Bind this .sov name as an alias to your account. Enabled only once \
@@ -10835,37 +11442,40 @@ impl Station {
                     {
                         do_register_named = true;
                     }
-                });
-                // Live status: empty / checking / available / invalid / taken.
-                if typed_name.is_empty() {
-                    ui.label(egui::RichText::new("enter a name like alice.sov").weak());
-                } else if name_busy {
-                    ui.label(egui::RichText::new("checking the network…").weak());
-                } else if !name_msg.is_empty() {
-                    let col = if name_ok {
-                        palette::success()
-                    } else {
-                        palette::error()
-                    };
-                    ui.colored_label(col, &name_msg);
-                }
-                if !my_names_list.is_empty() {
-                    ui.add_space(2.0);
-                    ui.label(
-                        egui::RichText::new(format!("Your names: {}", my_names_list.join(", ")))
+                    });
+                    // Live status: empty / checking / available / invalid / taken.
+                    if typed_name.is_empty() {
+                        ui.label(egui::RichText::new("enter a name like alice.sov").weak());
+                    } else if name_busy {
+                        ui.label(egui::RichText::new("checking the network…").weak());
+                    } else if !name_msg.is_empty() {
+                        let col = if name_ok {
+                            palette::success()
+                        } else {
+                            palette::error()
+                        };
+                        ui.colored_label(col, &name_msg);
+                    }
+                    if !my_names_list.is_empty() {
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Your names: {}",
+                                my_names_list.join(", ")
+                            ))
                             .color(named_color(true)),
-                    );
-                }
-                if !self.operate_msg.is_empty() {
-                    status_label(ui, &self.operate_msg);
-                }
-            });
+                        );
+                    }
+                    if !self.operate_msg.is_empty() {
+                        status_label(ui, &self.operate_msg);
+                    }
+                });
 
-            // ── Operate a named account you control (advanced) ─────────────
-            // The genesis/tax-account path: act AS a named account this key
-            // already controls. This is NOT name registration.
-            ui.add_space(6.0);
-            egui::CollapsingHeader::new("Operate a named account (advanced)")
+                // ── Operate a named account you control (advanced) ─────────────
+                // The genesis/tax-account path: act AS a named account this key
+                // already controls. This is NOT name registration.
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new("Operate a named account (advanced)")
                 .default_open(operate_as.is_some())
                 .show(ui, |ui| {
                     if let Some(named) = &operate_as {
@@ -10892,12 +11502,12 @@ impl Station {
                             )
                             .weak(),
                         );
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Account");
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.operate_as_field)
                                     .hint_text("name.reserve.sov")
-                                    .desired_width(220.0),
+                                    .desired_width(ui.available_width().min(220.0)),
                             );
                             if ui.button("Attach").clicked() {
                                 do_set_operate = true;
@@ -10905,11 +11515,14 @@ impl Station {
                         });
                     }
                 });
+            }
 
             // ── Receive ──
-            ui.separator();
-            ui.label(egui::RichText::new("Receive").strong().size(ty::SECTION));
-            ui.horizontal(|ui| {
+            if self.wallet_view == WalletView::Receive {
+                card_frame().show(ui, |ui| {
+            ui.label(egui::RichText::new("Choose an address").strong().size(ty::SECTION));
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(
                     &mut self.receive_kind,
                     ReceiveKind::Shielded,
@@ -10917,19 +11530,13 @@ impl Station {
                 );
                 ui.selectable_value(&mut self.receive_kind, ReceiveKind::Unified, "Unified");
                 ui.selectable_value(&mut self.receive_kind, ReceiveKind::Account, "Account");
-                // Pool v2 is marked in the tab strip itself, so its state is visible
-                // BEFORE it is selected — an operator never clicks in expecting a
-                // working receive address and discovers the dormancy afterwards.
+                let v2_state = PoolState::classify_v2(s.online, s.shielded_v2.as_ref());
                 ui.selectable_value(
                     &mut self.receive_kind,
                     ReceiveKind::ShieldedV2,
-                    "Post-quantum (v2) ◌",
+                    format!("Post-quantum (v2) · {}", v2_state.word()),
                 )
-                .on_hover_text(
-                    "The xusq1… address this seed controls in the post-quantum shielded \
-                     pool. The pool is NOT ACTIVE yet — the address is shown so you can \
-                     record it, but nothing can be sent to it.",
-                );
+                .on_hover_text(v2_state.explanation(Pool::V2));
             });
             let recv_addr = match self.receive_kind {
                 ReceiveKind::Shielded => shielded.clone(),
@@ -10938,10 +11545,7 @@ impl Station {
                 ReceiveKind::ShieldedV2 => v2_addr.clone(),
             };
             if self.receive_kind == ReceiveKind::ShieldedV2 {
-                // Pool v2 gets its own presentation. It is NOT a peer of the three
-                // working addresses above, for two independent reasons — it is not
-                // payable, and it is ~1,957 characters — and pretending otherwise
-                // would be both dishonest and unusable.
+                // The long ML-KEM address needs bounded inspection and full exports.
                 if v2_addr.is_empty() {
                     ui.add_space(sp::S);
                     empty_hint(
@@ -10956,8 +11560,14 @@ impl Station {
                     let v2_state = PoolState::classify_v2(s.online, s.shielded_v2.as_ref());
                     v2_address_block(ui, &v2_addr, &v2_tag, v2_state, &mut did_copy);
                 }
+            } else if recv_addr.is_empty() {
+                empty_hint(
+                    ui,
+                    "No address of this type for this wallet",
+                    "A watch-only wallet holds a public key. Choose Account to receive to its public account, or restore the recovery phrase to derive private addresses.",
+                );
             } else {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     qr_widget(ui, &recv_addr, 132.0);
                     ui.vertical(|ui| {
                         if self.receive_kind == ReceiveKind::Shielded {
@@ -11012,44 +11622,40 @@ impl Station {
                     });
                 });
             }
+            });
+            }
 
             // ── Send ──
-            ui.separator();
-            ui.label(egui::RichText::new("Send").strong().size(ty::SECTION));
-            // One label-column width shared by every form row in the send flow
-            // (transparent AND private), so the To / Amount fields start on the
-            // same x even across the auction panel that sits between them.
-            const SEND_LABEL_W: f32 = 84.0;
-            // Spendable balance of the account we're sending FROM (the effective).
-            let spendable: u128 = onchain.map(|a| a.balance.parse().unwrap_or(0)).unwrap_or(0);
-            egui::Grid::new("send_to_form")
-                .num_columns(2)
-                .min_col_width(SEND_LABEL_W)
-                .spacing([sp::L, sp::M])
-                .show(ui, |ui| {
-                    ui.label(egui::RichText::new("To").weak());
-                    ui.horizontal(|ui| {
-                        let edited = ui
-                            .add(egui::TextEdit::singleline(&mut self.send_to).desired_width(420.0))
-                            .changed();
-                        // Typing is the operator asserting the recipient themselves;
-                        // the stale undo from an earlier click must not linger and
-                        // offer to overwrite it.
-                        if edited {
-                            self.send_to_undo = None;
-                        }
+            let mut open_offline_signing = false;
+            if self.wallet_view == WalletView::Send {
+                card_frame().show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    // Text rows need their natural height; action targets below
+                    // retain explicit heights so the form remains easy to operate.
+                    ui.spacing_mut().interact_size.y = 0.0;
+                    ui.label(egui::RichText::new("To").strong().size(ty::SMALL));
+                    let edited = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.send_to)
+                                .hint_text("Account, .sov name, or wallet address")
+                                .margin(egui::Margin::symmetric(12.0, 10.0))
+                                .desired_width((ui.available_width() - 24.0).max(24.0)),
+                        )
+                        .changed();
+                    // Typing asserts the recipient; an earlier shortcut's undo must not
+                    // offer to overwrite an address the user subsequently entered.
+                    if edited {
+                        self.send_to_undo = None;
+                    }
+                    ui.horizontal_wrapped(|ui| {
                         if ui
-                            .button("Shield to my pool")
+                            .add(egui::Button::new("Shield to my pool").min_size(egui::vec2(0.0, 32.0)))
                             .on_hover_text(
                                 "Replace the recipient with this wallet's own shielded \
-                                 address. Reversible — an Undo appears if it replaced \
-                                 something.",
+                                         address. Reversible — an Undo appears if it replaced something.",
                             )
                             .clicked()
                         {
-                            // REVERSIBLE. This used to overwrite a pasted recipient
-                            // silently and irrecoverably — one stray click on a filled
-                            // field and the intended address was simply gone.
                             let prev = std::mem::replace(&mut self.send_to, shielded.clone());
                             if !prev.is_empty() && prev != self.send_to {
                                 self.send_to_undo = Some(prev);
@@ -11058,7 +11664,7 @@ impl Station {
                         }
                         if let Some(prev) = self.send_to_undo.clone() {
                             if ui
-                                .button("↩ Undo")
+                                .add(egui::Button::new("↩ Undo").min_size(egui::vec2(0.0, 32.0)))
                                 .on_hover_text(format!("restore {}", truncate_middle(&prev, 14, 8)))
                                 .clicked()
                             {
@@ -11067,205 +11673,255 @@ impl Station {
                             }
                         }
                     });
-                    ui.end_row();
-                });
-            // Live route detection + self-send labelling.
-            let route = SendRoute::detect(&self.send_to);
-            // Owned, not a borrow of `self.send_to`: the auction panel below takes
-            // `&mut self` to drive the tip field.
-            let to_trim = self.send_to.trim().to_string();
-            let to_trim = to_trim.as_str();
-            let self_send = !to_trim.is_empty()
-                && (to_trim == shielded
-                    || to_trim == unified
-                    || to_trim == account
-                    || to_trim == effective);
-            let (route_text, route_color) = route.label();
-            if !route_text.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(route_text).small().color(route_color));
-                    if self_send {
+                    // Live route detection + self-send labelling.
+                    let route = SendRoute::detect(&self.send_to);
+                    // Owned, not a borrow of `self.send_to`: the auction panel below takes
+                    // `&mut self` to drive the tip field.
+                    let to_trim = self.send_to.trim().to_string();
+                    let to_trim = to_trim.as_str();
+                    let self_send = !to_trim.is_empty()
+                        && (to_trim == shielded
+                            || to_trim == unified
+                            || to_trim == account
+                            || to_trim == effective);
+                    let (route_text, route_color) = route.label();
+                    if !route_text.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new(route_text).small().color(route_color));
+                            if self_send {
+                                ui.label(
+                                    egui::RichText::new("· your own address")
+                                        .small()
+                                        .color(named_color(true)),
+                                );
+                            }
+                        });
+                    } else {
                         ui.label(
-                            egui::RichText::new("· your own address")
-                                .small()
-                                .color(named_color(true)),
+                            egui::RichText::new(
+                                "Account / .sov name / xust1… → transparent · xus1… / uxus1… → shielded",
+                            )
+                            .size(ty::SMALL)
+                            .color(palette::text_dim()),
                         );
                     }
-                });
-            } else {
-                ui.label(
-                    egui::RichText::new("named account → transparent · xus1…/uxus1… → shielded")
-                        .weak(),
-                );
-            }
-            // Amount + Max + live validation. The network fee AND the auction tip are
-            // RESERVED: a send must leave room for both (amount + fee + tip ≤ balance),
-            // or the tx would fail execution ("cannot afford fee") and clog the mempool
-            // while blocks come up empty.
-            let base_fee = if route.private() {
-                s.fee_shielded_grains
-            } else {
-                s.fee_transfer_grains
-            };
-            // ── Blockspace auction: the live floor, and this send's bid ──────────
-            // Rendered BEFORE the amount field, because the tip changes what "Max"
-            // means and a spender must see the price of blockspace before they
-            // decide how much of their balance to commit.
-            let tip = self.auction_controls(ui, &s.auction);
-            // A tip is an ENVELOPE, and the envelope costs gas of its own — so the
-            // fee this send is charged is not the bare route's fee once a tip is
-            // attached. Reserving the bare figure would build a send that cannot
-            // pay for itself (a hard `CannotAffordFee` reject).
-            let fee = auction::route_fee_grains(base_fee, s.gas_price_grains, tip);
-            // The most you can send while still covering the fee AND the tip.
-            let sendable = auction::max_sendable_grains(spendable, fee, tip);
-            let amount_grains = parse_xus(&self.send_amount);
-            let amount_resp = egui::Grid::new("send_amount_form")
-                .num_columns(2)
-                .min_col_width(SEND_LABEL_W)
-                .spacing([sp::L, sp::M])
-                .show(ui, |ui| {
-                    ui.label(egui::RichText::new("Amount XUS").weak());
-                    let r = ui
+                    // Amount + Max + live validation. The network fee AND the auction tip are
+                    // RESERVED: a send must leave room for both (amount + fee + tip ≤ balance),
+                    // or the tx would fail execution ("cannot afford fee") and clog the mempool
+                    // while blocks come up empty.
+                    let base_fee = if route.private() {
+                        s.fee_shielded_grains
+                    } else {
+                        s.fee_transfer_grains
+                    };
+                    // ── Blockspace auction: the live floor, and this send's bid ──────────
+                    // Rendered BEFORE the amount field, because the tip changes what "Max"
+                    // means and a spender must see the price of blockspace before they
+                    // decide how much of their balance to commit.
+                    let tip = self.auction_controls(ui, &s.auction);
+                    // A tip is an ENVELOPE, and the envelope costs gas of its own — so the
+                    // fee this send is charged is not the bare route's fee once a tip is
+                    // attached. Reserving the bare figure would build a send that cannot
+                    // pay for itself (a hard `CannotAffordFee` reject).
+                    let fee = auction::route_fee_grains(base_fee, s.gas_price_grains, tip);
+                    // The most you can send while still covering the fee AND the tip.
+                    let sendable = auction::max_sendable_grains(spendable, fee, tip);
+                    ui.add_space(sp::L);
+                    ui.label(egui::RichText::new("Amount XUS").strong().size(ty::SMALL));
+                    let amount_resp = ui
                         .horizontal(|ui| {
+                            let field_width =
+                                (ui.available_width() - 68.0 - ui.spacing().item_spacing.x - 24.0)
+                                    .max(24.0);
                             let r = ui.add(
                                 egui::TextEdit::singleline(&mut self.send_amount)
-                                    .desired_width(160.0),
+                                    .hint_text("0.00")
+                                    .font(egui::FontId::proportional(22.0))
+                                    .margin(egui::Margin::symmetric(12.0, 10.0))
+                                    .desired_width(field_width),
                             );
                             if ui
-                                .button("Max")
+                                .add_sized([68.0, 46.0], egui::Button::new("Max"))
                                 .on_hover_text(
-                                    "send the most that still leaves room for the network fee \
-                                     and the tip",
+                                    "Send the most that still leaves room for the network fee and the tip.",
                                 )
                                 .clicked()
                             {
                                 self.send_amount = grains_to_xus_plain(sendable);
                             }
-                            let note = match (fee, tip) {
-                                (0, 0) => format!("balance {} XUS", xus(&spendable.to_string())),
-                                (f, 0) => format!(
-                                    "balance {} XUS · fee ~{} XUS",
-                                    xus(&spendable.to_string()),
-                                    xus(&f.to_string())
-                                ),
-                                (f, t) => format!(
-                                    "balance {} XUS · fee ~{} + tip {} XUS",
-                                    xus(&spendable.to_string()),
-                                    xus(&f.to_string()),
-                                    xus(&t.to_string())
-                                ),
-                            };
-                            ui.label(egui::RichText::new(note).weak());
                             r
                         })
                         .inner;
-                    ui.end_row();
-                    r
-                })
-                .inner;
-            let amount_err: Option<String> = match amount_grains {
-                None if !self.send_amount.trim().is_empty() => {
-                    Some("amount must be a number (e.g. 1.5)".to_string())
-                }
-                Some(0) => Some("amount must be greater than zero".to_string()),
-                Some(g) if g > spendable => Some("amount exceeds your balance".to_string()),
-                Some(g) if g > sendable => Some(format!(
-                    "amount + network fee (~{} XUS){} exceeds your balance — lower it, lower the \
-                     tip, or use Max",
-                    xus(&fee.to_string()),
-                    if tip > 0 {
-                        format!(" + tip ({} XUS)", xus(&tip.to_string()))
-                    } else {
-                        String::new()
+                    let amount_grains = parse_xus(&self.send_amount);
+                    ui.label(
+                        egui::RichText::new("Max keeps the network fee and priority tip covered.")
+                            .size(ty::SMALL)
+                            .color(palette::text_dim()),
+                    );
+                    let amount_err: Option<String> = match amount_grains {
+                        None if !self.send_amount.trim().is_empty() => {
+                            Some("amount must be a number (e.g. 1.5)".to_string())
+                        }
+                        Some(0) => Some("amount must be greater than zero".to_string()),
+                        Some(g) if g > spendable => Some("amount exceeds your balance".to_string()),
+                        Some(g) if g > sendable => Some(format!(
+                            "amount + network fee (~{} XUS){} exceeds your balance — lower it, lower the \
+                             tip, or use Max",
+                            xus(&fee.to_string()),
+                            if tip > 0 {
+                                format!(" + tip ({} XUS)", xus(&tip.to_string()))
+                            } else {
+                                String::new()
+                            }
+                        )),
+                        _ => None,
+                    };
+                    // The full cost stays together: the available account balance,
+                    // consensus fee, bid, total debit, and balance remaining.
+                    ui.add_space(sp::M);
+                    egui::Frame::none()
+                        .fill(palette::field())
+                        .rounding(10.0)
+                        .inner_margin(egui::Margin::same(12.0))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().interact_size.y = 0.0;
+                            ui.set_min_width(ui.available_width());
+                            egui::Grid::new("send_cost_summary")
+                                .num_columns(2)
+                                .max_col_width((ui.available_width() - sp::XL) * 0.5)
+                                .spacing([sp::XL, sp::S])
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new("Available balance").color(palette::text_dim()),
+                                    );
+                                    let balance = onchain
+                                        .and_then(|a| a.balance.parse::<u128>().ok())
+                                        .map(|g| format!("{} XUS", xus(&g.to_string())))
+                                        .unwrap_or_else(|| "—".to_string());
+                                    ui.label(num(balance).color(palette::text()));
+                                    ui.end_row();
+                                    ui.label(egui::RichText::new("Network fee").color(palette::text_dim()));
+                                    ui.label(
+                                        num(format!("~{} XUS", xus(&fee.to_string())))
+                                            .color(palette::text()),
+                                    );
+                                    ui.end_row();
+                                    ui.label(
+                                        egui::RichText::new("Priority tip").color(palette::text_dim()),
+                                    );
+                                    ui.label(
+                                        num(format!("{} XUS", xus(&tip.to_string())))
+                                            .color(palette::text()),
+                                    );
+                                    ui.end_row();
+                                    if let Some(g) = amount_grains.filter(|g| *g > 0) {
+                                        let cost = SendCost {
+                                            amount_grains: g,
+                                            fee_grains: fee,
+                                            tip_grains: tip,
+                                        };
+                                        let color = if cost.affordable(spendable) {
+                                            palette::text()
+                                        } else {
+                                            palette::error()
+                                        };
+                                        ui.label(egui::RichText::new("Total debit").strong().color(color));
+                                        ui.label(
+                                            num(format!("{} XUS", xus(&cost.total_grains().to_string())))
+                                                .strong()
+                                                .color(color),
+                                        );
+                                        ui.end_row();
+                                        ui.label(
+                                            egui::RichText::new("Balance after").color(palette::text_dim()),
+                                        );
+                                        let balance_after = onchain
+                                            .and_then(|a| a.balance.parse::<u128>().ok())
+                                            .map(|g| {
+                                                format!("{} XUS", xus(&cost.balance_after(g).to_string()))
+                                            })
+                                            .unwrap_or_else(|| "—".to_string());
+                                        ui.label(num(balance_after).color(color));
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    if let Some(e) = &amount_err {
+                        ui.label(
+                            egui::RichText::new(format!("✗ {e}"))
+                                .small()
+                                .color(palette::error()),
+                        );
                     }
-                )),
-                _ => None,
-            };
-            // The full cost, once, in one place: what the recipient gets, what
-            // consensus charges, what the bid costs, and what is left.
-            if let Some(g) = amount_grains.filter(|g| *g > 0) {
-                let cost = SendCost {
-                    amount_grains: g,
-                    fee_grains: fee,
-                    tip_grains: tip,
-                };
-                ui.add_space(sp::XS);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "total {} XUS  ·  balance after {} XUS",
-                        xus(&cost.total_grains().to_string()),
-                        xus(&cost.balance_after(spendable).to_string())
-                    ))
-                    .size(ty::SMALL)
-                    .color(if cost.affordable(spendable) {
-                        palette::text_dim()
-                    } else {
-                        palette::error()
-                    }),
-                );
-            }
-            if let Some(e) = &amount_err {
-                ui.label(
-                    egui::RichText::new(format!("✗ {e}"))
-                        .small()
-                        .color(palette::error()),
-                );
-            }
-            let busy = self.action.lock().map(|a| a.busy).unwrap_or(false);
-            let can_send = route.is_valid()
-                && matches!(amount_grains, Some(g) if g > 0 && g <= sendable)
-                && !busy;
-            // Pressing Enter in the amount field reviews the send (same as the button).
-            let submit_enter =
-                amount_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let mut review_clicked = false;
-            ui.add_space(sp::S);
-            // The one step forward, styled as THE primary action — the same filled
-            // treatment as the modal's "Confirm & send", so the path reads as two
-            // matching green steps: review, then confirm. Nothing is sent here.
-            ui.add_enabled_ui(can_send, |ui| {
-                if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new("Review send →")
-                                .strong()
-                                .color(egui::Color32::WHITE),
-                        )
-                        .fill(palette::accent()),
-                    )
-                    .clicked()
-                {
-                    review_clicked = true;
-                }
-            });
-            if (review_clicked || submit_enter) && can_send {
-                if let Some(g) = amount_grains {
-                    new_pending = Some(PendingSend {
-                        from_label: label.clone(),
-                        from_account: effective.clone(),
-                        to: to_trim.to_string(),
-                        amount_grains: g,
-                        from_balance_grains: spendable,
-                        route_label: route.label().0,
-                        self_send,
-                        // Any transparent route puts sender, recipient, and amount
-                        // on-chain in the clear — the privacy downgrade.
-                        links_public: !route.private(),
-                        source: SendSource::Transparent,
-                        fee_grains: fee,
-                        tip_grains: tip,
+                    let can_send = !w_watch_only
+                        && route.is_valid()
+                        && matches!(amount_grains, Some(g) if g > 0 && g <= sendable)
+                        && !busy;
+                    // Pressing Enter in the amount field reviews the send (same as the button).
+                    let submit_enter =
+                        amount_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let mut review_clicked = false;
+                    ui.add_space(sp::S);
+                    // The one step forward, styled as THE primary action — the same filled
+                    // treatment as the modal's "Confirm & send", so the path reads as two
+                    // matching green steps: review, then confirm. Nothing is sent here.
+                    if ui
+                        .vertical_centered_justified(|ui| primary_button(ui, "Review send", can_send))
+                        .inner
+                        .clicked()
+                    {
+                        review_clicked = true;
+                    }
+                    if (review_clicked || submit_enter) && can_send {
+                        if let Some(g) = amount_grains {
+                            new_pending = Some(PendingSend {
+                                from_label: label.clone(),
+                                wallet_account: account.clone(),
+                                from_account: effective.clone(),
+                                network: self.network,
+                                rpc: self
+                                    .config
+                                    .lock()
+                                    .map(|c| c.rpc.clone())
+                                    .unwrap_or_default(),
+                                to: to_trim.to_string(),
+                                amount_grains: g,
+                                from_balance_grains: spendable,
+                                route_label: route.label().0,
+                                self_send,
+                                // Any transparent route puts sender, recipient, and amount
+                                // on-chain in the clear — the privacy downgrade.
+                                links_public: !route.private(),
+                                source: SendSource::Transparent,
+                                fee_grains: fee,
+                                tip_grains: tip,
+                            });
+                        }
+                    }
+                    if busy {
+                        ui.label(egui::RichText::new("working…").weak());
+                    }
+                    ui.add_space(sp::S);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Open offline signing").clicked() {
+                            open_offline_signing = true;
+                        }
+                        ui.label(
+                            egui::RichText::new(if w_watch_only {
+                                "Watch-only wallet · sign on the device that holds your key."
+                            } else {
+                                "Build, sign, and broadcast from separate devices."
+                            })
+                            .size(ty::SMALL)
+                            .color(palette::text_dim()),
+                        );
                     });
-                }
-            }
-            if busy {
-                ui.label(egui::RichText::new("working…").weak());
+                });
             }
 
             // Shielded pool: private balance (scanned by trial-decryption) + de-shield.
-            ui.add_space(sp::L);
-            ui.separator();
-            ui.add_space(sp::M);
+            if self.wallet_view == WalletView::Privacy {
+                card_frame().show(ui, |ui| {
             // THIS wallet's scanned view, looked up by its own account — never
             // whatever was scanned last. An unscanned wallet yields the default
             // view (scanned_height 0), which renders as UNKNOWN, not zero.
@@ -11297,10 +11953,29 @@ impl Station {
                 .map(|m| m.view_for(&account))
                 .unwrap_or_default();
             let v2_own = v2v.own_figures(&account);
-            shielded_pools_view(ui, &snap, v1_own, v2_own);
+            let pool_summaries = [
+                (Pool::V1, PoolState::classify_v1(snap.online, snap.shielded_v1_available), v1_own),
+                (Pool::V2, PoolState::classify_v2(snap.online, snap.shielded_v2.as_ref()), v2_own),
+            ];
+            if ui.available_width() >= 720.0 {
+                ui.columns(2, |columns| {
+                    for (column, (pool, state, own)) in columns.iter_mut().zip(pool_summaries) {
+                        pool_balance_card(column, pool, state, own, false);
+                    }
+                });
+            } else {
+                for (pool, state, own) in pool_summaries {
+                    pool_balance_card(ui, pool, state, own, false);
+                    ui.add_space(sp::M);
+                }
+            }
+            ui.add_space(sp::M);
+            ui.collapsing("Pool details · drain budgets, cryptography & network totals", |ui| {
+                shielded_pools_view(ui, &snap, v1_own, v2_own);
+            });
             if sv.scanning {
                 ui.add_space(sp::S);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.spinner();
                     ui.label(
                         egui::RichText::new("scanning pool v1 by trial-decryption…")
@@ -11317,7 +11992,7 @@ impl Station {
                 PoolState::Active
             ) {
                 ui.add_space(sp::S);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.add_enabled_ui(!v2v.scanning && !busy, |ui| {
                         if ui
                             .button("Scan pool v2")
@@ -11346,11 +12021,25 @@ impl Station {
 
             ui.add_space(sp::L);
             ui.label(
-                egui::RichText::new("Pool v1 — move value")
+                egui::RichText::new("Pool v1 · shield and de-shield")
                     .size(ty::SECTION)
                     .strong(),
             );
             ui.add_space(sp::S);
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(!shielded.is_empty() && !busy, egui::Button::new("Shield into pool v1"))
+                    .on_hover_text("Open Send with your own v1 address. Choose the amount and review before shielding.")
+                    .clicked()
+                {
+                    self.send_to = shielded.clone();
+                    self.send_amount.clear();
+                    self.send_to_undo = None;
+                    self.pending_send = None;
+                    self.wallet_view = WalletView::Send;
+                }
+                ui.label(egui::RichText::new("Fund from your public balance, or move shielded value back below.").small().color(palette::text_dim()));
+            });
+            ui.add_space(sp::M);
             // De-shield a VARIABLE amount: move `amount` from the pool to this
             // account's transparent balance; any remainder stays shielded as change.
             // The amount is bounded by the wallet's shielded balance AND the node's
@@ -11365,7 +12054,7 @@ impl Station {
                 None => sv.balance as u128,
             };
             let ds_grains = parse_xus(&self.deshield_amount);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Scan pool").clicked() {
                     do_scan = true;
                 }
@@ -11389,7 +12078,7 @@ impl Station {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.deshield_amount)
                         .hint_text("amount")
-                        .desired_width(140.0),
+                        .desired_width(ui.available_width().min(140.0)),
                 );
                 ui.add_enabled_ui(deshield_cap > 0, |ui| {
                     if ui
@@ -11414,7 +12103,7 @@ impl Station {
             // Confirmation for the destructive "Rescan from scratch": deleting the cache is
             // safe (rebuildable) but a full re-scan is expensive, so require an explicit OK.
             if self.rescan_armed {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.colored_label(
                         palette::warning(),
                         "Delete this wallet's note-store cache and re-scan the whole chain?",
@@ -11565,8 +12254,8 @@ impl Station {
             // who never looked at this control.
             let v2_selectable = v2_state == PoolState::Active;
             let mut pick = chosen;
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut pick, Some(Pool::V1), Pool::V1.selector_label())
+            ui.horizontal_wrapped(|ui| {
+                ui.selectable_value(&mut pick, Some(Pool::V1), egui::RichText::new(Pool::V1.selector_label()).monospace())
                     .on_hover_text(
                         "Zcash Orchard / Halo2, live since genesis. Its hiding is discrete-log \
                          based: a future quantum adversary who recorded this chain could break \
@@ -11576,7 +12265,7 @@ impl Station {
                     ui.selectable_value(
                         &mut pick,
                         Some(Pool::V2),
-                        format!("{} {}", Pool::V2.selector_label(), v2_state.glyph()),
+                        egui::RichText::new(format!("{} {}", Pool::V2.selector_label(), v2_state.glyph())).monospace(),
                     )
                     .on_hover_text(
                         "ML-KEM-768 note carriers with a STARK spend proof — no discrete-log \
@@ -11606,7 +12295,9 @@ impl Station {
             // would give them the exact property they were trying to avoid.
             let armed = armed_pool(chosen, v2_state);
             ui.add_space(sp::S);
-            arm_banner(ui, armed);
+            if chosen.is_none() {
+                arm_banner(ui, armed);
+            }
 
             // No pool chosen ⇒ no form at all. An operator must not be able to
             // fill in a recipient and an amount and only then discover which pool
@@ -11642,10 +12333,16 @@ impl Station {
                 // rendering a bare `0` beside the word "balance" is exactly how an
                 // operator concludes their funds are gone — so the state word replaces
                 // the figure rather than sitting next to a misleading one.
-                let sel_balance_text = match sel_state {
-                    PoolState::Active => format!("{} XUS scanned", xus(&sel_balance.to_string())),
-                    PoolState::Dormant => format!("{} — no notes can exist yet", sel_state.word()),
-                    PoolState::Unavailable => format!("{} — balance unknown", sel_state.word()),
+                let sel_own = match sel {
+                    Pool::V1 => sv.own_figures(&account),
+                    Pool::V2 => v2v.own_figures(&account),
+                };
+                let sel_balance_text = match (sel_state, sel_own) {
+                    (PoolState::Active, Some((balance, _, _))) => {
+                        format!("{} XUS scanned", xus(&balance.to_string()))
+                    }
+                    (PoolState::Dormant, _) => format!("{} — no notes can exist yet", sel_state.word()),
+                    _ => "balance unknown — scan this pool first".to_string(),
                 };
                 ui.label(
                     egui::RichText::new(format!(
@@ -11653,7 +12350,7 @@ impl Station {
                         sel.name(),
                         sel.crypto(),
                         sel.pq_claim(),
-                        sel_state.glyph(),
+                        sel_state.word(),
                     ))
                     .small()
                     .color(match sel {
@@ -11684,7 +12381,7 @@ impl Station {
                                     "{} (recipient stays private)",
                                     sel.address_hint()
                                 ))
-                                .desired_width(420.0),
+                                .desired_width(ui.available_width().min(420.0)),
                         );
                         ui.end_row();
                     });
@@ -11714,9 +12411,9 @@ impl Station {
                     .spacing([sp::L, sp::M])
                     .show(ui, |ui| {
                         ui.label(egui::RichText::new("Amount XUS").weak());
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.add(
-                                egui::TextEdit::singleline(priv_amount_field).desired_width(160.0),
+                                egui::TextEdit::singleline(priv_amount_field).desired_width(ui.available_width().min(160.0)),
                             );
                             if ui
                                 .button("Max")
@@ -11828,17 +12525,7 @@ impl Station {
                 ui.add_enabled_ui(priv_ok, |ui| {
                     // Primary-styled like the transparent "Review send →" and the
                     // modal's confirm — one visual language for "the step forward".
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("Review private send →")
-                                    .strong()
-                                    .color(egui::Color32::WHITE),
-                            )
-                            .fill(palette::accent()),
-                        )
-                        .clicked()
-                    {
+                    if primary_button(ui, "Review private send", true).clicked() {
                         // EVERY condition re-decided at click time, not inherited from
                         // paint: what is armed, and whether the recipient belongs to
                         // the armed pool. Both can go stale between the two.
@@ -11854,7 +12541,10 @@ impl Station {
                                     };
                                     new_pending = Some(PendingSend {
                                         from_label: label.clone(),
+                                        wallet_account: account.clone(),
                                         from_account: effective.clone(),
+                                        network: self.network,
+                                        rpc: self.config.lock().map(|c| c.rpc.clone()).unwrap_or_default(),
                                         to,
                                         amount_grains: g,
                                         from_balance_grains: sel_balance,
@@ -11951,15 +12641,15 @@ impl Station {
                     .spacing([sp::L, sp::M])
                     .show(ui, |ui| {
                         ui.label(egui::RichText::new("Shield in").weak());
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.shield_v2_amount_in)
                                     .hint_text("amount")
-                                    .desired_width(140.0),
+                                    .desired_width(ui.available_width().min(140.0)),
                             );
                             ui.add_enabled_ui(shield_v.is_ok(), |ui| {
                                 if ui
-                                    .button("Shield →")
+                                    .button("Shield")
                                     .on_hover_text(
                                         "Move transparent value into the post-quantum pool. \
                                          Builds a real STARK proof (~25 s).",
@@ -11988,16 +12678,16 @@ impl Station {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.shield_v2_to)
                                 .hint_text("xusq1… (blank = yourself)")
-                                .desired_width(360.0),
+                                .desired_width(ui.available_width().min(360.0)),
                         );
                         ui.end_row();
 
                         ui.label(egui::RichText::new("De-shield out").weak());
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.deshield_v2_amount_in)
                                     .hint_text("amount")
-                                    .desired_width(140.0),
+                                    .desired_width(ui.available_width().min(140.0)),
                             );
                             ui.add_enabled_ui(v2_cap > 0, |ui| {
                                 if ui
@@ -12062,7 +12752,7 @@ impl Station {
                         .map(|a| a.message.clone())
                         .unwrap_or_default();
                     ui.add_space(sp::S);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.spinner();
                         ui.label(
                             egui::RichText::new(if act_msg.is_empty() {
@@ -12098,314 +12788,379 @@ impl Station {
                     );
                 }
             }
+            });
+            }
 
             // ── Offline / air-gapped signing (cold reserves) ──────────────────
-            ui.add_space(6.0);
-            egui::CollapsingHeader::new("🔌 Offline / air-gapped signing").show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "Keep keys off the network. Build an UNSIGNED tx here, carry it to the \
-                         air-gapped machine to SIGN, then BROADCAST the signed result from an \
-                         online node. A watch-only wallet can do step 1 and 3.",
-                    )
-                    .weak()
-                    .small(),
-                );
-                // 1. Build unsigned (online / watch-only).
-                ui.label(egui::RichText::new("1 · Build unsigned transfer").strong());
-                ui.horizontal(|ui| {
-                    ui.label("To");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.ofl_to)
-                            .hint_text("recipient account id")
-                            .desired_width(360.0),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Amount XUS");
-                    ui.add(egui::TextEdit::singleline(&mut self.ofl_amount).desired_width(120.0));
-                    if ui.button("Build unsigned").clicked() {
-                        do_build_unsigned = true;
-                    }
-                });
-                if !self.ofl_unsigned.is_empty() {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.ofl_unsigned)
-                            .desired_rows(4)
-                            .desired_width(f32::INFINITY)
-                            .font(egui::TextStyle::Monospace),
-                    );
-                    if ui.button("Copy unsigned").clicked() {
-                        ui.output_mut(|o| o.copied_text = self.ofl_unsigned.clone());
-                        did_copy = true;
-                    }
-                }
-                ui.separator();
-                // 2. Sign (offline machine that holds the seed).
-                ui.label(egui::RichText::new("2 · Sign (machine with the seed)").strong());
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.ofl_sign_in)
-                        .hint_text("paste the unsigned tx JSON here")
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace),
-                );
-                if ui.button("Sign").clicked() {
-                    do_sign_offline = true;
-                }
-                if !self.ofl_signed.is_empty() {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.ofl_signed)
-                            .desired_rows(4)
-                            .desired_width(f32::INFINITY)
-                            .font(egui::TextStyle::Monospace),
-                    );
-                    if ui.button("Copy signed").clicked() {
-                        ui.output_mut(|o| o.copied_text = self.ofl_signed.clone());
-                        did_copy = true;
-                    }
-                }
-                ui.separator();
-                // 3. Broadcast (online node).
-                ui.label(egui::RichText::new("3 · Broadcast (online node)").strong());
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.ofl_broadcast_in)
-                        .hint_text("paste the signed tx JSON here")
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace),
-                );
-                if ui.button("Broadcast").clicked() {
-                    do_broadcast = true;
-                }
-                if !self.ofl_msg.is_empty() {
-                    status_label(ui, &self.ofl_msg);
-                }
-            });
+            if matches!(self.wallet_view, WalletView::Send | WalletView::Backup) {
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new("🔌 Offline / air-gapped signing")
+                    .open(open_offline_signing.then_some(true))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Keep keys off the network. Build an UNSIGNED tx here, carry it to the \
+                                 air-gapped machine to SIGN, then BROADCAST the signed result from an \
+                                 online node. A watch-only wallet can do step 1 and 3.",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                        // 1. Build unsigned (online / watch-only).
+                        ui.add_space(sp::M);
+                        ui.label(
+                            egui::RichText::new("1 · Build unsigned transfer")
+                                .size(ty::SECTION)
+                                .strong(),
+                        );
+                        ui.label(
+                            egui::RichText::new("To")
+                                .size(ty::SMALL)
+                                .color(palette::text_dim()),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.ofl_to)
+                                .hint_text("Recipient account id")
+                                .margin(egui::Margin::symmetric(12.0, 8.0))
+                                .desired_width(ui.available_width()),
+                        );
+                        ui.label(
+                            egui::RichText::new("Amount XUS")
+                                .size(ty::SMALL)
+                                .color(palette::text_dim()),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.ofl_amount)
+                                .hint_text("0.00")
+                                .margin(egui::Margin::symmetric(12.0, 8.0))
+                                .desired_width(ui.available_width()),
+                        );
+                        if primary_button(ui, "Build unsigned", true).clicked() {
+                            do_build_unsigned = true;
+                        }
+                        if !self.ofl_unsigned.is_empty() {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.ofl_unsigned)
+                                    .desired_rows(4)
+                                    .desired_width(f32::INFINITY)
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                            if ui.button("Copy unsigned").clicked() {
+                                ui.output_mut(|o| o.copied_text = self.ofl_unsigned.clone());
+                                did_copy = true;
+                            }
+                        }
+                        ui.separator();
+                        // 2. Sign (offline machine that holds the seed).
+                        ui.label(
+                            egui::RichText::new("2 · Sign (machine with the seed)")
+                                .size(ty::SECTION)
+                                .strong(),
+                        );
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.ofl_sign_in)
+                                .hint_text("paste the unsigned tx JSON here")
+                                .desired_rows(3)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if primary_button(ui, "Sign", true).clicked() {
+                            do_sign_offline = true;
+                        }
+                        if !self.ofl_signed.is_empty() {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.ofl_signed)
+                                    .desired_rows(4)
+                                    .desired_width(f32::INFINITY)
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                            if ui.button("Copy signed").clicked() {
+                                ui.output_mut(|o| o.copied_text = self.ofl_signed.clone());
+                                did_copy = true;
+                            }
+                        }
+                        ui.separator();
+                        // 3. Broadcast (online node).
+                        ui.label(
+                            egui::RichText::new("3 · Broadcast (online node)")
+                                .size(ty::SECTION)
+                                .strong(),
+                        );
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.ofl_broadcast_in)
+                                .hint_text("paste the signed tx JSON here")
+                                .desired_rows(3)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if primary_button(ui, "Broadcast", true).clicked() {
+                            do_broadcast = true;
+                        }
+                        if !self.ofl_msg.is_empty() {
+                            status_label(ui, &self.ofl_msg);
+                        }
+                    });
+            }
         }
 
         // A freshly-reviewed send opens the confirmation modal.
         if new_pending.is_some() {
             self.pending_send = new_pending;
         }
+        if let Some(review) = self.pending_send.as_ref() {
+            if let Err(why) = self.validate_reviewed_send(review) {
+                self.expired_review(why);
+            }
+        }
         // ── Send confirmation modal (review before broadcast) ──
         if let Some(p) = self.pending_send.clone() {
             let ctx = ui.ctx().clone();
-            let network = self.network;
+            let network = p.network;
+            let modal_width = transaction_review_width(&ctx);
             egui::Window::new(egui::RichText::new("Review transaction").strong())
                 .collapsible(false)
                 .resizable(false)
-                .default_width(450.0)
+                .default_width(modal_width)
+                .max_width(modal_width)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(&ctx, |ui| {
-                    ui.set_max_width(450.0);
-                    // Hero amount + privacy state — the two things that matter most.
-                    // The amount is the modal's ONE hero figure, on the type ladder.
-                    ui.add_space(sp::XS);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            num(xus(&p.amount_grains.to_string()))
-                                .size(ty::HERO)
-                                .strong()
-                                .color(palette::text()),
-                        );
-                        ui.label(
-                            egui::RichText::new("XUS")
-                                .size(ty::SECTION)
-                                .color(palette::text_dim()),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if p.links_public {
-                                pill(ui, "PUBLIC", palette::warning());
-                            } else {
-                                pill(ui, "PRIVATE", palette::success());
-                            }
-                            // The post-quantum status as a WORD, beside the
-                            // privacy pill. "PRIVATE" alone is the dangerous
-                            // half-truth — private against whom, and for how
-                            // long, is what the pool decides.
-                            if let Some(pool) = p.pool() {
-                                pill(
-                                    ui,
-                                    pool.pq_badge(),
-                                    match pool {
-                                        Pool::V1 => palette::warning(),
-                                        Pool::V2 => palette::success(),
-                                    },
-                                );
-                            }
+                    ui.set_max_width(modal_width);
+                    transaction_review_scroll(ui, "transaction_review_scroll", |ui| {
+                        // Hero amount + privacy state — the two things that matter most.
+                        // The amount is the modal's ONE hero figure, on the type ladder.
+                        ui.add_space(sp::XS);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                num(xus(&p.amount_grains.to_string()))
+                                    .size(ty::HERO)
+                                    .strong()
+                                    .color(palette::text()),
+                            );
+                            ui.label(
+                                egui::RichText::new("XUS")
+                                    .size(ty::SECTION)
+                                    .color(palette::text_dim()),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if p.links_public {
+                                        pill(ui, "PUBLIC", palette::warning());
+                                    } else {
+                                        pill(ui, "PRIVATE", palette::success());
+                                    }
+                                    // The post-quantum status as a WORD, beside the
+                                    // privacy pill. "PRIVATE" alone is the dangerous
+                                    // half-truth — private against whom, and for how
+                                    // long, is what the pool decides.
+                                    if let Some(pool) = p.pool() {
+                                        pill(
+                                            ui,
+                                            pool.pq_badge(),
+                                            match pool {
+                                                Pool::V1 => palette::warning(),
+                                                Pool::V2 => palette::success(),
+                                            },
+                                        );
+                                    }
+                                },
+                            );
                         });
-                    });
-                    // The source, stated where it cannot be missed and in terms
-                    // that decide the durability of this payment's privacy. Read
-                    // straight off `SendSource`, which is total — every reachable
-                    // confirm screen carries this line, pool or transparent.
-                    ui.add_space(sp::M);
-                    ui.label(
-                        egui::RichText::new(p.source.confirm_line())
-                            .strong()
-                            .monospace()
-                            .color(match p.pool() {
-                                Some(Pool::V1) => palette::warning(),
-                                Some(Pool::V2) => palette::success(),
-                                None => palette::warning(),
-                            }),
-                    );
-                    ui.add_space(sp::L);
-                    egui::Grid::new("confirm_grid")
-                        .num_columns(2)
-                        .spacing([16.0, 8.0])
-                        .show(ui, |ui| {
-                            kv(
-                                ui,
-                                "From",
-                                &format!("{} · {}", p.from_label, short_id(&p.from_account)),
-                            );
-                            // Recipient, monospace + wrapped so it never overflows. A
-                            // pool-v2 xusq1… address carries an ML-KEM key (~1.2 KiB)
-                            // and is NEVER rendered raw — head…tail elision, the same
-                            // rule as everywhere else it appears.
-                            let to_display = if p.to.starts_with("xusq1") {
-                                truncate_middle(&p.to, 22, 12)
-                            } else {
-                                p.to.clone()
-                            };
-                            ui.label(egui::RichText::new("To").weak());
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(to_display).monospace().size(ty::SMALL),
-                                )
-                                .wrap(),
-                            );
-                            ui.end_row();
-                            kv(ui, "Route", &p.route_label);
-                            // WHICH pool moves, and whether its privacy is
-                            // post-quantum, as a named row as well as the banner
-                            // below — so it is present both where the eye scans
-                            // for facts and where it cannot be skipped.
-                            if let Some(pool) = p.pool() {
+                        // The source, stated where it cannot be missed and in terms
+                        // that decide the durability of this payment's privacy. Read
+                        // straight off `SendSource`, which is total — every reachable
+                        // confirm screen carries this line, pool or transparent.
+                        ui.add_space(sp::M);
+                        ui.label(
+                            egui::RichText::new(p.source.confirm_line())
+                                .strong()
+                                .monospace()
+                                .color(match p.pool() {
+                                    Some(Pool::V1) => palette::warning(),
+                                    Some(Pool::V2) => palette::success(),
+                                    None => palette::warning(),
+                                }),
+                        );
+                        ui.add_space(sp::L);
+                        egui::Grid::new("confirm_grid")
+                            .num_columns(2)
+                            .max_col_width(modal_width * 0.72)
+                            .spacing([16.0, 8.0])
+                            .show(ui, |ui| {
                                 kv(
                                     ui,
-                                    "Pool",
-                                    &format!(
-                                        "{} {} · {} · {}",
-                                        pool.glyph(),
-                                        pool.name(),
-                                        pool.crypto(),
-                                        pool.pq_claim()
-                                    ),
+                                    "From",
+                                    &format!("{} · {}", p.from_label, short_id(&p.from_account)),
                                 );
-                            }
-                            kv(
-                                ui,
-                                "Network",
-                                &format!("{} · {}", network.label(), network.pow_algo()),
-                            );
-                            // The EXACT cost, in the three parts a spender must be
-                            // able to tell apart: the network fee consensus charges
-                            // (`sov_estimateFee`), the blockspace bid they chose,
-                            // and the resulting balance. Both were captured when
-                            // Review was clicked, so this modal shows precisely the
-                            // numbers about to be signed.
-                            let cost = SendCost {
-                                amount_grains: p.amount_grains,
-                                fee_grains: p.fee_grains,
-                                tip_grains: p.tip_grains,
-                            };
-                            let fee_str = if cost.fee_grains == 0 {
-                                "0 XUS  ·  no network fee".to_string()
-                            } else {
-                                format!("{} XUS", xus(&cost.fee_grains.to_string()))
-                            };
-                            kv(ui, "Network fee", &fee_str);
-                            let tip_str = if cost.tip_grains == 0 {
-                                "0 XUS  ·  no bid (blockspace is free right now)".to_string()
-                            } else {
-                                format!(
-                                    "{} XUS  ·  paid to the miner who includes it",
-                                    xus(&cost.tip_grains.to_string())
-                                )
-                            };
-                            kv(ui, "Blockspace tip", &tip_str);
-                            // The bottom line, WEIGHTED as the bottom line: total
-                            // cost and the balance it leaves are the two figures a
-                            // spender confirms against, so they carry the emphasis
-                            // the per-part rows above them do not.
-                            ui.label(egui::RichText::new("Total cost").weak());
-                            ui.label(
-                                num(format!("{} XUS", xus(&cost.total_grains().to_string())))
+                                // Recipient, monospace + wrapped so it never overflows. A
+                                // pool-v2 xusq1… address carries an ML-KEM key (~1.2 KiB)
+                                // and is NEVER rendered raw — head…tail elision, the same
+                                // rule as everywhere else it appears.
+                                let to_display = if p.to.starts_with("xusq1") {
+                                    truncate_middle(&p.to, 22, 12)
+                                } else {
+                                    p.to.clone()
+                                };
+                                ui.label(egui::RichText::new("To").weak());
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(to_display).monospace().size(ty::SMALL),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.end_row();
+                                kv(ui, "Route", &p.route_label);
+                                // WHICH pool moves, and whether its privacy is
+                                // post-quantum, as a named row as well as the banner
+                                // below — so it is present both where the eye scans
+                                // for facts and where it cannot be skipped.
+                                if let Some(pool) = p.pool() {
+                                    kv(
+                                        ui,
+                                        "Pool",
+                                        &format!(
+                                            "{} {} · {} · {}",
+                                            pool.glyph(),
+                                            pool.name(),
+                                            pool.crypto(),
+                                            pool.pq_claim()
+                                        ),
+                                    );
+                                }
+                                kv(
+                                    ui,
+                                    "Network",
+                                    &format!("{} · {}", network.label(), network.pow_algo()),
+                                );
+                                // The EXACT cost, in the three parts a spender must be
+                                // able to tell apart: the network fee consensus charges
+                                // (`sov_estimateFee`), the blockspace bid they chose,
+                                // and the resulting balance. Both were captured when
+                                // Review was clicked, so this modal shows precisely the
+                                // numbers about to be signed.
+                                let cost = SendCost {
+                                    amount_grains: p.amount_grains,
+                                    fee_grains: p.fee_grains,
+                                    tip_grains: p.tip_grains,
+                                };
+                                let fee_str = if p.pool() == Some(Pool::V2) {
+                                    "Not available until the STARK proof is built; paid by your public account".to_string()
+                                } else if cost.fee_grains == 0 {
+                                    "0 XUS  ·  no network fee".to_string()
+                                } else {
+                                    format!("{} XUS", xus(&cost.fee_grains.to_string()))
+                                };
+                                kv(
+                                    ui,
+                                    if p.pool().is_some() {
+                                        "Public network fee"
+                                    } else {
+                                        "Network fee"
+                                    },
+                                    &fee_str,
+                                );
+                                let tip_str = if p.pool().is_some() {
+                                    "0 XUS  ·  pool sends carry no priority bid".to_string()
+                                } else if cost.tip_grains == 0 {
+                                    "0 XUS  ·  no priority bid".to_string()
+                                } else {
+                                    format!(
+                                        "{} XUS  ·  paid to the miner who includes it",
+                                        xus(&cost.tip_grains.to_string())
+                                    )
+                                };
+                                kv(ui, "Blockspace tip", &tip_str);
+                                // The bottom line, WEIGHTED as the bottom line: total
+                                // cost and the balance it leaves are the two figures a
+                                // spender confirms against, so they carry the emphasis
+                                // the per-part rows above them do not.
+                                ui.label(
+                                    egui::RichText::new(if p.pool().is_some() {
+                                        "Pool debit"
+                                    } else {
+                                        "Total cost"
+                                    })
+                                    .weak(),
+                                );
+                                ui.label(
+                                    num(format!(
+                                        "{} XUS",
+                                        xus(&p.source_debit_grains().to_string())
+                                    ))
                                     .strong(),
-                            );
-                            ui.end_row();
-                            ui.label(egui::RichText::new("Balance after").weak());
-                            ui.label(
-                                num(format!(
-                                    "{} XUS",
-                                    xus(&cost.balance_after(p.from_balance_grains).to_string())
-                                ))
-                                .strong(),
-                            );
-                            ui.end_row();
-                        });
-                    ui.add_space(sp::M);
-                    // Privacy + self-send context.
-                    if p.links_public {
-                        ui.colored_label(
+                                );
+                                ui.end_row();
+                                ui.label(
+                                    egui::RichText::new(if p.pool().is_some() {
+                                        "Pool balance after"
+                                    } else {
+                                        "Balance after"
+                                    })
+                                    .weak(),
+                                );
+                                ui.label(
+                                    num(format!(
+                                        "{} XUS",
+                                        xus(&p
+                                            .from_balance_grains
+                                            .saturating_sub(p.source_debit_grains())
+                                            .to_string())
+                                    ))
+                                    .strong(),
+                                );
+                                ui.end_row();
+                            });
+                        ui.add_space(sp::M);
+                        // Privacy + self-send context.
+                        if p.links_public {
+                            ui.colored_label(
                             palette::warning(),
                             "⚠ Public — sender, recipient, and amount are visible on-chain. Send \
                              to a xus1…/uxus1… address to keep it private.",
                         );
-                    } else {
-                        ui.colored_label(
-                            palette::success(),
-                            "🛡 Private — recipient and amount are shielded on-chain.",
-                        );
-                    }
-                    if p.self_send {
-                        ui.colored_label(
-                            palette::text_dim(),
-                            "↩ This is one of your own addresses.",
-                        );
-                    }
-                    ui.add_space(sp::L);
-                    ui.separator();
-                    ui.add_space(sp::S);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("✓ Confirm & send")
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
+                        } else {
+                            ui.colored_label(
+                                palette::success(),
+                                "🛡 Private — recipient and amount are shielded on-chain.",
+                            );
+                        }
+                        if p.self_send {
+                            ui.colored_label(
+                                palette::text_dim(),
+                                "↩ This is one of your own addresses.",
+                            );
+                        }
+                        ui.add_space(sp::L);
+                        ui.separator();
+                        ui.add_space(sp::S);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("✓ Confirm & send")
+                                            .strong()
+                                            .color(palette::accent_text()),
+                                    )
+                                    .fill(palette::accent()),
                                 )
-                                .fill(palette::accent()),
-                            )
-                            .clicked()
-                        {
-                            // A pool spend (sender hidden) goes through the shielded
-                            // path OF THE POOL THE OPERATOR SELECTED — the two pools
-                            // are different circuits, so the pool travels with the
-                            // pending send rather than being re-inferred here. Every
-                            // other route goes through the transparent/shield send.
-                            match p.source {
-                                SendSource::Pool(Pool::V2) => do_send_v2 = true,
-                                SendSource::Pool(Pool::V1) => do_private_send = true,
-                                SendSource::Transparent => {
-                                    do_send = true;
-                                    confirmed_tip_grains = p.tip_grains;
+                                .clicked()
+                            {
+                                // A pool spend (sender hidden) goes through the shielded
+                                // path OF THE POOL THE OPERATOR SELECTED — the two pools
+                                // are different circuits, so the pool travels with the
+                                // pending send rather than being re-inferred here. Every
+                                // other route goes through the transparent/shield send.
+                                if let Err(why) = self.validate_reviewed_send(&p) {
+                                    self.expired_review(why);
+                                } else {
+                                    confirmed_send = Some(p.clone());
                                 }
+                                self.pending_send = None;
                             }
-                            // DISARM. The choice was made for THIS payment; the
-                            // next one gets made deliberately too, rather than
-                            // inheriting a pool nobody re-examined.
-                            if p.is_pool_spend() {
-                                self.pool_selection.clear();
+                            if ui.button("Cancel").clicked() {
+                                self.pending_send = None;
                             }
-                            self.pending_send = None;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.pending_send = None;
-                        }
+                        });
                     });
                 });
         }
@@ -12413,7 +13168,7 @@ impl Station {
         // This session's sends, each with a BUMP for anything still pooled — the
         // lever that makes "stuck below the floor" a recoverable state instead of
         // an indefinite wait.
-        self.pending_sends_view(ui, &ctx, &s.auction);
+        let confirmed_bump = self.pending_sends_view(ui, &ctx, &s.auction);
 
         // Action status — a spinner while broadcasting, then a green (success) or red
         // (failure) banner so the result of a sent transaction is unmistakable.
@@ -12438,7 +13193,7 @@ impl Station {
         // and colored by outcome (green = succeeded, red = failed). Open by default so
         // you can always see what just happened.
         let log = self.activity.lock().map(|l| l.clone()).unwrap_or_default();
-        if !log.is_empty() {
+        if !log.is_empty() && self.wallet_view == WalletView::Overview {
             ui.add_space(4.0);
             egui::CollapsingHeader::new(format!("Recent activity ({})", log.len()))
                 .default_open(true)
@@ -12475,37 +13230,49 @@ impl Station {
         }
 
         // Encrypted keystore — wallets survive restart (Argon2id + ChaCha20-Poly1305).
-        ui.separator();
-        ui.label(egui::RichText::new("Wallet file (encrypted keystore)").strong());
-        ui.label(
+        let mut do_load = false;
+        if self.wallet_view == WalletView::Backup {
+            card_frame().show(ui, |ui| {
+                section_heading(
+                    ui,
+                    "Encrypted wallet backup",
+                    "One portable file for all wallets loaded on this device.",
+                );
+                ui.label(
             egui::RichText::new(
-                "Save persists ALL wallets (keys + recovery phrases) to an encrypted file \
-                 (Argon2id + ChaCha20-Poly1305) so they survive restart. Load restores them under \
-                 the same passphrase.",
+                "Save all loaded wallets, including keys and recovery phrases, in an encrypted \
+                 file. Keep its backup passphrase safe: you need it to restore these wallets.",
             )
             .weak(),
         );
-        if let Ok(path) = keystore_path() {
-            ui.label(egui::RichText::new(format!("file: {}", path.display())).weak());
-        }
-        // `do_save` is declared at the top of STATE 3 (the unsaved banner can set it).
-        let mut do_load = false;
-        ui.horizontal(|ui| {
-            ui.label("Passphrase");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.keystore_pass)
-                    .password(true)
-                    .desired_width(180.0),
-            );
-            if ui.button("Save wallets").clicked() {
-                do_save = true;
-            }
-            if ui.button("Load wallets").clicked() {
-                do_load = true;
-            }
-        });
-        if !self.keystore_msg.is_empty() {
-            status_label(ui, &self.keystore_msg);
+                if let Ok(path) = keystore_path() {
+                    ui.label(egui::RichText::new(format!("file: {}", path.display())).weak());
+                }
+                // `do_save` is declared at the top of STATE 3 (the unsaved banner can set it).
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new("Backup passphrase")
+                        .small()
+                        .color(palette::text_dim()),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.keystore_pass)
+                        .password(true)
+                        .desired_width(ui.available_width().min(420.0)),
+                );
+                ui.add_space(12.0);
+                ui.horizontal_wrapped(|ui| {
+                    if primary_button(ui, "Save wallets →", true).clicked() {
+                        do_save = true;
+                    }
+                    if ui.button("Load wallets").clicked() {
+                        do_load = true;
+                    }
+                });
+                if !self.keystore_msg.is_empty() {
+                    status_label(ui, &self.keystore_msg);
+                }
+            });
         }
 
         // Dispatch collected actions (after the UI borrows end).
@@ -12515,6 +13282,7 @@ impl Station {
                 // land on the wrong account: clear the rename box, disarm forget,
                 // and drop any "operate as" link from the previous wallet's view.
                 self.selected = i;
+                self.clear_transaction_reviews();
                 self.rename_field.clear();
                 self.forget_armed = false;
                 self.forget_confirm.clear();
@@ -12636,11 +13404,32 @@ impl Station {
                 }
             }
         }
-        if do_send {
-            self.send(&ctx, confirmed_tip_grains);
+        if let Some(review) = confirmed_bump {
+            if let Err(why) = self.validate_reviewed_bump(&review) {
+                self.expired_review(why);
+            } else {
+                self.bump_send(&review.sent, &ctx, review.tip_grains);
+            }
         }
-        if do_private_send {
-            self.send_private(&ctx);
+        if let Some(review) = confirmed_send {
+            if let Err(why) = self.validate_reviewed_send(&review) {
+                self.expired_review(why);
+            } else {
+                // Only unchanged reviewed fields can reach the existing signing
+                // paths. The captured source and bid decide dispatch.
+                if review.is_pool_spend() {
+                    self.pool_selection.clear();
+                }
+                match review.source {
+                    SendSource::Transparent => self.send(&ctx, review.tip_grains),
+                    SendSource::Pool(Pool::V1) => self.send_private(&ctx),
+                    SendSource::Pool(Pool::V2) => {
+                        if self.send_private_v2(&ctx) {
+                            self.private_v2_amount.clear();
+                        }
+                    }
+                }
+            }
         }
         if do_scan {
             self.scan_shielded(&ctx);
@@ -12657,9 +13446,6 @@ impl Station {
         }
         if do_deshield_v2 && self.deshield_v2(&ctx) {
             self.deshield_v2_amount_in.clear();
-        }
-        if do_send_v2 && self.send_private_v2(&ctx) {
-            self.private_v2_amount.clear();
         }
         if do_rescan {
             self.rescan_shielded(&ctx);
@@ -12748,7 +13534,7 @@ fn blocks_panel(ui: &mut egui::Ui, s: &Snapshot, selected: &mut Option<u64>) {
         .size(ty::SMALL)
         .color(palette::text_dim()),
     );
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(
             egui::RichText::new("click a height to inspect the block →")
                 .size(ty::SMALL)
@@ -13210,6 +13996,8 @@ fn set_swap_view_msg(view: &Arc<Mutex<SwapsView>>, ctx: &egui::Context, msg: &st
 /// — for a replace-by-fee — the nonce slot to reuse.
 #[derive(Clone, Copy, Debug)]
 struct SendTerms {
+    /// The network approved before the worker began (never a later UI reading).
+    chain_id: &'static str,
     /// What the recipient receives, in grains.
     amount_grains: u128,
     /// The auction bid. `0` produces the BARE action (`Transfer` / `Shielded`),
@@ -13243,6 +14031,7 @@ fn send_payment(
     action: &Arc<Mutex<ActionState>>,
 ) -> Result<SentTx, String> {
     let SendTerms {
+        chain_id,
         amount_grains: grains,
         tip_grains,
         replace_nonce,
@@ -13298,10 +14087,9 @@ fn send_payment(
         }
         Receiver::ShieldedV2(_) => {
             return Err(
-                "recipient routes to the post-quantum shielded pool (v2), which is not \
-                        active on any chain yet — refusing to send. Paying the address's \
-                        transparent receiver instead would pay a different recipient and \
-                        downgrade privacy without your consent."
+                "recipient routes to pool v2. Use Privacy → Pool v2 → Shield in to spend \
+                 public funds, or choose Pool v2 in Send privately to spend shielded funds. \
+                 This form cannot send to v2 and will never fall back to a public receiver."
                     .to_string(),
             )
         }
@@ -13316,6 +14104,10 @@ fn send_payment(
     // Phase-2 signing domain: binds the signature to {chain_id, genesis} once the
     // tx-domain fork is active (`None` = dormant/legacy, byte-identical).
     let domain = client.signing_domain().map_err(|e| e.to_string())?;
+    let reported_chain = client.chain_id().map_err(|e| e.to_string())?;
+    if reported_chain != chain_id || domain.as_ref().is_some_and(|d| d.chain_id() != chain_id) {
+        return Err("the node changed networks — reconnect and review the send again".into());
+    }
     let tx_action = if tip_grains == 0 {
         inner
     } else {
@@ -13334,6 +14126,8 @@ fn send_payment(
     let txid = client.submit_transaction(&stx).map_err(|e| e.to_string())?;
     Ok(SentTx {
         txid: txid.to_hex(),
+        chain_id: chain_id.into(),
+        rpc: rpc.into(),
         from_account: from.to_string(),
         // The RESOLVED recipient, so a bump can never pay a different party than
         // the original if a `.sov` name is re-pointed in between.
@@ -14131,14 +14925,11 @@ fn shielded_send(
         Receiver::Transparent(_) => {
             return Err("recipient must be a shielded (xus1…) or unified address".to_string())
         }
-        // Pool v2 (post-quantum): well-formed but unspendable — bit 2 is defined
-        // and NOT armed, so `Action::ShieldedV2` is a hard reject everywhere.
-        // Refuse rather than fall back to another receiver on the same address,
-        // which would pay someone the sender did not choose.
+        // A v1 spend cannot cross into v2 or silently fall back to another receiver.
         Receiver::ShieldedV2(_) => {
             return Err(
-                "recipient routes to the post-quantum shielded pool (v2), which is not \
-                 active yet — refusing to send"
+                "recipient routes to pool v2, but this spend is from pool v1. \
+                 Choose Pool v2 in Privacy → Send privately to spend v2 notes."
                     .to_string(),
             )
         }
@@ -14344,31 +15135,40 @@ fn render_passphrase_setup(
     pw: &mut String,
     pw2: &mut String,
 ) -> (SetupAction, egui::Rect) {
-    let red = egui::Color32::from_rgb(220, 80, 80);
-    let amber = egui::Color32::from_rgb(220, 160, 60);
-    let green = egui::Color32::from_rgb(80, 200, 120);
-    ui.heading("🔐  Create a passphrase");
-    ui.add_space(8.0);
     ui.label(
-        "This encrypts your wallets on this device and is required on every launch. \
-         There is no reset — if you forget it, the only recovery is re-importing each \
-         wallet from its 24-word phrase. Write it down.",
+        egui::RichText::new("Protect your wallets")
+            .size(ty::HERO)
+            .strong()
+            .color(palette::text()),
     );
-    ui.add_space(16.0);
+    ui.label(
+        egui::RichText::new("Create a passphrase for this device's wallets.")
+            .size(ty::BODY)
+            .color(palette::text_dim()),
+    );
+    ui.add_space(sp::L);
+    ui.label(egui::RichText::new("Passphrase").size(ty::SMALL).strong());
     ui.add(
         egui::TextEdit::singleline(pw)
             .password(true)
-            .hint_text("passphrase")
-            .desired_width(280.0),
+            .hint_text("Choose a passphrase")
+            .font(egui::TextStyle::Body)
+            .margin(egui::Margin::symmetric(12.0, 10.0))
+            .desired_width(ui.available_width()),
     );
-    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new("Confirm passphrase")
+            .size(ty::SMALL)
+            .strong(),
+    );
     ui.add(
         egui::TextEdit::singleline(pw2)
             .password(true)
-            .hint_text("re-enter passphrase")
-            .desired_width(280.0),
+            .hint_text("Re-enter your passphrase")
+            .font(egui::TextStyle::Body)
+            .margin(egui::Margin::symmetric(12.0, 10.0))
+            .desired_width(ui.available_width()),
     );
-    ui.add_space(10.0);
     let too_short = pw.chars().count() < PASSPHRASE_MIN_LEN;
     let mismatch = pw.as_str() != pw2.as_str();
     let ok = passphrase_setup_valid(pw, pw2);
@@ -14376,32 +15176,43 @@ fn render_passphrase_setup(
     if pw.is_empty() && pw2.is_empty() {
         ui.label(
             egui::RichText::new(format!("at least {PASSPHRASE_MIN_LEN} characters"))
-                .small()
-                .weak(),
+                .size(ty::SMALL)
+                .color(palette::text_dim()),
         );
     } else if too_short {
         ui.colored_label(
-            amber,
+            palette::warning(),
             format!("use at least {PASSPHRASE_MIN_LEN} characters"),
         );
     } else if mismatch {
-        ui.colored_label(red, "✗ passphrases don't match");
+        ui.colored_label(palette::error(), "✗ passphrases don't match");
     } else {
-        ui.colored_label(green, "✓ passphrases match");
+        ui.colored_label(palette::success(), "✓ passphrases match");
     }
-    ui.add_space(12.0);
+    ui.add_space(sp::S);
     let mut action = SetupAction::None;
-    let mut set_rect = egui::Rect::NOTHING;
-    ui.horizontal(|ui| {
-        let set = ui.add_enabled(ok, egui::Button::new("Set passphrase"));
-        set_rect = set.rect;
-        if set.clicked() {
-            action = SetupAction::Set;
-        }
-        if ui.button("Cancel").clicked() {
+    let set = ui
+        .vertical_centered_justified(|ui| primary_button(ui, "Set passphrase", ok))
+        .inner;
+    let set_rect = set.rect;
+    if set.clicked() {
+        action = SetupAction::Set;
+    }
+    ui.vertical_centered(|ui| {
+        if ui.small_button("Cancel").clicked() {
             action = SetupAction::Cancel;
         }
     });
+    ui.add_space(sp::S);
+    ui.separator();
+    ui.label(
+        egui::RichText::new(
+            "Keep this passphrase safe. You need it every launch and it cannot be reset. \
+             If you forget it, re-import each wallet from its 24-word recovery phrase.",
+        )
+        .size(ty::SMALL)
+        .color(palette::text_dim()),
+    );
     (action, set_rect)
 }
 
@@ -15413,7 +16224,7 @@ pub fn run(rpc: String) -> Result<(), String> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 720.0])
+            .with_inner_size([1180.0, 800.0])
             .with_min_inner_size([720.0, 480.0])
             .with_title("SOV Station"),
         ..Default::default()
@@ -15451,11 +16262,13 @@ pub fn run(rpc: String) -> Result<(), String> {
 ///
 /// Runs on the poller thread, never the UI thread, and holds the outbox lock only
 /// to read the work list and to write results back — never across an RPC call.
-fn refresh_outbox(client: &RpcClient, outbox: &Arc<Mutex<Vec<SentTx>>>) {
+// The caller has polled this client's chain id. A different node on that same
+// chain can confirm a payment; its original RPC remains provenance metadata.
+fn refresh_outbox(client: &RpcClient, outbox: &Arc<Mutex<Vec<SentTx>>>, chain_id: &str) {
     let pending: Vec<(String, String, u64)> = match outbox.lock() {
         Ok(o) => o
             .iter()
-            .filter(|t| t.state.is_pending())
+            .filter(|t| t.state.is_pending() && t.on_chain(chain_id))
             .map(|t| (t.txid.clone(), t.from_account.clone(), t.nonce))
             .collect(),
         Err(_) => return,
@@ -15488,7 +16301,7 @@ fn refresh_outbox(client: &RpcClient, outbox: &Arc<Mutex<Vec<SentTx>>>) {
                 // Only ever settle something still pending: a bump may have moved
                 // this entry to REPLACED while the RPCs above were in flight, and
                 // that user-known truth must not be overwritten by a stale read.
-                if entry.state.is_pending() {
+                if entry.state.is_pending() && entry.on_chain(chain_id) {
                     entry.state = *state;
                     entry.note = note.clone();
                 }
@@ -15548,7 +16361,7 @@ fn spawn_poller(
                     .iter()
                     .map(|m| (m.account.clone(), m.blocks))
                     .collect();
-                refresh_outbox(&client, &outbox);
+                refresh_outbox(&client, &outbox, &snap.chain_id);
                 consecutive_fail = 0;
                 if let Ok(mut s) = snapshot.lock() {
                     *s = snap;
@@ -15571,6 +16384,188 @@ fn spawn_poller(
 
 #[cfg(test)]
 mod tests {
+    /// Exercise the actual wallet presentation against a disposable, keyless
+    /// wallet. Every task must stay reachable, and the recovery gate must still
+    /// replace all of those tasks rather than merely hiding one panel.
+    #[test]
+    fn wallet_task_navigation_keeps_features_and_recovery_gate_reachable() {
+        let _guard = env_guard();
+        struct Scratch {
+            previous: Option<String>,
+            path: PathBuf,
+        }
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                match &self.previous {
+                    Some(previous) => std::env::set_var("SOV_STATION_DIR", previous),
+                    None => std::env::remove_var("SOV_STATION_DIR"),
+                }
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+        let scratch = Scratch {
+            previous: std::env::var("SOV_STATION_DIR").ok(),
+            path: std::env::temp_dir().join(format!(
+                "sov-wallet-ui-test-{}-{}",
+                std::process::id(),
+                now_ms()
+            )),
+        };
+        std::env::set_var("SOV_STATION_DIR", &scratch.path);
+        let mut station = Station::new(
+            Arc::new(Mutex::new(Snapshot::default())),
+            Arc::new(Mutex::new(Config {
+                rpc: "127.0.0.1:0".into(),
+                accounts: Vec::new(),
+                mining_accounts: Vec::new(),
+            })),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let wallet = LoadedWallet::watch_only("UI test wallet".into(), &"00".repeat(32)).unwrap();
+        let account = wallet.account.clone();
+        station.wallets.push(wallet);
+        station.names_refreshed_at = Some(Instant::now());
+        let station = std::cell::RefCell::new(station);
+        let snapshot = Snapshot::default();
+        for (view, feature) in [
+            (WalletView::Overview, "Privacy pools"),
+            (WalletView::Send, "To"),
+            (WalletView::Receive, "Receive"),
+            (WalletView::Privacy, "Pool v2"),
+            (WalletView::Identity, "Add or import a wallet"),
+            (WalletView::Backup, "Encrypted wallet backup"),
+        ] {
+            station.borrow_mut().wallet_view = view;
+            let text =
+                painted_at_width(520.0, |ui| station.borrow_mut().wallet_panel(ui, &snapshot));
+            assert!(
+                text.contains(view.description()),
+                "missing task heading: {text}"
+            );
+            assert!(
+                text.contains(feature),
+                "missing {feature} in {}: {text}",
+                view.label()
+            );
+            if view == WalletView::Overview || view == WalletView::Privacy {
+                assert!(
+                    text.contains("Pool v1") && text.contains("Pool v2"),
+                    "both pools must be visible: {text}"
+                );
+            }
+            if view == WalletView::Privacy {
+                for control in [
+                    "Scan pool",
+                    "Rescan from scratch",
+                    "De-shield",
+                    "Send privately",
+                    "Pool details",
+                ] {
+                    assert!(
+                        text.contains(control),
+                        "private wallet control missing: {control}: {text}"
+                    );
+                }
+            }
+            assert!(
+                !station.borrow().reveal_phrase,
+                "navigation must not reveal a phrase"
+            );
+        }
+        // A live chain does not prove that this wallet has scanned its v2 notes.
+        // The private-send form must agree with Overview's unknown-balance state.
+        let mut live_v2 = snapshot.clone();
+        live_v2.online = true;
+        live_v2.shielded_v2 = Some(ShieldedV2Info {
+            active: true,
+            ..Default::default()
+        });
+        station.borrow_mut().wallet_view = WalletView::Privacy;
+        station
+            .borrow_mut()
+            .pool_selection
+            .choose(Pool::V2, &account);
+        let text = painted_at_width(520.0, |ui| station.borrow_mut().wallet_panel(ui, &live_v2));
+        assert!(
+            text.contains("balance unknown — scan this pool first"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("0 XUS scanned"),
+            "an unscanned live pool is not empty: {text}"
+        );
+        station.borrow_mut().backup_mnemonic = Some((account, "TEST RECOVERY PHRASE".into()));
+        station.borrow_mut().wallet_view = WalletView::Send;
+        let text = painted_at_width(520.0, |ui| station.borrow_mut().wallet_panel(ui, &snapshot));
+        assert!(
+            text.contains("I have written it down"),
+            "backup acknowledgement disappeared: {text}"
+        );
+        assert!(
+            !text.contains(WalletView::Send.description()),
+            "task navigation bypassed recovery gate: {text}"
+        );
+    }
+
+    #[test]
+    fn workspace_navigation_contains_every_existing_destination_once() {
+        let destinations: Vec<_> = Tab::WALLET.into_iter().chain(Tab::NETWORK).collect();
+        for tab in [
+            Tab::Node,
+            Tab::Mining,
+            Tab::Wallet,
+            Tab::Tokens,
+            Tab::Swaps,
+            Tab::Vault,
+            Tab::Blocks,
+            Tab::Activity,
+        ] {
+            assert_eq!(
+                destinations
+                    .iter()
+                    .filter(|&&candidate| candidate == tab)
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(destinations.len(), 8);
+        assert_eq!(WalletView::ALL.len(), 6);
+    }
+
+    #[test]
+    fn pool_summary_never_presents_an_unknown_or_dormant_balance_as_zero() {
+        for pool in [Pool::V1, Pool::V2] {
+            for state in [PoolState::Unavailable, PoolState::Active] {
+                let text = painted_at_width(440.0, |ui| {
+                    pool_balance_card(ui, pool, state, None, true);
+                });
+                assert!(
+                    text.contains("Unknown"),
+                    "unscanned funds must remain unknown: {text}"
+                );
+                assert!(
+                    !text.contains("0 XUS"),
+                    "unknown funds must not appear empty: {text}"
+                );
+            }
+        }
+        let own = Some((130_000_000_000, 3, 21818));
+        let active = painted_at_width(440.0, |ui| {
+            pool_balance_card(ui, Pool::V2, PoolState::Active, own, true);
+        });
+        assert!(
+            active.contains("1,300 XUS") && active.contains("3 unspent notes"),
+            "wallet-owned v2 amount missing: {active}"
+        );
+        let dormant = painted_at_width(440.0, |ui| {
+            pool_balance_card(ui, Pool::V2, PoolState::Dormant, own, true);
+        });
+        assert!(
+            dormant.contains("Not active yet") && !dormant.contains("1,300 XUS"),
+            "stale notes must not be claimed on a dormant pool: {dormant}"
+        );
+    }
+
     /// Operational logs must survive the process.
     ///
     /// This buffer was memory-only, so the sync that stalled and the error
@@ -17174,6 +18169,8 @@ mod tests {
         let a = contested_auction();
         let sent = SentTx {
             txid: "ab".repeat(32),
+            chain_id: "sov-mainnet".into(),
+            rpc: "127.0.0.1:8645".into(),
             from_account: "usa.reserve.sov".to_string(),
             to: "ecb.reserve.sov".to_string(),
             amount_grains: 250_000_000, // 2.5 XUS
@@ -17449,12 +18446,42 @@ mod tests {
                 "{:?}: the owner tag must be shown in full:\n{out}",
                 state
             );
-            // And the non-active states say the address is not payable yet.
+            if state == PoolState::Dormant {
+                assert!(
+                    out.contains("no one can pay it until the pool activates"),
+                    "{out}"
+                );
+            } else {
+                assert!(
+                    !out.contains("no one can pay it until the pool activates"),
+                    "unknown is not dormant: {out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_live_v2_receiving_address_and_export_never_claim_dormancy() {
+        let addr = format!("xusq1{}", "q".repeat(1_952));
+        let tag = "ab".repeat(32);
+        let out = painted_text(|ui| {
+            v2_address_block(ui, &addr, &tag, PoolState::Active, &mut false);
+        });
+        for text in [&out, &v2_address_document(&addr, &tag, PoolState::Active)] {
+            assert!(text.contains(PoolState::Active.word()), "{text}");
             assert!(
-                out.contains("no one can pay it until the pool activates"),
-                "{:?}: unpayability must be stated:\n{out}",
-                state
+                !text.contains("not active")
+                    && !text.contains("NOT ACTIVE")
+                    && !text.contains("until the pool activates"),
+                "{text}"
             );
+        }
+        for state in [PoolState::Dormant, PoolState::Unavailable] {
+            let document = v2_address_document(&addr, &tag, state);
+            assert!(
+                document.contains(state.word()) && document.contains(state.explanation(Pool::V2))
+            );
+            assert!(document.ends_with(&format!("{addr}\n")));
         }
     }
 
@@ -18114,6 +19141,441 @@ mod tests {
             .is_mining(),
             "an idle registry row is not mining"
         );
+    }
+}
+
+#[cfg(test)]
+mod transaction_review_tests {
+    use super::*;
+
+    #[test]
+    fn a_pool_review_keeps_public_fees_out_of_the_shielded_balance() {
+        for pool in [Pool::V1, Pool::V2] {
+            let p = review(SendSource::Pool(pool));
+            assert_eq!(p.source_debit_grains(), 100_000_000);
+            assert_eq!(p.from_balance_grains - p.source_debit_grains(), 100_000_000);
+        }
+        let mut public = review(SendSource::Transparent);
+        public.tip_grains = 5;
+        assert_eq!(public.source_debit_grains(), 100_000_015);
+        assert_eq!(
+            public.from_balance_grains - public.source_debit_grains(),
+            99_999_985
+        );
+    }
+
+    fn review(source: SendSource) -> PendingSend {
+        PendingSend {
+            from_label: "Alice".into(),
+            wallet_account: "alice-key".into(),
+            from_account: "alice.sov".into(),
+            network: Network::Mainnet,
+            rpc: "127.0.0.1:8645".into(),
+            to: "recipient".into(),
+            amount_grains: 100_000_000,
+            from_balance_grains: 200_000_000,
+            route_label: "reviewed route".into(),
+            self_send: false,
+            links_public: source == SendSource::Transparent,
+            source,
+            fee_grains: 10,
+            tip_grains: 0,
+        }
+    }
+
+    fn current(p: &PendingSend) -> SendReviewContext<'_> {
+        SendReviewContext {
+            wallet_account: &p.wallet_account,
+            from_account: &p.from_account,
+            network: p.network,
+            rpc: &p.rpc,
+            to: &p.to,
+            amount_grains: Some(p.amount_grains),
+            source: p.source,
+            fee_grains: p.fee_grains,
+            fee_auction_active: true,
+            can_sign: true,
+            busy: false,
+        }
+    }
+
+    #[test]
+    fn unchanged_reviewed_sends_remain_authorized_on_every_source_and_network() {
+        for network in [Network::Mainnet, Network::Testnet] {
+            for source in [
+                SendSource::Transparent,
+                SendSource::Pool(Pool::V1),
+                SendSource::Pool(Pool::V2),
+            ] {
+                let mut p = review(source);
+                p.network = network;
+                let mut ctx = current(&p);
+                assert_eq!(p.validate(&ctx), Ok(()));
+                // A zero-tip payment remains legal on a dormant auction.
+                ctx.fee_auction_active = false;
+                assert_eq!(p.validate(&ctx), Ok(()));
+                // Equivalent numeric spelling and recipient whitespace do not
+                // change the transaction that will be signed.
+                ctx.to = "  recipient  ";
+                ctx.amount_grains = parse_xus("1.00000000");
+                assert_eq!(p.validate(&ctx), Ok(()));
+            }
+        }
+    }
+
+    #[test]
+    fn changes_behind_the_review_window_can_never_authorize_a_different_send() {
+        let changes: [fn(&mut SendReviewContext<'_>); 11] = [
+            |c| c.wallet_account = "bob-key",
+            |c| c.from_account = "reserve.sov",
+            |c| c.network = Network::Testnet,
+            |c| c.rpc = "another-node:8645",
+            |c| c.to = "another-recipient",
+            |c| c.amount_grains = Some(2_000_000_000),
+            |c| c.amount_grains = None,
+            |c| c.source = SendSource::Pool(Pool::V2),
+            |c| c.fee_grains = 11,
+            |c| c.can_sign = false,
+            |c| c.busy = true,
+        ];
+        for (i, change) in changes.iter().enumerate() {
+            let p = review(SendSource::Transparent);
+            let mut ctx = current(&p);
+            change(&mut ctx);
+            assert!(
+                p.validate(&ctx).is_err(),
+                "context mutation {i} authorized a send"
+            );
+        }
+        let p = review(SendSource::Pool(Pool::V2));
+        let mut ctx = current(&p);
+        ctx.source = SendSource::Pool(Pool::V1);
+        assert!(
+            p.validate(&ctx).is_err(),
+            "a review must never change pools"
+        );
+    }
+
+    #[test]
+    fn a_reviewed_tip_cannot_be_silently_removed_when_activation_changes() {
+        let mut p = review(SendSource::Transparent);
+        p.tip_grains = 5;
+        let mut ctx = current(&p);
+        assert_eq!(p.validate(&ctx), Ok(()));
+        ctx.fee_auction_active = false;
+        assert!(p.validate(&ctx).is_err());
+        assert_eq!(p.tip_grains, 5, "the authorized bid remains immutable");
+    }
+
+    fn pending_bump(p: &PendingSend, a: &Auction) -> PendingBump {
+        PendingBump {
+            sent: SentTx {
+                txid: "pending-id".into(),
+                chain_id: p.network.chain_id().into(),
+                rpc: p.rpc.clone(),
+                from_account: p.from_account.clone(),
+                to: p.to.clone(),
+                amount_grains: p.amount_grains,
+                nonce: 7,
+                tip_grains: 2,
+                shielded_route: false,
+                submitted_ms: 1,
+                state: SendState::Pending,
+                note: String::new(),
+            },
+            wallet_account: p.wallet_account.clone(),
+            network: p.network,
+            rpc: p.rpc.clone(),
+            tip_grains: auction::bump_tip_grains(2, a),
+        }
+    }
+
+    #[test]
+    fn replacement_review_pins_the_approved_bid_and_the_original_payment() {
+        let p = review(SendSource::Transparent);
+        let mut auction = Auction {
+            available: true,
+            fee_auction_active: true,
+            ..Default::default()
+        };
+        let mut bump = pending_bump(&p, &auction);
+        let ctx = current(&p);
+        assert_eq!(bump.validate(&ctx, &auction), Ok(()));
+        let approved_tip = bump.tip_grains;
+        auction.next_block_floor_grains = approved_tip + 100;
+        assert!(bump.validate(&ctx, &auction).is_err());
+        assert_eq!(bump.tip_grains, approved_tip, "no automatic bid increase");
+        assert_eq!(bump.sent.nonce, 7, "the original nonce must remain pinned");
+        assert_eq!(bump.sent.to, "recipient");
+        assert_eq!(bump.sent.amount_grains, 100_000_000);
+        auction.next_block_floor_grains = 0;
+        assert_eq!(bump.validate(&ctx, &auction), Ok(()));
+        bump.sent.state = SendState::Confirmed;
+        assert!(bump.validate(&ctx, &auction).is_err());
+    }
+
+    #[test]
+    fn replacement_reviews_cannot_survive_a_signer_or_connection_change() {
+        let p = review(SendSource::Transparent);
+        let auction = Auction {
+            fee_auction_active: true,
+            ..Default::default()
+        };
+        let bump = pending_bump(&p, &auction);
+        let changes: [fn(&mut SendReviewContext<'_>); 6] = [
+            |c| c.wallet_account = "bob-key",
+            |c| c.from_account = "reserve.sov",
+            |c| c.network = Network::Testnet,
+            |c| c.rpc = "another-node:8645",
+            |c| c.can_sign = false,
+            |c| c.busy = true,
+        ];
+        for change in changes {
+            let mut ctx = current(&p);
+            change(&mut ctx);
+            assert!(bump.validate(&ctx, &auction).is_err());
+        }
+    }
+
+    #[test]
+    fn a_deferred_replacement_is_refused_after_same_frame_account_changes() {
+        let p = review(SendSource::Transparent);
+        let auction = Auction {
+            fee_auction_active: true,
+            ..Default::default()
+        };
+        let intent = pending_bump(&p, &auction);
+        let before_dispatch = current(&p);
+        assert_eq!(intent.validate(&before_dispatch, &auction), Ok(()));
+
+        // Confirmation records an intent. The wallet panel then applies a
+        // queued selection or operate-as change before checking that intent.
+        for (wallet, account) in [("bob-key", "alice.sov"), ("alice-key", "reserve.sov")] {
+            let mut after_dispatch = current(&p);
+            after_dispatch.wallet_account = wallet;
+            after_dispatch.from_account = account;
+            assert!(intent.validate(&after_dispatch, &auction).is_err());
+        }
+        assert_eq!(intent.sent.nonce, 7);
+        assert_eq!(intent.sent.to, "recipient");
+    }
+
+    /// A bounded local RPC fixture for receipt/nonce polling, without a chain or
+    /// signing keys. Shared by the node-migration and cross-chain tests.
+    fn receipt_node() -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let rpc = listener.local_addr().unwrap().to_string();
+        let node = std::thread::spawn(move || {
+            let mut methods = Vec::new();
+            for _ in 0..2 {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline, "missing RPC query");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("RPC fixture accept: {e}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                let (split, length) = loop {
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buffer[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(split) = text.find("\r\n\r\n") {
+                        let length = text[..split]
+                            .lines()
+                            .find_map(|l| l.strip_prefix("Content-Length: "))
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap();
+                        if request.len() >= split + 4 + length {
+                            break (split, length);
+                        }
+                    }
+                };
+                let payload: Value =
+                    serde_json::from_slice(&request[split + 4..split + 4 + length]).unwrap();
+                let method = payload["method"].as_str().unwrap().to_string();
+                let result = if method == "sov_getReceipt" {
+                    json!({ "status": { "status": "success" } })
+                } else {
+                    assert_eq!(method, "sov_getNonce");
+                    json!(8)
+                };
+                methods.push(method);
+                let body = json!({ "jsonrpc": "2.0", "id": 1, "result": result }).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+            methods
+        });
+        (rpc, node)
+    }
+
+    #[test]
+    fn old_mainnet_sends_are_not_refreshed_settled_or_bumped_on_testnet() {
+        let (rpc, node) = receipt_node();
+        // Only the TESTNET entry may be queried. Both entries deliberately have
+        // the same transaction id/nonce/account, so settlement must check chain.
+        let mut p = review(SendSource::Transparent);
+        p.rpc = rpc.clone();
+        let auction = Auction {
+            fee_auction_active: true,
+            ..Default::default()
+        };
+        let mut old_review = pending_bump(&p, &auction);
+        let mainnet = old_review.sent.clone();
+        let mut testnet = mainnet.clone();
+        testnet.chain_id = Network::Testnet.chain_id().into();
+        let outbox = Arc::new(Mutex::new(vec![mainnet, testnet]));
+        let client = RpcClient::new(rpc.clone()).with_timeout(Duration::from_secs(2));
+        refresh_outbox(&client, &outbox, Network::Testnet.chain_id());
+        assert_eq!(node.join().unwrap(), ["sov_getReceipt", "sov_getNonce"]);
+        let entries = outbox.lock().unwrap();
+        assert_eq!(entries.len(), 2, "old-network history must be retained");
+        assert_eq!(
+            entries[0].state,
+            SendState::Pending,
+            "the mainnet row is untouched"
+        );
+        assert_eq!(entries[1].state, SendState::Confirmed);
+        assert!(!entries[0].on_origin(Network::Testnet.chain_id(), &rpc));
+        drop(entries);
+
+        // Even constructing a NEW review under Testnet cannot adopt the old
+        // Mainnet entry: origin metadata survives the UI network transition.
+        old_review.network = Network::Testnet;
+        let mut current_connection = current(&p);
+        current_connection.network = Network::Testnet;
+        assert!(old_review.validate(&current_connection, &auction).is_err());
+        old_review.network = Network::Mainnet;
+        current_connection.network = Network::Mainnet;
+        assert_eq!(old_review.validate(&current_connection, &auction), Ok(()));
+    }
+
+    #[test]
+    fn another_node_on_the_same_chain_can_confirm_the_original_payment() {
+        let (rpc, node) = receipt_node();
+        let p = review(SendSource::Transparent);
+        let auction = Auction {
+            fee_auction_active: true,
+            ..Default::default()
+        };
+        let original = pending_bump(&p, &auction).sent;
+        assert_ne!(original.rpc, rpc);
+        let outbox = Arc::new(Mutex::new(vec![original]));
+        let client = RpcClient::new(rpc.clone()).with_timeout(Duration::from_secs(2));
+        refresh_outbox(&client, &outbox, Network::Mainnet.chain_id());
+        assert_eq!(node.join().unwrap(), ["sov_getReceipt", "sov_getNonce"]);
+        let entries = outbox.lock().unwrap();
+        assert_eq!(entries[0].state, SendState::Confirmed);
+        assert!(entries[0].on_origin(Network::Mainnet.chain_id(), &p.rpc));
+    }
+
+    #[test]
+    fn a_fresh_replacement_review_can_use_another_node_on_the_same_chain() {
+        let p = review(SendSource::Transparent);
+        let auction = Auction {
+            fee_auction_active: true,
+            ..Default::default()
+        };
+        let mut bump = pending_bump(&p, &auction);
+        // The transaction keeps its original origin. A new review pins the
+        // current endpoint instead, and still expires on a subsequent change.
+        bump.rpc = "second-node:8645".into();
+        let mut ctx = current(&p);
+        ctx.rpc = "second-node:8645";
+        assert_eq!(bump.validate(&ctx, &auction), Ok(()));
+        assert_eq!(bump.sent.rpc, p.rpc);
+        ctx.rpc = "third-node:8645";
+        assert!(bump.validate(&ctx, &auction).is_err());
+        ctx.rpc = "second-node:8645";
+        ctx.network = Network::Testnet;
+        assert!(bump.validate(&ctx, &auction).is_err());
+    }
+
+    #[test]
+    fn compact_transaction_modals_keep_scrolled_confirmation_controls_on_screen() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0));
+        for (title, confirm_text, cancel_text) in [
+            ("Review transaction", "✓ Confirm & send", "Cancel"),
+            (
+                "Replace this transaction",
+                "⇄ Replace & raise tip",
+                "Keep waiting",
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            install_theme(&ctx, true);
+            let mut buttons = None;
+            let mut modal_rect = None;
+            for frame in 0..4 {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        time: Some(frame as f64),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        let width = transaction_review_width(ctx);
+                        let modal = egui::Window::new(title)
+                            .collapsible(false)
+                            .resizable(false)
+                            .default_width(width)
+                            .max_width(width)
+                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                            .show(ctx, |ui| {
+                                ui.set_max_width(width);
+                                transaction_review_scroll(ui, "compact_review_test", |ui| {
+                                    // A receipt/pool review can contain more facts
+                                    // than fit above the controls at this height.
+                                    for _ in 0..18 {
+                                        ui.label("Reviewed transaction details and network costs");
+                                    }
+                                    let controls = ui.horizontal_wrapped(|ui| {
+                                        let confirm = ui.button(confirm_text);
+                                        let cancel = ui.button(cancel_text);
+                                        buttons = Some((confirm.rect, cancel.rect, ui.clip_rect()));
+                                    });
+                                    controls.response.scroll_to_me_animation(
+                                        Some(egui::Align::BOTTOM),
+                                        egui::style::ScrollAnimation::none(),
+                                    );
+                                });
+                            });
+                        modal_rect = modal.map(|m| m.response.rect);
+                    },
+                );
+            }
+            let (confirm, cancel, clip) = buttons.expect("confirmation buttons rendered");
+            assert!(
+                screen.contains_rect(modal_rect.expect("modal rendered")),
+                "{title}"
+            );
+            assert!(
+                screen.contains_rect(confirm) && screen.contains_rect(cancel),
+                "{title}"
+            );
+            assert!(
+                clip.contains(confirm.center()) && clip.contains(cancel.center()),
+                "{title}"
+            );
+        }
     }
 }
 

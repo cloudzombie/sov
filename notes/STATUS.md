@@ -1,15 +1,44 @@
 # SOV — STATUS (master anchor)
 
-_Last updated: **2026-08-06**. Update at the end of every session._
+_Last updated: **2026-10-01** for the Station UI checkpoint below. Network/fleet
+observations below remain dated 2026-08-06 and were not reverified in this UI session._
 
 _(Previous update was 2026-07-21 at v0.1.97. It sat stale through thirteen releases and described
 an already-activated fork as pending — flagged as item E1 in `consensus-open-list.md` on
 2026-07-27 and unfixed for ten days. If you are reading this at the end of a session and it is
 more than one release behind, fix it now; that is the whole job of this file.)_
 
-## One-line state
+## Current Station UI checkpoint — 2026-10-01
 
-Mainnet LIVE (genesis `cb0272ff…e72d`, FROZEN). Current release **v0.2.10** (`eb51cd6`,
+- The existing local production window reports **v0.2.13**. Source baseline:
+  `29e7a11`; UI branch: `codex/station-next-gen-ui`. The development package is
+  **v0.2.14**, with a separate **v0.2.14-preview** application. No release was
+  cut, published or installed over the existing app.
+- Eight workspace destinations and six wallet tasks are preserved. Public XUS,
+  v1-owned shielded XUS and live-v2-owned shielded XUS have separate readouts.
+  Send, fee auction, replacement, offline signing, both pool workflows,
+  receiving, identity, backups, assets, swaps, vaults, node/mining and blocks
+  are indexed in [station-ui-feature-map.md](station-ui-feature-map.md).
+- Transaction reviews pin wallet/account, selected network, RPC, route, amount
+  and bid. Pending history can refresh through another node on the **same chain**;
+  a fresh replacement review uses that node, while original RPC metadata remains
+  recorded. Another network cannot settle or replace the old payment.
+- Native preview uses disposable data, synthetic balances, active-v2 and active
+  fee-auction fixtures. Real signing, proof generation, broadcasting, node
+  launch and mining are disabled there. The running production wallet/node,
+  real keys, stored chain and genesis were not changed.
+- Validation: Station suite **160 passed, 0 failed, 1 ignored**; see the daily
+  checkpoint for build/lint and native inspection evidence and limitations.
+- **Next action:** review the native preview and source diff; perform ordinary
+  release/integration gates before publishing or replacing a production app.
+  Do not treat preview balances or scans as live-chain evidence.
+
+See [2026-10-01.md](2026-10-01.md) for this session. Fleet state and current live
+node version need a separate fresh check before acting on the historical tracks.
+
+## Previous network checkpoint — 2026-08-06
+
+Mainnet LIVE (genesis `cb0272ff…e72d`, FROZEN). Release at that checkpoint **v0.2.10** (`eb51cd6`,
 2026-08-02). Live tip **18715** as of 2026-08-06. Three activations are **Active on the live
 chain** — tx-domain and fee-auction at h11520, the post-quantum shielded pool (bit 2) at h15552.
 A fourth, `tx-timestamp` (bit 3), was armed in v0.2.6 and its signaling window has **closed** —

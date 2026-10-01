@@ -370,6 +370,10 @@ impl SendState {
 pub struct SentTx {
     /// Transaction id hex, as returned by the node.
     pub txid: String,
+    /// The chain and node used when the send started, retained even if the UI
+    /// switches networks while the submission is still in flight.
+    pub chain_id: String,
+    pub rpc: String,
     /// The signing account.
     pub from_account: String,
     /// The resolved recipient, exactly as submitted.
@@ -392,6 +396,15 @@ pub struct SentTx {
 }
 
 impl SentTx {
+    /// A payment remains on its chain when the user connects to another node.
+    pub fn on_chain(&self, chain_id: &str) -> bool {
+        self.chain_id == chain_id
+    }
+
+    pub fn on_origin(&self, chain_id: &str, rpc: &str) -> bool {
+        self.on_chain(chain_id) && self.rpc == rpc
+    }
+
     /// Whether a bump is offerable for this entry: still pooled, and on a chain
     /// where a tip is legal at all.
     pub fn bumpable(&self, auction: &Auction) -> bool {
@@ -853,6 +866,8 @@ mod tests {
         let dormant = Auction::from_rpc(None, Some(&info(5_000, 1, 0)), false);
         let mut sent = SentTx {
             txid: "ab".repeat(32),
+            chain_id: "sov-mainnet".into(),
+            rpc: "127.0.0.1:8645".into(),
             from_account: "usa.reserve.sov".to_string(),
             to: "ecb.reserve.sov".to_string(),
             amount_grains: 1_000,
