@@ -29,8 +29,12 @@ more than one release behind, fix it now; that is the whole job of this file.)_
   real keys, stored chain and genesis were not changed.
 - Validation: Station suite **160 passed, 0 failed, 1 ignored**; see the daily
   checkpoint for build/lint and native inspection evidence and limitations.
-- **Next action:** review the native preview and source diff; perform ordinary
-  release/integration gates before publishing or replacing a production app.
+- **Release follow-up:** the owner subsequently requested a GitHub release and
+  confirmed **main only, no release branch**. The tested UI commit is now on
+  local `main`; push it and run the unchanged release gate for **v0.2.14**.
+  See [release-v0.2.14.md](release-v0.2.14.md). No tag exists at this checkpoint.
+- **Next action:** run the ordinary release/integration gates, publish from
+  current `origin/main`, and verify the GitHub build/publish results.
   Do not treat preview balances or scans as live-chain evidence.
 
 See [2026-10-01.md](2026-10-01.md) for this session. Fleet state and current live
