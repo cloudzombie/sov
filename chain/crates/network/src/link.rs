@@ -94,7 +94,7 @@ impl SealedLink {
     }
 
     /// Build a link from parts already negotiated by the caller. `handshake_hash`
-    /// must be the complete channel binding returned by [`pq_handshake`], not
+    /// must be the complete channel binding returned by `pq_handshake`, not
     /// the earlier Noise-only handshake hash.
     pub fn from_parts(
         stream: TcpStream,
