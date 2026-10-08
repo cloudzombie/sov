@@ -1,6 +1,6 @@
 [package]
 name = "sov-station"
-version = "0.2.14"
+version = "0.2.15"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
@@ -12,10 +12,8 @@ sov-rpc = { path = "../chain/crates/rpc" }
 sov-crypto = { path = "../chain/crates/crypto" }
 sov-wallet = { path = "../chain/crates/wallet" }
 sov-shielded = { path = "../chain/crates/shielded" }
-# Pool v2 (post-quantum) key derivation, so the Receive view can show the
-# `xusq1…` address a wallet's seed controls. READ-ONLY use: the deployment is
-# dormant (signal bit 2 unarmed), so the station derives and displays the
-# address but can never build a v2 spend.
+# Pool v2 uses post-quantum primitives; its current prover is quarantined.
+# Keep historical note/address inspection without creating new pool-v2 actions.
 sov-shielded-pq = { path = "../chain/crates/shielded-pq" }
 # UPnP port mapping: Station runs the node IN-PROCESS, so it needs to ask the
 # router for a mapping itself rather than inheriting one from sov-rpcd.

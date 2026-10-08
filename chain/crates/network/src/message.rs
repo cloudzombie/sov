@@ -60,10 +60,10 @@ pub enum NetMessage {
     /// Authenticated handshake: a peer proves it is on the same chain — matching
     /// `chain_id` and `genesis_hash` — controls `public_key`, AND is speaking over
     /// the specific encrypted channel identified by `channel_binding` (the Noise
-    /// handshake hash), by signing all of it. Binding to the channel defeats a
-    /// man-in-the-middle: a relayed handshake carries the sender's channel hash,
-    /// which will not equal the receiver's hash for its own leg. A peer that fails
-    /// this is never trusted with blocks or transactions.
+    /// transcript plus both exact ML-KEM messages), by signing all of it.
+    /// Binding the KEM messages defeats substitution even if an attacker breaks
+    /// X25519 and preserves the Noise transcript. A peer that fails this is never
+    /// trusted with blocks or transactions.
     Hello {
         /// The peer's network/chain id.
         chain_id: String,
@@ -73,10 +73,11 @@ pub enum NetMessage {
         account: AccountId,
         /// The public key that produced `signature`.
         public_key: PublicKey,
-        /// The Noise handshake hash of the connection this Hello is sent over —
+        /// The complete Noise + ML-KEM channel binding of this connection —
         /// cryptographically ties the authenticated identity to the encrypted pipe.
         channel_binding: Vec<u8>,
-        /// Ed25519 signature over [`handshake_bytes`]`(chain_id, genesis_hash, channel_binding)`.
+        /// Identity signature over [`hello_signing_bytes`], including the claimed account.
+        /// A hybrid identity signs with both Ed25519 and ML-DSA-65.
         signature: Signature,
     },
     /// Software/protocol version advertisement (v0.1.86+). Sent once per peer right after
@@ -146,7 +147,13 @@ pub enum NetMessage {
 /// protocol change peers must negotiate; v0.1.86 was the first versioned protocol
 /// (v1). v2 adds headers-first fork-point discovery
 /// ([`GetHeaders`](NetMessage::GetHeaders) / [`Headers`](NetMessage::Headers)).
-pub const PROTOCOL_VERSION: u32 = 2;
+/// v3 authenticates the full hybrid transcript and signs the claimed account.
+pub const PROTOCOL_VERSION: u32 = 3;
+
+// The complete hybrid channel binding changes authentication semantics without
+// changing message encoding or the frame KDF. Version advertisements are unsigned
+// telemetry, so they cannot safely negotiate a legacy binding fallback. Old peers
+// fail signed Hello authentication; operators must coordinate their upgrade.
 
 /// The lowest protocol version this build will still peer with. `0` = accept every
 /// peer (pre-v0.1.86 nodes advertise nothing and are treated as version 0), so the
@@ -185,7 +192,12 @@ impl NetMessage {
         keypair: &Keypair,
     ) -> NetMessage {
         let chain_id = chain_id.into();
-        let signature = keypair.sign(&handshake_bytes(&chain_id, &genesis_hash, channel_binding));
+        let signature = keypair.sign(&hello_signing_bytes(
+            &chain_id,
+            &genesis_hash,
+            &account,
+            channel_binding,
+        ));
         NetMessage::Hello {
             chain_id,
             genesis_hash,
@@ -198,7 +210,7 @@ impl NetMessage {
 
     /// If this is a valid handshake for the expected chain AND the expected channel
     /// — same `chain_id`, `genesis_hash`, and `channel_binding` (the receiver's own
-    /// Noise handshake hash for this connection), with a signature that verifies
+    /// complete Noise + ML-KEM binding for this connection), with a signature that verifies
     /// against its own `public_key` — return the authenticated account; else `None`.
     pub fn authenticated_account(
         &self,
@@ -218,16 +230,10 @@ impl NetMessage {
                 && genesis_hash == expected_genesis
                 && channel_binding.as_slice() == expected_binding
                 && public_key.verify(
-                    &handshake_bytes(chain_id, genesis_hash, channel_binding),
+                    &hello_signing_bytes(chain_id, genesis_hash, account, channel_binding),
                     signature,
                 )
-                // Interim implicit-id guard (no wire-format change): the signed
-                // `handshake_bytes` do NOT yet cover `account`, so a valid keypair could
-                // otherwise CLAIM any account id (which drives peer dedup/identity). When
-                // the claimed id is an IMPLICIT (hash-of-pubkey) id, require it to derive
-                // from this very key — closing the spoof for implicit ids without the
-                // coordinated P2P v3 fork that would sign the account field. Named /
-                // ledger-bound ids are not implicit, so this never rejects them.
+                // Implicit identities also prove their self-certifying key relation.
                 && !implicit_account_spoofed(account, public_key) =>
             {
                 Some(account)
@@ -263,9 +269,30 @@ fn implicit_account_spoofed(account: &AccountId, public_key: &PublicKey) -> bool
 }
 
 /// The canonical bytes a [`NetMessage::Hello`] signs: chain id, genesis hash, and
-/// the channel binding (Noise handshake hash). Binding all three means a handshake
+/// the complete Noise + ML-KEM channel binding. Binding all three means a handshake
 /// signed for one chain/fork, or relayed onto a different encrypted channel, cannot
 /// be replayed.
+pub fn hello_signing_bytes(
+    chain_id: &str,
+    genesis_hash: &Hash,
+    account: &AccountId,
+    channel_binding: &[u8],
+) -> Vec<u8> {
+    let mut bytes = b"sov:p2p:hello:v3\0".to_vec();
+    for field in [
+        chain_id.as_bytes(),
+        account.as_str().as_bytes(),
+        channel_binding,
+    ] {
+        bytes.extend_from_slice(&(field.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(field);
+    }
+    bytes.extend_from_slice(genesis_hash.as_bytes());
+    bytes
+}
+
+/// Historical v2 preimage, retained only for interoperability regression tests.
+/// New Hello messages always use [`hello_signing_bytes`].
 pub fn handshake_bytes(chain_id: &str, genesis_hash: &Hash, channel_binding: &[u8]) -> Vec<u8> {
     let mut bytes = chain_id.as_bytes().to_vec();
     bytes.extend_from_slice(genesis_hash.as_bytes());
@@ -287,6 +314,35 @@ pub enum NetworkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hello_signature_binds_named_account_and_rejects_historical_preimage() {
+        let key = Keypair::hybrid_from_seed([40; 32]);
+        let genesis = Hash::digest(b"genesis");
+        let binding = [7; 32];
+        let mut hello = NetMessage::hello(
+            "sov-mainnet",
+            genesis,
+            AccountId::new("named.sov").unwrap(),
+            &binding,
+            &key,
+        );
+        assert!(hello
+            .authenticated_account("sov-mainnet", &genesis, &binding)
+            .is_some());
+        if let NetMessage::Hello { account, .. } = &mut hello {
+            *account = AccountId::new("another.sov").unwrap();
+        }
+        assert!(hello
+            .authenticated_account("sov-mainnet", &genesis, &binding)
+            .is_none());
+        if let NetMessage::Hello { signature, .. } = &mut hello {
+            *signature = key.sign(&handshake_bytes("sov-mainnet", &genesis, &binding));
+        }
+        assert!(hello
+            .authenticated_account("sov-mainnet", &genesis, &binding)
+            .is_none());
+    }
 
     #[test]
     fn status_roundtrips() {
@@ -415,6 +471,62 @@ mod tests {
         // Wrong genesis is still rejected.
         assert!(h
             .authenticated_account("sov", &Hash::digest(b"other"), binding)
+            .is_none());
+    }
+
+    #[test]
+    fn authentic_hybrid_hello_rejects_substituted_kem_transcripts_and_legacy_binding() {
+        use crate::pq::channel_binding;
+
+        let kp = Keypair::hybrid_from_seed([31; 32]);
+        let genesis = Hash::digest(b"genesis");
+        let account = kp.public_key().implicit_account_id();
+        let noise_hash = [1; 32];
+        let mut ek = [2; fips203::ml_kem_768::EK_LEN];
+        let mut ct = [3; fips203::ml_kem_768::CT_LEN];
+        let binding = channel_binding(&noise_hash, &ek, &ct);
+        let hello = NetMessage::hello("sov", genesis, account.clone(), &binding, &kp);
+        assert_eq!(
+            hello.authenticated_account("sov", &genesis, &binding),
+            Some(&account),
+            "an honest complete transcript authenticates the hybrid signature"
+        );
+
+        // Model a quantum attacker that preserves the Noise transcript while
+        // replacing either KEM message and relaying the authentic signed Hello.
+        ek[0] ^= 1;
+        let substituted_ek_binding = channel_binding(&noise_hash, &ek, &ct);
+        assert!(hello
+            .authenticated_account("sov", &genesis, &substituted_ek_binding)
+            .is_none());
+        ek[0] ^= 1;
+        ct[0] ^= 1;
+        let substituted_ct_binding = channel_binding(&noise_hash, &ek, &ct);
+        assert!(hello
+            .authenticated_account("sov", &genesis, &substituted_ct_binding)
+            .is_none());
+
+        // Replacing the Hello's binding to match the attacker's local transcript
+        // also fails: the original hybrid signature covers the honest binding.
+        let mut retagged = hello.clone();
+        if let NetMessage::Hello {
+            channel_binding, ..
+        } = &mut retagged
+        {
+            *channel_binding = substituted_ct_binding.to_vec();
+        }
+        assert!(retagged
+            .authenticated_account("sov", &genesis, &substituted_ct_binding)
+            .is_none());
+
+        // Mixed deployments must fail closed rather than negotiate the previous
+        // Noise-only binding, even when that old Hello has a hybrid signature.
+        let legacy = NetMessage::hello("sov", genesis, account, &noise_hash, &kp);
+        assert!(legacy
+            .authenticated_account("sov", &genesis, &binding)
+            .is_none());
+        assert!(hello
+            .authenticated_account("sov", &genesis, &noise_hash)
             .is_none());
     }
 

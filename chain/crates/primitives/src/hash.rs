@@ -1,8 +1,14 @@
 //! Cryptographic hashing for the SOV protocol.
 //!
 //! Every block, transaction, and state root is identified by a [`Hash`](struct@Hash): a
-//! 32-byte Blake3 digest. Blake3 is chosen for its speed, parallelism, and
-//! 256-bit security — appropriate for a high-throughput, sharded chain.
+//! 32-byte Blake3 digest. The 256-bit output width is not a claim of 256-bit
+//! collision security: generic classical collision search costs about 2^128
+//! evaluations. In an ideal quantum query model, generic preimage search costs
+//! about 2^128 queries and collision search about 2^(256/3), with substantial
+//! resource assumptions. These estimates do not establish practical attack costs
+//! or the quantum soundness of protocols built from this hash. Extending Blake3's
+//! output beyond 32 bytes does not increase its security (see the upstream
+//! [security notes](https://github.com/BLAKE3-team/BLAKE3/blob/master/c/README.md#security-notes)).
 
 use core::fmt;
 

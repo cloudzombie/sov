@@ -18,6 +18,7 @@
 //! sov-testnet gen    [--miners N] [--out DIR] [--policy test|mainnet-like]
 //!                    [--base-rpc 8645] [--base-p2p 9645] [--faucet-sov F]
 //!                    [--block-time-ms 60000] [--pow sha256d|randomx]
+//!                    [--pq-rehearsal yes] # isolated mandatory PQ R=48 / S=64
 //!     # DEFAULT policy is mainnet-like: NO pre-mine (genesis funds nothing, the
 //!     # whole 21M cap is mined at 12.5 XUS/block and taxed 9%/1%). The faucet is
 //!     # the first miner, dispensing coins it mines. `--policy test` instead
@@ -58,6 +59,7 @@ use serde::{Deserialize, Serialize};
 use sov_primitives::{AccountId, Balance};
 use sov_rpc::{
     ChainSpec, Keystore, KeystoreEntry, NodeConfig, PolicyPreset, RpcClient, SpecAccount,
+    PQ_REHEARSAL_CHAIN_PREFIX,
 };
 
 use sov_crypto::Keypair;
@@ -240,7 +242,36 @@ fn public_key_string(seed_hex: &str) -> Result<String, Box<dyn Error>> {
 // gen
 // ---------------------------------------------------------------------------
 
+/// Select the pinned retirement namespace explicitly; a canonical identity can
+/// never be repurposed as a rehearsal with different consensus rules.
+fn generated_chain_id(flags: &Flags) -> Result<String, Box<dyn Error>> {
+    let pq_rehearsal = match flags.get("pq-rehearsal") {
+        None | Some("no") | Some("false") => false,
+        Some("yes") | Some("true") => true,
+        Some(_) => return Err("--pq-rehearsal requires yes|no".into()),
+    };
+    let default = if pq_rehearsal {
+        "sov-pq-rehearsal-local"
+    } else {
+        "sov-testnet"
+    };
+    let chain_id = flags.get("chain-id").unwrap_or(default);
+    if pq_rehearsal
+        && (!chain_id.starts_with(PQ_REHEARSAL_CHAIN_PREFIX) || chain_id.contains("mainnet"))
+    {
+        return Err(format!(
+            "--pq-rehearsal requires an isolated {PQ_REHEARSAL_CHAIN_PREFIX} chain id without mainnet"
+        )
+        .into());
+    }
+    if !pq_rehearsal && chain_id.starts_with(PQ_REHEARSAL_CHAIN_PREFIX) {
+        return Err("the reserved PQ rehearsal namespace requires --pq-rehearsal yes".into());
+    }
+    Ok(chain_id.to_string())
+}
+
 fn cmd_gen(flags: &Flags) -> Result<(), Box<dyn Error>> {
+    let chain_id = generated_chain_id(flags)?;
     let out = flags.out_dir();
     let miners: usize = flags.parse_or("miners", 2usize)?;
     if miners == 0 {
@@ -307,7 +338,6 @@ fn cmd_gen(flags: &Flags) -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
-    let chain_id = flags.get("chain-id").unwrap_or("sov-testnet").to_string();
 
     fs::create_dir_all(&out)?;
 
@@ -1554,4 +1584,31 @@ fn rpcd_path() -> PathBuf {
         }
     }
     PathBuf::from(name)
+}
+
+#[cfg(test)]
+mod pq_rehearsal_tests {
+    use super::*;
+
+    fn flags(args: &[&str]) -> Flags {
+        Flags::parse(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn explicit_rehearsal_cannot_repurpose_canonical_network_identity() {
+        assert_eq!(generated_chain_id(&flags(&[])).unwrap(), "sov-testnet");
+        assert_eq!(
+            generated_chain_id(&flags(&["--pq-rehearsal", "yes"])).unwrap(),
+            "sov-pq-rehearsal-local"
+        );
+        for chain_id in ["sov-mainnet", "sov-testnet-1", "sov-pq-rehearsal-mainnet"] {
+            assert!(
+                generated_chain_id(&flags(&["--pq-rehearsal", "yes", "--chain-id", chain_id]))
+                    .is_err()
+            );
+        }
+        assert!(generated_chain_id(&flags(&["--chain-id", "sov-pq-rehearsal-local"])).is_err());
+        assert!(generated_chain_id(&flags(&["--pq-rehearsal"])).is_err());
+        assert!(generated_chain_id(&flags(&["--pq-rehearsal", "maybe"])).is_err());
+    }
 }

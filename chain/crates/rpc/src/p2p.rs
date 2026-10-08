@@ -123,6 +123,25 @@ pub struct P2pConfig {
     pub keypair: Keypair,
 }
 
+impl P2pConfig {
+    fn requires_hybrid_identity(&self) -> bool {
+        self.chain_id.contains("mainnet")
+            || self.chain_id.starts_with(crate::PQ_REHEARSAL_CHAIN_PREFIX)
+    }
+
+    fn allows_identity(&self, msg: &NetMessage) -> bool {
+        !self.requires_hybrid_identity()
+            || matches!(
+                msg,
+                NetMessage::Hello {
+                    public_key: sov_crypto::PublicKey::V2HybridMlDsa65 { .. },
+                    signature: sov_crypto::Signature::V2HybridMlDsa65 { .. },
+                    ..
+                }
+            )
+    }
+}
+
 /// A peer-to-peer node: a TCP gossip transport bound to a shared [`Node`].
 pub struct P2p {
     tcp: Arc<TcpNode>,
@@ -182,6 +201,17 @@ impl P2pHandle {
 impl P2p {
     /// Bind a TCP transport on `addr` for the shared `node`.
     pub fn bind(node: Arc<Mutex<Node>>, config: P2pConfig, addr: &str) -> std::io::Result<P2p> {
+        if config.requires_hybrid_identity()
+            && !matches!(
+                config.keypair.public_key(),
+                sov_crypto::PublicKey::V2HybridMlDsa65 { .. }
+            )
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "this network requires a hybrid Ed25519 + ML-DSA-65 peer identity",
+            ));
+        }
         Ok(P2p {
             tcp: Arc::new(TcpNode::bind(addr)?),
             node,
@@ -1440,6 +1470,9 @@ impl SyncState {
         // membership and key control are trusted with any chain data.
         let binding = tcp.peer_handshake_hash(&peer);
         let authed_account = binding.as_ref().and_then(|b| {
+            if !config.allows_identity(&msg) {
+                return None;
+            }
             msg.authenticated_account(&config.chain_id, &config.genesis_hash, b)
                 .cloned()
         });
@@ -1455,6 +1488,9 @@ impl SyncState {
                     format!("wrong chain id {chain_id}")
                 } else if genesis_hash != &config.genesis_hash {
                     "wrong genesis hash".to_string()
+                } else if !config.allows_identity(&msg) {
+                    "classical peer identity refused; hybrid Ed25519 + ML-DSA-65 required"
+                        .to_string()
                 } else if spoofed_implicit {
                     "implicit account id does not derive from its public key (spoof)".to_string()
                 } else {
@@ -1587,6 +1623,9 @@ impl SyncState {
                 }
             }
             NetMessage::NewTransaction(stx) => {
+                if !crate::safe_new_transaction(&stx.transaction.action) {
+                    return;
+                }
                 let accepted = node
                     .lock()
                     .map(|mut n| n.submit(stx.clone()).is_ok())
@@ -4018,5 +4057,62 @@ mod tests {
             "same survivor regardless of input order"
         );
         assert_eq!(survivor(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod quantum_identity_tests {
+    use super::*;
+
+    #[test]
+    fn protected_networks_require_both_hybrid_key_and_signature() {
+        let legacy = Keypair::from_seed([98; 32]);
+        let hybrid = Keypair::hybrid_from_seed([99; 32]);
+        for chain_id in [
+            "sov-mainnet",
+            "sov-pq-rehearsal-local",
+            "sov-pq-rehearsal-mainnet",
+        ] {
+            let config = P2pConfig {
+                chain_id: chain_id.into(),
+                genesis_hash: Hash::ZERO,
+                account: hybrid.public_key().implicit_account_id(),
+                keypair: Keypair::hybrid_from_seed([99; 32]),
+            };
+            let mut hello = NetMessage::hello(
+                chain_id,
+                Hash::ZERO,
+                config.account.clone(),
+                b"binding",
+                &hybrid,
+            );
+            assert!(config.allows_identity(&hello));
+            if let NetMessage::Hello { signature, .. } = &mut hello {
+                *signature = legacy.sign(b"binding");
+            }
+            assert!(!config.allows_identity(&hello));
+            let hello = NetMessage::hello(
+                chain_id,
+                Hash::ZERO,
+                legacy.public_key().implicit_account_id(),
+                b"binding",
+                &legacy,
+            );
+            assert!(!config.allows_identity(&hello));
+        }
+        let config = P2pConfig {
+            chain_id: "sov-dev".into(),
+            genesis_hash: Hash::ZERO,
+            account: legacy.public_key().implicit_account_id(),
+            keypair: Keypair::from_seed([98; 32]),
+        };
+        let hello = NetMessage::hello(
+            "sov-dev",
+            Hash::ZERO,
+            config.account.clone(),
+            b"binding",
+            &legacy,
+        );
+        assert!(config.allows_identity(&hello));
     }
 }

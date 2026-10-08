@@ -1199,3 +1199,87 @@ fn fresh_node_syncs_across_many_batch_boundaries_despite_losing_its_only_peer() 
     a_p2p.shutdown();
     c_p2p.shutdown();
 }
+
+#[test]
+fn pq_rehearsal_accepts_hybrid_peers_and_refuses_classical_hello() {
+    let mut g = genesis();
+    g.chain_id = "sov-pq-rehearsal-peering".into();
+    let new_node = || {
+        Arc::new(std::sync::Mutex::new(sov_node::Node::new(
+            sov_chain::Blockchain::new(&g).unwrap(),
+            1024,
+            256,
+        )))
+    };
+    let a = new_node();
+    let genesis_hash = a.lock().unwrap().chain().head().hash();
+    let config = |seed, hybrid| {
+        let keypair = if hybrid {
+            Keypair::hybrid_from_seed(seed)
+        } else {
+            Keypair::from_seed(seed)
+        };
+        P2pConfig {
+            chain_id: g.chain_id.clone(),
+            genesis_hash,
+            account: keypair.public_key().implicit_account_id(),
+            keypair,
+        }
+    };
+    assert_eq!(
+        P2p::bind(Arc::clone(&a), config([119; 32], false), "127.0.0.1:0")
+            .err()
+            .unwrap()
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    let a_sync = Arc::new(SyncShared::new());
+    let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let a_peer = P2p::bind(a, config([120; 32], true), "127.0.0.1:0")
+        .unwrap()
+        .with_sync_status(Arc::clone(&a_sync))
+        .with_log_sink(Arc::clone(&logs))
+        .start();
+    let raw = TcpNode::bind("127.0.0.1:0").unwrap();
+    raw.connect(&a_peer.local_addr().to_string()).unwrap();
+    assert!(wait_until(10, || raw
+        .peer_handshake_hash(&a_peer.local_addr())
+        .is_some()));
+    let binding = raw.peer_handshake_hash(&a_peer.local_addr()).unwrap();
+    let legacy = Keypair::from_seed([121; 32]);
+    let hello = NetMessage::hello(
+        &g.chain_id,
+        genesis_hash,
+        legacy.public_key().implicit_account_id(),
+        &binding,
+        &legacy,
+    );
+    assert!(
+        hello
+            .authenticated_account(&g.chain_id, &genesis_hash, &binding)
+            .is_some(),
+        "this has a valid channel binding; rejection must enforce the key policy"
+    );
+    assert!(raw.send(a_peer.local_addr(), &hello));
+    assert!(
+        wait_until(10, || logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("classical peer identity refused"))),
+        "{:?}",
+        logs.lock().unwrap()
+    );
+    assert_eq!(a_sync.authed_peers(), 0);
+    raw.shutdown();
+    let b_sync = Arc::new(SyncShared::new());
+    let b_peer = P2p::bind(new_node(), config([122; 32], true), "127.0.0.1:0")
+        .unwrap()
+        .with_sync_status(Arc::clone(&b_sync))
+        .start();
+    b_peer.connect(&a_peer.local_addr().to_string()).unwrap();
+    assert!(wait_until(10, || a_sync.authed_peers() == 1
+        && b_sync.authed_peers() == 1));
+    a_peer.shutdown();
+    b_peer.shutdown();
+}

@@ -11,9 +11,10 @@
 //! proof_len:u32le:4 | proof:proof_len | binding_sig:64
 //! ```
 //!
-//! Decoding rebuilds the exact bundle; the round-trip test re-verifies the
-//! Halo2 proof afterward, so a mis-encoding cannot pass silently. Decoding is
-//! strict: truncated input, an invalid component, or trailing bytes all error.
+//! Decoding rebuilds the exact bundle; the round-trip test re-verifies its
+//! proof and authorization signatures afterward. Decoding only checks the
+//! encoding: callers must run [`ShieldedBundle::verify`] for cryptographic
+//! validity. Truncated input, invalid components, and trailing bytes all error.
 
 use nonempty::NonEmpty;
 use orchard::bundle::{Authorized, Flags, ProofSizeEnforcement};
@@ -29,6 +30,7 @@ use crate::ShieldedError;
 // Orchard fixed component sizes, in bytes.
 const ENC_CIPHERTEXT: usize = 580;
 const OUT_CIPHERTEXT: usize = 80;
+const ACTION_BYTES: usize = 32 * 5 + ENC_CIPHERTEXT + OUT_CIPHERTEXT + 64;
 
 impl ShieldedBundle {
     /// Serialize to the canonical byte encoding (see module docs).
@@ -68,6 +70,12 @@ impl ShieldedBundle {
             Option::from(Anchor::from_bytes(r.arr::<32>()?)).ok_or_else(|| decode("anchor"))?;
 
         let count = u32::from_le_bytes(r.arr::<4>()?) as usize;
+        // The action count is untrusted. Bound it by the actual input before
+        // allocating, leaving room for the proof length and binding signature.
+        // Otherwise even a tiny malformed bundle can request a huge allocation.
+        if count == 0 || count > r.remaining().saturating_sub(4 + 64) / ACTION_BYTES {
+            return Err(decode("invalid action count"));
+        }
         let mut actions = Vec::with_capacity(count);
         for _ in 0..count {
             let nf = Option::from(Nullifier::from_bytes(&r.arr::<32>()?))
@@ -160,6 +168,60 @@ impl<'a> Reader<'a> {
     fn finished(&self) -> bool {
         self.pos == self.buf.len()
     }
+
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+}
+
+/// Regression checks shared by real mint and spend tests. Alter only the
+/// authorization/value-balance bytes in a legitimately generated bundle; no
+/// custom proof construction or unauthorized spending is involved.
+#[cfg(test)]
+pub(crate) fn assert_authorization_mutations_rejected(
+    bundle: &ShieldedBundle,
+    params: &crate::ShieldedParams,
+) {
+    const HEADER_BYTES: usize = 1 + 8 + 32 + 4;
+    const ACTION_SIGNATURE_OFFSET: usize = ACTION_BYTES - 64;
+
+    let bytes = bundle.to_bytes();
+    for action_index in 0..bundle.inner().actions().len() {
+        let mut changed = bytes.clone();
+        let start = HEADER_BYTES + action_index * ACTION_BYTES + ACTION_SIGNATURE_OFFSET;
+        changed[start..start + 64].fill(0);
+        let invalid = ShieldedBundle::from_bytes(&changed).expect("signature has valid encoding");
+        assert!(
+            invalid.verify_proof_only_legacy(params),
+            "changing spend authorization must leave the proof intact"
+        );
+        assert!(
+            !invalid.verify(params),
+            "each spend signature must be verified"
+        );
+    }
+
+    let mut changed = bytes.clone();
+    let binding_start = changed.len() - 64;
+    changed[binding_start..].fill(0);
+    let invalid = ShieldedBundle::from_bytes(&changed).expect("binding has valid encoding");
+    assert!(invalid.verify_proof_only_legacy(params));
+    assert!(
+        !invalid.verify(params),
+        "the binding signature must be verified"
+    );
+
+    let mut changed = bytes;
+    changed[1] ^= 1;
+    let invalid = ShieldedBundle::from_bytes(&changed).expect("modified value balance encodes");
+    assert!(
+        invalid.verify_proof_only_legacy(params),
+        "the proof alone does not bind the public value balance"
+    );
+    assert!(
+        !invalid.verify(params),
+        "value-balance mutations must be rejected"
+    );
 }
 
 #[cfg(test)]
@@ -177,17 +239,31 @@ mod tests {
         let bytes = bundle.to_bytes();
         let decoded = ShieldedBundle::from_bytes(&bytes).expect("decodes");
 
-        // Re-encoding is identical (canonical), the proof still verifies, and the
-        // public value balance survived the round trip.
+        // Re-encoding is identical (canonical), complete authorization verifies,
+        // and the public value balance survived the round trip.
         assert_eq!(decoded.to_bytes(), bytes, "encoding is canonical");
-        assert!(decoded.verify(&params), "proof verifies after round-trip");
+        assert!(
+            decoded.verify(&params),
+            "authorization verifies after round-trip"
+        );
         assert_eq!(decoded.value_balance(), bundle.value_balance());
         assert_eq!(decoded.value_balance(), -77);
+
+        assert_authorization_mutations_rejected(&decoded, &params);
     }
 
     #[test]
     fn malformed_input_is_rejected() {
         assert!(ShieldedBundle::from_bytes(&[]).is_err());
         assert!(ShieldedBundle::from_bytes(&[0u8; 10]).is_err());
+
+        let mut oversized_count = vec![0; 1 + 8];
+        oversized_count.extend_from_slice(&Anchor::empty_tree().to_bytes());
+        oversized_count.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            ShieldedBundle::from_bytes(&oversized_count).err(),
+            Some(decode("invalid action count")),
+            "untrusted action counts must be bounded before allocation"
+        );
     }
 }

@@ -72,10 +72,11 @@ pub fn run_matrix(ctx: &mut Ctx) -> Vec<StepResult> {
     let mut aborted: Option<&'static str> = None;
 
     type StepFn = fn(&mut Ctx) -> Result<(String, Value), String>;
-    let live_steps: [(&'static str, StepFn); 8] = [
+    let live_steps: [(&'static str, StepFn); 9] = [
         ("genesis-determinism", step_genesis),
         ("p2p-mesh-and-late-join-sync", step_mesh_and_late_join),
         ("mining-block-production", step_mining),
+        ("pool-v2-quarantine-inactive", step_v2_quarantine_inactive),
         // Shields BEFORE the activation window opens, drives the deployment all
         // the way to Active, cold-boots a node, and only then spends the note.
         ("shielded-v1-never-stranded", step_never_stranded),
@@ -108,21 +109,31 @@ pub fn run_matrix(ctx: &mut Ctx) -> Vec<StepResult> {
         }
     }
 
-    // Pool-v2 lifecycle. These ran as blanket SKIPs while W2 was unlanded;
-    // audit PQV2-02 showed that a harness reporting green over six skipped v2
-    // steps evidences nothing about the feature it purports to validate. They
-    // are live steps now, gated on the `shielded-v2` (bit 2) deployment that
-    // the rehearsal preset arms one window after `tx-domain`.
+    // New v2 carriers are quarantined because the current unmasked prover
+    // exposes private inputs. Rehearse bit-2 activation without admitting a
+    // new proof, and require live rejection/state/replay evidence, never skips.
     let v2_steps: [(&'static str, StepFn); 6] = [
         (
             "shielded-v1-never-stranded-across-pool-v2",
             step_v1_across_v2,
         ),
-        ("shield-v2", step_shield_v2),
-        ("z-send-v2", step_zsend_v2),
-        ("unshield-v2", step_unshield_v2),
-        ("v1-to-v2-migration", step_v1_to_v2_migration),
-        ("reorg-with-v2-state", step_reorg_with_v2),
+        (
+            "pool-v2-quarantine-direct-active",
+            step_v2_quarantine_direct,
+        ),
+        (
+            "pool-v2-quarantine-wrapped-active",
+            step_v2_quarantine_wrapped,
+        ),
+        (
+            "pool-v2-quarantine-deferred-active",
+            step_v2_quarantine_deferred,
+        ),
+        (
+            "pool-v2-quarantine-cross-node",
+            step_v2_quarantine_cross_node,
+        ),
+        ("pool-v2-quarantine-replay", step_v2_quarantine_replay),
     ];
     for (name, f) in v2_steps {
         if let Some(failed) = aborted {
@@ -1317,39 +1328,14 @@ fn step_bip9_activation(ctx: &mut Ctx) -> Result<(String, Value), String> {
 /// The `shielded-v2` deployment name (BIP-9 signal bit 2).
 const V2_DEPLOYMENT: &str = "shielded-v2";
 
-/// Block the harness until pool v2 is Active, proving DORMANCY first.
-///
-/// While dormant this asserts the pool is a hard reject rather than a silent
-/// no-op — the property that lets pool v2 ship inside a release that does not
-/// yet arm it. Then it waits out the compressed BIP-9 schedule for real.
+/// The exact admission-policy message, distinct from bad signatures,
+/// malformed params, dormant deployments, or a broken RPC connection.
+const V2_QUARANTINE_MESSAGE: &str = "pool-v2 transactions disabled: the current proof implementation does not protect private inputs; historical block verification remains available";
+
+/// Block until the real BIP-9 machinery activates bit 2. Activation is not
+/// permission to use the quarantined proof suite; write-policy probes run both
+/// before activation (an early matrix step) and afterwards.
 fn await_v2_active(ctx: &mut Ctx) -> Result<Value, String> {
-    let obs = ctx.rpc("node-4");
-    let addr = obs.addr.clone();
-
-    // The node must KNOW about pool v2 even while it is unusable — otherwise a
-    // wallet cannot tell "empty pool" from "node too old".
-    let info = obs.shielded_v2_info()?;
-    if info.get("poolValue").is_none() {
-        return Err(format!("node serves no pool-v2 info while dormant: {info}"));
-    }
-
-    // DORMANCY PROOF: while bit 2 is unarmed a v2 action must be REFUSED, not
-    // quietly accepted. The CLI's own guard is the first line; a refusal here
-    // is the evidence that a v0.2.2 release can carry this code safely.
-    let mut dormancy_evidence = json!(null);
-    if !obs.shielded_v2_active()? {
-        let seed = ctx.net.key("user1.e2e.sov").seed_hex.clone();
-        let refusal = wallet_expect_failure(ctx, &addr, &["shield2", &seed, "1"])?;
-        if !refusal.to_lowercase().contains("not active") {
-            return Err(format!(
-                "pool v2 is dormant but a v2 shield was not refused for dormancy: {refusal}"
-            ));
-        }
-        dormancy_evidence = json!(refusal.trim());
-    }
-
-    // Now let the real BIP-9 machinery activate it: miners signal bit 2 via the
-    // baked mask, so this is a genuine Defined->Started->LockedIn->Active walk.
     let obs = ctx.rpc("node-4");
     poll(
         "pool v2 (bit 2) to reach Active",
@@ -1357,42 +1343,172 @@ fn await_v2_active(ctx: &mut Ctx) -> Result<Value, String> {
         Duration::from_secs(2),
         || Ok(obs.shielded_v2_active()?.then_some(())),
     )?;
-    let height = obs.height()?;
     Ok(json!({
-        "dormant_shield_refusal": dormancy_evidence,
-        "active_at_observed_height": height,
+        "active_at_observed_height": obs.height()?,
         "deployment": V2_DEPLOYMENT,
+        "new_carriers_allowed": false,
     }))
 }
 
-/// `z2-address` for a seed (the `xusq1…` pool-v2 receiving address).
-fn z2address(ctx: &Ctx, addr: &str, seed_hex: &str) -> Result<String, String> {
-    let out = wallet(ctx, addr, &["z2-address", seed_hex])?;
-    labeled_value(&out, "pool v2 address")
-        .ok_or_else(|| format!("z2-address output lacks `pool v2 address`:\n{out}"))
+/// Raw wire probes deliberately carry a structurally valid, zero signature
+/// and an empty bundle. Admission MUST identify the privacy quarantine before
+/// signature or proof verification. A signature/proof/dormancy error is a FAIL.
+/// The harness derives the public key with the real wallet, never implements
+/// cryptography, and never creates an unsafe proof containing private inputs.
+fn v2_probe(ctx: &Ctx, action: Value) -> Value {
+    let key = ctx.net.key("user1.e2e.sov");
+    json!({
+        "transaction": {
+            "signer": key.account,
+            "public_key": key.public_key,
+            "nonce": 0,
+            "action": action,
+        },
+        "signature": format!("hybrid65:0x{}", "00".repeat(3373)),
+    })
 }
 
-/// `z2-balance` for a seed, as `(xus_string, unspent_note_count)`.
-fn z2balance(ctx: &Ctx, addr: &str, seed_hex: &str) -> Result<(String, u64), String> {
-    let out = wallet(ctx, addr, &["z2-balance", seed_hex])?;
-    let bal = labeled_value(&out, "shielded balance")
-        .and_then(|v| v.strip_suffix("XUS").map(|s| s.trim().to_string()))
-        .ok_or("z2-balance output lacks `shielded balance`")?;
-    let notes = labeled_value(&out, "unspent notes")
-        .and_then(|v| v.parse::<u64>().ok())
-        .ok_or("z2-balance output lacks `unspent notes`")?;
-    Ok((bal, notes))
+fn v2_probe_actions() -> Vec<(&'static str, Value)> {
+    let leaf = || json!({ "type": "shielded_v2", "bundle": [] });
+    vec![
+        ("direct", leaf()),
+        (
+            "tipped",
+            json!({ "type": "tipped", "tip": "0", "inner": leaf() }),
+        ),
+        (
+            "timestamped",
+            json!({ "type": "timestamped", "created_at_ms": 1, "inner": leaf() }),
+        ),
+        (
+            "multisig_exec",
+            json!({ "type": "multisig_exec", "action": leaf(), "approvals": [] }),
+        ),
+        (
+            "propose_multisig",
+            json!({ "type": "propose_multisig", "account": "vault.e2e.sov", "action": leaf() }),
+        ),
+        (
+            "wrapped_proposal",
+            json!({
+                "type": "timestamped", "created_at_ms": 1,
+                "inner": {
+                    "type": "tipped", "tip": "0",
+                    "inner": { "type": "propose_multisig", "account": "vault.e2e.sov", "action": leaf() },
+                },
+            }),
+        ),
+    ]
 }
 
-/// Poll pool v2's value until it equals `expected` grains.
-fn poll_pool_v2_eq(rpc: &Rpc, expected: u128, what: &str, timeout: Duration) -> Result<(), String> {
-    poll(what, timeout, Duration::from_millis(500), || {
-        Ok((rpc.pool_v2_grains()? == expected).then_some(()))
-    })
-    .map_err(|e| {
-        let got = rpc.pool_v2_grains().unwrap_or_default();
-        format!("{e} (pool v2 = {got} grains, expected {expected})")
-    })
+fn quarantine_rejection(reply: Result<Value, String>) -> Result<String, String> {
+    match reply {
+        Err(error) if error.contains(V2_QUARANTINE_MESSAGE) => Ok(error),
+        Err(error) => Err(format!("v2 probe failed for the wrong reason: {error}")),
+        Ok(reply) => Err(format!("quarantined v2 carrier was accepted: {reply}")),
+    }
+}
+
+fn assert_quarantine_status(status: &Value, info: &Value, active: bool) -> Result<(), String> {
+    for field in [
+        "v2ProofSecurityEstablished",
+        "v2PrivacyEstablished",
+        "poolV2CreationAllowed",
+        "fullyPostQuantum",
+    ] {
+        if status.get(field).and_then(Value::as_bool) != Some(false) {
+            return Err(format!(
+                "quantum status must explicitly report {field}=false: {status}"
+            ));
+        }
+    }
+    for field in [
+        "proofSecurityEstablished",
+        "privacyEstablished",
+        "creationAllowed",
+    ] {
+        if info.get(field).and_then(Value::as_bool) != Some(false) {
+            return Err(format!(
+                "pool-v2 status must explicitly report {field}=false: {info}"
+            ));
+        }
+    }
+    if info.get("active").and_then(Value::as_bool) != Some(active)
+        || status.get("v2Active").and_then(Value::as_bool) != Some(active)
+    {
+        return Err(format!(
+            "v2 deployment state should be {active}: {info}; {status}"
+        ));
+    }
+    if status["pqSunset"]["armed"] != false || status["pqSunset"]["stage"] != "unarmed" {
+        return Err(format!(
+            "this E2E namespace must not arm PQ sunset: {status}"
+        ));
+    }
+    Ok(())
+}
+
+/// Snapshot the effects a rejected carrier could cause. Mining may continue
+/// between calls, so height/emission/drain-window telemetry are excluded; the
+/// wallet users, both pools, proposals, and ready/queued mempool remain exact.
+fn quarantine_snapshot(rpc: &Rpc) -> Result<Value, String> {
+    let info = rpc.shielded_v2_info()?;
+    let anchors = rpc.call("sov_getShieldedV2Anchors", json!({}))?;
+    let mempool = rpc.call("sov_getMempoolTxs", json!({}))?;
+    if mempool["txCount"] != 0 || mempool["queuedCount"] != 0 || mempool["txs"] != json!([]) {
+        return Err(format!(
+            "quarantine probes require an empty ready/queued mempool: {mempool}"
+        ));
+    }
+    let mut pool = serde_json::Map::new();
+    for field in ["poolValue", "anchor", "noteCount", "nullifierCount"] {
+        let value = info
+            .get(field)
+            .ok_or_else(|| format!("pool-v2 info lacks {field}: {info}"))?;
+        pool.insert(field.into(), value.clone());
+    }
+    Ok(json!({
+        "pool_v1_grains": rpc.pool_grains()?.to_string(),
+        "pool_v2": pool,
+        "v2_anchors": anchors.get("anchors").ok_or_else(|| format!("anchor ring missing: {anchors}"))?,
+        "user1": rpc.call("sov_getAccount", json!({ "account": "user1.e2e.sov" }))?,
+        "user2": rpc.call("sov_getAccount", json!({ "account": "user2.e2e.sov" }))?,
+        "vault": rpc.call("sov_getAccount", json!({ "account": "vault.e2e.sov" }))?,
+        "proposals": rpc.call("sov_getMultisigProposals", json!({ "account": "vault.e2e.sov" }))?,
+        "mempool": { "ready": mempool["txCount"], "queued": mempool["queuedCount"], "txs": mempool["txs"] },
+    }))
+}
+
+fn assert_v2_quarantine(
+    ctx: &Ctx,
+    rpc: &Rpc,
+    active: bool,
+    probes: &[(&str, Value)],
+) -> Result<Value, String> {
+    let status = rpc.call("sov_getQuantumStatus", json!({}))?;
+    let info = rpc.shielded_v2_info()?;
+    assert_quarantine_status(&status, &info, active)?;
+    let before = quarantine_snapshot(rpc)?;
+    let mut refusals = serde_json::Map::new();
+    for (name, action) in probes {
+        let error =
+            quarantine_rejection(rpc.call("sov_submitTransaction", v2_probe(ctx, action.clone())))?;
+        refusals.insert((*name).into(), json!(error));
+        let after = quarantine_snapshot(rpc)?;
+        if after != before {
+            return Err(format!(
+                "rejected {name} mutated account/pool/proposal/mempool state: {before} -> {after}"
+            ));
+        }
+    }
+    Ok(
+        json!({ "refusals": refusals, "unchanged_state": before, "quantum_status": status, "deployment_active": active }),
+    )
+}
+
+fn step_v2_quarantine_inactive(ctx: &mut Ctx) -> Result<(String, Value), String> {
+    let evidence = assert_v2_quarantine(ctx, &ctx.rpc("node-4"), false, &v2_probe_actions())?;
+    Ok(("all six direct/wrapped/deferred v2 RPC carriers refused by the privacy policy while bit 2 is inactive; accounts, pools, proposals and both mempool queues unchanged".into(), evidence))
 }
 
 /// Law F8, the half that needed a pool v2 to exist: a pool-v1 note created
@@ -1487,7 +1603,7 @@ fn step_v1_across_v2(ctx: &mut Ctx) -> Result<(String, Value), String> {
     Ok((
         format!(
             "law F8 across the introduction of pool v2: 4 XUS shielded into v1 while bit 2 \
-             was DORMANT (a v2 shield was refused outright), bit 2 then driven to Active for \
+             was DORMANT, bit 2 then driven to Active for \
              real, and the v1 note was still intact ({} XUS) and still spendable — de-shielded \
              1 XUS after activation with exact deltas; pool v2 stayed at 0",
             z_after.0
@@ -1503,553 +1619,119 @@ fn step_v1_across_v2(ctx: &mut Ctx) -> Result<(String, Value), String> {
     ))
 }
 
-/// A real STARK-proved shield into pool v2, mined and verified in consensus.
-fn step_shield_v2(ctx: &mut Ctx) -> Result<(String, Value), String> {
-    let obs = ctx.rpc("node-4");
-    let addr = obs.addr.clone();
-    let val01 = ctx.net.key("val01.e2e.sov").clone();
-    let user1 = ctx.net.key("user1.e2e.sov").clone();
-    let xus = |n: u128| n * GRAINS_PER_XUS;
-
-    if !obs.shielded_v2_active()? {
-        return Err(
-            "pool v2 is not Active — `shielded-v1-never-stranded-across-pool-v2` \
-                    should have driven the activation"
-                .to_string(),
-        );
-    }
-    let pool_v2_before = obs.pool_v2_grains()?;
-    let pool_v1_before = obs.pool_grains()?;
-
-    // user1 needs transparent headroom to pay the carrier fee.
-    let fund = wallet(
-        ctx,
-        &addr,
-        &[
-            "transfer",
-            &val01.seed_hex,
-            "val01.e2e.sov",
-            "user1.e2e.sov",
-            "12",
-        ],
-    )?;
-    let fund_tx = parse_tx_id(&fund).ok_or("no tx id in v2 funding transfer")?;
-    await_success(&obs, &fund_tx, "v2 funding", Duration::from_secs(90))?;
-
-    let v2_addr = z2address(ctx, &addr, &user1.seed_hex)?;
-    if !v2_addr.starts_with("xusq1") {
-        return Err(format!("pool-v2 address is not xusq1-prefixed: {v2_addr}"));
-    }
-
-    // The shield itself: the CLI builds a REAL Winterfell STARK; the node
-    // verifies it inside consensus before the bundle can be mined.
-    let out = wallet(
-        ctx,
-        &addr,
-        &["shield2", &user1.seed_hex, "5", "--signer", "user1.e2e.sov"],
-    )?;
-    let tx = parse_tx_id(&out).ok_or("no tx id in shield2 output")?;
-    let rcpt = await_success(&obs, &tx, "v2 shield", Duration::from_secs(300))?;
-
-    poll_pool_v2_eq(
-        &obs,
-        pool_v2_before + xus(5),
-        "pool v2 after shield",
-        Duration::from_secs(90),
-    )?;
-    let zb = z2balance(ctx, &addr, &user1.seed_hex)?;
-    if zb != ("5".to_string(), 1) {
-        return Err(format!(
-            "user1 pool-v2 balance after shield: expected (5 XUS, 1 note), got {zb:?}"
-        ));
-    }
-    // Shielding into v2 must not disturb pool v1.
-    let pool_v1_after = obs.pool_grains()?;
-    if pool_v1_after != pool_v1_before {
-        return Err(format!(
-            "a pool-v2 shield moved pool v1: {pool_v1_before} -> {pool_v1_after}"
-        ));
-    }
-    // Every node must agree on the new anchor, or witnesses desync.
-    let anchors = v2_anchor_agreement(ctx)?;
-
+fn step_v2_quarantine_direct(ctx: &mut Ctx) -> Result<(String, Value), String> {
+    let probes = v2_probe_actions();
+    let evidence = assert_v2_quarantine(ctx, &ctx.rpc("node-4"), true, &probes[..1])?;
     Ok((
-        format!(
-            "5 XUS shielded into pool v2 with a REAL STARK proof verified in consensus; \
-             pool v2 {} -> {} grains, wallet sees 5 XUS x 1 note, pool v1 untouched, and all \
-             {} nodes agree on the v2 anchor",
-            pool_v2_before,
-            pool_v2_before + xus(5),
-            anchors.0
-        ),
-        json!({
-            "fund_tx": fund_tx,
-            "shield_tx": tx,
-            "gas": gas_used(&rcpt)?,
-            "pool_v2_address": v2_addr,
-            "pool_v2_grains": { "before": pool_v2_before.to_string(), "after": (pool_v2_before + xus(5)).to_string() },
-            "pool_v1_grains_unchanged": pool_v1_before.to_string(),
-            "anchor": anchors.1,
-        }),
+        "an active bit-2 deployment still refuses new direct v2 carriers without changing state"
+            .into(),
+        evidence,
     ))
 }
 
-/// A fully private pool-v2 transfer: value never leaves the pool.
-fn step_zsend_v2(ctx: &mut Ctx) -> Result<(String, Value), String> {
-    let obs = ctx.rpc("node-4");
-    let addr = obs.addr.clone();
-    let user1 = ctx.net.key("user1.e2e.sov").clone();
-    let user2 = ctx.net.key("user2.e2e.sov").clone();
-
-    let pool_before = obs.pool_v2_grains()?;
-    let to = z2address(ctx, &addr, &user2.seed_hex)?;
-    let bal_before = obs.balance_grains("user1.e2e.sov")?;
-
-    let out = wallet(
-        ctx,
-        &addr,
-        &[
-            "z2-send",
-            &user1.seed_hex,
-            &to,
-            "2",
-            "--signer",
-            "user1.e2e.sov",
-        ],
-    )?;
-    let tx = parse_tx_id(&out).ok_or("no tx id in z2-send output")?;
-    let rcpt = await_success(&obs, &tx, "v2 z-send", Duration::from_secs(300))?;
-    let gas = gas_used(&rcpt)?;
-
-    // THE invariant of a private transfer: pool value is conserved exactly.
-    let pool_after = obs.pool_v2_grains()?;
-    if pool_after != pool_before {
-        return Err(format!(
-            "a private v2 transfer moved pool value: {pool_before} -> {pool_after} grains"
-        ));
-    }
-    // Sender keeps change, recipient's wallet DETECTS the note by trial
-    // decapsulation — nothing on-chain names them.
-    let zb1 = z2balance(ctx, &addr, &user1.seed_hex)?;
-    if zb1.0 != "3" {
-        return Err(format!(
-            "sender pool-v2 balance after z2-send: expected 3 XUS change, got {zb1:?}"
-        ));
-    }
-    let zb2 = z2balance(ctx, &addr, &user2.seed_hex)?;
-    if zb2 != ("2".to_string(), 1) {
-        return Err(format!(
-            "recipient pool-v2 balance after z2-send: expected (2 XUS, 1 note), got {zb2:?}"
-        ));
-    }
-    // Only the carrier fee touches the transparent ledger.
-    poll_balance_eq(
-        &obs,
-        "user1.e2e.sov",
-        bal_before - GAS_PRICE_GRAINS * u128::from(gas),
-        Duration::from_secs(60),
-    )?;
-
-    Ok((
-        format!(
-            "2 XUS sent privately inside pool v2: pool value UNCHANGED at {pool_before} grains, \
-             sender left with {} XUS of change, recipient's wallet found the note by trial \
-             decapsulation, and only the carrier fee ({gas} gas) touched the transparent ledger",
-            zb1.0
-        ),
-        json!({
-            "zsend_tx": tx,
-            "gas": gas,
-            "pool_v2_grains_unchanged": pool_before.to_string(),
-            "sender_after": format!("{} XUS x {}", zb1.0, zb1.1),
-            "recipient_after": format!("{} XUS x {}", zb2.0, zb2.1),
-        }),
-    ))
+fn step_v2_quarantine_wrapped(ctx: &mut Ctx) -> Result<(String, Value), String> {
+    let probes = v2_probe_actions();
+    let evidence = assert_v2_quarantine(ctx, &ctx.rpc("node-4"), true, &probes[1..4])?;
+    Ok(("tipped, timestamped and multisig-exec v2 carriers refused by the privacy policy with state unchanged".into(), evidence))
 }
 
-/// A pool-v2 de-shield: value crosses the turnstile back to transparent, with
-/// change returning shielded so a partial exit never burns the remainder.
-fn step_unshield_v2(ctx: &mut Ctx) -> Result<(String, Value), String> {
-    let obs = ctx.rpc("node-4");
-    let addr = obs.addr.clone();
-    let user2 = ctx.net.key("user2.e2e.sov").clone();
-    let xus = |n: u128| n * GRAINS_PER_XUS;
-
-    let pool_before = obs.pool_v2_grains()?;
-    let bal_before = obs.balance_grains("user2.e2e.sov")?;
-    let supply_before = obs.supply()?;
-
-    let out = wallet(
-        ctx,
-        &addr,
-        &["unshield2", &user2.seed_hex, "user2.e2e.sov", "1"],
-    )?;
-    let tx = parse_tx_id(&out).ok_or("no tx id in unshield2 output")?;
-    let rcpt = await_success(&obs, &tx, "v2 de-shield", Duration::from_secs(300))?;
-    let gas = gas_used(&rcpt)?;
-
-    poll_pool_v2_eq(
-        &obs,
-        pool_before - xus(1),
-        "pool v2 after de-shield",
-        Duration::from_secs(90),
-    )?;
-    poll_balance_eq(
-        &obs,
-        "user2.e2e.sov",
-        bal_before + xus(1) - GAS_PRICE_GRAINS * u128::from(gas),
-        Duration::from_secs(60),
-    )?;
-    // Change came back shielded rather than being burned.
-    let zb = z2balance(ctx, &addr, &user2.seed_hex)?;
-    if zb.0 != "1" {
-        return Err(format!(
-            "de-shield change: expected 1 XUS still shielded, got {zb:?}"
-        ));
-    }
-    // The turnstile moved value between spaces; it must not have CREATED any.
-    //
-    // TOTAL supply is the wrong thing to pin: the chain keeps mining while the
-    // de-shield confirms, so emission legitimately raises it. The real
-    // conservation statement is that the SHIELDED total fell by exactly the
-    // de-shielded amount — value left the pool and went nowhere else.
-    let supply_after = obs.supply()?;
-    let shielded_before = shielded_total_grains(&supply_before)?;
-    let shielded_after = shielded_total_grains(&supply_after)?;
-    if shielded_before.saturating_sub(shielded_after) != xus(1) {
-        return Err(format!(
-            "a 1 XUS de-shield moved the shielded total by {} grains, not {}: {supply_before} -> \
-             {supply_after}",
-            shielded_before.saturating_sub(shielded_after),
-            xus(1)
-        ));
-    }
-    // ...and total supply may only have grown by whole coinbase emissions.
-    let total_before = supply_field_grains(&supply_before, "total")?;
-    let total_after = supply_field_grains(&supply_after, "total")?;
-    if total_after < total_before {
-        return Err(format!(
-            "total supply DECREASED across a v2 de-shield: {total_before} -> {total_after}"
-        ));
-    }
-
-    Ok((
-        format!(
-            "1 XUS de-shielded from pool v2 under the drain limiter: pool {} -> {} grains, \
-             transparent credited exactly (minus {gas} gas), 1 XUS of change returned SHIELDED \
-             rather than burned, and total supply conserved at {}",
-            pool_before,
-            pool_before - xus(1),
-            supply_after
-        ),
-        json!({
-            "unshield_tx": tx,
-            "gas": gas,
-            "pool_v2_grains": { "before": pool_before.to_string(), "after": (pool_before - xus(1)).to_string() },
-            "change_still_shielded": format!("{} XUS x {}", zb.0, zb.1),
-            "total_supply_conserved": supply_after.clone(),
-        }),
-    ))
+fn step_v2_quarantine_deferred(ctx: &mut Ctx) -> Result<(String, Value), String> {
+    let probes = v2_probe_actions();
+    let evidence = assert_v2_quarantine(ctx, &ctx.rpc("node-4"), true, &probes[4..])?;
+    Ok(("direct and nested deferred v2 multisig proposals refused before admission; no proposal, nonce, fee or pool mutation".into(), evidence))
 }
 
-/// Moving value from pool v1 to pool v2 end-to-end. The pools are separate
-/// value spaces with no direct bridge, so a migration is de-shield then
-/// re-shield — and BOTH pools' invariants must hold exactly across it.
-fn step_v1_to_v2_migration(ctx: &mut Ctx) -> Result<(String, Value), String> {
-    let obs = ctx.rpc("node-4");
-    let addr = obs.addr.clone();
-    let user1 = ctx.net.key("user1.e2e.sov").clone();
-    let xus = |n: u128| n * GRAINS_PER_XUS;
-
-    let v1_before = obs.pool_grains()?;
-    let v2_before = obs.pool_v2_grains()?;
-    let z1_before = zbalance(ctx, &addr, &user1.seed_hex)?;
-    if z1_before.0 == "0" {
-        return Err("user1 holds no pool-v1 value to migrate".to_string());
+/// Reads stay available: all live nodes agree on the real empty pool/anchor
+/// and truthfully report that activation has not made this suite safe.
+fn step_v2_quarantine_cross_node(ctx: &mut Ctx) -> Result<(String, Value), String> {
+    let mut per_node = serde_json::Map::new();
+    let mut pool: Option<Value> = None;
+    for (name, rpc) in ctx.running_rpcs() {
+        let evidence = assert_v2_quarantine(ctx, &rpc, true, &v2_probe_actions())?;
+        let state = &evidence["unchanged_state"]["pool_v2"];
+        if state["poolValue"] != "0" || state["noteCount"] != 0 || state["nullifierCount"] != 0 {
+            return Err(format!(
+                "quarantined pool acquired new value/notes/nullifiers at {name}: {state}"
+            ));
+        }
+        if let Some(expected) = &pool {
+            if state != expected {
+                return Err(format!(
+                    "pool-v2 state disagrees at {name}: {state} != {expected}"
+                ));
+            }
+        } else {
+            pool = Some(state.clone());
+        }
+        if rpc.shielded_v2_nullifier_seen(&"00".repeat(32))? {
+            return Err(format!("{name}: empty pool reports a spent zero nullifier"));
+        }
+        per_node.insert(name, evidence);
     }
-    let supply_before = obs.supply()?;
-
-    // Leg 1: exit pool v1.
-    let out1 = wallet(
-        ctx,
-        &addr,
-        &["unshield", &user1.seed_hex, "user1.e2e.sov", "1"],
-    )?;
-    let tx1 = parse_tx_id(&out1).ok_or("no tx id in migration de-shield")?;
-    let r1 = await_success(&obs, &tx1, "migration v1 exit", Duration::from_secs(180))?;
-    poll_pool_eq(
-        &obs,
-        v1_before - xus(1),
-        "pool v1 after migration exit",
-        Duration::from_secs(60),
-    )?;
-
-    // Leg 2: enter pool v2.
-    let out2 = wallet(
-        ctx,
-        &addr,
-        &["shield2", &user1.seed_hex, "1", "--signer", "user1.e2e.sov"],
-    )?;
-    let tx2 = parse_tx_id(&out2).ok_or("no tx id in migration shield2")?;
-    let r2 = await_success(&obs, &tx2, "migration v2 entry", Duration::from_secs(300))?;
-    poll_pool_v2_eq(
-        &obs,
-        v2_before + xus(1),
-        "pool v2 after migration entry",
-        Duration::from_secs(90),
-    )?;
-
-    // Conservation across the whole migration: value left v1, arrived in v2,
-    // and no supply was created anywhere.
-    // As in `unshield-v2`: emission keeps raising TOTAL supply while the two
-    // legs confirm, so the invariant that actually holds is that the combined
-    // shielded total is unchanged — value left pool v1 and arrived in pool v2,
-    // and none was created or destroyed in between.
-    let supply_after = obs.supply()?;
-    let shielded_before = shielded_total_grains(&supply_before)?;
-    let shielded_after = shielded_total_grains(&supply_after)?;
-    if shielded_before != shielded_after {
+    // Retain real wallet read coverage without creating any unsafe proof.
+    let rpc = ctx.rpc("node-4");
+    let key = ctx.net.key("user1.e2e.sov");
+    let address = wallet(ctx, &rpc.addr, &["z2-address", &key.seed_hex])?;
+    let address =
+        labeled_value(&address, "pool v2 address").ok_or("z2-address lacks pool v2 address")?;
+    if !address.starts_with("xusq1") {
+        return Err(format!("pool-v2 address has wrong prefix: {address}"));
+    }
+    let balance = wallet(ctx, &rpc.addr, &["z2-balance", &key.seed_hex])?;
+    if labeled_value(&balance, "shielded balance").as_deref() != Some("0 XUS")
+        || labeled_value(&balance, "unspent notes").as_deref() != Some("0")
+    {
         return Err(format!(
-            "a v1->v2 migration changed the combined shielded total: {shielded_before} -> \
-             {shielded_after} grains ({supply_before} -> {supply_after})"
+            "wallet misreports quarantined empty pool: {balance}"
         ));
     }
-    let z2_after = z2balance(ctx, &addr, &user1.seed_hex)?;
-
-    Ok((
-        format!(
-            "1 XUS migrated v1 -> v2 end-to-end: pool v1 {} -> {}, pool v2 {} -> {}, wallet now \
-             holds {} XUS in v2 alongside its remaining v1 notes, total supply conserved at {} \
-             (the pools are separate value spaces — the migration is an exit and an entry, with \
-             both turnstiles balancing exactly)",
-            v1_before,
-            v1_before - xus(1),
-            v2_before,
-            v2_before + xus(1),
-            z2_after.0,
-            supply_after
-        ),
-        json!({
-            "v1_exit_tx": tx1, "v1_exit_gas": gas_used(&r1)?,
-            "v2_entry_tx": tx2, "v2_entry_gas": gas_used(&r2)?,
-            "pool_v1_grains": { "before": v1_before.to_string(), "after": (v1_before - xus(1)).to_string() },
-            "pool_v2_grains": { "before": v2_before.to_string(), "after": (v2_before + xus(1)).to_string() },
-            "total_supply_conserved": supply_after.clone(),
-        }),
-    ))
+    Ok((format!("all {} live nodes refuse every v2 carrier and agree on the unchanged empty pool; read RPCs and wallet scans remain available", per_node.len()), json!({ "nodes": per_node, "wallet_address": address, "wallet_balance": balance })))
 }
 
-/// Pool-v2 state must survive a reorg: a nullifier published on an orphaned
-/// branch must not stay spent, and the pool's value must roll back with it.
-fn step_reorg_with_v2(ctx: &mut Ctx) -> Result<(String, Value), String> {
-    let obs = ctx.rpc("node-4");
-    let addr = obs.addr.clone();
-    let user2 = ctx.net.key("user2.e2e.sov").clone();
-
-    let pool_before = obs.pool_v2_grains()?;
-    let nullifiers_before = v2_nullifier_count(&obs)?;
-    let anchor_before = v2_anchor(&obs)?;
-
-    // Spend inside pool v2, publishing a nullifier and a new anchor.
-    let to = z2address(ctx, &addr, &user2.seed_hex)?;
-    let out = wallet(
-        ctx,
-        &addr,
-        &[
-            "z2-send",
-            &user2.seed_hex,
-            &to,
-            "1",
-            "--signer",
-            "user2.e2e.sov",
-        ],
-    )?;
-    let tx = parse_tx_id(&out).ok_or("no tx id in reorg z2-send")?;
-    await_success(&obs, &tx, "v2 spend before reorg", Duration::from_secs(300))?;
-
-    let nullifiers_after = v2_nullifier_count(&obs)?;
-    if nullifiers_after <= nullifiers_before {
-        return Err(format!(
-            "a v2 spend published no nullifier: {nullifiers_before} -> {nullifiers_after}"
-        ));
-    }
-    let anchor_after = v2_anchor(&obs)?;
-    if anchor_after == anchor_before {
-        return Err("a v2 spend did not move the commitment tree anchor".to_string());
-    }
-    // A published nullifier must be queryable as SPENT — this is the lookup a
-    // wallet uses to avoid building a doomed double-spend, and the state that
-    // has to survive (or roll back with) a fork.
-    let anchors_seen = obs
-        .shielded_v2_nullifier_seen(&anchor_after)
-        .unwrap_or(false);
-    if anchors_seen {
-        return Err("an anchor was reported as a spent nullifier — the two \
-                    namespaces must not be confused"
-            .to_string());
-    }
-    // Private transfer: pool value must be conserved across it.
-    let pool_after = obs.pool_v2_grains()?;
-    if pool_after != pool_before {
-        return Err(format!(
-            "pool v2 value moved on a private transfer: {pool_before} -> {pool_after}"
-        ));
-    }
-
-    // Every node must converge on the SAME v2 state — a node that resolved a
-    // fork differently would carry a different nullifier set.
-    let (nodes, anchor) = v2_anchor_agreement(ctx)?;
-
-    // COLD-BOOT REPLAY of pool-v2 state. A reorg and a replay run on the same
-    // machinery — the ledger's undo/redo path — so this proves the v2 pool is
-    // reconstructed EXACTLY from the block log rather than trusted from a
-    // snapshot: same anchor, same nullifier set, same pool value.
-    //
-    // Honesty about scope: the local backend puts every node on loopback with
-    // a shared seed list, so it cannot partition the network into two mining
-    // branches, and a genuine multi-node reorg is therefore out of reach here.
-    // The consensus half — that disconnecting a block restores the v2 pool
-    // bit-for-bit and frees its nullifiers — is asserted directly against the
-    // ledger in `sov_state::shielded_v2_reorg_tests`.
+/// Rebuild from committed blocks, then reassert the quarantine. Historical
+/// nonempty v2 verifier/undo fixtures remain in sov-state and sov-shielded-pq
+/// tests; this live release never creates a new unsafe proof to seed a pool.
+fn step_v2_quarantine_replay(ctx: &mut Ctx) -> Result<(String, Value), String> {
     let victim = "node-4";
     let plan = ctx.net.plan(victim).clone();
-    let rpc4 = ctx.rpc(victim);
-    let before_anchor = v2_anchor(&rpc4)?;
-    let before_nullifiers = v2_nullifier_count(&rpc4)?;
-    let before_pool = rpc4.pool_v2_grains()?;
-    let h_pin = rpc4.height()?;
-
+    let rpc = ctx.rpc(victim);
+    let before = assert_v2_quarantine(ctx, &rpc, true, &v2_probe_actions())?;
+    let height = rpc.height()?;
+    let digest = rpc.digest(height)?.ok_or("no tip digest before replay")?;
     ctx.backend.stop(victim)?;
     if !ctx.backend.remove_data_file(&plan, "chainstate.snapshot")? {
-        return Err("chainstate.snapshot vanished before deletion".to_string());
+        return Err("chainstate.snapshot vanished before quarantine replay deletion".into());
     }
     ctx.backend.start(&plan, &ctx.rpcd)?;
     poll(
-        "node-4 to serve RPC after a cold boot with pool-v2 state",
+        "node-4 RPC after quarantine cold boot",
         Duration::from_secs(180),
         Duration::from_millis(300),
-        || Ok(rpc4.healthy().then_some(())),
+        || Ok(rpc.healthy().then_some(())),
     )?;
     poll(
-        &format!("node-4 to replay back past height {h_pin}"),
+        "node-4 to replay pinned quarantine tip",
         Duration::from_secs(300),
         Duration::from_millis(500),
-        || Ok((rpc4.height()? >= h_pin).then_some(())),
+        || Ok((rpc.height()? >= height).then_some(())),
     )?;
-
-    let after_anchor = v2_anchor(&rpc4)?;
-    let after_nullifiers = v2_nullifier_count(&rpc4)?;
-    let after_pool = rpc4.pool_v2_grains()?;
-    if after_anchor != before_anchor {
+    let replayed = rpc
+        .digest(height)?
+        .ok_or("missing pinned digest after quarantine replay")?;
+    for field in ["hash", "stateRoot"] {
+        if digest.get(field).is_none() || replayed.get(field) != digest.get(field) {
+            return Err(format!(
+                "quarantine replay changed pinned {field}: {digest} -> {replayed}"
+            ));
+        }
+    }
+    let after = assert_v2_quarantine(ctx, &rpc, true, &v2_probe_actions())?;
+    if before["unchanged_state"] != after["unchanged_state"] {
         return Err(format!(
-            "cold-boot replay produced a DIFFERENT pool-v2 anchor: {after_anchor} != \
-             {before_anchor}"
+            "cold boot changed quarantine state: {before} -> {after}"
         ));
     }
-    if after_nullifiers != before_nullifiers {
-        return Err(format!(
-            "cold-boot replay produced a different pool-v2 nullifier count: {after_nullifiers} \
-             != {before_nullifiers} — a rebuilt node would accept or refuse different spends"
-        ));
-    }
-    if after_pool != before_pool {
-        return Err(format!(
-            "cold-boot replay produced a different pool-v2 value: {after_pool} != {before_pool}"
-        ));
-    }
-
-    Ok((
-        format!(
-            "a pool-v2 spend published its nullifier and moved the anchor with pool value \
-             conserved at {pool_before} grains; all {nodes} nodes agree on anchor {anchor}; and \
-             node-4 cold-booted with its snapshot DELETED reproduced the pool-v2 state exactly \
-             from the block log — same anchor, same {after_nullifiers} nullifiers, same pool \
-             value (the undo/redo path a reorg runs on)"
-        ),
-        json!({
-            "spend_tx": tx,
-            "nullifier_count": { "before": nullifiers_before, "after": nullifiers_after },
-            "anchor": { "before": anchor_before, "after": anchor_after },
-            "pool_v2_grains_conserved": pool_before.to_string(),
-            "nodes_agreeing": nodes,
-            "cold_boot_replay": {
-                "height_pinned": h_pin,
-                "anchor_reproduced": after_anchor,
-                "nullifiers_reproduced": after_nullifiers,
-                "pool_value_reproduced": after_pool.to_string(),
-            },
-            "multi_node_reorg": "out of reach on the local loopback backend; the consensus \
-                                 undo path is asserted in sov_state::shielded_v2_reorg_tests",
-        }),
-    ))
-}
-
-/// One numeric field of `sov_getSupply`, in grains.
-fn supply_field_grains(supply: &Value, field: &str) -> Result<u128, String> {
-    supply
-        .get(field)
-        .and_then(grains_of)
-        .ok_or_else(|| format!("supply lacks a parseable `{field}`: {supply}"))
-}
-
-/// Value held across BOTH shielded pools, in grains. Prefers the explicit
-/// `shieldedTotal`; falls back to v1 + v2 so the step still works against a
-/// node that predates that field.
-fn shielded_total_grains(supply: &Value) -> Result<u128, String> {
-    if let Some(t) = supply.get("shieldedTotal").and_then(grains_of) {
-        return Ok(t);
-    }
-    let v1 = supply_field_grains(supply, "shielded")?;
-    let v2 = supply.get("shieldedV2").and_then(grains_of).unwrap_or(0);
-    Ok(v1 + v2)
-}
-
-/// Pool v2's current anchor (commitment-tree root) at one node.
-fn v2_anchor(rpc: &Rpc) -> Result<String, String> {
-    let info = rpc.shielded_v2_info()?;
-    info.get("anchor")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| format!("no `anchor` in {info}"))
-}
-
-/// Published pool-v2 nullifier count at one node.
-fn v2_nullifier_count(rpc: &Rpc) -> Result<u64, String> {
-    let info = rpc.shielded_v2_info()?;
-    info.get("nullifierCount")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("no `nullifierCount` in {info}"))
-}
-
-/// Assert every live node reports the SAME pool-v2 anchor. A disagreement here
-/// means wallets on different nodes would build witnesses against different
-/// trees — silent, and fatal.
-fn v2_anchor_agreement(ctx: &mut Ctx) -> Result<(usize, String), String> {
-    let names: Vec<String> = ctx.running.clone();
-    let mut agreed: Option<String> = None;
-    for name in &names {
-        let rpc = ctx.rpc(name);
-        // Nodes may be a block apart; give the laggard a moment to catch up to
-        // a shared anchor rather than flagging a race as a disagreement.
-        let want = agreed.clone();
-        let got = poll(
-            &format!("{name} to agree on the pool-v2 anchor"),
-            Duration::from_secs(60),
-            Duration::from_millis(500),
-            || {
-                let a = v2_anchor(&rpc)?;
-                Ok(match &want {
-                    None => Some(a),
-                    Some(w) if *w == a => Some(a),
-                    Some(_) => None,
-                })
-            },
-        )
-        .map_err(|e| format!("pool-v2 anchor disagreement at {name}: {e}"))?;
-        agreed = Some(got);
-    }
-    let anchor = agreed.ok_or("no live nodes to compare pool-v2 anchors across")?;
-    Ok((names.len(), anchor))
+    Ok(("snapshot-deleted cold boot reproduces the committed hash/state root and unchanged pool/accounts/proposals; every v2 carrier remains refused".into(), json!({ "pinned_height": height, "pinned_digest": digest, "before": before, "after": after })))
 }
 
 // ---------------------------------------------------------------------------
@@ -2295,4 +1977,83 @@ fn poll_pool_eq(rpc: &Rpc, expected: u128, what: &str, timeout: Duration) -> Res
             }
         },
     )
+}
+
+#[cfg(test)]
+mod quarantine_tests {
+    use super::*;
+
+    #[test]
+    fn quarantine_requires_the_policy_error_not_any_rejection() {
+        assert!(quarantine_rejection(Err(format!(
+            "127.0.0.1 rpc error on sov_submitTransaction: {V2_QUARANTINE_MESSAGE}"
+        )))
+        .is_ok());
+        for error in [
+            "rejected: invalid signature",
+            "invalid SignedTransaction: missing field",
+            "pool v2 is NOT ACTIVE",
+            "connect refused",
+        ] {
+            assert!(quarantine_rejection(Err(error.into())).is_err());
+        }
+        assert!(quarantine_rejection(Ok(json!({ "accepted": true }))).is_err());
+    }
+
+    fn status(active: bool) -> (Value, Value) {
+        (
+            json!({
+                "v2ProofSecurityEstablished": false,
+                "v2PrivacyEstablished": false,
+                "poolV2CreationAllowed": false,
+                "fullyPostQuantum": false,
+                "v2Active": active,
+                "pqSunset": { "armed": false, "stage": "unarmed" },
+            }),
+            json!({
+                "proofSecurityEstablished": false,
+                "privacyEstablished": false,
+                "creationAllowed": false,
+                "active": active,
+            }),
+        )
+    }
+
+    #[test]
+    fn missing_or_false_security_claims_are_not_interchangeable() {
+        for active in [false, true] {
+            let (baseline, info) = status(active);
+            assert!(assert_quarantine_status(&baseline, &info, active).is_ok());
+            for field in [
+                "v2ProofSecurityEstablished",
+                "v2PrivacyEstablished",
+                "poolV2CreationAllowed",
+                "fullyPostQuantum",
+            ] {
+                let mut missing = baseline.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                assert!(assert_quarantine_status(&missing, &info, active).is_err());
+                let mut claimed = baseline.clone();
+                claimed[field] = json!(true);
+                assert!(assert_quarantine_status(&claimed, &info, active).is_err());
+            }
+            assert!(assert_quarantine_status(&baseline, &info, !active).is_err());
+        }
+    }
+
+    #[test]
+    fn pool_read_status_cannot_claim_creation_or_privacy_after_activation() {
+        let (status, baseline) = status(true);
+        for field in [
+            "proofSecurityEstablished",
+            "privacyEstablished",
+            "creationAllowed",
+        ] {
+            let mut claimed = baseline.clone();
+            claimed[field] = json!(true);
+            assert!(assert_quarantine_status(&status, &claimed, true).is_err());
+            claimed.as_object_mut().unwrap().remove(field);
+            assert!(assert_quarantine_status(&status, &claimed, true).is_err());
+        }
+    }
 }

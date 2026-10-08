@@ -8,7 +8,7 @@ use orchard::value::NoteValue;
 use rand::rngs::OsRng;
 
 use crate::keys::{ShieldedAddress, ShieldedKey};
-use crate::pool::{ShieldedBundle, ShieldedParams};
+use crate::pool::{ShieldedBundle, ShieldedCarrier, ShieldedParams};
 use crate::wallet::ReceivedNote;
 use crate::ShieldedError;
 
@@ -75,6 +75,54 @@ pub fn shielded_transfer_with_change(
     recipient: &ShieldedAddress,
     amount: u64,
 ) -> Result<ShieldedBundle, ShieldedError> {
+    shielded_transfer_with_change_impl(
+        params,
+        spender,
+        note,
+        merkle_path,
+        anchor,
+        recipient,
+        amount,
+        None,
+    )
+}
+
+/// Build a bundle with authorization bound to its exact chain, account, nonce,
+/// and Orchard effects. Required for the post-quantum migration window.
+#[allow(clippy::too_many_arguments)]
+pub fn shielded_transfer_with_change_bound(
+    params: &ShieldedParams,
+    spender: &ShieldedKey,
+    note: &ReceivedNote,
+    merkle_path: MerklePath,
+    anchor: Anchor,
+    recipient: &ShieldedAddress,
+    amount: u64,
+    carrier: &ShieldedCarrier<'_>,
+) -> Result<ShieldedBundle, ShieldedError> {
+    shielded_transfer_with_change_impl(
+        params,
+        spender,
+        note,
+        merkle_path,
+        anchor,
+        recipient,
+        amount,
+        Some(carrier),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shielded_transfer_with_change_impl(
+    params: &ShieldedParams,
+    spender: &ShieldedKey,
+    note: &ReceivedNote,
+    merkle_path: MerklePath,
+    anchor: Anchor,
+    recipient: &ShieldedAddress,
+    amount: u64,
+    carrier: Option<&ShieldedCarrier<'_>>,
+) -> Result<ShieldedBundle, ShieldedError> {
     let total = note.value();
     let change = total
         .checked_sub(amount)
@@ -118,11 +166,12 @@ pub fn shielded_transfer_with_change(
         .ok_or(ShieldedError::EmptyBundle)?
         .0;
 
+    let digest = carrier.map_or([0u8; 32], |c| c.digest(unauthorized.commitment().into()));
     let ask = SpendAuthorizingKey::from(spender.spending_key());
     let bundle = unauthorized
         .create_proof(params.proving_key(), &mut rng)
         .map_err(|e| ShieldedError::Prove(e.to_string()))?
-        .apply_signatures(rng, [0u8; 32], &[ask])
+        .apply_signatures(rng, digest, &[ask])
         .map_err(|e| ShieldedError::Build(e.to_string()))?;
 
     Ok(ShieldedBundle::from_authorized(bundle))
@@ -247,6 +296,32 @@ pub fn unshield_amount_multi(
     anchor: Anchor,
     amount: u64,
 ) -> Result<ShieldedBundle, ShieldedError> {
+    unshield_amount_multi_impl(params, spender, notes, anchor, amount, None)
+}
+
+/// Build a bundle with authorization bound to its exact chain, account, nonce,
+/// and Orchard effects. Required for the post-quantum migration window.
+#[allow(clippy::too_many_arguments)]
+pub fn unshield_amount_multi_bound(
+    params: &ShieldedParams,
+    spender: &ShieldedKey,
+    notes: &[(ReceivedNote, MerklePath)],
+    anchor: Anchor,
+    amount: u64,
+    carrier: &ShieldedCarrier<'_>,
+) -> Result<ShieldedBundle, ShieldedError> {
+    unshield_amount_multi_impl(params, spender, notes, anchor, amount, Some(carrier))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn unshield_amount_multi_impl(
+    params: &ShieldedParams,
+    spender: &ShieldedKey,
+    notes: &[(ReceivedNote, MerklePath)],
+    anchor: Anchor,
+    amount: u64,
+    carrier: Option<&ShieldedCarrier<'_>>,
+) -> Result<ShieldedBundle, ShieldedError> {
     if notes.is_empty() {
         return Err(ShieldedError::Build("no notes to de-shield".to_string()));
     }
@@ -292,11 +367,12 @@ pub fn unshield_amount_multi(
 
     // Every spend is authorized by the same key; Orchard matches it to each action,
     // so a single `ask` in the slice signs all spends in the bundle.
+    let digest = carrier.map_or([0u8; 32], |c| c.digest(unauthorized.commitment().into()));
     let ask = SpendAuthorizingKey::from(spender.spending_key());
     let bundle = unauthorized
         .create_proof(params.proving_key(), &mut rng)
         .map_err(|e| ShieldedError::Prove(e.to_string()))?
-        .apply_signatures(rng, [0u8; 32], &[ask])
+        .apply_signatures(rng, digest, &[ask])
         .map_err(|e| ShieldedError::Build(e.to_string()))?;
 
     Ok(ShieldedBundle::from_authorized(bundle))
@@ -334,6 +410,7 @@ mod tests {
         let transfer =
             shielded_transfer(&params, &alice, &received[0], path, anchor, &bob.address()).unwrap();
         assert!(transfer.verify(&params), "real transfer proof must verify");
+        crate::codec::assert_authorization_mutations_rejected(&transfer, &params);
         assert_eq!(
             transfer.value_balance(),
             0,
@@ -453,11 +530,55 @@ mod tests {
 
         // De-shield 60 — more than either note alone — by spending BOTH in one bundle.
         let notes = vec![(note_a, path_a), (note_b, path_b)];
-        let bundle = unshield_amount_multi(&params, &alice, &notes, anchor, 60).unwrap();
-        assert!(
-            bundle.verify(&params),
-            "multi-note de-shield proof must verify"
+        let domain = sov_primitives::SigningDomain::new(
+            "sov-pq-rehearsal-local",
+            sov_primitives::Hash::digest(b"genesis"),
         );
+        let account = sov_primitives::AccountId::new("receiver.sov").unwrap();
+        let carrier = ShieldedCarrier {
+            domain: &domain,
+            account: &account,
+            nonce: 7,
+        };
+        let bundle =
+            unshield_amount_multi_bound(&params, &alice, &notes, anchor, 60, &carrier).unwrap();
+        assert!(bundle.verify_for_carrier(&params, &carrier));
+        let decoded = ShieldedBundle::from_bytes(&bundle.to_bytes()).unwrap();
+        assert!(decoded.verify_for_carrier(&params, &carrier));
+        assert!(
+            !bundle.verify(&params),
+            "legacy zero digest cannot authorize a bound recovery"
+        );
+        let other_account = sov_primitives::AccountId::new("other.sov").unwrap();
+        let other_domain = sov_primitives::SigningDomain::new("sov-testnet", domain.genesis());
+        let other_genesis = sov_primitives::SigningDomain::new(
+            domain.chain_id(),
+            sov_primitives::Hash::digest(b"different genesis"),
+        );
+        for wrong in [
+            ShieldedCarrier {
+                domain: &domain,
+                account: &other_account,
+                nonce: 7,
+            },
+            ShieldedCarrier {
+                domain: &domain,
+                account: &account,
+                nonce: 8,
+            },
+            ShieldedCarrier {
+                domain: &other_domain,
+                account: &account,
+                nonce: 7,
+            },
+            ShieldedCarrier {
+                domain: &other_genesis,
+                account: &account,
+                nonce: 7,
+            },
+        ] {
+            assert!(!bundle.verify_for_carrier(&params, &wrong));
+        }
         assert_eq!(bundle.value_balance(), 60, "exactly 60 leaves the pool");
 
         // 10 change (70 in − 60 out) returns shielded to Alice.

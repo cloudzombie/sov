@@ -169,3 +169,39 @@ fn nullifier_lookup_answers_and_rejects_a_non_canonical_digest() {
 
     handle.shutdown();
 }
+
+#[test]
+fn quantum_status_and_write_policy_fail_closed_without_mutating_state() {
+    let (node, handle, addr) = serve();
+    let before = node.lock().unwrap().chain().head().hash();
+    let status = rpc(addr, "sov_getQuantumStatus", json!({}));
+    assert_eq!(status["result"]["pqSunset"]["stage"], "unarmed");
+    assert_eq!(status["result"]["poolV2CreationAllowed"], false);
+    assert_eq!(status["result"]["v2PrivacyEstablished"], false);
+    let key = Keypair::hybrid_from_seed([123; 32]);
+    let tx = sov_types::SignedTransaction::sign(
+        sov_types::Transaction {
+            signer: key.public_key().implicit_account_id(),
+            public_key: key.public_key(),
+            nonce: 0,
+            action: sov_types::Action::ProposeMultisig {
+                account: id("vault.sov"),
+                action: Box::new(sov_types::Action::ShieldedV2 { bundle: vec![] }),
+            },
+        },
+        &key,
+    )
+    .unwrap();
+    let reply = rpc(
+        addr,
+        "sov_submitTransaction",
+        serde_json::to_value(tx).unwrap(),
+    );
+    assert!(reply["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("private inputs"));
+    assert_eq!(node.lock().unwrap().mempool_len(), 0);
+    assert_eq!(node.lock().unwrap().chain().head().hash(), before);
+    handle.shutdown();
+}

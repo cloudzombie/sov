@@ -98,17 +98,18 @@ jobs:
   # THE FIVE-NODE END-TO-END SUITE — a required release job (audit PQV2-02).
   #
   # This boots a real, isolated, loopback multi-node chain, mines it under real
-  # PoW, drives a genuine BIP-9 activation, and exercises both shielded pools
-  # end to end. `--require-complete` makes any SKIPPED step fatal: the harness
-  # previously exited 0 while skipping every pool-v2 step, so a release could be
-  # cut on a "GREEN" that had tested none of the feature it claimed to validate.
+  # PoW, drives genuine BIP-9 activations, exercises the existing pool-v1
+  # lifecycle, and proves that the unsafe pool-v2 suite remains quarantined
+  # before/after bit-2 activation, across wrappers, nodes, and cold replay.
+  # `--require-complete` makes any SKIPPED step fatal: a release requires live
+  # evidence for its actual safety policy, including unchanged state on refusal.
   # A release now requires zero failures AND zero skips.
   #
   # It runs on the release path rather than every push because it mines a real
   # chain to a real activation height (~25 minutes), which is not a per-commit
   # cost — but it MUST gate a tag, which is what this job is.
   e2e:
-    name: five-node E2E (both shielded pools · zero skips)
+    name: five-node E2E (v1 lifecycle + v2 quarantine · zero skips)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -372,7 +373,24 @@ jobs:
 
             The app runs a node **in-process** and opens on **Mainnet** (genesis
             `cb0272ff…`, live since midnight July 4, 2026). Create or import a wallet,
-            hold and send XUS (transparent or shielded), and optionally mine.
+            hold and send XUS transparently, and optionally mine.
+
+            **v0.2.15 Rust security hardening:** new wallets use hybrid
+            Ed25519 + ML-DSA-65 keys. Legacy keys have an explicit migration flow;
+            shielded-v1 recovery is available only in a consensus-authorized
+            recovery window with recipient-bound authorization. New Station
+            shielded-v1 deposits/private sends are disabled. All new pool-v2
+            transaction admission and Station proof creation are disabled because
+            the current unmasked prover does not protect private inputs.
+            Historical block verification and wallet read/scan operations remain.
+
+            Peer authentication now binds the full Noise/ML-KEM transcript and
+            claimed account using protocol v3. Older peers cannot authenticate
+            with these binaries; operators must coordinate their upgrade.
+            Mainnet's PQ retirement deployment remains unarmed. This release
+            does **not** claim complete post-quantum protection: a reviewed
+            replacement privacy prover and coordinated mainnet activation are
+            still required.
 
             SOV is a young network — live, but new and **not yet independently
             audited**. Hold funds accordingly.

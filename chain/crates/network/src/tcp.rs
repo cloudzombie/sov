@@ -20,8 +20,11 @@
 //! still binds a peer to its chain and node identity.
 //!
 //! The Noise static key is per-connection (identity is proven by the signed
-//! `Hello` at the app layer). Binding the `Hello` signature to the Noise handshake
-//! hash — full channel binding — is a documented follow-up.
+//! `Hello` at the app layer). Its channel binding includes the Noise handshake
+//! hash and both exact ML-KEM messages, preventing KEM substitution even if
+//! X25519 is broken. The signed identity must use a hybrid key for post-quantum
+//! authentication. Old Noise-only bindings are rejected; rollout requires a
+//! coordinated peer upgrade.
 //!
 //! **Peer discovery** is gossip-based. On every new connection a node announces
 //! its own listening address plus the peers it already knows
@@ -81,9 +84,9 @@ struct Peer {
     /// frame is sealed here FIRST, then chunked through the Noise cipher —
     /// so recorded traffic stays confidential unless BOTH key exchanges fall.
     pq: Mutex<PqChannel>,
-    /// The Noise handshake hash for this connection — a unique fingerprint of the
-    /// encrypted channel, used by the application layer to bind the signed `Hello`
-    /// identity to this specific pipe (anti-MITM).
+    /// The complete Noise + ML-KEM transcript binding for this connection,
+    /// including both exact KEM messages. Used to bind the signed `Hello`
+    /// identity to this pipe even if the Noise key exchange is broken.
     handshake_hash: Vec<u8>,
 }
 
@@ -851,8 +854,9 @@ impl TcpNode {
         self.disconnect(&addr);
     }
 
-    /// The Noise handshake hash for the connection to `peer` (its channel
-    /// fingerprint), or `None` if not connected. Used to bind the signed `Hello`.
+    /// The complete Noise + ML-KEM channel binding for `peer`, or `None` if
+    /// not connected. The historical method name is retained; the Noise-only
+    /// hash is never returned. Used to bind the signed `Hello`.
     pub fn peer_handshake_hash(&self, peer: &SocketAddr) -> Option<Vec<u8>> {
         self.shared
             .peers
@@ -1127,10 +1131,11 @@ fn setup_connection(
         // A write must never block forever: a vanished peer's full send window
         // would otherwise wedge whichever thread hits it (see WRITE_TIMEOUT).
         stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
-        let (mut transport, handshake_hash) = noise_handshake(&mut stream, initiator)?;
+        let (mut transport, noise_hash) = noise_handshake(&mut stream, initiator)?;
         // Hybrid PQ key exchange, inside the Noise channel. Fail-closed: a
         // peer that cannot complete it never becomes a connection.
-        let pq = pq_handshake(&mut stream, &mut transport, initiator, &handshake_hash)?;
+        let (pq, handshake_hash) =
+            pq_handshake(&mut stream, &mut transport, initiator, &noise_hash)?;
         stream.set_read_timeout(None)?;
         let reader = stream.try_clone()?;
         Ok((reader, transport, pq, handshake_hash))
@@ -1782,6 +1787,49 @@ mod tests {
                 .any(|(_, m)| matches!(m, NetMessage::Status { height: 7, .. }))
         });
         assert!(got, "status message delivered to peer over TCP");
+    }
+
+    #[test]
+    fn honest_tcp_peers_share_complete_binding_and_exchange_hybrid_hellos() {
+        use sov_crypto::Keypair;
+
+        let a = TcpNode::bind("127.0.0.1:0").unwrap();
+        let b = TcpNode::bind("127.0.0.1:0").unwrap();
+        a.connect(&b.local_addr().to_string()).unwrap();
+        assert!(wait_until(15, || a.peer_count() >= 1 && b.peer_count() >= 1));
+
+        let a_peer = a.connected_peers()[0];
+        let binding = a.peer_handshake_hash(&a_peer).unwrap();
+        assert_eq!(binding.len(), 32);
+        let b_peer = b
+            .connected_peers()
+            .into_iter()
+            .find(|peer| b.peer_handshake_hash(peer).as_deref() == Some(binding.as_slice()))
+            .expect("both TCP endpoints return the same complete hybrid binding");
+
+        let a_key = Keypair::hybrid_from_seed([61; 32]);
+        let b_key = Keypair::hybrid_from_seed([62; 32]);
+        let a_id = a_key.public_key().implicit_account_id();
+        let b_id = b_key.public_key().implicit_account_id();
+        let genesis = Hash::digest(b"hybrid-channel-test");
+        let a_hello = NetMessage::hello("sov", genesis, a_id.clone(), &binding, &a_key);
+        let b_hello = NetMessage::hello("sov", genesis, b_id.clone(), &binding, &b_key);
+        assert!(a.send(a_peer, &a_hello));
+        assert!(b.send(b_peer, &b_hello));
+        assert!(wait_until(15, || b.drain().iter().any(
+            |(peer, message)| {
+                *peer == b_peer
+                    && message.authenticated_account("sov", &genesis, &binding) == Some(&a_id)
+            }
+        )));
+        assert!(wait_until(15, || a.drain().iter().any(
+            |(peer, message)| {
+                *peer == a_peer
+                    && message.authenticated_account("sov", &genesis, &binding) == Some(&b_id)
+            }
+        )));
+        a.shutdown();
+        b.shutdown();
     }
 
     #[test]

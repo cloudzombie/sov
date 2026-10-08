@@ -183,6 +183,14 @@ pub enum ExecutionError {
         /// The frozen account.
         account: String,
     },
+    /// The PQ rotation window has opened: no new value may enter the
+    /// discrete-log-based v1 pool. Hard reject, before nonce or state changes.
+    #[error("post-quantum migration: shielded-v1 deposits are closed")]
+    PqShieldedV1DepositsClosed,
+    /// The PQ sunset freezes the entire v1 pool, including private transfers
+    /// and withdrawals. A classical proof/signature no longer authorizes it.
+    #[error("post-quantum sunset: shielded-v1 is frozen")]
+    PqShieldedV1Sunset,
     /// A miner-signaled feature was used before it activated. A block carrying such a
     /// transaction is INVALID (this propagates to `BlockExecutionError`), so every
     /// node running the same deployment schedule rejects it uniformly — the dormant
@@ -246,6 +254,9 @@ pub enum ExecutionError {
         /// The maximum permitted age — the transaction's lifetime.
         max_age_ms: u64,
     },
+    /// The migration fork quarantines the unmasked, unreviewed v2 proof suite.
+    #[error("pool-v2 proof suite frozen by post-quantum migration: private-input protection is not established")]
+    PqShieldedV2Unreviewed,
     /// A pool-v2 ([`Action::ShieldedV2`]) bundle was refused. **Every** v2
     /// failure lands here as a hard, block-invalidating reject — the pool-v2
     /// surface has no mineable failure mode by design (see
@@ -331,6 +342,99 @@ fn has_nested_timestamp(action: &Action) -> bool {
     }
 }
 
+/// Whether ordinary authorization of this account must include a post-quantum
+/// key. Consult the account being spent from, not a solver or policy member's
+/// personal account: a hybrid relayer cannot revive a retired owner's key.
+fn pq_requires_hybrid_authority(account: &sov_state::Account, ctx: &BlockContext<'_>) -> bool {
+    ctx.pq.as_ref().is_some_and(|pq| {
+        ctx.height >= pq.sunset_height
+            || (ctx.height >= pq.rotation_only_height
+                && account
+                    .total()
+                    .map(|total| total.grains() >= pq.threshold_grains)
+                    .unwrap_or(true))
+    })
+}
+
+fn is_hybrid_key(key: &sov_crypto::PublicKey) -> bool {
+    matches!(key, sov_crypto::PublicKey::V2HybridMlDsa65 { .. })
+}
+
+/// Like a single-key rotation, a multisig policy may use its old authority to
+/// migrate during the rotation window, but never after that authority sunsets.
+fn is_pq_multisig_migration(action: &Action, ctx: &BlockContext<'_>) -> bool {
+    ctx.pq
+        .as_ref()
+        .is_some_and(|pq| ctx.height < pq.sunset_height)
+        && matches!(action, Action::SetMultisig { signers, .. }
+            if !signers.is_empty() && signers.iter().all(is_hybrid_key))
+}
+
+/// Enforce pool-v1 retirement everywhere in the bounded carrier chain, before
+/// a carrier can short-circuit or consume a nonce. The existing codec places
+/// the signed i64 value balance at bytes 1..9, after its one-byte flags field.
+/// Reading just that fixed header keeps malformed/unreached carriers out of
+/// the expensive Orchard decoder. Malformed bundles retain their normal
+/// failed-action handling before sunset; at sunset every v1 action is frozen.
+fn check_shielded_retirement(
+    action: &Action,
+    ctx: &BlockContext<'_>,
+) -> Result<(), ExecutionError> {
+    let Some(pq) = &ctx.pq else {
+        return Ok(());
+    };
+    if ctx.height < pq.rotation_only_height && ctx.height < pq.sunset_height {
+        return Ok(());
+    }
+    let mut node = action;
+    loop {
+        if matches!(node, Action::ShieldedV2 { .. }) {
+            return Err(ExecutionError::PqShieldedV2Unreviewed);
+        }
+        if let Action::Shielded { bundle } = node {
+            if ctx.height >= pq.sunset_height {
+                return Err(ExecutionError::PqShieldedV1Sunset);
+            }
+            if bundle.get(1..9).is_some_and(|bytes| {
+                i64::from_le_bytes(bytes.try_into().expect("fixed eight-byte slice")) < 0
+            }) {
+                return Err(ExecutionError::PqShieldedV1DepositsClosed);
+            }
+            return Ok(());
+        }
+        node = match node {
+            Action::MultisigExec { action, .. } | Action::ProposeMultisig { action, .. } => action,
+            Action::Tipped { inner, .. } | Action::Timestamped { inner, .. } => inner,
+            _ => return Ok(()),
+        };
+    }
+}
+
+fn verify_shielded_v1_for_context(
+    bundle: &ShieldedBundle,
+    account: &AccountId,
+    nonce: u64,
+    ctx: &BlockContext<'_>,
+) -> bool {
+    if ctx
+        .pq
+        .as_ref()
+        .is_some_and(|pq| ctx.height >= pq.rotation_only_height)
+    {
+        // Surviving v1 migration/private actions must prove both spend-key
+        // ownership and the value commitment, in addition to the Halo2 proof.
+        bundle.verify_for_carrier_cached(&sov_shielded::ShieldedCarrier {
+            domain: &ctx.chain_domain,
+            account,
+            nonce,
+        })
+    } else {
+        // Historical replay is consensus-frozen, including proof-only v1
+        // authorization. Never silently revalidate old receipts more strictly.
+        bundle.verify_proof_only_legacy_cached()
+    }
+}
+
 /// Apply one signed transaction to `ledger` in `ctx`, returning its [`Receipt`].
 ///
 /// Returns `Err` only if the transaction is *rejected* (bad signature, wrong
@@ -409,7 +513,10 @@ pub fn apply_transaction(
     // are progressively retired: first the highest-value accounts may only
     // rotate to a hybrid key, then — at the sunset — a V1 signature stops
     // proving ownership entirely and is rejected for every action. Hybrid
-    // (V2) transactions are never touched.
+    // authorization remains usable, but may not reinstall retired authority.
+    // Capture holdings before fees are debited: paying a fee cannot lower an
+    // account below the rotation threshold and make a downgrade admissible.
+    let requires_hybrid_authority = pq_requires_hybrid_authority(&signer, ctx);
     if let Some(pq) = &ctx.pq {
         let legacy = matches!(tx.public_key, sov_crypto::PublicKey::V1Ed25519(_));
         if legacy && ctx.height >= pq.sunset_height {
@@ -417,20 +524,16 @@ pub fn apply_transaction(
                 account: tx.signer.to_string(),
             });
         }
-        if legacy
-            && ctx.height >= pq.rotation_only_height
-            && signer
-                .total()
-                .map(|t| t.grains() >= pq.threshold_grains)
-                .unwrap_or(true)
-        {
-            // The ONLY admissible action is a rotation to a non-legacy key —
-            // a V1 -> V1 rotation would evade the sunset and is refused.
+        if legacy && requires_hybrid_authority {
+            // The only admissible use of retired authority during this window
+            // is migration to hybrid control, for a single key or a multisig
+            // policy. Ordinary spends and V1 -> V1 rotations remain refused.
             let rotating_to_hybrid = matches!(
                 &tx.action,
                 Action::RotateKey { new_key, .. }
-                    if !matches!(new_key, sov_crypto::PublicKey::V1Ed25519(_))
-            );
+                    if is_hybrid_key(new_key)
+            ) || matches!(&tx.action, Action::MultisigExec { action, .. }
+                if is_pq_multisig_migration(action, ctx));
             if !rotating_to_hybrid {
                 return Err(ExecutionError::PqRotationRequired {
                     account: tx.signer.to_string(),
@@ -438,6 +541,8 @@ pub fn apply_transaction(
             }
         }
     }
+
+    check_shielded_retirement(&tx.action, ctx)?;
 
     // ── Dormant-variant hard gate (PR#8 audit finding F1) ────────────────────
     // A miner-signaled action variant that is not yet Active must be a HARD,
@@ -667,7 +772,11 @@ pub fn apply_transaction(
                     let mut approved = std::collections::BTreeSet::new();
                     for ap in approvals {
                         if let Some(pk) = policy.signers.get(ap.signer as usize) {
-                            if pk.verify(&msg, &ap.signature) {
+                            if (!requires_hybrid_authority
+                                || is_hybrid_key(pk)
+                                || is_pq_multisig_migration(inner, ctx))
+                                && pk.verify(&msg, &ap.signature)
+                            {
                                 approved.insert(ap.signer);
                             }
                         }
@@ -938,9 +1047,20 @@ pub fn apply_transaction(
                     Err(_) => ExecutionStatus::Failed {
                         reason: "malformed shielded bundle".into(),
                     },
-                    Ok(sb) if !sb.verify_cached() => ExecutionStatus::Failed {
-                        reason: "invalid shielded proof".into(),
-                    },
+                    Ok(sb) if !verify_shielded_v1_for_context(&sb, &tx.signer, tx.nonce, ctx) => {
+                        ExecutionStatus::Failed {
+                            reason: if ctx
+                                .pq
+                                .as_ref()
+                                .is_some_and(|pq| ctx.height >= pq.rotation_only_height)
+                            {
+                                "invalid shielded authorization or proof"
+                            } else {
+                                "invalid shielded proof"
+                            }
+                            .into(),
+                        }
+                    }
                     Ok(sb) if !ledger.shielded().anchor_is_known(&sb.anchor()) => {
                         ExecutionStatus::Failed {
                             reason: "unknown shielded anchor".into(),
@@ -1324,6 +1444,12 @@ pub fn apply_transaction(
                     ExecutionStatus::Failed {
                         reason: "intent key is not the owner account's registered key".into(),
                     }
+                } else if !is_hybrid_key(&intent.public_key)
+                    && pq_requires_hybrid_authority(&ledger.account(&intent.owner), ctx)
+                {
+                    ExecutionStatus::Failed {
+                        reason: "post-quantum policy: intent owner's legacy key cannot authorize settlement".into(),
+                    }
                 } else if !settlement.intent.verify_mode(&ctx.tx_domain) {
                     ExecutionStatus::Failed {
                         reason: "invalid intent signature".into(),
@@ -1384,7 +1510,11 @@ pub fn apply_transaction(
                 // account can never be rotated to a key nobody holds, and the
                 // proof is single-use. The old key is dead on commit.
                 let msg = sov_types::rotation_signing_bytes(&tx.signer, tx_nonce, new_key);
-                if !new_key.verify(&msg, proof) {
+                if requires_hybrid_authority && !is_hybrid_key(new_key) {
+                    ExecutionStatus::Failed {
+                        reason: "post-quantum policy: rotation must install a hybrid key".into(),
+                    }
+                } else if !new_key.verify(&msg, proof) {
                     ExecutionStatus::Failed {
                         reason: "rotation proof does not verify under the new key".into(),
                     }
@@ -1583,6 +1713,11 @@ pub fn apply_transaction(
                     ExecutionStatus::Failed {
                         reason: format!("multisig: threshold {threshold} out of range 1..={n}"),
                     }
+                } else if requires_hybrid_authority && !signers.iter().all(is_hybrid_key) {
+                    ExecutionStatus::Failed {
+                        reason: "post-quantum policy: multisig must install only hybrid keys"
+                            .into(),
+                    }
                 } else {
                     ledger.set_multisig(
                         tx.signer.clone(),
@@ -1626,6 +1761,14 @@ pub fn apply_transaction(
                             Some(_) if !is_proposable(inner) => ExecutionStatus::Failed {
                                 reason: "multisig: only a Transfer can be proposed".into(),
                             },
+                            Some(_)
+                                if !is_hybrid_key(&tx.public_key)
+                                    && pq_requires_hybrid_authority(&ledger.account(account), ctx) =>
+                            {
+                                ExecutionStatus::Failed {
+                                    reason: "post-quantum policy: legacy member cannot authorize this vault".into(),
+                                }
+                            }
                             Some(idx) => {
                                 let action_bytes = borsh::to_vec(inner)
                                     .expect("Action serialization is infallible");
@@ -1672,7 +1815,22 @@ pub fn apply_transaction(
                                         .into(),
                                 }
                             }
+                            (Some(_), Some(_))
+                                if !is_hybrid_key(&tx.public_key)
+                                    && pq_requires_hybrid_authority(&ledger.account(account), ctx) =>
+                            {
+                                ExecutionStatus::Failed {
+                                    reason: "post-quantum policy: legacy member cannot authorize this vault".into(),
+                                }
+                            }
                             (Some(idx), Some(mut prop)) => {
+                                // Cached approvals retain their signer indices, not a
+                                // permanent exemption from the current PQ policy.
+                                if pq_requires_hybrid_authority(&ledger.account(account), ctx) {
+                                    prop.approvers.retain(|idx| {
+                                        policy.signers.get(*idx as usize).is_some_and(is_hybrid_key)
+                                    });
+                                }
                                 let idx = idx as u16;
                                 if !prop.approvers.contains(&idx) {
                                     prop.approvers.push(idx);
@@ -1711,6 +1869,13 @@ pub fn apply_transaction(
                 if !is_member {
                     ExecutionStatus::Failed {
                         reason: "multisig: signer is not a policy member".into(),
+                    }
+                } else if !is_hybrid_key(&tx.public_key)
+                    && pq_requires_hybrid_authority(&ledger.account(account), ctx)
+                {
+                    ExecutionStatus::Failed {
+                        reason: "post-quantum policy: legacy member cannot authorize this vault"
+                            .into(),
                     }
                 } else if !belongs {
                     ExecutionStatus::Failed {
@@ -6144,6 +6309,585 @@ mod tests {
         assert!(apply_transaction(&mut ledger, &stx, &pq_ctx(10_000, &p))
             .unwrap()
             .succeeded());
+    }
+
+    fn pq_signed(
+        keypair: &Keypair,
+        account: &AccountId,
+        nonce: u64,
+        action: Action,
+    ) -> SignedTransaction {
+        SignedTransaction::sign(
+            Transaction {
+                signer: account.clone(),
+                public_key: keypair.public_key(),
+                nonce,
+                action,
+            },
+            keypair,
+        )
+        .unwrap()
+    }
+
+    fn pq_multisig_tx(
+        relay: &Keypair,
+        vault: &AccountId,
+        nonce: u64,
+        action: Action,
+        approvers: &[(u16, &Keypair)],
+    ) -> SignedTransaction {
+        let msg = sov_types::multisig_signing_bytes(vault, nonce, &action);
+        let approvals = approvers
+            .iter()
+            .map(|(idx, kp)| sov_types::MultisigApproval {
+                signer: *idx,
+                signature: kp.sign(&msg),
+            })
+            .collect();
+        pq_signed(
+            relay,
+            vault,
+            nonce,
+            Action::MultisigExec {
+                action: Box::new(action),
+                approvals,
+            },
+        )
+    }
+
+    #[test]
+    fn pq_v1_recovery_verifies_the_actual_carrier_and_preserves_history() {
+        use sov_shielded::{
+            mint_to_shielded, recover_outputs, unshield_amount_multi, unshield_amount_multi_bound,
+            witness_latest, ShieldedCarrier, ShieldedKey, ShieldedParams,
+        };
+        let p = policy();
+        let key = Keypair::hybrid_from_seed([96; 32]);
+        let account = key.public_key().implicit_account_id();
+        let note_key = ShieldedKey::from_seed([96; 32]).unwrap();
+        let params = ShieldedParams::build();
+        let mint = mint_to_shielded(&params, &note_key.address(), 50).unwrap();
+        let mut ledger = Ledger::new();
+        ledger.set_account(
+            &account,
+            Account::new(key.public_key(), Balance::from_sov(2).unwrap()),
+        );
+        let deposit = pq_signed(
+            &key,
+            &account,
+            0,
+            Action::Shielded {
+                bundle: mint.to_bytes(),
+            },
+        );
+        assert!(apply_transaction(&mut ledger, &deposit, &pq_ctx(99, &p))
+            .unwrap()
+            .succeeded());
+        let note = recover_outputs(&note_key, &mint).remove(0);
+        let (path, anchor) = witness_latest(&mint.note_commitment_bytes()).unwrap();
+        let notes = [(note, path)];
+        let context = pq_ctx(100, &p);
+        let carrier = ShieldedCarrier {
+            domain: &context.chain_domain,
+            account: &account,
+            nonce: 1,
+        };
+        let bound =
+            unshield_amount_multi_bound(&params, &note_key, &notes, anchor, 50, &carrier).unwrap();
+        let legacy = unshield_amount_multi(&params, &note_key, &notes, anchor, 50).unwrap();
+        let before = ledger.clone();
+        let tx = |bytes| pq_signed(&key, &account, 1, Action::Shielded { bundle: bytes });
+        let failed = apply_transaction(&mut ledger, &tx(legacy.to_bytes()), &context).unwrap();
+        assert!(!failed.succeeded());
+        assert_eq!(ledger.shielded_value(), before.shielded_value());
+        assert_eq!(ledger.shielded().snapshot(), before.shielded().snapshot());
+        assert_eq!(ledger.account(&account).nonce, 2);
+        ledger = before.clone();
+        let mut wrong_context = pq_ctx(100, &p);
+        wrong_context.chain_domain =
+            sov_primitives::SigningDomain::new("different-chain", context.chain_domain.genesis());
+        assert!(
+            !apply_transaction(&mut ledger, &tx(bound.to_bytes()), &wrong_context)
+                .unwrap()
+                .succeeded()
+        );
+        assert_eq!(ledger.shielded_value(), before.shielded_value());
+        ledger = before.clone();
+        assert!(
+            apply_transaction(&mut ledger, &tx(bound.to_bytes()), &context)
+                .unwrap()
+                .succeeded()
+        );
+        assert_eq!(ledger.shielded_value(), Balance::ZERO);
+        assert_eq!(
+            ledger.account(&account).balance,
+            Balance::from_sov(2).unwrap()
+        );
+        ledger = before;
+        assert!(
+            apply_transaction(&mut ledger, &tx(legacy.to_bytes()), &pq_ctx(99, &p))
+                .unwrap()
+                .succeeded(),
+            "pre-upgrade history replays unchanged"
+        );
+    }
+
+    #[test]
+    fn pq_shielded_v1_retirement_cannot_be_bypassed_by_a_carrier() {
+        let p = policy();
+        let key = Keypair::hybrid_from_seed([94; 32]);
+        let account = key.public_key().implicit_account_id();
+        let shielded = |vb: i64| {
+            let mut bundle = vec![0];
+            bundle.extend_from_slice(&vb.to_le_bytes());
+            Action::Shielded { bundle }
+        };
+        let wrap = |inner: Action| {
+            vec![
+                inner.clone(),
+                Action::Tipped {
+                    tip: Balance::from_sov(1).unwrap(),
+                    inner: Box::new(inner.clone()),
+                },
+                Action::Timestamped {
+                    created_at_ms: TEST_BLOCK_TIME_MS,
+                    inner: Box::new(inner.clone()),
+                },
+                Action::MultisigExec {
+                    action: Box::new(inner.clone()),
+                    approvals: vec![],
+                },
+                Action::ProposeMultisig {
+                    account: id("vault.sov"),
+                    action: Box::new(inner.clone()),
+                },
+                Action::Timestamped {
+                    created_at_ms: TEST_BLOCK_TIME_MS,
+                    inner: Box::new(Action::Tipped {
+                        tip: Balance::from_sov(1).unwrap(),
+                        inner: Box::new(Action::ProposeMultisig {
+                            account: id("vault.sov"),
+                            action: Box::new(inner),
+                        }),
+                    }),
+                },
+            ]
+        };
+        for (height, expected) in [
+            (100, ExecutionError::PqShieldedV1DepositsClosed),
+            (200, ExecutionError::PqShieldedV1Sunset),
+        ] {
+            for action in wrap(shielded(-1)) {
+                let mut ledger = Ledger::new();
+                ledger.set_account(
+                    &account,
+                    Account::new(key.public_key(), Balance::from_sov(100).unwrap()),
+                );
+                // Even a MultisigExec that would fail its threshold first must
+                // encounter retirement before it can produce a mined receipt.
+                if matches!(action, Action::MultisigExec { .. }) {
+                    ledger.set_multisig(
+                        account.clone(),
+                        sov_state::Multisig {
+                            signers: vec![key.public_key()],
+                            threshold: 1,
+                        },
+                    );
+                }
+                let root = ledger.state_root();
+                let mut context = pq_ctx(height, &p);
+                context.gas_price = Balance::from_grains(1);
+                context.fee_auction_active = true;
+                context.tx_timestamp_active = true;
+                let tx = pq_signed(&key, &account, 0, action);
+                assert_eq!(
+                    apply_transaction(&mut ledger, &tx, &context).unwrap_err(),
+                    expected
+                );
+                assert_eq!(
+                    ledger.state_root(),
+                    root,
+                    "hard rejection changes no state, fee, tip, or nonce"
+                );
+                assert_eq!(ledger.account(&account).nonce, 0);
+            }
+        }
+        // At S, positive withdrawals, fully private transfers, and even a
+        // malformed bundle are all frozen; no proof-decoding path can bypass it.
+        for inner in [
+            shielded(1),
+            shielded(0),
+            Action::Shielded { bundle: vec![] },
+        ] {
+            for action in wrap(inner) {
+                assert_eq!(
+                    check_shielded_retirement(&action, &pq_ctx(200, &p)),
+                    Err(ExecutionError::PqShieldedV1Sunset)
+                );
+                assert!(check_shielded_retirement(&action, &pq_ctx(199, &p)).is_ok());
+                assert!(check_shielded_retirement(&action, &ctx_at(200, &p)).is_ok());
+            }
+        }
+        assert!(check_shielded_retirement(&shielded(-1), &pq_ctx(99, &p)).is_ok());
+    }
+
+    #[test]
+    fn pq_migration_quarantines_v2_without_changing_historical_activation() {
+        let p = policy();
+        let key = Keypair::hybrid_from_seed([95; 32]);
+        let account = key.public_key().implicit_account_id();
+        for height in [100, 200] {
+            for action in [
+                Action::ShieldedV2 { bundle: vec![] },
+                Action::Timestamped {
+                    created_at_ms: TEST_BLOCK_TIME_MS,
+                    inner: Box::new(Action::ShieldedV2 { bundle: vec![] }),
+                },
+                Action::ProposeMultisig {
+                    account: id("vault.sov"),
+                    action: Box::new(Action::ShieldedV2 { bundle: vec![] }),
+                },
+            ] {
+                let mut context = pq_ctx(height, &p);
+                context.shielded_v2_active = true;
+                let mut ledger = Ledger::new();
+                ledger.set_account(
+                    &account,
+                    Account::new(key.public_key(), Balance::from_sov(2).unwrap()),
+                );
+                let root = ledger.state_root();
+                let tx = pq_signed(&key, &account, 0, action.clone());
+                assert_eq!(
+                    apply_transaction(&mut ledger, &tx, &context),
+                    Err(ExecutionError::PqShieldedV2Unreviewed)
+                );
+                assert_eq!(ledger.state_root(), root);
+                assert!(check_shielded_retirement(&action, &pq_ctx(99, &p)).is_ok());
+                assert!(check_shielded_retirement(&action, &ctx_at(200, &p)).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn pq_intent_owner_policy_cannot_be_bypassed_by_a_hybrid_solver() {
+        let p = policy();
+        let owner = id("usa.reserve.sov");
+        let solver = id("bob.sov");
+        let legacy = Keypair::from_seed([1; 32]);
+        let hybrid_owner = Keypair::hybrid_from_seed([81; 32]);
+        let hybrid_solver = Keypair::hybrid_from_seed([82; 32]);
+
+        // The restriction follows the passive owner's holdings, not the solver's
+        // key or balance. A valid V1 signature models what a quantum forgery could
+        // produce; it must no longer authorize the owner's funds after retirement.
+        for (height, owner_balance, owner_key, succeeds) in [
+            (99, 1_000, &legacy, true),
+            (100, 1_000, &legacy, false),
+            (199, 10, &legacy, true),
+            (200, 10, &legacy, false),
+            (200, 1_000, &hybrid_owner, true),
+        ] {
+            let (mut ledger, asset) = liquidity_setup();
+            ledger.set_account(
+                &owner,
+                Account::new(
+                    owner_key.public_key(),
+                    Balance::from_sov(owner_balance).unwrap(),
+                ),
+            );
+            ledger.set_account(
+                &solver,
+                Account::new(hybrid_solver.public_key(), Balance::from_sov(100).unwrap()),
+            );
+            let intent = Intent {
+                owner: owner.clone(),
+                public_key: owner_key.public_key(),
+                nonce: 0,
+                give_asset: IntentAsset::Token(asset),
+                give_amount: Balance::from_sov(100).unwrap().grains(),
+                want_asset: IntentAsset::Sov,
+                min_receive: Balance::from_sov(90).unwrap().grains(),
+                expiry_height: 10_000,
+            }
+            .sign(owner_key)
+            .unwrap();
+            let intent_id = intent.intent.id();
+            let tx = pq_signed(
+                &hybrid_solver,
+                &solver,
+                0,
+                Action::IntentSettle {
+                    settlement: Settlement {
+                        intent,
+                        solver: solver.clone(),
+                        deliver_amount: Balance::from_sov(90).unwrap().grains(),
+                    },
+                },
+            );
+            let receipt = apply_transaction(&mut ledger, &tx, &pq_ctx(height, &p)).unwrap();
+            assert_eq!(receipt.succeeded(), succeeds, "height {height}");
+            assert_eq!(ledger.intent_consumed(&intent_id), succeeds);
+            assert_eq!(
+                ledger.token_balance(&asset, &owner),
+                Balance::from_sov(if succeeds { 900 } else { 1_000 }).unwrap()
+            );
+            assert_eq!(
+                ledger.account(&solver).nonce,
+                1,
+                "solver's valid tx is admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn pq_multisig_rejects_legacy_approvals_and_preserves_hybrid_thresholds() {
+        let p = policy();
+        let vault = id("pq.vault.sov");
+        let relay = Keypair::hybrid_from_seed([83; 32]);
+        let second = Keypair::hybrid_from_seed([84; 32]);
+        let legacy = Keypair::from_seed([85; 32]);
+        let transfer = Action::Transfer {
+            to: id("recipient.sov"),
+            amount: Balance::from_sov(10).unwrap(),
+        };
+        for (height, approvals, succeeds) in [
+            (99, vec![(0, &relay), (2, &legacy)], true),
+            (100, vec![(0, &relay), (2, &legacy)], false),
+            (200, vec![(0, &relay), (2, &legacy)], false),
+            (200, vec![(0, &relay), (1, &second)], true),
+        ] {
+            let mut ledger = Ledger::new();
+            ledger.set_account(
+                &vault,
+                Account::new(relay.public_key(), Balance::from_sov(100).unwrap()),
+            );
+            ledger.set_multisig(
+                vault.clone(),
+                sov_state::Multisig {
+                    signers: vec![relay.public_key(), second.public_key(), legacy.public_key()],
+                    threshold: 2,
+                },
+            );
+            let tx = pq_multisig_tx(&relay, &vault, 0, transfer.clone(), &approvals);
+            let receipt = apply_transaction(&mut ledger, &tx, &pq_ctx(height, &p)).unwrap();
+            assert_eq!(receipt.succeeded(), succeeds, "height {height}");
+            assert_eq!(
+                ledger.account(&id("recipient.sov")).balance,
+                Balance::from_sov(if succeeds { 10 } else { 0 }).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn pq_cached_multisig_approvals_are_retired_when_the_vault_requires_hybrid() {
+        let p = policy();
+        let vault = id("pq.vault.sov");
+        let legacy = Keypair::from_seed([86; 32]);
+        let hybrid = Keypair::hybrid_from_seed([87; 32]);
+        let second = Keypair::hybrid_from_seed([88; 32]);
+        let proposer = legacy.public_key().implicit_account_id();
+        let approver = hybrid.public_key().implicit_account_id();
+        let second_approver = second.public_key().implicit_account_id();
+
+        for height in [100, 200] {
+            let mut ledger = Ledger::new();
+            ledger.set_account(
+                &vault,
+                Account::new(hybrid.public_key(), Balance::from_sov(100).unwrap()),
+            );
+            ledger.set_multisig(
+                vault.clone(),
+                sov_state::Multisig {
+                    signers: vec![
+                        legacy.public_key(),
+                        hybrid.public_key(),
+                        second.public_key(),
+                    ],
+                    threshold: 2,
+                },
+            );
+            let propose = pq_signed(
+                &legacy,
+                &proposer,
+                0,
+                Action::ProposeMultisig {
+                    account: vault.clone(),
+                    action: Box::new(Action::Transfer {
+                        to: id("recipient.sov"),
+                        amount: Balance::from_sov(10).unwrap(),
+                    }),
+                },
+            );
+            assert!(apply_transaction(&mut ledger, &propose, &pq_ctx(99, &p))
+                .unwrap()
+                .succeeded());
+            let proposal = ledger.proposals_for(&vault)[0].0;
+
+            // An old cached V1 vote cannot combine with a fresh hybrid vote to
+            // reach 2-of-3 after the vault's retirement boundary.
+            let approve = pq_signed(
+                &hybrid,
+                &approver,
+                0,
+                Action::ApproveMultisig {
+                    account: vault.clone(),
+                    proposal,
+                },
+            );
+            assert!(
+                apply_transaction(&mut ledger, &approve, &pq_ctx(height, &p))
+                    .unwrap()
+                    .succeeded()
+            );
+            assert_eq!(
+                ledger.account(&vault).balance,
+                Balance::from_sov(100).unwrap()
+            );
+            assert_eq!(ledger.proposal(&proposal).unwrap().approvers, vec![1]);
+
+            // Two surviving hybrid members still satisfy the original threshold.
+            let approve = pq_signed(
+                &second,
+                &second_approver,
+                0,
+                Action::ApproveMultisig {
+                    account: vault.clone(),
+                    proposal,
+                },
+            );
+            assert!(
+                apply_transaction(&mut ledger, &approve, &pq_ctx(height, &p))
+                    .unwrap()
+                    .succeeded()
+            );
+            assert_eq!(
+                ledger.account(&vault).balance,
+                Balance::from_sov(90).unwrap()
+            );
+            assert!(ledger.proposal(&proposal).is_none());
+        }
+    }
+
+    #[test]
+    fn pq_retired_account_cannot_install_a_legacy_key_or_multisig_policy() {
+        let p = policy();
+        let account = id("pq.owner.sov");
+        let hybrid = Keypair::hybrid_from_seed([89; 32]);
+        let replacement = Keypair::hybrid_from_seed([93; 32]);
+        let legacy = Keypair::from_seed([90; 32]);
+        let new_key = legacy.public_key();
+        for (height, balance, succeeds) in [
+            (99, 100, true),
+            (100, 100, false),
+            (199, 10, true),
+            (200, 10, false),
+        ] {
+            for (action, expected_success) in [
+                (
+                    Action::RotateKey {
+                        new_key,
+                        proof: legacy
+                            .sign(&sov_types::rotation_signing_bytes(&account, 0, &new_key)),
+                    },
+                    succeeds,
+                ),
+                (
+                    Action::SetMultisig {
+                        signers: vec![new_key],
+                        threshold: 1,
+                    },
+                    succeeds,
+                ),
+                (
+                    Action::SetMultisig {
+                        signers: vec![hybrid.public_key(), new_key],
+                        threshold: 1,
+                    },
+                    succeeds,
+                ),
+                (
+                    Action::RotateKey {
+                        new_key: replacement.public_key(),
+                        proof: replacement.sign(&sov_types::rotation_signing_bytes(
+                            &account,
+                            0,
+                            &replacement.public_key(),
+                        )),
+                    },
+                    true,
+                ),
+                (
+                    Action::SetMultisig {
+                        signers: vec![hybrid.public_key(), replacement.public_key()],
+                        threshold: 2,
+                    },
+                    true,
+                ),
+            ] {
+                let mut ledger = Ledger::new();
+                ledger.set_account(
+                    &account,
+                    Account::new(hybrid.public_key(), Balance::from_sov(balance).unwrap()),
+                );
+                let tx = pq_signed(&hybrid, &account, 0, action);
+                let receipt = apply_transaction(&mut ledger, &tx, &pq_ctx(height, &p)).unwrap();
+                assert_eq!(receipt.succeeded(), expected_success, "height {height}");
+                if !expected_success {
+                    assert_eq!(ledger.account(&account).key, Some(hybrid.public_key()));
+                    assert!(ledger.multisig_of(&account).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pq_legacy_multisig_can_migrate_only_before_sunset() {
+        let p = policy();
+        let vault = id("pq.vault.sov");
+        let legacy = Keypair::from_seed([91; 32]);
+        let hybrid = Keypair::hybrid_from_seed([92; 32]);
+        for height in [100, 200] {
+            let mut ledger = Ledger::new();
+            ledger.set_account(
+                &vault,
+                Account::new(legacy.public_key(), Balance::from_sov(100).unwrap()),
+            );
+            ledger.set_multisig(
+                vault.clone(),
+                sov_state::Multisig {
+                    signers: vec![legacy.public_key()],
+                    threshold: 1,
+                },
+            );
+            let tx = pq_multisig_tx(
+                &legacy,
+                &vault,
+                0,
+                Action::SetMultisig {
+                    signers: vec![hybrid.public_key()],
+                    threshold: 1,
+                },
+                &[(0, &legacy)],
+            );
+            if height < 200 {
+                assert!(apply_transaction(&mut ledger, &tx, &pq_ctx(height, &p))
+                    .unwrap()
+                    .succeeded());
+                assert_eq!(
+                    ledger.multisig_of(&vault).unwrap().signers,
+                    vec![hybrid.public_key()]
+                );
+            } else {
+                assert!(matches!(
+                    apply_transaction(&mut ledger, &tx, &pq_ctx(height, &p)),
+                    Err(ExecutionError::PqSunset { .. })
+                ));
+                assert_eq!(
+                    ledger.multisig_of(&vault).unwrap().signers,
+                    vec![legacy.public_key()]
+                );
+            }
+        }
     }
 
     // ---- Hybrid post-quantum keys (Ed25519 + ML-DSA-65) ----

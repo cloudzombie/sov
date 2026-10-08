@@ -4,13 +4,17 @@
 //! `winter-crypto`) over the 64-bit "Goldilocks" field `p = 2^64 - 2^32 + 1` —
 //! the hash the winterfell proof system proves natively. There are **no
 //! elliptic curves anywhere in this crate**: hiding and binding of commitments
-//! rest on hash assumptions only, which survive a cryptographically relevant
-//! quantum computer (Grover halves margins; no structural break).
+//! rest on hash assumptions only, with no discrete-log or factoring assumption
+//! for Shor's algorithm to attack. This does not establish a quantum security
+//! level: for an ideal n-bit hash, generic quantum preimage search costs about
+//! 2^(n/2) queries, while collision search can cost about 2^(n/3) with substantial
+//! resource assumptions. Rescue-Prime's concrete margins and the proof's quantum
+//! soundness require separate analysis (PQV2-05).
 //!
 //! The digest type [`PqDigest`] is 4 field elements (32 bytes). All composite
 //! structures (note commitments, nullifiers, Merkle nodes) are built from the
-//! single 2-to-1 compression [`merge_domain`], which is byte-identical to
-//! `Rp64_256::merge` (pinned by a test).
+//! single 2-to-1 compression [`merge_domain`], whose reserved domain-0 form is
+//! byte-identical to `Rp64_256::merge` (pinned by a test).
 
 use winter_crypto::hashers::Rp64_256;
 use winter_math::{fields::f64::BaseElement, FieldElement, StarkField};
@@ -96,9 +100,11 @@ impl PqDigest {
 ///
 /// `merge_domain(0, l, r)` is byte-identical to `Rp64_256::merge` (pinned by
 /// a test below); domain 0 is reserved and never used by the protocol.
-/// Distinct domains initialize the sponge capacity differently, so outputs
-/// under different domains are computationally independent (a cross-domain
-/// collision would be a collision of the Rescue permutation itself).
+/// Distinct protocol domains initialize the sponge capacity differently, so
+/// their permutation inputs are disjoint. Collision resistance of the resulting
+/// four-element digest remains a cryptographic assumption: equality of projected
+/// digests does not imply equality of the full permutation output or a collision
+/// of the permutation itself.
 pub fn merge_domain(domain: u64, left: PqDigest, right: PqDigest) -> PqDigest {
     let mut state = [Felt::ZERO; STATE_WIDTH];
     state[0] = Felt::new(8); // RATE_WIDTH, per Rp64_256::merge

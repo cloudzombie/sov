@@ -7,9 +7,11 @@
 //!    capacity element 1 (capacity element 0 stays the upstream rate-width
 //!    seed, 8). Distinct capacity initialization is the standard sponge
 //!    domain-separation technique: two merges with different domains are
-//!    evaluations of the permutation on disjoint input sets, so a collision
-//!    across domains is a permutation collision. Domain 0 is RESERVED as the
-//!    upstream-compatibility point (`merge_domain(0, ..) == Rp64_256::merge`,
+//!    evaluations of the permutation on disjoint input sets. The resulting
+//!    four-element digest is a projection of the permutation output, so its
+//!    collision resistance, including across domains, remains an assumption;
+//!    a digest collision is not a permutation collision. Domain 0 is RESERVED
+//!    as the upstream-compatibility point (`merge_domain(0, ..) == Rp64_256::merge`,
 //!    pinned by a test) and is never used by the protocol.
 //!
 //! 2. **Native blake3 `derive_key` domains**: used only OUTSIDE the circuit
@@ -17,8 +19,9 @@
 //!    bundle digest). blake3's `derive_key` mode gives full cryptographic
 //!    context separation per string.
 //!
-//! Every constant below is used in exactly the place its name says; a test
-//! in this module proves cross-domain outputs differ for identical inputs.
+//! Every constant below is used in exactly the place its name says; tests
+//! in this module check distinct constants and cross-domain outputs for fixed
+//! inputs. Those regression checks do not prove cryptographic domain separation.
 
 /// In-circuit domain: owner tag `merge_d(nsk, 0)`.
 pub const RESCUE_DOMAIN_OWNER_TAG: u64 = 1;
@@ -32,8 +35,8 @@ pub const RESCUE_DOMAIN_MERKLE_NODE: u64 = 4;
 pub const RESCUE_DOMAIN_NULLIFIER: u64 = 5;
 /// In-circuit domain: the nullifier hash of a DUMMY input slot. Dummy slots
 /// never surface a nullifier (the verifier excludes them), but the circuit
-/// still domain-separates the dummy hash so a dummy's in-trace nullifier can
-/// never equal any real nullifier — defense in depth against any future
+/// still domain-separates the dummy hash so matching a real nullifier requires
+/// a collision under the hash assumption — defense in depth against any future
 /// handling bug that leaks a dummy slot into the nullifier set.
 pub const RESCUE_DOMAIN_DUMMY_NULLIFIER: u64 = 6;
 

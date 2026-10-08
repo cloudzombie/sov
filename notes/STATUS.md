@@ -1,14 +1,34 @@
 # SOV — STATUS (master anchor)
 
-_Last updated: **2026-10-01** for the Station UI checkpoint below. Network/fleet
-observations below remain dated 2026-08-06 and were not reverified in this UI session._
+_Last updated: **2026-10-08** for the Rust quantum hardening release preparation.
+Network/fleet observations below remain dated 2026-08-06 and were not reverified
+in this session._
 
 _(Previous update was 2026-07-21 at v0.1.97. It sat stale through thirteen releases and described
 an already-activated fork as pending — flagged as item E1 in `consensus-open-list.md` on
 2026-07-27 and unfixed for ten days. If you are reading this at the end of a session and it is
 more than one release behind, fix it now; that is the whole job of this file.)_
 
-## Current Station UI checkpoint — 2026-10-01
+## Current Rust Station checkpoint — 2026-10-08
+
+- Source is being prepared as **v0.2.15** at the owner's request for a `main`
+  push and platform releases. See [release-v0.2.15.md](release-v0.2.15.md).
+- Protocol-3 peer authentication binds the full hybrid transport transcript and
+  account identity. Mainnet/rehearsal peer admission requires hybrid keys and a
+  coordinated operator upgrade.
+- Scheduled legacy retirement covers secondary authority paths. Station preserves
+  imported legacy keys and provides explicit reviewed migration to hybrid keys.
+  V1 recovery binds recipient, chain, genesis and nonce once retirement activates.
+- New pool-v2 creation and broadcast are quarantined because the current unmasked
+  proof trace does not establish privacy. Historical verification remains.
+- Mainnet PQ retirement remains **unarmed**; existing genesis and deployment
+  schedules are preserved. An isolated fresh rehearsal verifies retirement at 48,
+  sunset at 64 and cold replay. No claim of full post-quantum security is made.
+- All 170 active Station tests passed (one intentional ignore), with relevant
+  runtime, proof, transport, RPC and replay checks plus Clippy. The complete
+  release gate and platform workflow must pass before publication is complete.
+
+## Previous Station UI checkpoint — 2026-10-01
 
 - The existing local production window reports **v0.2.13**. Source baseline:
   `29e7a11`; UI branch: `codex/station-next-gen-ui`. The development package is
@@ -31,8 +51,9 @@ more than one release behind, fix it now; that is the whole job of this file.)_
   checkpoint for build/lint and native inspection evidence and limitations.
 - **Release follow-up:** the owner subsequently requested a GitHub release and
   confirmed **main only, no release branch**. The tested UI commit is now on
-  local `main`; push it and run the unchanged release gate for **v0.2.14**.
-  See [release-v0.2.14.md](release-v0.2.14.md). No tag exists at this checkpoint.
+  local `main`. The subsequent 2026-10-08 release request supersedes that target
+  with **v0.2.15**. See [release-v0.2.14.md](release-v0.2.14.md) for the earlier
+  preparation. No tag existed at that checkpoint.
 - **Next action:** run the ordinary release/integration gates, publish from
   current `origin/main`, and verify the GitHub build/publish results.
   Do not treat preview balances or scans as live-chain evidence.

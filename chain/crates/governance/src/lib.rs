@@ -69,7 +69,7 @@ pub const MAX_SIGNAL_BIT: u8 = 28;
 // ── The signal-bit registry (forward-compat law F1) ──────────────────────────
 // ONE table owns every signaling bit SOV has ever assigned. Adding a deployment
 // means claiming the next bit HERE first; nothing else may reuse or renumber a
-// bit. Bits 4..=28 are reserved and unassigned.
+// bit. Bits 5..=28 are reserved and unassigned.
 
 /// Signal bit 0 — the `tx-domain` hard fork (chain-bound tx/intent signatures).
 /// Armed and ACTIVATED on mainnet (v0.1.99, active at height 11520).
@@ -96,6 +96,13 @@ pub const SHIELDED_V2_DEPLOYMENT: &str = "shielded-v2";
 pub const BIT_TX_TIMESTAMP: u8 = 3;
 /// The canonical deployment name for signal bit [`BIT_TX_TIMESTAMP`].
 pub const TX_TIMESTAMP_DEPLOYMENT: &str = "tx-timestamp";
+
+/// Signal bit 4 — the `pq-sunset` deployment: legacy authorization retirement
+/// and pool-v1 retirement. Armed only in the isolated PQ rehearsal namespace;
+/// canonical networks require their own published, release-pinned schedule.
+pub const BIT_PQ_SUNSET: u8 = 4;
+/// The canonical deployment name for signal bit [`BIT_PQ_SUNSET`].
+pub const PQ_SUNSET_DEPLOYMENT: &str = "pq-sunset";
 
 /// Errors constructing or operating the governance machine.
 ///

@@ -22,7 +22,8 @@ pub mod transport;
 
 pub use link::{LinkRead, SealedLink};
 pub use message::{
-    handshake_bytes, NetMessage, NetworkError, MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION,
+    handshake_bytes, hello_signing_bytes, NetMessage, NetworkError, MIN_SUPPORTED_PROTOCOL,
+    PROTOCOL_VERSION,
 };
 pub use portmap::{try_map_port, Gateway, PortMapper, Reachability};
 pub use pq::PqChannel;

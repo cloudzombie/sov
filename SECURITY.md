@@ -53,10 +53,22 @@ continuously checked by the [`sov-verify`](chain/crates/verify) suite:
 
 In scope: the Rust workspace under `chain/` — Nakamoto proof-of-work consensus,
 runtime, state, crypto composition, coinbase emission, the shielded pool, VM, and
-the verification suite. The crypto primitives themselves are audited upstream
-crates (ed25519-dalek, blake3, sha2, randomx-rs (RandomX reference), fips204
-(ML-DSA), fips203 (ML-KEM), chacha20poly1305, wasmi); SOV's job is correct
-composition, which is what an audit should target.
+the verification suite. Cryptographic implementations include ed25519-dalek,
+blake3, sha2, randomx-rs (RandomX reference), fips204 (ML-DSA), fips203 (ML-KEM),
+and chacha20poly1305; execution also depends on wasmi. Their audit coverage
+varies. NIST standardization of an algorithm does not audit its Rust library
+or SOV's composition. Assess upstream implementations and integration together,
+including the peer Noise/ML-KEM transcript binding and secondary authorization
+under the legacy-key sunset policy.
+
+The [quantum posture](chain/docs/quantum-posture.md) records unresolved scope:
+mainnet legacy-key retirement is unarmed; corrected v1 authorization and
+recipient binding require coordinated activation. The current unmasked v2
+prover lacks private-input protection, so new v2 activity is disabled in Rust
+Station/RPC/gossip and quarantined at R by the new fork. The replacement
+requires confidentiality review, external circuit audit, and quantified QROM
+soundness analysis. Neither supply conservation nor passing
+tests constitute a claim that the entire chain is quantum-safe.
 
 Now **live and in scope** (fair-launched mainnet, 2026-07-04): the P2P transport +
 daemon (`chain/crates/network`, `chain/crates/rpc`) and SOV Station (`node/`). These

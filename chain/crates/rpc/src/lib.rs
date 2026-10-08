@@ -84,7 +84,7 @@ use sov_chain::MiningCandidate;
 use sov_node::Node;
 use sov_primitives::{AccountId, Balance, Hash};
 use sov_shielded_pq::hash::PqDigest;
-use sov_types::{Block, BlockHeader, SignedTransaction};
+use sov_types::{Action, Block, BlockHeader, SignedTransaction};
 
 /// Serializes the CPU-/scheduler-heavy networking tests in this crate (real
 /// `TcpNode` sync + daemon mining) so they never run concurrently. `cargo test`
@@ -103,7 +103,7 @@ pub mod daemon;
 pub use daemon::{
     keystore_fingerprint_of, keystore_stored_fingerprint, BlockLog, ChainSpec, CheckpointSpec,
     Daemon, DaemonError, DaemonHandle, Keystore, KeystoreEntry, NodeConfig, PolicyPreset,
-    SpecAccount,
+    SpecAccount, PQ_REHEARSAL_CHAIN_PREFIX,
 };
 
 pub mod p2p;
@@ -787,6 +787,111 @@ fn block_with_hash(b: &Block) -> Value {
 
 // ---- method dispatch ------------------------------------------------------
 
+/// Quantum policy for the next includable block, derived from the same release
+/// configuration and committed signals as consensus. `false` proof-security
+/// disclosure is deliberate: hash-based proofs are not a completed QROM audit.
+fn quantum_status(chain: &sov_chain::Blockchain) -> Value {
+    let height = chain.height();
+    let evaluated_height = height.saturating_add(1);
+    let config = chain.pq_deployment_config();
+    let schedule = chain.resolved_pq(evaluated_height);
+    let state = chain
+        .deployment_states()
+        .into_iter()
+        .find(|d| config.is_some_and(|cfg| cfg.deployment.name == d.name))
+        .map(|d| format!("{:?}", d.state));
+    let stage = match schedule {
+        Some(ref pq) if evaluated_height >= pq.sunset_height => "sunset",
+        Some(_) => "rotation_only",
+        None if config.is_some() => "scheduled",
+        None => "unarmed",
+    };
+    let rotation_only = stage == "rotation_only";
+    let sunset = stage == "sunset";
+    let threshold = config.map(|cfg| cfg.threshold_grains);
+    let all_legacy_restricted = sunset || (rotation_only && threshold == Some(0));
+    let v1_stage = if sunset {
+        "frozen"
+    } else if rotation_only {
+        "drain_only"
+    } else {
+        "available"
+    };
+    let legacy_policy = if sunset {
+        "frozen"
+    } else if rotation_only && threshold == Some(0) {
+        "rotation_only"
+    } else if rotation_only {
+        "threshold_rotation_only"
+    } else {
+        "allowed"
+    };
+    json!({
+        "height": height,
+        "evaluatedHeight": evaluated_height,
+        "pqSunset": {
+            "armed": config.is_some(),
+            "state": state,
+            "stage": stage,
+            "bit": config.map(|cfg| cfg.deployment.bit),
+            "startHeight": config.map(|cfg| cfg.deployment.start_height.get()),
+            "timeoutHeight": config.map(|cfg| cfg.deployment.timeout_height.get()),
+            "period": config.map(|cfg| cfg.deployment.period),
+            "threshold": config.map(|cfg| json!({
+                "num": cfg.deployment.threshold.num,
+                "den": cfg.deployment.threshold.den,
+            })),
+            "minActivationHeight": config.map(|cfg| cfg.deployment.min_activation_height.get()),
+            "lockinontimeout": config.map(|cfg| cfg.deployment.lockinontimeout),
+            "sunsetDelayBlocks": config.map(|cfg| cfg.sunset_delay_blocks),
+            "thresholdGrains": threshold.map(|grains| grains.to_string()),
+            // Actual R/S are reported only once consensus resolves activation.
+            "rotationOnlyHeight": schedule.as_ref().map(|pq| pq.rotation_only_height),
+            "sunsetHeight": schedule.as_ref().map(|pq| pq.sunset_height),
+        },
+        // Ordinary legacy actions. Migration-only authorization is reported
+        // separately so clients cannot mistake it for ordinary spend permission.
+        "legacyTransactionsAllowed": !all_legacy_restricted,
+        "legacyMigrationAllowed": !sunset,
+        "legacyTransactionPolicy": legacy_policy,
+        "newLegacyAccountsAllowed": !rotation_only && !sunset,
+        "poolV1Stage": v1_stage,
+        "poolV1DepositsAllowed": !rotation_only && !sunset,
+        "poolV1SpendsAllowed": !sunset,
+        "poolV1CarrierBindingRequired": rotation_only,
+        "poolV1RecoveryAllowed": rotation_only,
+        "v2Active": chain.shielded_v2_active(evaluated_height),
+        "v2ProofSecurityEstablished": false,
+        "v2PrivacyEstablished": false,
+        "poolV2CreationAllowed": false,
+        "fullyPostQuantum": false,
+        "signatureScheme": "Ed25519 + ML-DSA-65 (hybrid)",
+        "hash": {
+            "algorithm": "BLAKE3-256",
+            "outputBits": 256,
+            "genericQuantumPreimageBits": 128,
+            "genericQuantumCollisionBitsApprox": 85.3,
+            "securityEstimateModel": "ideal generic quantum query model; not a protocol security proof",
+        },
+    })
+}
+
+/// Admission policy for new transactions, independent of historical consensus.
+/// The deployed v2 verifier stays available for block-log replay, but creating
+/// new unmasked Winterfell proofs exposes private inputs. Both RPC and gossip
+/// must refuse new carriers, including proposals that defer their execution.
+pub(crate) fn safe_new_transaction(action: &Action) -> bool {
+    let mut action = action;
+    loop {
+        action = match action {
+            Action::ShieldedV2 { .. } => return false,
+            Action::MultisigExec { action, .. } | Action::ProposeMultisig { action, .. } => action,
+            Action::Tipped { inner, .. } | Action::Timestamped { inner, .. } => inner,
+            _ => return true,
+        };
+    }
+}
+
 fn call(
     node: &Arc<Mutex<Node>>,
     ctx: &RpcCtx,
@@ -1153,6 +1258,9 @@ fn call(
             };
             Ok(json!({
                 "active": c.shielded_v2_active(height),
+                "proofSecurityEstablished": false,
+                "privacyEstablished": false,
+                "creationAllowed": false,
                 "poolValue": to_value(l.shielded_v2_value()),
                 "noteCount": v2.note_count(),
                 "nullifierCount": v2.nullifier_count(),
@@ -1662,8 +1770,10 @@ fn call(
             Ok(json!({
                 "height": node.chain().height(),
                 "deployments": deployments,
+                "quantumPolicy": quantum_status(node.chain()),
             }))
         }
+        "sov_getQuantumStatus" => Ok(quantum_status(node.chain())),
         "sov_getSigningDomain" => {
             // The network signing domain a client should bind a NEW transaction or
             // intent signature to, resolved at the next height (the earliest a
@@ -1705,6 +1815,9 @@ fn call(
         "sov_submitTransaction" => {
             let stx: SignedTransaction = serde_json::from_value(params.clone())
                 .map_err(|e| RpcError::invalid_params(format!("invalid SignedTransaction: {e}")))?;
+            if !safe_new_transaction(&stx.transaction.action) {
+                return Err(RpcError::server("pool-v2 transactions disabled: the current proof implementation does not protect private inputs; historical block verification remains available"));
+            }
             let tx_id = stx.id();
             let admitted = node
                 .submit(stx.clone())
@@ -2123,5 +2236,40 @@ fn call(
             }
         }
         other => Err(RpcError::method_not_found(other)),
+    }
+}
+
+#[cfg(test)]
+mod quantum_admission_tests {
+    use super::*;
+
+    #[test]
+    fn v2_admission_is_closed_inside_every_carrier() {
+        let v2 = || Action::ShieldedV2 { bundle: vec![] };
+        for action in [
+            v2(),
+            Action::Tipped {
+                tip: Balance::ZERO,
+                inner: Box::new(v2()),
+            },
+            Action::Timestamped {
+                created_at_ms: 1,
+                inner: Box::new(v2()),
+            },
+            Action::MultisigExec {
+                action: Box::new(v2()),
+                approvals: vec![],
+            },
+            Action::ProposeMultisig {
+                account: AccountId::new("vault.sov").unwrap(),
+                action: Box::new(v2()),
+            },
+        ] {
+            assert!(!safe_new_transaction(&action));
+        }
+        assert!(safe_new_transaction(&Action::Transfer {
+            to: AccountId::new("receiver.sov").unwrap(),
+            amount: Balance::from_grains(1)
+        }));
     }
 }

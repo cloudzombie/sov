@@ -21,20 +21,26 @@
 //! - a **de-shield** spends a shielded note and pays a transparent account —
 //!   value flows *out* of the pool (positive value balance).
 //!
-//! Every shielded action carries a Halo2 zero-knowledge proof; the chain accepts
-//! it only if the proof verifies (and, once wired into the runtime, the spent
-//! notes' nullifiers are unseen and the anchor is a commitment-tree root the
-//! chain has held).
+//! Every shielded action carries a Halo2 zero-knowledge proof, a RedPallas spend
+//! authorization, and a bundle binding signature. [`ShieldedBundle::verify`]
+//! checks all of them, including the binding of the public value balance. A
+//! validator must also check that spent nullifiers are unseen and the anchor is
+//! a commitment-tree root the chain has held. The explicit proof-only legacy
+//! methods exist exclusively to reproduce historical consensus.
 //!
 //! ## Honest scope
 //!
 //! The cryptography here is real and delegated to the audited Orchard/Halo2
-//! crates — proofs are genuine Halo2 proofs, verified the way Zcash verifies
-//! them, with no trusted setup. This crate is built incrementally; each landed
-//! piece is covered by a test that constructs a *real* proof and verifies it.
-//! The first landed capability is the mint→shielded path. Still to be wired:
-//! the note-commitment tree + nullifier set in ledger state, the shielded
-//! transaction action in the runtime, and shielded↔transparent value movement.
+//! crates, with no trusted setup. **Orchard v1 is not post-quantum:** its proof
+//! system and signatures rely on elliptic curves. The current v2 proof suite is
+//! quarantined pending confidentiality and quantum soundness remediation.
+//! Historical v1 builders sign a fixed zero digest;
+//! this does not bind a transparent withdrawal to its intended recipient, even
+//! when the outer SOV transaction authenticates its complete action. V1
+//! withdrawals after R require the recipient-bound builder and verification
+//! APIs; pre-R proof-only behavior is preserved exclusively for history.
+//! Tests construct real mint and spend proofs, verify complete authorization,
+//! and reject modified signatures and value balances.
 //!
 //! [Orchard]: https://github.com/zcash/orchard
 //! [Halo2]: https://github.com/zcash/halo2
@@ -55,12 +61,12 @@ pub use address::{
     UnifiedAddress, SHIELDED_V2_ADDRESS_CHARS,
 };
 pub use keys::{ShieldedAddress, ShieldedKey};
-pub use pool::{mint_to_shielded, ShieldedBundle, ShieldedParams};
+pub use pool::{mint_to_shielded, ShieldedBundle, ShieldedCarrier, ShieldedParams};
 pub use state::ShieldedState;
 pub use store::NoteStore;
 pub use transfer::{
-    shielded_transfer, shielded_transfer_with_change, unshield, unshield_amount,
-    unshield_amount_multi,
+    shielded_transfer, shielded_transfer_with_change, shielded_transfer_with_change_bound,
+    unshield, unshield_amount, unshield_amount_multi, unshield_amount_multi_bound,
 };
 pub mod address;
 pub use wallet::{recover_outputs, witness_latest, NoteWitnessTree, ReceivedNote};

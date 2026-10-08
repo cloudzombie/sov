@@ -25,7 +25,7 @@ use sov_rpc::{
 };
 use sov_shielded::{
     decode_shielded_v2, encode_shielded, encode_shielded_v2, mint_to_shielded,
-    shielded_transfer_with_change, unshield_amount_multi, AnyAddress, NoteStore, Receiver,
+    shielded_transfer_with_change, unshield_amount_multi_bound, AnyAddress, NoteStore, Receiver,
     ShieldedBundle, ShieldedKey, ShieldedParams, UnifiedAddress,
 };
 use sov_shielded_pq::bundle::SpendBundle;
@@ -296,9 +296,88 @@ enum Pool {
     /// discrete-log based, so a future quantum adversary who recorded the chain could
     /// break the privacy of transactions made today ("harvest now, decrypt later").
     V1,
-    /// Pool v2 — ML-KEM-768 note carriers with a STARK spend proof. Its activation
-    /// state is reported by the node, independently of pool v1.
+    /// Pool v2 — ML-KEM-768 note carriers with a STARK spend proof whose external
+    /// audit and quantum soundness review are pending. Activation is independent
+    /// of that review and is reported by the node, independently of pool v1.
     V2,
+}
+
+const V2_PROOF_SECURITY_NOTE: &str =
+    "Pool v2 uses post-quantum primitives, but its proof audit and \
+    quantum soundness review are pending. Security of hidden amounts and note linkages remains \
+    unverified, even when this pool is active. New v2 proofs are disabled because the current trace is unmasked and may expose private inputs.";
+
+// No remote RPC flag can establish the soundness of this proof implementation.
+// This release has no reviewed quantum-security proof/parameter allowlist.
+const LOCAL_V2_QUANTUM_PROOF_REVIEW_ESTABLISHED: bool = false;
+
+#[derive(Clone)]
+struct QuantumStatus {
+    height: u64,
+    evaluated_height: u64,
+    sunset_stage: String,
+    rotation_height: Option<u64>,
+    sunset_height: Option<u64>,
+    legacy_policy: String,
+    migration_allowed: bool,
+    v1_stage: String,
+    remote_v2_review_claim: bool,
+}
+
+fn quantum_status(value: &Value) -> Option<QuantumStatus> {
+    let sunset = value.get("pqSunset")?;
+    let stage = sunset.get("stage")?.as_str()?;
+    let policy = value.get("legacyTransactionPolicy")?.as_str()?;
+    let v1 = value.get("poolV1Stage")?.as_str()?;
+    if !matches!(stage, "unarmed" | "scheduled" | "rotation_only" | "sunset")
+        || !matches!(
+            policy,
+            "allowed" | "rotation_only" | "threshold_rotation_only" | "frozen"
+        )
+        || !matches!(v1, "available" | "drain_only" | "frozen")
+    {
+        return None;
+    }
+    let height = value.get("height")?.as_u64()?;
+    let evaluated_height = value.get("evaluatedHeight")?.as_u64()?;
+    if evaluated_height != height.checked_add(1)? {
+        return None;
+    }
+    let optional_height = |name| match sunset.get(name)? {
+        Value::Null => Some(None),
+        value => value.as_u64().map(Some),
+    };
+    Some(QuantumStatus {
+        height,
+        evaluated_height,
+        sunset_stage: stage.into(),
+        rotation_height: optional_height("rotationOnlyHeight")?,
+        sunset_height: optional_height("sunsetHeight")?,
+        legacy_policy: policy.into(),
+        migration_allowed: value.get("legacyMigrationAllowed")?.as_bool()?,
+        v1_stage: v1.into(),
+        remote_v2_review_claim: value.get("v2ProofSecurityEstablished")?.as_bool()?,
+    })
+}
+
+fn quantum_policy_disclosure(status: Option<&QuantumStatus>) -> String {
+    let Some(status) = status else {
+        return "Node policy: unavailable — this view does not verify legacy-key acceptance or peer upgrade requirements. Local restrictions on new shielded deposits still apply.".into();
+    };
+    format!("Connected node reports height {} / next block {}: sunset {}; legacy transactions {}; legacy migration {}. Rotation-only height {}; sunset height {}; pool v1 {}. Remote v2 proof-review claim {}; locally established {}. New shielded deposits remain disabled in this build.",
+        status.height, status.evaluated_height, status.sunset_stage, status.legacy_policy,
+        if status.migration_allowed { "allowed" } else { "disabled" },
+        status.rotation_height.map(|h| h.to_string()).unwrap_or_else(|| "uncommitted".into()),
+        status.sunset_height.map(|h| h.to_string()).unwrap_or_else(|| "uncommitted".into()),
+        status.v1_stage, status.remote_v2_review_claim, LOCAL_V2_QUANTUM_PROOF_REVIEW_ESTABLISHED)
+}
+
+fn quantum_deposit_allowed(pool: Pool) -> Result<(), &'static str> {
+    match pool {
+        Pool::V1 => Err("new pool-v1 deposits are disabled: Orchard/Halo2 privacy is not post-quantum; ask for a transparent hybrid account address"),
+        Pool::V2 if !LOCAL_V2_QUANTUM_PROOF_REVIEW_ESTABLISHED => Err("new pool-v2 deposits are disabled: this Station build has no established quantum proof-security review"),
+        Pool::V2 => Ok(()),
+    }
 }
 
 impl Pool {
@@ -317,11 +396,11 @@ impl Pool {
         }
     }
 
-    /// The post-quantum claim, stated as the plain truth in both directions.
+    /// Distinguish post-quantum primitives from an audited proof-security claim.
     fn pq_claim(self) -> &'static str {
         match self {
             Pool::V1 => "NOT post-quantum",
-            Pool::V2 => "post-quantum",
+            Pool::V2 => "post-quantum primitives · proof audit pending",
         }
     }
 
@@ -331,7 +410,7 @@ impl Pool {
     /// colour-vision deficiency can all remove.
     ///
     /// Open ring for v1 (its privacy has a hole a quantum adversary can widen),
-    /// solid diamond for v2 (closed under the same adversary).
+    /// solid diamond for v2 (different primitives; its proof review is pending).
     fn glyph(self) -> &'static str {
         match self {
             Pool::V1 => "○",
@@ -344,14 +423,14 @@ impl Pool {
     fn pq_badge(self) -> &'static str {
         match self {
             Pool::V1 => "NOT PQ",
-            Pool::V2 => "PQ",
+            Pool::V2 => "PQ PRIMITIVES · AUDIT PENDING",
         }
     }
 
     /// The pool as ONE unambiguous line, for a control where the operator is
     /// CHOOSING between the two. The three facts are never separated: a selector
     /// reading only "Pool v1 / Pool v2" makes the most consequential property of
-    /// the choice — whether the privacy survives a quantum adversary — invisible
+    /// the choice — which privacy assumptions still need quantum review — invisible
     /// at the moment of choosing.
     fn selector_label(self) -> String {
         format!(
@@ -371,6 +450,61 @@ impl Pool {
             Pool::V2 => "xusq1…",
         }
     }
+}
+
+/// The local wallet key is known; a remote node's acceptance policy is not.
+fn wallet_signing_disclosure(public_key: &str, watch_only: bool) -> String {
+    let parsed: Result<PublicKey, _> =
+        serde_json::from_value(Value::String(public_key.to_string()));
+    let mut text = match parsed {
+        Ok(PublicKey::V2HybridMlDsa65 { .. }) => {
+            "Ed25519 + ML-DSA-65; both signatures required.".to_string()
+        }
+        Ok(PublicKey::V1Ed25519(_)) => {
+            "Classical Ed25519 only; vulnerable to quantum key recovery.".to_string()
+        }
+        Err(_) => "Signing scheme unavailable; quantum resistance is unknown.".to_string(),
+    };
+    if watch_only {
+        text.push_str(" Watch-only: this device cannot sign.");
+    }
+    text
+}
+
+/// Cryptographic assumptions accompany the wallet and node views, independently
+/// of reachability or pool activation. None of these disclosures arms a route.
+fn quantum_security_panel(
+    ui: &mut egui::Ui,
+    wallet: Option<(&str, bool)>,
+    status: Option<&QuantumStatus>,
+) {
+    card(ui, |ui| {
+        ui.label(
+            egui::RichText::new("QUANTUM SECURITY")
+                .size(ty::MICRO)
+                .color(palette::text_dim()),
+        );
+        ui.add_space(sp::S);
+        let signing = wallet
+            .map(|(key, watch)| wallet_signing_disclosure(key, watch))
+            .unwrap_or_else(|| {
+                "New Station wallets use Ed25519 + ML-DSA-65; both signatures required.".to_string()
+            });
+        ui.label(egui::RichText::new(format!("Signing: {signing}")).size(ty::SMALL));
+        ui.label(egui::RichText::new(
+            "Privacy: Orchard/Halo2 pool v1 and unified addresses using it are NOT post-quantum."
+        ).size(ty::SMALL));
+        ui.label(egui::RichText::new(V2_PROOF_SECURITY_NOTE).size(ty::SMALL));
+        ui.label(egui::RichText::new(
+            "Hashes and mining: 256-bit hashes (BLAKE3) have reduced quantum search/collision margins. \
+             Proof of work still assumes sufficient honest mining power."
+        ).size(ty::SMALL));
+        ui.label(
+            egui::RichText::new(quantum_policy_disclosure(status))
+                .size(ty::SMALL)
+                .color(palette::text_dim()),
+        );
+    });
 }
 
 /// The three states a shielded-pool surface can be in. **These must never be collapsed.**
@@ -494,6 +628,7 @@ impl PoolState {
 #[derive(Clone, Default)]
 struct Snapshot {
     online: bool,
+    quantum_status: Option<QuantumStatus>,
     chain_id: String,
     height: Option<u64>,
     head_hash: String,
@@ -1398,6 +1533,14 @@ fn pool_note(ui: &mut egui::Ui, pool: Pool, state: PoolState, extra: &str) {
                     palette::text()
                 }),
         );
+        if pool == Pool::V2 {
+            ui.add_space(sp::XS);
+            ui.label(
+                egui::RichText::new(V2_PROOF_SECURITY_NOTE)
+                    .size(ty::SMALL)
+                    .color(palette::text_dim()),
+            );
+        }
         if !extra.is_empty() {
             ui.add_space(sp::XS);
             ui.label(
@@ -1695,12 +1838,13 @@ fn pool_panel(
 /// written with normal permissions, unlike the keystore.
 fn v2_address_document(addr: &str, owner_tag: &str, state: PoolState) -> String {
     format!(
-        "SOV pool-v2 (post-quantum shielded) receiving address\n\
+        "SOV pool-v2 (post-quantum primitives; proof audit pending) receiving address\n\
          owner tag : {owner_tag}\n\
          length    : {} characters\n\
          pool state: {} at export time\n\
          \n\
          {}\n\
+         {V2_PROOF_SECURITY_NOTE}\n\
          Verify the current pool state with your node before sending.\n\
          \n\
          {addr}\n",
@@ -1760,9 +1904,9 @@ fn v2_address_block(
     ui.add_space(sp::S);
     card(ui, |ui| {
         // 1. State first — before the address, never after it.
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(
-                egui::RichText::new("POOL V2 · POST-QUANTUM")
+                egui::RichText::new("POOL V2 · PQ PRIMITIVES · PROOF AUDIT PENDING")
                     .size(ty::MICRO)
                     .color(palette::text_dim()),
             );
@@ -1773,6 +1917,12 @@ fn v2_address_block(
             egui::RichText::new(state.explanation(Pool::V2))
                 .size(ty::SMALL)
                 .color(palette::text()),
+        );
+        ui.add_space(sp::XS);
+        ui.label(
+            egui::RichText::new(V2_PROOF_SECURITY_NOTE)
+                .size(ty::SMALL)
+                .color(palette::text_dim()),
         );
         if state == PoolState::Dormant {
             ui.add_space(sp::XS);
@@ -2051,6 +2201,10 @@ fn poll(client: &RpcClient, cfg: &Config) -> Snapshot {
         }
     }
     s.height = client.height().ok();
+    s.quantum_status = client
+        .call("sov_getQuantumStatus", json!({}))
+        .ok()
+        .and_then(|v| quantum_status(&v));
     if let Ok(head) = client.head() {
         s.head_hash = head.hash().to_hex();
         // The head block's proof of work: the nonce a miner found and the compact
@@ -2285,6 +2439,9 @@ struct LoadedWallet {
     /// air-gapped flow (build unsigned here → sign on the offline machine that
     /// holds the seed → broadcast here). `seed` is unused (zeroed) when true.
     watch_only: bool,
+    /// Original Ed25519 seed retained for encrypted recovery, never used by the
+    /// hybrid-only signing/mining paths. Its actual legacy identity is monitored.
+    legacy_recovery: bool,
 }
 
 impl LoadedWallet {
@@ -2320,6 +2477,7 @@ impl LoadedWallet {
             mnemonic,
             operate_as: None,
             watch_only: false,
+            legacy_recovery: false,
         })
     }
 
@@ -2345,7 +2503,64 @@ impl LoadedWallet {
             mnemonic: None,
             operate_as: None,
             watch_only: true,
+            legacy_recovery: false,
         })
+    }
+
+    fn legacy_from_seed(
+        label: String,
+        seed: [u8; 32],
+        mnemonic: Option<String>,
+    ) -> Result<Self, String> {
+        let key = Keypair::from_seed(seed).public_key();
+        let mut wallet = Self::watch_only(label, &key.to_string())?;
+        wallet.seed = seed;
+        wallet.mnemonic = mnemonic;
+        wallet.legacy_recovery = true;
+        Ok(wallet)
+    }
+
+    fn from_keystore_entry(entry: &KeystoreEntry) -> Result<Self, String> {
+        if let Some(key) = &entry.public_key {
+            if !entry.seed_hex.is_empty() {
+                return Err("ambiguous entry contains both a seed and a watch-only key".into());
+            }
+            return Self::watch_only(entry.account.clone(), key);
+        }
+        let mut seed = hex_decode32(&entry.seed_hex)?;
+        let result = match entry.scheme.as_deref() {
+            Some("hybrid65") => {
+                Self::from_seed(entry.account.clone(), seed, entry.mnemonic.clone())
+            }
+            Some("ed25519") | None => {
+                Self::legacy_from_seed(entry.account.clone(), seed, entry.mnemonic.clone())
+            }
+            Some(_) => Err("unsupported wallet signing scheme; encrypted entry retained".into()),
+        };
+        seed.zeroize();
+        result
+    }
+
+    fn keystore_entry(&self) -> KeystoreEntry {
+        let public_only = self.watch_only && !self.legacy_recovery;
+        KeystoreEntry {
+            account: self.label.clone(),
+            seed_hex: if public_only {
+                String::new()
+            } else {
+                hex_lower(&self.seed)
+            },
+            scheme: Some(
+                if self.public_key.starts_with("hybrid65:") {
+                    "hybrid65"
+                } else {
+                    "ed25519"
+                }
+                .into(),
+            ),
+            mnemonic: self.mnemonic.clone(),
+            public_key: public_only.then(|| self.public_key.clone()),
+        }
     }
 
     /// The account this wallet currently acts as: a linked named account if one
@@ -2491,7 +2706,19 @@ enum V2Intent<'a> {
 /// The ordering is deliberate: conditions that are true of the whole pool come
 /// first, then wallet state, then the specific request. A user is told the most
 /// fundamental blocker rather than a downstream symptom of it.
+fn quantum_v2_activity_allowed() -> Result<(), &'static str> {
+    if !LOCAL_V2_QUANTUM_PROOF_REVIEW_ESTABLISHED {
+        return Err("pool-v2 proof creation and broadcast are disabled: the current proof trace is unmasked and does not protect private inputs");
+    }
+    Ok(())
+}
+
 fn v2_allows(g: &V2Guard, intent: V2Intent<'_>) -> Result<(), &'static str> {
+    quantum_v2_activity_allowed()?;
+    v2_request_valid(g, intent)
+}
+
+fn v2_request_valid(g: &V2Guard, intent: V2Intent<'_>) -> Result<(), &'static str> {
     // Pool-wide conditions. A dormant pool rejects every v2 spend at every
     // node, so proving one would waste ~25 s to earn a guaranteed rejection.
     if !g.pool_active {
@@ -3316,8 +3543,8 @@ fn pool_send_receipt(pool: Pool, grains: u128, txid: &str) -> String {
     )
 }
 
-/// Which of a wallet's addresses the Receive view shows (shielded is the private
-/// default).
+/// Which address the Receive view shows. Transparent hybrid accounts are the
+/// default; classical privacy must be selected explicitly.
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum ReceiveKind {
     Shielded,
@@ -3728,6 +3955,9 @@ pub struct Station {
     gen_name: String,
     import_name: String,
     import_mnemonic: String,
+    import_legacy: bool,
+    /// Entries this build cannot interpret remain encrypted and re-exportable.
+    retained_entries: Vec<KeystoreEntry>,
     watch_label: String,  // label for a new watch-only wallet
     watch_pubkey: String, // public key to watch (hybrid65:0x…)
     // Air-gapped (offline) signing: build an unsigned tx here (online), sign it on
@@ -3772,10 +4002,11 @@ pub struct Station {
     htlc_lookup_id: String,
     swaps_view: Arc<Mutex<SwapsView>>,
     backup_mnemonic: Option<(String, String)>, // (account, mnemonic) shown once
-    operate_as_field: String,                  // named account to link to the selected wallet
-    operate_msg: String,                       // result of the last control check
-    name_field: String,                        // SNS name to register (e.g. alice.sov)
-    name_check: Arc<Mutex<NameCheck>>,         // live availability/format check for name_field
+    legacy_migration_review: Option<(String, Network, String)>,
+    operate_as_field: String, // named account to link to the selected wallet
+    operate_msg: String,      // result of the last control check
+    name_field: String,       // SNS name to register (e.g. alice.sov)
+    name_check: Arc<Mutex<NameCheck>>, // live availability/format check for name_field
     // SNS is foundational: every loaded wallet's on-chain names are cached here,
     // keyed by the account they resolve to, so a wallet's name is shown uniformly
     // everywhere (header, switch list, your-names) — not just for the active one.
@@ -4117,7 +4348,7 @@ impl Station {
             forget_armed: false,
             forget_confirm: String::new(),
             reveal_phrase: false,
-            receive_kind: ReceiveKind::Shielded,
+            receive_kind: ReceiveKind::Account,
             wallet_view: WalletView::Overview,
             pending_send: None,
             block_detail: None,
@@ -4127,6 +4358,8 @@ impl Station {
             gen_name: "my-wallet".to_string(),
             import_name: "imported".to_string(),
             import_mnemonic: String::new(),
+            import_legacy: false,
+            retained_entries: Vec::new(),
             watch_label: String::new(),
             watch_pubkey: String::new(),
             ofl_to: String::new(),
@@ -4161,6 +4394,7 @@ impl Station {
             htlc_lookup_id: String::new(),
             swaps_view: Arc::new(Mutex::new(SwapsView::default())),
             backup_mnemonic: None,
+            legacy_migration_review: None,
             operate_as_field: String::new(),
             operate_msg: String::new(),
             name_field: String::new(),
@@ -4235,6 +4469,7 @@ impl Station {
         }
         self.wallets.push(wallet);
         self.selected = self.wallets.len() - 1;
+        self.receive_kind = ReceiveKind::Account;
         self.wallets_dirty = true;
     }
 
@@ -4317,7 +4552,11 @@ impl Station {
             };
             (seed, Some(input.clone()))
         };
-        let result = LoadedWallet::from_seed(label, seed, mnemonic_opt);
+        let result = if self.import_legacy {
+            LoadedWallet::legacy_from_seed(label, seed, mnemonic_opt)
+        } else {
+            LoadedWallet::from_seed(label, seed, mnemonic_opt)
+        };
         seed.zeroize(); // wipe the stack copy; the wallet owns its own (also zeroized)
         match result {
             Ok(w) => {
@@ -4326,7 +4565,7 @@ impl Station {
                 // typed phrase doesn't linger in the field's freed capacity.
                 self.import_mnemonic.zeroize();
                 self.import_mnemonic.clear();
-                self.set_action("wallet imported");
+                self.set_action(if self.import_legacy { "legacy wallet recovered read-only — migration required; encrypted backup preserved" } else { "wallet imported" });
                 self.auto_save();
             }
             Err(e) => self.set_action(&format!("import failed: {e}")),
@@ -4580,6 +4819,62 @@ impl Station {
         self.operate_msg.clear();
     }
 
+    fn migrate_legacy_wallet(&mut self, ctx: &egui::Context) {
+        let Some(wallet) = self.wallets.get(self.selected) else {
+            return;
+        };
+        let reviewed = (
+            wallet.effective_account(),
+            self.network,
+            self.rpc_field.clone(),
+        );
+        if !wallet.legacy_recovery || self.legacy_migration_review.as_ref() != Some(&reviewed) {
+            return;
+        }
+        let seed = zeroize::Zeroizing::new(wallet.seed);
+        let account = wallet.effective_account();
+        let network = self.network;
+        let rpc = self.rpc_field.clone();
+        let successor = match LoadedWallet::from_seed(
+            format!("{} (hybrid migration)", wallet.label),
+            *seed,
+            wallet.mnemonic.clone(),
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                self.set_action(&e);
+                return;
+            }
+        };
+        if !self
+            .wallets
+            .iter()
+            .any(|w| w.account == successor.account && !w.watch_only)
+        {
+            self.register_wallet(successor);
+            self.auto_save();
+            if self.wallets_dirty {
+                self.set_action("rotation refused: encrypted hybrid backup could not be saved");
+                return;
+            }
+        }
+        self.clear_transaction_reviews();
+        let action = Arc::clone(&self.action);
+        let activity = Arc::clone(&self.activity);
+        let ctx = ctx.clone();
+        begin(&action, "checking legacy authority and migration policy…");
+        std::thread::spawn(move || {
+            let result = submit_legacy_rotation(&rpc, *seed, &account, network);
+            let message = match result {
+                Ok(id) => format!("hybrid key rotation SUBMITTED (tx {id}); verify its receipt before spending from the original account"),
+                Err(e) => format!("legacy migration was not submitted: {e}"),
+            };
+            finish(&action, &message);
+            record(&activity, &message);
+            ctx.request_repaint();
+        });
+    }
+
     /// Rename the active wallet's display label (local only — the on-chain id is
     /// the key's fingerprint and never changes).
     fn rename_selected(&mut self) {
@@ -4790,6 +5085,9 @@ impl Station {
         }
         let (to, amount, source, fee) = match review.source {
             SendSource::Transparent => {
+                if SendRoute::detect(&self.send_to).private() {
+                    quantum_deposit_allowed(Pool::V1)?;
+                }
                 let base_fee = if SendRoute::detect(&self.send_to).private() {
                     snap.fee_shielded_grains
                 } else {
@@ -4849,6 +5147,7 @@ impl Station {
     }
 
     fn clear_transaction_reviews(&mut self) {
+        self.legacy_migration_review = None;
         self.pending_send = None;
         self.pending_bump = None;
         self.pool_selection.clear();
@@ -5502,6 +5801,12 @@ impl Station {
     /// amount field, so a second click cannot re-fire the SAME amount, while a
     /// validation refusal leaves what was typed intact.
     fn run_v2_action(&self, ctx: &egui::Context, what: V2Action) -> bool {
+        if matches!(what, V2Action::Shield) {
+            if let Err(why) = quantum_deposit_allowed(Pool::V2) {
+                finish(&self.action, why);
+                return false;
+            }
+        }
         if !self.require_signing() {
             return false;
         }
@@ -5782,22 +6087,8 @@ impl Station {
             miners: self
                 .wallets
                 .iter()
-                .map(|w| KeystoreEntry {
-                    account: w.label.clone(),
-                    // Watch-only entries carry no seed — just the watched key.
-                    seed_hex: if w.watch_only {
-                        String::new()
-                    } else {
-                        hex_lower(&w.seed)
-                    },
-                    scheme: Some("hybrid65".to_string()),
-                    mnemonic: w.mnemonic.clone(),
-                    public_key: if w.watch_only {
-                        Some(w.public_key.clone())
-                    } else {
-                        None
-                    },
-                })
+                .map(LoadedWallet::keystore_entry)
+                .chain(self.retained_entries.iter().cloned())
                 .collect(),
         }
     }
@@ -5809,7 +6100,7 @@ impl Station {
     /// it can never overwrite the encrypted store with something weaker.
     fn auto_save(&mut self) {
         let Ok(path) = autosave_path() else { return };
-        if self.wallets.is_empty() {
+        if self.wallets.is_empty() && self.retained_entries.is_empty() {
             // No wallets → remove the file so the empty state also persists.
             let _ = std::fs::remove_file(&path);
             self.wallets_dirty = false;
@@ -5858,24 +6149,29 @@ impl Station {
     fn load_keystore_entries(&mut self, ks: &Keystore) -> usize {
         let mut loaded = 0;
         for entry in &ks.miners {
-            // A watch-only entry carries a public key and no seed; a normal entry
-            // carries a seed.
-            let built = if let Some(pk) = &entry.public_key {
-                LoadedWallet::watch_only(entry.account.clone(), pk)
-            } else {
-                match hex_decode32(&entry.seed_hex) {
-                    Ok(bytes) => LoadedWallet::from_seed(
-                        entry.account.clone(),
-                        bytes,
-                        entry.mnemonic.clone(),
-                    ),
-                    Err(_) => continue,
+            let Ok(w) = LoadedWallet::from_keystore_entry(entry) else {
+                if !self.retained_entries.iter().any(|saved| {
+                    saved.account == entry.account
+                        && saved.seed_hex == entry.seed_hex
+                        && saved.scheme == entry.scheme
+                        && saved.mnemonic == entry.mnemonic
+                        && saved.public_key == entry.public_key
+                }) {
+                    self.retained_entries.push(entry.clone());
                 }
-            };
-            let Ok(w) = built else {
+                self.keystore_msg = "unsupported or malformed entries retained in encrypted backup; no keys were reinterpreted".into();
                 continue;
             };
-            if self.wallets.iter().any(|x| x.account == w.account) {
+            if let Some(existing) = self.wallets.iter().position(|x| x.account == w.account) {
+                // Importing a seed after a public-only watch must preserve it,
+                // without upgrading a legacy seed to hybrid signing authority.
+                if self.wallets[existing].watch_only
+                    && !self.wallets[existing].legacy_recovery
+                    && (!w.watch_only || w.legacy_recovery)
+                {
+                    self.wallets[existing] = w;
+                    loaded += 1;
+                }
                 continue;
             }
             self.register_wallet(w);
@@ -6321,7 +6617,7 @@ impl Station {
                             .desired_width(ui.available_width().min(260.0)),
                     );
                     if ui.button("Add").clicked() {
-                        match vault::parse_pubkey(&self.vault_ui.new_member_key) {
+                        match vault::parse_hybrid_member(&self.vault_ui.new_member_key) {
                             Ok(_) => {
                                 let name = if self.vault_ui.new_member_name.trim().is_empty() {
                                     format!("member {}", self.vault_ui.new_members.len() + 1)
@@ -6340,6 +6636,7 @@ impl Station {
                         }
                     }
                     if !my_key.is_empty()
+                        && vault::parse_hybrid_member(&my_key).is_ok()
                         && ui.button("Add me").clicked()
                         && !self.vault_ui.new_members.iter().any(|m| m.pubkey == my_key)
                     {
@@ -6721,7 +7018,7 @@ impl Station {
             self.keystore_msg = "enter a passphrase for the backup file first".to_string();
             return;
         }
-        if self.wallets.is_empty() {
+        if self.wallets.is_empty() && self.retained_entries.is_empty() {
             self.keystore_msg = "no wallets to save".to_string();
             return;
         }
@@ -6757,25 +7054,7 @@ impl Station {
                 return;
             }
         };
-        let mut loaded = 0;
-        for entry in &ks.miners {
-            let Ok(bytes) = hex_decode32(&entry.seed_hex) else {
-                continue;
-            };
-            // `entry.account` is the saved display label; the on-chain id is
-            // re-derived from the seed. Dedup by that derived id. The phrase is
-            // restored when the keystore carried it (so it can be re-exported).
-            let Ok(w) =
-                LoadedWallet::from_seed(entry.account.clone(), bytes, entry.mnemonic.clone())
-            else {
-                continue;
-            };
-            if self.wallets.iter().any(|x| x.account == w.account) {
-                continue;
-            }
-            self.register_wallet(w);
-            loaded += 1;
-        }
+        let loaded = self.load_keystore_entries(&ks);
         // If there's no master passphrase yet, adopt the backup's so the loaded
         // wallets persist on this device; otherwise keep the existing master.
         if !self.passphrase_set {
@@ -6784,7 +7063,7 @@ impl Station {
         }
         // Persist the imported backup to this device too, so it auto-loads next time.
         self.auto_save();
-        self.keystore_msg = format!("loaded {loaded} wallet(s)");
+        self.keystore_msg = format!("loaded {loaded} wallet(s); {} uninterpreted entry/entries retained in encrypted backup", self.retained_entries.len());
     }
 
     /// Launch a local testnet-1 node the station supervises, and point the poller
@@ -6798,6 +7077,10 @@ impl Station {
                 "create or open a wallet first — a node mines to a wallet you control".to_string();
             return;
         };
+        if w.watch_only {
+            self.node_status = "select a hybrid signing wallet to start the node; watch-only and legacy recovery wallets cannot supply mining keys".into();
+            return;
+        }
         // Idempotent: never start a second node on top of a running/starting one.
         if self.local_node_running() {
             return;
@@ -7426,6 +7709,12 @@ impl Drop for Station {
         self.setup_pw2.zeroize();
         self.import_mnemonic.zeroize();
         self.htlc_preimage.zeroize();
+        for entry in &mut self.retained_entries {
+            entry.seed_hex.zeroize();
+            if let Some(mnemonic) = &mut entry.mnemonic {
+                mnemonic.zeroize();
+            }
+        }
         if let Some((_, phrase)) = self.backup_mnemonic.as_mut() {
             phrase.zeroize();
         }
@@ -8211,6 +8500,12 @@ fn node_panel(ui: &mut egui::Ui, s: &Snapshot) {
                 kv(ui, "Difficulty", &fmt_difficulty(&s.difficulty));
             });
     });
+    ui.add_space(sp::M);
+    quantum_security_panel(
+        ui,
+        None,
+        s.online.then_some(s.quantum_status.as_ref()).flatten(),
+    );
     // ── Sync progress — drawn ONLY while syncing ──────────────────────────────
     // A progress bar that is permanently full is noise, so it appears only when it is
     // reporting something. The numbers are always shown beside it: a bar alone encodes
@@ -10613,7 +10908,7 @@ impl Station {
             if let Some(named) = s
                 .accounts
                 .iter()
-                .find(|a| is_named_account(&a.account) && a.key == w.public_key)
+                .find(|a| a.account != w.account && a.key == w.public_key)
             {
                 w.operate_as = Some(named.account.clone());
             }
@@ -10814,6 +11109,10 @@ impl Station {
                         do_import = true;
                     }
                 });
+                ui.checkbox(
+                    &mut self.import_legacy,
+                    "Legacy Ed25519 recovery · read-only, migration required",
+                );
                 ui.separator();
                 ui.label(
                 egui::RichText::new(
@@ -11177,6 +11476,7 @@ impl Station {
         let mut do_build_unsigned = false;
         let mut do_sign_offline = false;
         let mut do_broadcast = false;
+        let mut do_migrate_legacy = false;
         if let Some((
             label,
             account,
@@ -11188,6 +11488,63 @@ impl Station {
             w_watch_only,
         )) = sel
         {
+            if self
+                .wallets
+                .get(self.selected)
+                .is_some_and(|w| w.legacy_recovery)
+            {
+                ui.label(egui::RichText::new(
+                    "LEGACY RECOVERY · MIGRATION REQUIRED — the original Ed25519 identity is monitored; \
+                     signing and mining are disabled. The original seed and phrase remain in your \
+                     encrypted backup. Migration must use the original signing scheme."
+                ).small().color(palette::warning()));
+                let migration_account = operate_as.clone().unwrap_or_else(|| account.clone());
+                let migration_context = (
+                    migration_account.clone(),
+                    self.network,
+                    self.rpc_field.clone(),
+                );
+                let can_migrate = s.online
+                    && s.quantum_status
+                        .as_ref()
+                        .is_some_and(|q| q.migration_allowed)
+                    && !self.action.lock().map(|a| a.busy).unwrap_or(true);
+                if self.legacy_migration_review.as_ref() == Some(&migration_context) {
+                    let replacement = self
+                        .wallets
+                        .get(self.selected)
+                        .map(|w| {
+                            Keypair::hybrid_from_seed(w.seed)
+                                .public_key()
+                                .implicit_account_id()
+                                .to_string()
+                        })
+                        .unwrap_or_default();
+                    ui.label(format!("Rotate {} on {} to the hybrid key {}. The account and its funds stay in place; this on-chain action pays a transaction fee. Both recovery identities stay in your encrypted backup.", truncate_middle(&migration_account, 10, 8), self.network.label(), truncate_middle(&replacement, 10, 8)));
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                can_migrate,
+                                egui::Button::new("Confirm hybrid key rotation"),
+                            )
+                            .clicked()
+                        {
+                            do_migrate_legacy = true;
+                        }
+                        if ui.button("Cancel rotation").clicked() {
+                            self.legacy_migration_review = None;
+                        }
+                    });
+                } else if ui
+                    .add_enabled(
+                        can_migrate,
+                        egui::Button::new("Review legacy key migration"),
+                    )
+                    .clicked()
+                {
+                    self.legacy_migration_review = Some(migration_context);
+                }
+            }
             // The account the wallet is acting as: a linked named account, or its
             // own implicit id. Balances/nonce/actions follow this.
             let effective = operate_as.clone().unwrap_or_else(|| account.clone());
@@ -11264,10 +11621,22 @@ impl Station {
                         }
                     });
                 ui.add_space(14.0);
+                quantum_security_panel(
+                    ui,
+                    Some((&public_key, w_watch_only)),
+                    s.online.then_some(s.quantum_status.as_ref()).flatten(),
+                );
+                ui.add_space(sp::M);
             }
 
             if self.wallet_view == WalletView::Identity {
                 ui.add_space(6.0);
+                quantum_security_panel(
+                    ui,
+                    Some((&public_key, w_watch_only)),
+                    s.online.then_some(s.quantum_status.as_ref()).flatten(),
+                );
+                ui.add_space(sp::M);
                 egui::Grid::new("wdetail")
                     .num_columns(2)
                     .spacing([16.0, 4.0])
@@ -11526,15 +11895,15 @@ impl Station {
                 ui.selectable_value(
                     &mut self.receive_kind,
                     ReceiveKind::Shielded,
-                    "Shielded (private)",
+                    "Pool v1 (classical privacy)",
                 );
-                ui.selectable_value(&mut self.receive_kind, ReceiveKind::Unified, "Unified");
-                ui.selectable_value(&mut self.receive_kind, ReceiveKind::Account, "Account");
+                ui.selectable_value(&mut self.receive_kind, ReceiveKind::Unified, "Unified (v1 privacy; classical)");
+                ui.selectable_value(&mut self.receive_kind, ReceiveKind::Account, "Account (transparent)");
                 let v2_state = PoolState::classify_v2(s.online, s.shielded_v2.as_ref());
                 ui.selectable_value(
                     &mut self.receive_kind,
                     ReceiveKind::ShieldedV2,
-                    format!("Post-quantum (v2) · {}", v2_state.word()),
+                    format!("PQ primitives (v2) · proof audit pending · {}", v2_state.word()),
                 )
                 .on_hover_text(v2_state.explanation(Pool::V2));
             });
@@ -11572,7 +11941,7 @@ impl Station {
                     ui.vertical(|ui| {
                         if self.receive_kind == ReceiveKind::Shielded {
                             ui.label(
-                                egui::RichText::new("✓ private — recommended receive address")
+                                egui::RichText::new("Pool v1 privacy is NOT post-quantum; selected explicitly")
                                     .size(ty::SMALL)
                                     .color(named_color(true)),
                             );
@@ -11855,8 +12224,12 @@ impl Station {
                     }
                     let can_send = !w_watch_only
                         && route.is_valid()
+                        && !route.private()
                         && matches!(amount_grains, Some(g) if g > 0 && g <= sendable)
                         && !busy;
+                    if route.private() {
+                        ui.label(egui::RichText::new(quantum_deposit_allowed(Pool::V1).unwrap_err()).small().color(palette::warning()));
+                    }
                     // Pressing Enter in the amount field reviews the send (same as the button).
                     let submit_enter =
                         amount_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -11998,8 +12371,8 @@ impl Station {
                             .button("Scan pool v2")
                             .on_hover_text(
                                 "Trial-decapsulate this chain's pool-v2 notes with this \
-                                 wallet's ML-KEM key. Slower than a v1 scan by design — a \
-                                 post-quantum pool has no ECDH detection shortcut.",
+                                 wallet's ML-KEM key. Slower than a v1 scan by design — \
+                                 this ML-KEM route has no ECDH detection shortcut.",
                             )
                             .clicked()
                         {
@@ -12268,9 +12641,9 @@ impl Station {
                         egui::RichText::new(format!("{} {}", Pool::V2.selector_label(), v2_state.glyph())).monospace(),
                     )
                     .on_hover_text(
-                        "ML-KEM-768 note carriers with a STARK spend proof — no discrete-log \
-                         assumption, so the privacy of a payment made today is not retroactively \
-                         breakable. Slower to build (~25 s to prove).",
+                        "ML-KEM-768 note carriers with a STARK spend proof. Post-quantum primitives; \
+                         proof audit and quantum soundness review pending. Security of hidden \
+                         amounts and note linkages is unverified. Slower to build (~25 s to prove).",
                     );
                 });
             });
@@ -12307,10 +12680,9 @@ impl Station {
                 empty_hint(
                     ui,
                     "Choose a pool before you can send privately",
-                    "The two shielded pools use different cryptography and only Pool v2 is \
-                     post-quantum. Nothing is pre-selected, because which pool your payment \
-                     leaves decides whether its privacy survives a future quantum adversary — \
-                     that is your choice to make, not this app's. Pick one above.",
+                    "Pool v1 is NOT post-quantum. Pool v2 uses post-quantum primitives, with its \
+                     proof audit and quantum soundness review pending. Nothing is pre-selected; \
+                     choose the pool whose assumptions you accept before sending.",
                 );
             }
             if let Some(sel) = chosen {
@@ -12358,6 +12730,9 @@ impl Station {
                         Pool::V2 => palette::success(),
                     }),
                 );
+                if sel == Pool::V2 {
+                    ui.label(egui::RichText::new(V2_PROOF_SECURITY_NOTE).size(ty::SMALL).color(palette::text_dim()));
+                }
 
                 // The recipient must belong to the SELECTED pool. A cross-pool paste
                 // names the pool it actually belongs to and the one action that fixes
@@ -12586,10 +12961,11 @@ impl Station {
             if v2_state == PoolState::Active {
                 ui.add_space(sp::L);
                 ui.label(
-                    egui::RichText::new("Pool v2 — shield in / de-shield out (post-quantum)")
+                    egui::RichText::new("Pool v2 — shield in / de-shield out · PQ primitives · proof audit pending")
                         .size(ty::SECTION)
                         .strong(),
                 );
+                ui.label(egui::RichText::new(V2_PROOF_SECURITY_NOTE).size(ty::SMALL).color(palette::text_dim()));
                 // The cost of a v2 move, stated IN the panel rather than buried in a
                 // hover tooltip: every shield/de-shield builds a real STARK proof, and
                 // ~25 s of silence after a click reads as a frozen app to anyone who
@@ -12613,13 +12989,13 @@ impl Station {
                 let mut verdicts: Vec<&'static str> = Vec::new();
 
                 // SHIELD IN — spends no notes, so it needs no scan.
-                let shield_v = v2_allows(
+                let shield_v = quantum_deposit_allowed(Pool::V2).and_then(|_| v2_allows(
                     &guard,
                     V2Intent::Shield {
                         to: &self.shield_v2_to,
                         amount: parse_xus(&self.shield_v2_amount_in),
                     },
-                );
+                ));
                 // DE-SHIELD OUT — bounded by balance AND the window budget.
                 let deshield_v = v2_allows(
                     &guard,
@@ -12651,8 +13027,8 @@ impl Station {
                                 if ui
                                     .button("Shield")
                                     .on_hover_text(
-                                        "Move transparent value into the post-quantum pool. \
-                                         Builds a real STARK proof (~25 s).",
+                                        "Move transparent value into pool v2 (post-quantum primitives; \
+                                         proof audit pending). Builds a real STARK proof (~25 s).",
                                     )
                                     .clicked()
                                 {
@@ -13282,6 +13658,7 @@ impl Station {
                 // land on the wrong account: clear the rename box, disarm forget,
                 // and drop any "operate as" link from the previous wallet's view.
                 self.selected = i;
+                self.receive_kind = ReceiveKind::Account;
                 self.clear_transaction_reviews();
                 self.rename_field.clear();
                 self.forget_armed = false;
@@ -13304,6 +13681,9 @@ impl Station {
         }
         if do_add_watch {
             self.add_watch_only();
+        }
+        if do_migrate_legacy {
+            self.migrate_legacy_wallet(&ctx);
         }
         if do_set_operate {
             self.set_operate_as();
@@ -14059,6 +14439,7 @@ fn send_payment(
             false,
         ),
         Receiver::Shielded(recipient) => {
+            quantum_deposit_allowed(Pool::V1).map_err(str::to_string)?;
             let params = {
                 let cached = params_cache.lock().ok().and_then(|p| p.clone());
                 match cached {
@@ -14533,6 +14914,91 @@ fn deshieldable_now(client: &RpcClient) -> Option<u128> {
         .and_then(|s| s.parse::<u128>().ok())
 }
 
+fn legacy_rotation_transaction(
+    seed: [u8; 32],
+    account: &AccountId,
+    nonce: u64,
+    domain: Option<&sov_primitives::SigningDomain>,
+) -> Result<SignedTransaction, String> {
+    let legacy = Keypair::from_seed(seed);
+    let successor = Keypair::hybrid_from_seed(seed);
+    let key = successor.public_key();
+    let proof = successor.sign(&sov_types::rotation_signing_bytes(account, nonce, &key));
+    SignedTransaction::sign_in(
+        Transaction {
+            signer: account.clone(),
+            public_key: legacy.public_key(),
+            nonce,
+            action: Action::RotateKey {
+                new_key: key,
+                proof,
+            },
+        },
+        &legacy,
+        domain,
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn submit_legacy_rotation(
+    rpc: &str,
+    seed: [u8; 32],
+    account: &str,
+    network: Network,
+) -> Result<String, String> {
+    let client = RpcClient::new(rpc.to_string());
+    let chain_domain = client.chain_domain().map_err(|e| e.to_string())?;
+    if chain_domain.chain_id() != network.chain_id() {
+        return Err("connected node is on a different network".into());
+    }
+    if ChainSpec::hardcoded_genesis_pin(network.chain_id())
+        != Some(chain_domain.genesis().to_hex().as_str())
+    {
+        return Err("connected node does not match the network's frozen genesis".into());
+    }
+    let status = client
+        .call("sov_getQuantumStatus", json!({}))
+        .map_err(|e| e.to_string())?;
+    if status
+        .get("legacyMigrationAllowed")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err("legacy migration is unavailable or sunset has passed".into());
+    }
+    let account = AccountId::new(account).map_err(|e| e.to_string())?;
+    let remote = client
+        .account(&account)
+        .map_err(|e| e.to_string())?
+        .ok_or("account has not been funded or registered")?;
+    let legacy = Keypair::from_seed(seed).public_key();
+    if remote.key != Some(legacy)
+        && !(remote.key.is_none() && account == legacy.implicit_account_id())
+    {
+        return Err(
+            "the original key no longer controls this account; inspect its current ownership"
+                .into(),
+        );
+    }
+    let nonce = client.next_nonce(&account).map_err(|e| e.to_string())?;
+    let domain = client.signing_domain().map_err(|e| e.to_string())?;
+    let tx = legacy_rotation_transaction(seed, &account, nonce, domain.as_ref())?;
+    client
+        .submit_transaction(&tx)
+        .map(|id| id.to_hex())
+        .map_err(|e| e.to_string())
+}
+
+fn require_v1_recovery(client: &RpcClient) -> Result<(), String> {
+    let status = client
+        .call("sov_getQuantumStatus", json!({}))
+        .map_err(|e| e.to_string())?;
+    if status.get("poolV1RecoveryAllowed").and_then(Value::as_bool) != Some(true) {
+        return Err("legacy shielded recovery requires an active recipient-bound migration window; this node has not enabled it or its sunset has passed".into());
+    }
+    Ok(())
+}
+
 fn deshield_amount(
     rpc: &str,
     seed: [u8; 32],
@@ -14542,6 +15008,8 @@ fn deshield_amount(
     action: &Arc<Mutex<ActionState>>,
 ) -> Result<String, String> {
     let amount = u64::try_from(amount_grains).map_err(|_| "amount too large".to_string())?;
+    let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(60));
+    require_v1_recovery(&client)?;
     let store = scan_store(rpc, seed)?;
     let zkey = ShieldedKey::from_seed(seed).ok_or("invalid shielded key")?;
     let unspent = store.unspent();
@@ -14551,7 +15019,6 @@ fn deshield_amount(
     // The node's live per-window drain budget: a de-shield over it would be mined
     // and REJECTED, leaving value in the pool looking "stuck". Pre-check and fail
     // fast with an actionable message instead of submitting a doomed transaction.
-    let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(60));
     if let Some(budget) = deshieldable_now(&client) {
         if amount_grains > budget {
             return Err(format!(
@@ -14605,8 +15072,6 @@ fn deshield_amount(
         action,
         &format!("proving the de-shield of {note_count} note(s) (real Halo2)…"),
     );
-    let bundle = unshield_amount_multi(&params, &zkey, &selected, anchor, effective)
-        .map_err(|e| e.to_string())?;
     // Wrap the de-shield bundle in a tx signed by the transparent account that
     // receives the funds and pays the fee.
     let kp = Keypair::hybrid_from_seed(seed);
@@ -14616,6 +15081,16 @@ fn deshield_amount(
     // (`None` = dormant/legacy).
     let nonce = client.next_nonce(&from).map_err(|e| e.to_string())?;
     let domain = client.signing_domain().map_err(|e| e.to_string())?;
+    let chain_domain = client.chain_domain().map_err(|e| e.to_string())?;
+    let carrier = sov_shielded::ShieldedCarrier {
+        domain: &chain_domain,
+        account: &from,
+        nonce,
+    };
+    let bundle =
+        unshield_amount_multi_bound(&params, &zkey, &selected, anchor, effective, &carrier)
+            .map_err(|e| e.to_string())?;
+
     let tx = Transaction {
         signer: from,
         public_key: kp.public_key(),
@@ -14649,6 +15124,7 @@ fn submit_v2_bundle(
     mut bundle: SpendBundle,
     action: &Arc<Mutex<ActionState>>,
 ) -> Result<V2Submitted, String> {
+    quantum_v2_activity_allowed().map_err(str::to_string)?;
     let key = PqShieldedKey::from_leaf_seed(&seed);
     let kp = Keypair::hybrid_from_seed(seed);
     let from = AccountId::new(account).map_err(|e| e.to_string())?;
@@ -14747,6 +15223,7 @@ struct V2Submitted {
 
 /// Refuse before spending ~25 s proving if pool v2 is not live on this chain.
 fn require_v2_live(client: &RpcClient) -> Result<(), String> {
+    quantum_v2_activity_allowed().map_err(str::to_string)?;
     let info = client
         .call("sov_getShieldedV2Info", json!({}))
         .map_err(|e| e.to_string())?;
@@ -14770,6 +15247,7 @@ fn shield_v2_amount(
     amount_grains: u128,
     action: &Arc<Mutex<ActionState>>,
 ) -> Result<V2Submitted, String> {
+    quantum_deposit_allowed(Pool::V2).map_err(str::to_string)?;
     let amount = u64::try_from(amount_grains).map_err(|_| "amount too large".to_string())?;
     let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(180));
     require_v2_live(&client)?;
@@ -14915,6 +15393,7 @@ fn shielded_send(
     params_cache: &Arc<Mutex<Option<Arc<ShieldedParams>>>>,
     action: &Arc<Mutex<ActionState>>,
 ) -> Result<String, String> {
+    quantum_deposit_allowed(Pool::V1).map_err(str::to_string)?;
     let amount = u64::try_from(grains).map_err(|_| "amount too large".to_string())?;
     // Resolve the recipient to a shielded address (privacy-first for a unified one).
     let recipient_addr = match AnyAddress::parse(recipient)
@@ -17681,9 +18160,12 @@ mod tests {
     #[test]
     fn pool_v1_is_never_described_as_post_quantum() {
         // The single most damaging thing this UI could claim. v1 is Orchard/Halo2 and
-        // its privacy is discrete-log based; only v2 is post-quantum.
+        // its privacy is discrete-log based. v2 has PQ primitives, not an audited proof.
         assert_eq!(Pool::V1.pq_claim(), "NOT post-quantum");
-        assert_eq!(Pool::V2.pq_claim(), "post-quantum");
+        assert_eq!(
+            Pool::V2.pq_claim(),
+            "post-quantum primitives · proof audit pending"
+        );
         assert!(
             !Pool::V1.crypto().to_lowercase().contains("kem"),
             "v1 must not name post-quantum primitives"
@@ -17694,6 +18176,66 @@ mod tests {
         assert!(PoolState::Active
             .explanation(Pool::V1)
             .contains("NOT post-quantum"));
+    }
+
+    #[test]
+    fn generated_and_restored_station_wallets_keep_the_same_hybrid_identity() {
+        let mnemonic = generate_mnemonic(24).expect("healthy OS entropy");
+        let generated_seed = HdWallet::from_mnemonic(&mnemonic, "")
+            .unwrap()
+            .derive_seed(0, 0);
+        let generated =
+            LoadedWallet::from_seed("Generated".into(), generated_seed, Some(mnemonic.clone()))
+                .unwrap();
+        let recovered_seed = HdWallet::from_mnemonic(&mnemonic, "")
+            .unwrap()
+            .derive_seed(0, 0);
+        let recovered =
+            LoadedWallet::from_seed("Restored".into(), recovered_seed, Some(mnemonic)).unwrap();
+        let raw_seed = LoadedWallet::from_seed("Raw seed".into(), generated_seed, None).unwrap();
+        let key = Keypair::hybrid_from_seed(generated_seed);
+        assert!(matches!(
+            key.public_key(),
+            PublicKey::V2HybridMlDsa65 { .. }
+        ));
+        assert_eq!(generated.public_key, key.public_key().to_string());
+        assert_eq!(
+            generated.account,
+            key.public_key().implicit_account_id().to_string()
+        );
+        for restored in [&recovered, &raw_seed] {
+            assert_eq!(restored.account, generated.account);
+            assert_eq!(restored.public_key, generated.public_key);
+            assert_eq!(restored.shielded, generated.shielded);
+            assert_eq!(restored.unified, generated.unified);
+            assert_eq!(restored.shielded_v2, generated.shielded_v2);
+            assert_eq!(restored.v2_owner_tag, generated.v2_owner_tag);
+        }
+        assert!(!generated.watch_only);
+        assert!(raw_seed.mnemonic.is_none());
+    }
+
+    #[test]
+    fn wallet_security_disclosure_uses_the_actual_key_scheme_and_watch_status() {
+        let hybrid = Keypair::hybrid_from_seed([7; 32]);
+        let legacy = Keypair::from_seed([7; 32]);
+        let active = wallet_signing_disclosure(&hybrid.public_key().to_string(), false);
+        assert!(active.contains("Ed25519 + ML-DSA-65"), "{active}");
+        assert!(active.contains("both signatures required"), "{active}");
+        assert!(!active.contains("Watch-only"), "{active}");
+        let watching =
+            LoadedWallet::watch_only("Legacy watch".into(), &legacy.public_key().to_string())
+                .unwrap();
+        let disclosed = wallet_signing_disclosure(&watching.public_key, watching.watch_only);
+        assert!(disclosed.contains("Classical Ed25519 only"), "{disclosed}");
+        assert!(
+            disclosed.contains("vulnerable to quantum key recovery"),
+            "{disclosed}"
+        );
+        assert!(disclosed.contains("this device cannot sign"), "{disclosed}");
+        assert!(!disclosed.contains("ML-DSA-65"), "{disclosed}");
+        let unavailable = wallet_signing_disclosure("invalid", false);
+        assert!(unavailable.contains("unknown"), "{unavailable}");
     }
 
     #[test]
@@ -17854,6 +18396,136 @@ mod tests {
             walk(std::slice::from_ref(&cs.shape), &mut text);
         }
         text
+    }
+
+    #[test]
+    fn v2_security_caveat_is_painted_and_exported_in_every_activation_state() {
+        for state in [
+            PoolState::Unavailable,
+            PoolState::Dormant,
+            PoolState::Active,
+        ] {
+            let pool_text = painted_text(|ui| pool_note(ui, Pool::V2, state, ""));
+            let receive_text = painted_text(|ui| {
+                v2_address_block(ui, "xusq1example", "001122", state, &mut false);
+            });
+            let exported = v2_address_document("xusq1example", "001122", state);
+            for surface in [pool_text, receive_text, exported] {
+                assert!(surface.contains("proof audit"), "{state:?}: {surface}");
+                assert!(
+                    surface.contains("quantum soundness review"),
+                    "{state:?}: {surface}"
+                );
+                assert!(
+                    surface.contains("hidden amounts and note linkages"),
+                    "{state:?}: {surface}"
+                );
+                assert!(
+                    surface.contains("unverified, even when this pool is active"),
+                    "{state:?}: {surface}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn security_panel_does_not_invent_a_remote_nodes_upgrade_policy() {
+        let node_text = painted_text(|ui| quantum_security_panel(ui, None, None));
+        assert!(node_text.contains("legacy-key acceptance"), "{node_text}");
+        assert!(
+            node_text.contains("this view does not verify legacy-key acceptance"),
+            "{node_text}"
+        );
+        assert!(node_text.contains("256-bit hashes (BLAKE3)"), "{node_text}");
+        assert!(
+            node_text.contains("quantum search/collision margins"),
+            "{node_text}"
+        );
+        assert!(
+            node_text.contains("sufficient honest mining power"),
+            "{node_text}"
+        );
+        assert!(node_text.contains("NOT post-quantum"), "{node_text}");
+        assert!(node_text.contains("proof audit"), "{node_text}");
+
+        let legacy = Keypair::from_seed([7; 32]).public_key().to_string();
+        let wallet_text =
+            painted_text(|ui| quantum_security_panel(ui, Some((&legacy, true)), None));
+        assert!(
+            wallet_text.contains("Classical Ed25519 only"),
+            "{wallet_text}"
+        );
+        assert!(
+            wallet_text.contains("this device cannot sign"),
+            "{wallet_text}"
+        );
+    }
+
+    #[test]
+    fn quantum_disclosures_fit_narrow_viewports() {
+        for width in [560.0, 700.0, 1200.0] {
+            let ctx = egui::Context::default();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 1200.0));
+            let render = || {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            quantum_security_panel(ui, None, None);
+                            v2_address_block(
+                                ui,
+                                "xusq1example",
+                                "001122",
+                                PoolState::Active,
+                                &mut false,
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(Pool::V2.pq_badge());
+                                ui.label(Pool::V2.selector_label());
+                            });
+                        });
+                    },
+                )
+            };
+            let _ = render();
+            let output = render();
+            fn check(shape: &egui::Shape, screen: egui::Rect, checked: &mut usize) {
+                match shape {
+                    egui::Shape::Text(text) => {
+                        let contents = text.galley.text();
+                        if contents.contains("audit")
+                            || contents.contains("AUDIT")
+                            || contents.starts_with("Hashes and mining")
+                        {
+                            let bounds = text.visual_bounding_rect();
+                            assert!(
+                                bounds.left() >= screen.left() - 1.0
+                                    && bounds.right() <= screen.right() + 1.0,
+                                "disclosure overflows {screen:?}: {bounds:?} {contents}"
+                            );
+                            *checked += 1;
+                        }
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        for child in shapes {
+                            check(child, screen, checked);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut checked = 0;
+            for shape in &output.shapes {
+                check(&shape.shape, screen, &mut checked);
+            }
+            assert!(
+                checked >= 6,
+                "every security surface must be painted at width {width}"
+            );
+        }
     }
 
     /// A snapshot shaped like the LIVE mainnet node this was developed against:
@@ -19602,7 +20274,7 @@ mod v2_guard_tests {
     fn a_shield_larger_than_the_transparent_balance_is_refused_up_front() {
         let g = permissive().with_transparent(Some(10_000));
         // Over balance → refused, and the reason names the actual constraint.
-        let err = v2_allows(
+        let err = v2_request_valid(
             &g,
             V2Intent::Shield {
                 to: "",
@@ -19613,7 +20285,7 @@ mod v2_guard_tests {
         assert!(err.contains("transparent balance"), "{err}");
         // Exactly the balance and below are allowed here (the node still prices
         // the fee; the guard does not invent a second refusal it cannot compute).
-        assert!(v2_allows(
+        assert!(v2_request_valid(
             &g,
             V2Intent::Shield {
                 to: "",
@@ -19621,7 +20293,7 @@ mod v2_guard_tests {
             }
         )
         .is_ok());
-        assert!(v2_allows(
+        assert!(v2_request_valid(
             &g,
             V2Intent::Shield {
                 to: "",
@@ -19637,7 +20309,7 @@ mod v2_guard_tests {
     #[test]
     fn an_unknown_transparent_balance_never_manufactures_a_refusal() {
         let g = permissive().with_transparent(None);
-        assert!(v2_allows(
+        assert!(v2_request_valid(
             &g,
             V2Intent::Shield {
                 to: "",
@@ -19654,7 +20326,7 @@ mod v2_guard_tests {
     fn affordability_bounds_shield_only_not_pool_spends() {
         let g = permissive().with_transparent(Some(1));
         // A de-shield is bounded by the POOL balance, not the transparent one.
-        assert!(v2_allows(&g, V2Intent::Deshield { amount: Some(500) }).is_ok());
+        assert!(v2_request_valid(&g, V2Intent::Deshield { amount: Some(500) }).is_ok());
     }
 
     /// THE REGRESSION. A pool-v2 shield/de-shield that is sitting in the mempool
@@ -19804,7 +20476,7 @@ mod v2_guard_tests {
                         };
                         for intent in all_intents(&addr) {
                             assert!(
-                                v2_allows(&g, intent).is_err(),
+                                v2_request_valid(&g, intent).is_err(),
                                 "DORMANT pool permitted {intent:?} under {g:?}"
                             );
                         }
@@ -19825,7 +20497,7 @@ mod v2_guard_tests {
         };
         for intent in all_intents(&addr) {
             assert!(
-                v2_allows(&g, intent).is_err(),
+                v2_request_valid(&g, intent).is_err(),
                 "a BUSY station permitted {intent:?}"
             );
         }
@@ -19842,7 +20514,7 @@ mod v2_guard_tests {
         };
         for intent in all_intents(&addr) {
             assert!(
-                v2_allows(&g, intent).is_err(),
+                v2_request_valid(&g, intent).is_err(),
                 "another wallet's view permitted {intent:?}"
             );
         }
@@ -19860,7 +20532,7 @@ mod v2_guard_tests {
             ..permissive()
         };
         assert!(
-            v2_allows(
+            v2_request_valid(
                 &g,
                 V2Intent::Shield {
                     to: "",
@@ -19870,8 +20542,8 @@ mod v2_guard_tests {
             .is_ok(),
             "a shield spends no notes, so it must not require a scan"
         );
-        assert!(v2_allows(&g, V2Intent::Deshield { amount: Some(1) }).is_err());
-        assert!(v2_allows(
+        assert!(v2_request_valid(&g, V2Intent::Deshield { amount: Some(1) }).is_err());
+        assert!(v2_request_valid(
             &g,
             V2Intent::Send {
                 to: &addr,
@@ -19890,8 +20562,8 @@ mod v2_guard_tests {
             balance_grains: 0,
             ..permissive()
         };
-        assert!(v2_allows(&g, V2Intent::Deshield { amount: Some(1) }).is_err());
-        assert!(v2_allows(
+        assert!(v2_request_valid(&g, V2Intent::Deshield { amount: Some(1) }).is_err());
+        assert!(v2_request_valid(
             &g,
             V2Intent::Send {
                 to: &addr,
@@ -19912,8 +20584,8 @@ mod v2_guard_tests {
             ..permissive()
         };
         for a in 0..=(balance * 2) {
-            let ok_deshield = v2_allows(&g, V2Intent::Deshield { amount: Some(a) }).is_ok();
-            let ok_send = v2_allows(
+            let ok_deshield = v2_request_valid(&g, V2Intent::Deshield { amount: Some(a) }).is_ok();
+            let ok_send = v2_request_valid(
                 &g,
                 V2Intent::Send {
                     to: &addr,
@@ -19926,7 +20598,7 @@ mod v2_guard_tests {
             assert_eq!(ok_send, should, "send of {a} against {balance}");
         }
         // And the extreme: never permit a saturating amount.
-        assert!(v2_allows(
+        assert!(v2_request_valid(
             &g,
             V2Intent::Deshield {
                 amount: Some(u128::MAX)
@@ -19948,9 +20620,9 @@ mod v2_guard_tests {
         };
         assert_eq!(g.deshield_cap(), 100, "the cap is the tighter of the two");
         for a in 1..=1_000u128 {
-            let de = v2_allows(&g, V2Intent::Deshield { amount: Some(a) }).is_ok();
+            let de = v2_request_valid(&g, V2Intent::Deshield { amount: Some(a) }).is_ok();
             assert_eq!(de, a <= 100, "de-shield of {a} under a 100 budget");
-            let send = v2_allows(
+            let send = v2_request_valid(
                 &g,
                 V2Intent::Send {
                     to: &addr,
@@ -19967,8 +20639,8 @@ mod v2_guard_tests {
             ..g
         };
         assert_eq!(g0.deshield_cap(), 0);
-        assert!(v2_allows(&g0, V2Intent::Deshield { amount: Some(1) }).is_err());
-        assert!(v2_allows(
+        assert!(v2_request_valid(&g0, V2Intent::Deshield { amount: Some(1) }).is_err());
+        assert!(v2_request_valid(
             &g0,
             V2Intent::Send {
                 to: &addr,
@@ -19984,9 +20656,9 @@ mod v2_guard_tests {
         let addr = v2_addr();
         let g = permissive();
         for amount in [None, Some(0u128)] {
-            assert!(v2_allows(&g, V2Intent::Shield { to: "", amount }).is_err());
-            assert!(v2_allows(&g, V2Intent::Deshield { amount }).is_err());
-            assert!(v2_allows(&g, V2Intent::Send { to: &addr, amount }).is_err());
+            assert!(v2_request_valid(&g, V2Intent::Shield { to: "", amount }).is_err());
+            assert!(v2_request_valid(&g, V2Intent::Deshield { amount }).is_err());
+            assert!(v2_request_valid(&g, V2Intent::Send { to: &addr, amount }).is_err());
         }
     }
 
@@ -20001,7 +20673,7 @@ mod v2_guard_tests {
         let v1 = v1_addr();
 
         assert!(
-            v2_allows(
+            v2_request_valid(
                 &g,
                 V2Intent::Shield {
                     to: "",
@@ -20012,7 +20684,7 @@ mod v2_guard_tests {
             "blank must mean shield-to-self"
         );
         assert!(
-            v2_allows(
+            v2_request_valid(
                 &g,
                 V2Intent::Shield {
                     to: "   ",
@@ -20023,7 +20695,7 @@ mod v2_guard_tests {
             "whitespace-only must also mean shield-to-self"
         );
         assert!(
-            v2_allows(
+            v2_request_valid(
                 &g,
                 V2Intent::Shield {
                     to: &good,
@@ -20035,7 +20707,7 @@ mod v2_guard_tests {
         );
         for bad in [v1.as_str(), "garbage", "xusq1", "usa.reserve.sov"] {
             assert!(
-                v2_allows(
+                v2_request_valid(
                     &g,
                     V2Intent::Shield {
                         to: bad,
@@ -20053,7 +20725,7 @@ mod v2_guard_tests {
             b.replace_range(i..i + 1, &ch.to_string());
             if b != good {
                 assert!(
-                    v2_allows(
+                    v2_request_valid(
                         &g,
                         V2Intent::Shield {
                             to: &b,
@@ -20078,7 +20750,7 @@ mod v2_guard_tests {
             v1.starts_with("xus1"),
             "fixture must really be a v1 address, got {v1}"
         );
-        let out = v2_allows(
+        let out = v2_request_valid(
             &g,
             V2Intent::Send {
                 to: &v1,
@@ -20135,7 +20807,7 @@ mod v2_guard_tests {
         }
 
         for s in hostile {
-            let out = v2_allows(
+            let out = v2_request_valid(
                 &g,
                 V2Intent::Send {
                     to: &s,
@@ -20147,7 +20819,7 @@ mod v2_guard_tests {
 
         // The genuine article, and only it, is permitted — including with the
         // surrounding whitespace a paste commonly carries.
-        assert!(v2_allows(
+        assert!(v2_request_valid(
             &g,
             V2Intent::Send {
                 to: &good,
@@ -20155,7 +20827,7 @@ mod v2_guard_tests {
             }
         )
         .is_ok());
-        assert!(v2_allows(
+        assert!(v2_request_valid(
             &g,
             V2Intent::Send {
                 to: &format!("  {good}  "),
@@ -20224,8 +20896,11 @@ mod v2_guard_tests {
                                                     && decode_shielded_v2(sto.trim()).is_ok());
                                             let want_shield = base && positive && sto_ok;
                                             assert_eq!(
-                                                v2_allows(&g, V2Intent::Shield { to: sto, amount })
-                                                    .is_ok(),
+                                                v2_request_valid(
+                                                    &g,
+                                                    V2Intent::Shield { to: sto, amount }
+                                                )
+                                                .is_ok(),
                                                 want_shield,
                                                 "shield {amount:?} to {sto:?} under {g:?}"
                                             );
@@ -20235,7 +20910,8 @@ mod v2_guard_tests {
                                         let want_deshield =
                                             can_spend && positive && a <= balance && a <= cap;
                                         assert_eq!(
-                                            v2_allows(&g, V2Intent::Deshield { amount }).is_ok(),
+                                            v2_request_valid(&g, V2Intent::Deshield { amount })
+                                                .is_ok(),
                                             want_deshield,
                                             "deshield {amount:?} under {g:?}"
                                         );
@@ -20246,7 +20922,7 @@ mod v2_guard_tests {
                                             let want_send =
                                                 can_spend && addr_ok && positive && a <= balance;
                                             assert_eq!(
-                                                v2_allows(&g, V2Intent::Send { to, amount })
+                                                v2_request_valid(&g, V2Intent::Send { to, amount })
                                                     .is_ok(),
                                                 want_send,
                                                 "send {amount:?} to {to:?} under {g:?}"
@@ -20297,7 +20973,7 @@ mod v2_guard_tests {
                                 amount: Some(50),
                             },
                         ] {
-                            if let Err(reason) = v2_allows(&g, intent) {
+                            if let Err(reason) = v2_request_valid(&g, intent) {
                                 assert!(
                                     reason.len() > 12 && reason.chars().any(char::is_alphabetic),
                                     "refusal reason is not actionable: {reason:?}"
@@ -20371,6 +21047,7 @@ mod pool_selector_tests {
         assert!(v2.contains("Pool v2"), "{v2}");
         assert!(v2.contains("ML-KEM-768 / STARK"), "{v2}");
         assert!(v2.contains("post-quantum"), "{v2}");
+        assert!(v2.contains("primitives · proof audit pending"), "{v2}");
         assert!(
             !v2.contains("NOT post-quantum"),
             "the v2 label must not inherit v1's disclaimer: {v2}"
@@ -20513,7 +21190,7 @@ mod pool_selector_tests {
         // THE ACTIVE PATH: guard permissive + pool Active + a v2 address ⇒ the
         // send is genuinely enabled. Both halves of the button's condition.
         let live = permissive_v2_guard();
-        assert!(v2_allows(
+        assert!(v2_request_valid(
             &live,
             V2Intent::Send {
                 to: &addr,
@@ -20530,7 +21207,7 @@ mod pool_selector_tests {
             pool_active: false,
             ..permissive_v2_guard()
         };
-        assert!(v2_allows(
+        assert!(v2_request_valid(
             &dormant,
             V2Intent::Send {
                 to: &addr,
@@ -20541,7 +21218,7 @@ mod pool_selector_tests {
 
         // Every other pre-existing guard survives the selector: over-balance,
         // unscanned, no notes, busy, wrong wallet.
-        let over = v2_allows(
+        let over = v2_request_valid(
             &live,
             V2Intent::Send {
                 to: &addr,
@@ -20571,7 +21248,7 @@ mod pool_selector_tests {
             },
         ] {
             assert!(
-                v2_allows(
+                v2_request_valid(
                     &g,
                     V2Intent::Send {
                         to: &addr,
@@ -20594,7 +21271,7 @@ mod pool_selector_tests {
             ..permissive_v2_guard()
         };
         let addr = v2_addr();
-        assert!(v2_allows(
+        assert!(v2_request_valid(
             &v2_rich,
             V2Intent::Send {
                 to: &addr,
@@ -20603,7 +21280,7 @@ mod pool_selector_tests {
         )
         .is_ok());
         assert!(
-            v2_allows(
+            v2_request_valid(
                 &v2_rich,
                 V2Intent::Send {
                     to: &addr,
@@ -20814,6 +21491,7 @@ mod pool_selector_explicit_tests {
         assert!(v2.contains("Pool v2"), "{v2}");
         assert!(v2.contains("ML-KEM-768 / STARK"), "{v2}");
         assert!(v2.contains("post-quantum"), "{v2}");
+        assert!(v2.contains("primitives · proof audit pending"), "{v2}");
         assert!(
             !v2.contains("NOT post-quantum"),
             "a v2 send must never be recorded as non-post-quantum: {v2}"
@@ -20880,7 +21558,7 @@ mod pool_selector_explicit_tests {
         assert_ne!(Pool::V1.glyph(), Pool::V2.glyph());
         // Words differ, and say the thing outright.
         assert_eq!(Pool::V1.pq_badge(), "NOT PQ");
-        assert_eq!(Pool::V2.pq_badge(), "PQ");
+        assert_eq!(Pool::V2.pq_badge(), "PQ PRIMITIVES · AUDIT PENDING");
         assert_ne!(Pool::V1.pq_badge(), Pool::V2.pq_badge());
 
         // Every surface an operator reads carries BOTH a shape and the words —
@@ -21079,7 +21757,7 @@ mod scanned_pools_tests {
             },
         ] {
             assert_eq!(
-                v2_allows(&g, intent),
+                v2_request_valid(&g, intent),
                 Err("this pool-v2 view belongs to a different wallet"),
                 "a foreign view must authorise nothing"
             );
@@ -21114,7 +21792,7 @@ mod scanned_pools_tests {
         );
         assert!(!g.scanned, "…but it is not scanned");
         assert_eq!(
-            v2_allows(&g, V2Intent::Deshield { amount: Some(1) }),
+            v2_request_valid(&g, V2Intent::Deshield { amount: Some(1) }),
             Err("scan pool v2 first — its balance is unknown until then")
         );
     }
@@ -21261,13 +21939,13 @@ mod scanned_pools_tests {
         assert_eq!(g.notes, 3);
         assert_eq!(g.deshield_cap(), 700);
         assert_eq!(
-            v2_allows(&g, V2Intent::Deshield { amount: Some(700) }),
+            v2_request_valid(&g, V2Intent::Deshield { amount: Some(700) }),
             Ok(())
         );
         // …and the window budget still binds.
         let capped = pools.view_for(A).guard(A, true, false, Some(100));
         assert_eq!(capped.deshield_cap(), 100);
-        assert!(v2_allows(&capped, V2Intent::Deshield { amount: Some(700) }).is_err());
+        assert!(v2_request_valid(&capped, V2Intent::Deshield { amount: Some(700) }).is_err());
     }
 
     // ── seed-peer normalization (the "no peers" trap) ───────────────────────
@@ -21354,5 +22032,104 @@ mod scanned_pools_tests {
             normalize_peer_addr("10.0.0.5:9645", "9645"),
             PeerAddr::Ok("10.0.0.5:9645".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod quantum_release_policy_tests {
+    use super::*;
+
+    #[test]
+    fn active_pool_cannot_override_local_confidentiality_gate() {
+        assert!(quantum_v2_activity_allowed()
+            .unwrap_err()
+            .contains("unmasked"));
+        for pool in [Pool::V1, Pool::V2] {
+            assert!(quantum_deposit_allowed(pool).is_err());
+        }
+        let guard = V2Guard {
+            pool_active: true,
+            for_this_wallet: true,
+            busy: false,
+            scanned: true,
+            notes: 1,
+            balance_grains: 100,
+            transparent_grains: Some(100),
+            window_budget: Some(100),
+        };
+        for intent in [
+            V2Intent::Shield {
+                to: "",
+                amount: Some(1),
+            },
+            V2Intent::Deshield { amount: Some(1) },
+            V2Intent::Send {
+                to: "xusq1fake",
+                amount: Some(1),
+            },
+        ] {
+            assert!(v2_allows(&guard, intent).unwrap_err().contains("unmasked"));
+        }
+    }
+
+    #[test]
+    fn migration_uses_legacy_authority_only_for_a_hybrid_rotation() {
+        let seed = [102; 32];
+        let account = Keypair::from_seed(seed).public_key().implicit_account_id();
+        let domain = sov_primitives::SigningDomain::new("sov-mainnet", Hash::digest(b"genesis"));
+        let tx = legacy_rotation_transaction(seed, &account, 4, Some(&domain)).unwrap();
+        assert_eq!(tx.transaction.signer, account);
+        assert_eq!(tx.transaction.nonce, 4);
+        assert!(matches!(tx.transaction.public_key, PublicKey::V1Ed25519(_)));
+        assert!(tx.verify_signature_in(Some(&domain)));
+        match tx.transaction.action {
+            Action::RotateKey { new_key, proof } => {
+                assert_eq!(new_key, Keypair::hybrid_from_seed(seed).public_key());
+                assert!(new_key.verify(
+                    &sov_types::rotation_signing_bytes(&account, 4, &new_key),
+                    &proof
+                ));
+            }
+            _ => panic!("migration may only rotate authority"),
+        }
+    }
+
+    #[test]
+    fn seeded_legacy_recovery_preserves_identity_and_encrypted_backup() {
+        let seed = [101; 32];
+        let entry = KeystoreEntry {
+            account: "Legacy".into(),
+            seed_hex: hex_lower(&seed),
+            scheme: None,
+            mnemonic: Some("original recovery phrase".into()),
+            public_key: None,
+        };
+        let wallet = LoadedWallet::from_keystore_entry(&entry).unwrap();
+        assert!(wallet.watch_only && wallet.legacy_recovery);
+        assert_eq!(
+            wallet.account,
+            Keypair::from_seed(seed)
+                .public_key()
+                .implicit_account_id()
+                .to_string()
+        );
+        let saved = wallet.keystore_entry();
+        assert_eq!(saved.scheme.as_deref(), Some("ed25519"));
+        assert_eq!(saved.seed_hex, entry.seed_hex);
+        assert_eq!(saved.mnemonic, entry.mnemonic);
+        let restored = LoadedWallet::from_keystore_entry(&saved).unwrap();
+        assert_eq!(restored.account, wallet.account);
+        let hybrid = KeystoreEntry {
+            scheme: Some("hybrid65".into()),
+            ..entry.clone()
+        };
+        let active = LoadedWallet::from_keystore_entry(&hybrid).unwrap();
+        assert!(!active.watch_only);
+        assert_ne!(active.account, wallet.account);
+        let invalid = KeystoreEntry {
+            scheme: Some("unknown".into()),
+            ..entry
+        };
+        assert!(LoadedWallet::from_keystore_entry(&invalid).is_err());
     }
 }

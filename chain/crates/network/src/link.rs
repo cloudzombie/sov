@@ -40,7 +40,7 @@ use fips203::ml_kem_768;
 use fips203::traits::{Decaps as _, Encaps as _, KeyGen as _, SerDes as _};
 use snow::{Builder, TransportState};
 
-use crate::pq::PqChannel;
+use crate::pq::{channel_binding, PqChannel};
 
 /// Largest plaintext frame the link will carry, in bytes.
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
@@ -72,9 +72,9 @@ pub struct SealedLink {
     /// The inner hybrid (X25519 + ML-KEM-768) AEAD layer. Every frame is sealed
     /// here FIRST, then chunked through the Noise cipher.
     pq: Mutex<PqChannel>,
-    /// This connection's Noise handshake hash — a unique channel fingerprint,
-    /// identical on both ends, used by application layers to bind a signed
-    /// identity to this specific pipe (anti-MITM).
+    /// The complete Noise + ML-KEM channel binding, identical on both ends.
+    /// This covers both KEM messages so a signed identity cannot be relayed
+    /// across substituted KEM exchanges if X25519 is broken.
     handshake_hash: Vec<u8>,
 }
 
@@ -83,8 +83,8 @@ impl SealedLink {
     /// an established TCP stream. Fail-closed: a peer that cannot complete
     /// either step never becomes a link. There is no classical-only fallback.
     pub fn establish(stream: &mut TcpStream, initiator: bool) -> io::Result<SealedLink> {
-        let (mut transport, handshake_hash) = noise_handshake(stream, initiator)?;
-        let pq = pq_handshake(stream, &mut transport, initiator, &handshake_hash)?;
+        let (mut transport, noise_hash) = noise_handshake(stream, initiator)?;
+        let (pq, handshake_hash) = pq_handshake(stream, &mut transport, initiator, &noise_hash)?;
         Ok(SealedLink {
             stream: Mutex::new(stream.try_clone()?),
             noise: Mutex::new(transport),
@@ -93,7 +93,9 @@ impl SealedLink {
         })
     }
 
-    /// Build a link from parts already negotiated by the caller.
+    /// Build a link from parts already negotiated by the caller. `handshake_hash`
+    /// must be the complete channel binding returned by [`pq_handshake`], not
+    /// the earlier Noise-only handshake hash.
     pub fn from_parts(
         stream: TcpStream,
         noise: TransportState,
@@ -108,7 +110,9 @@ impl SealedLink {
         }
     }
 
-    /// This connection's Noise handshake hash.
+    /// This connection's complete Noise + ML-KEM channel binding.
+    /// The historical method name is retained for callers; it never returns
+    /// the earlier Noise-only hash.
     pub fn handshake_hash(&self) -> &[u8] {
         &self.handshake_hash
     }
@@ -200,10 +204,11 @@ impl SealedLink {
 }
 
 /// Perform a Noise XX handshake over `stream`, returning the transport-mode cipher
-/// and the handshake hash (a unique per-connection channel fingerprint, identical
-/// on both ends, used for `Hello` channel binding). The static key is generated per
-/// connection; peer identity is authenticated by the application-level signed
-/// [`Hello`](NetMessage::Hello) once the channel is up.
+/// and the Noise handshake hash (identical on both ends). This is only an
+/// intermediate transcript: [`pq_handshake`] includes the KEM messages in the
+/// final `Hello` channel binding. The static key is generated per connection;
+/// peer identity is authenticated by the application-level signed
+/// [`Hello`](crate::NetMessage::Hello) once the channel is up.
 pub(crate) fn noise_handshake(
     stream: &mut TcpStream,
     initiator: bool,
@@ -262,41 +267,53 @@ pub(crate) fn noise_handshake(
 /// Run the hybrid post-quantum key exchange inside the freshly-established
 /// Noise channel: the initiator sends an ephemeral ML-KEM-768 encapsulation
 /// key; the responder encapsulates and returns the ciphertext; both derive
-/// the same 32-byte KEM secret and build the inner [`PqChannel`] bound to
-/// this connection's Noise handshake hash. Any failure aborts the connection
-/// — there is **no fallback** to a classical-only channel.
+/// the same 32-byte KEM secret and build the inner [`PqChannel`]. Also return
+/// the final authentication binding over the Noise hash and both exact KEM
+/// messages. Any failure aborts the connection — there is **no fallback** to
+/// a classical-only channel or to a Noise-only authentication binding.
 pub(crate) fn pq_handshake(
     stream: &mut TcpStream,
     noise: &mut TransportState,
     initiator: bool,
     handshake_hash: &[u8],
-) -> io::Result<PqChannel> {
+) -> io::Result<(PqChannel, Vec<u8>)> {
     if initiator {
         let (ek, dk) = ml_kem_768::KG::try_keygen()
             .map_err(|e| io::Error::other(format!("ml-kem keygen: {e}")))?;
-        noise_send(stream, noise, &ek.into_bytes())?;
+        let ek_bytes = ek.into_bytes();
+        noise_send(stream, noise, &ek_bytes)?;
         let ct_bytes = noise_recv(stream, noise)?;
         let ct: [u8; ml_kem_768::CT_LEN] = ct_bytes
             .try_into()
             .map_err(|_| io::Error::other("ml-kem ciphertext has the wrong length"))?;
+        let binding = channel_binding(handshake_hash, &ek_bytes, &ct).to_vec();
         let ct = ml_kem_768::CipherText::try_from_bytes(ct)
             .map_err(|e| io::Error::other(format!("ml-kem ciphertext: {e}")))?;
         let secret = dk
             .try_decaps(&ct)
             .map_err(|e| io::Error::other(format!("ml-kem decaps: {e}")))?;
-        Ok(PqChannel::new(handshake_hash, &secret.into_bytes(), true))
+        Ok((
+            PqChannel::new(handshake_hash, &secret.into_bytes(), true),
+            binding,
+        ))
     } else {
         let ek_bytes = noise_recv(stream, noise)?;
         let ek: [u8; ml_kem_768::EK_LEN] = ek_bytes
             .try_into()
             .map_err(|_| io::Error::other("ml-kem encaps key has the wrong length"))?;
-        let ek = ml_kem_768::EncapsKey::try_from_bytes(ek)
+        let ek_bytes = ek;
+        let ek = ml_kem_768::EncapsKey::try_from_bytes(ek_bytes)
             .map_err(|e| io::Error::other(format!("ml-kem encaps key: {e}")))?;
         let (secret, ct) = ek
             .try_encaps()
             .map_err(|e| io::Error::other(format!("ml-kem encaps: {e}")))?;
-        noise_send(stream, noise, &ct.into_bytes())?;
-        Ok(PqChannel::new(handshake_hash, &secret.into_bytes(), false))
+        let ct_bytes = ct.into_bytes();
+        noise_send(stream, noise, &ct_bytes)?;
+        let binding = channel_binding(handshake_hash, &ek_bytes, &ct_bytes).to_vec();
+        Ok((
+            PqChannel::new(handshake_hash, &secret.into_bytes(), false),
+            binding,
+        ))
     }
 }
 
@@ -346,4 +363,59 @@ pub(crate) fn noise_recv(
         .read_message(&ct, &mut buf)
         .map_err(|e| io::Error::other(format!("noise decrypt: {e}")))?;
     Ok(buf[..n].to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn sealed_link_exposes_complete_binding_and_interoperates_in_both_directions() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responder = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let (mut noise, noise_hash) = noise_handshake(&mut stream, false).unwrap();
+
+            // Negotiate the responder half explicitly, retaining the exact wire
+            // messages as an independent check of the initiator's binding.
+            let ek_bytes: [u8; ml_kem_768::EK_LEN] = noise_recv(&mut stream, &mut noise)
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let ek = ml_kem_768::EncapsKey::try_from_bytes(ek_bytes).unwrap();
+            let (secret, ct) = ek.try_encaps().unwrap();
+            let ct_bytes = ct.into_bytes();
+            noise_send(&mut stream, &mut noise, &ct_bytes).unwrap();
+            let binding = channel_binding(&noise_hash, &ek_bytes, &ct_bytes).to_vec();
+            assert_ne!(binding, noise_hash, "the old binding is never exposed");
+            let pq = PqChannel::new(&noise_hash, &secret.into_bytes(), false);
+            let mut reader = stream.try_clone().unwrap();
+            let link = SealedLink::from_parts(stream, noise, pq, binding.clone());
+            match link.recv(&mut reader) {
+                LinkRead::Frame(frame) => assert_eq!(frame, b"initiator frame"),
+                other => panic!("expected initiator frame, got {other:?}"),
+            }
+            link.send(b"responder frame").unwrap();
+            binding
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let link = SealedLink::establish(&mut stream, true).unwrap();
+        link.send(b"initiator frame").unwrap();
+        match link.recv(&mut stream) {
+            LinkRead::Frame(frame) => assert_eq!(frame, b"responder frame"),
+            other => panic!("expected responder frame, got {other:?}"),
+        }
+        assert_eq!(link.handshake_hash(), responder.join().unwrap());
+    }
 }

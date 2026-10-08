@@ -53,8 +53,8 @@ impl Vault {
         }
         let mut seen = BTreeSet::new();
         for m in &self.members {
-            parse_pubkey(&m.pubkey)?;
-            if !seen.insert(m.pubkey.trim().to_string()) {
+            let key = parse_hybrid_member(&m.pubkey)?;
+            if !seen.insert(key) {
                 return Err("the same key was added twice".into());
             }
         }
@@ -97,6 +97,11 @@ impl Vault {
 
 /// `<home>/.sov-station/vaults.json` — the saved vault directory.
 pub fn vaults_path() -> Result<PathBuf, String> {
+    if let Ok(dir) = std::env::var("SOV_STATION_DIR") {
+        if !dir.trim().is_empty() {
+            return Ok(PathBuf::from(dir).join("vaults.json"));
+        }
+    }
     let home = std::env::var("HOME")
         .ok()
         .or_else(|| std::env::var("USERPROFILE").ok())
@@ -130,6 +135,16 @@ pub fn save_vaults(vaults: &[Vault]) -> Result<(), String> {
 pub fn parse_pubkey(s: &str) -> Result<PublicKey, String> {
     serde_json::from_value(Value::String(s.trim().to_string()))
         .map_err(|e| format!("not a valid public key: {e}"))
+}
+
+/// New policies must not give spending authority to a classical-only member.
+/// Parsing old public vault directories remains permissive for inspection.
+pub fn parse_hybrid_member(s: &str) -> Result<PublicKey, String> {
+    let key = parse_pubkey(s)?;
+    if !matches!(key, PublicKey::V2HybridMlDsa65 { .. }) {
+        return Err("new vault members must use hybrid Ed25519 + ML-DSA-65 keys; classical Ed25519 is not accepted".into());
+    }
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -192,5 +207,31 @@ mod tests {
         assert_eq!(v.member_index(&b.public_key().to_string()), Some(1));
         assert_eq!(v.member_index(&c.public_key().to_string()), Some(2));
         assert_eq!(v.member_index(&kp(9).public_key().to_string()), None);
+    }
+
+    #[test]
+    fn new_policies_reject_classical_members_even_when_threshold_is_hybrid() {
+        let (a, b, c) = (kp(1), kp(2), Keypair::from_seed([3; 32]));
+        let vault = vault_2of3(&a, &b, &c);
+        assert!(vault
+            .set_multisig_action()
+            .unwrap_err()
+            .contains("classical Ed25519"));
+        // Historical policies are still readable and their member order stays intact.
+        let restored: Vault =
+            serde_json::from_str(&serde_json::to_string(&vault).unwrap()).unwrap();
+        assert_eq!(restored.member_index(&c.public_key().to_string()), Some(2));
+        assert!(parse_pubkey(&c.public_key().to_string()).is_ok());
+    }
+
+    #[test]
+    fn equivalent_key_spellings_cannot_inflate_new_policy_membership() {
+        let (a, b, c) = (kp(1), kp(2), kp(3));
+        let mut vault = vault_2of3(&a, &b, &c);
+        vault.members.push(Member {
+            name: "duplicate".into(),
+            pubkey: format!("hybrid65:{}", a.public_key().to_hex()),
+        });
+        assert!(vault.validate().unwrap_err().contains("same key"));
     }
 }

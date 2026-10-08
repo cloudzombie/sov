@@ -40,9 +40,15 @@ throughout:
 
 The proofs are unconditional **except** where they explicitly invoke one of:
 
-- **A1 (hash security).** Blake3 — the chain's only general-purpose hash
-  ([`hash.rs:30`](../crates/primitives/src/hash.rs)) — is collision- and
-  second-preimage-resistant, and behaves as a random oracle where stated.
+- **A1 (hash and PoW assumptions).** BLAKE3-256 commitments and SHA-256
+  HTLC locks provide the collision, preimage, or second-preimage resistance
+  invoked by each argument; a random-oracle model is an additional assumption
+  where stated. PoW target-search estimates additionally model the configured
+  seal (RandomX on mainnet, SHA-256d in development) as a uniform 256-bit output
+  on fresh candidates, with no attack reducing the number of **classical**
+  seal evaluations needed for target search. Those PoW assumptions do not
+  follow from BLAKE3 collision resistance. RandomX uses BLAKE2b internally
+  ([reference specification](https://github.com/tevador/RandomX/blob/master/doc/specs.md)).
 - **A2 (signature security).** Per-scheme, since keys are versioned
   (Part XI): **A2a** — Ed25519 is EUF-CMA secure (`ed25519-dalek`, strict
   verification); **A2b** — ML-DSA-65 (FIPS 204, `fips204` crate) is EUF-CMA
@@ -63,6 +69,28 @@ The proofs are unconditional **except** where they explicitly invoke one of:
   [`runtime/src/execution.rs`](../crates/runtime/src/execution.rs)). Distribution is a
   single credit to one recipient, so it trivially pays out exactly what was collected
   (no rounding, no remainder). Lemma 2 states where this is used.
+
+**Quantum interpretation of A1.** Output width and security are distinct.
+For an ideal 256-bit hash, generic classical collision search costs about
+`2^128` evaluations; generic quantum preimage/second-preimage search costs
+about `2^128` queries, while generic quantum collision search can cost about
+`2^(256/3)` queries. These are asymptotic query-model estimates with substantial
+memory and circuit assumptions, not measured practical attack costs or a
+quantified quantum security proof for the deployed constructions. See
+[quantum search analysis](https://arxiv.org/abs/quant-ph/9605034) and
+[Brassard–Høyer–Tapp collision search](https://arxiv.org/abs/quant-ph/9705002).
+The [BLAKE3 security notes](https://github.com/BLAKE3-team/BLAKE3/blob/master/c/README.md#security-notes)
+also state that extending its output beyond 256 bits adds no security.
+
+PoW is a different search problem: the miner needs **any** digest below the
+current target, rather than a particular 256-bit preimage. Under the ideal seal
+model, the per-candidate success probability is `p = (target+1)/2^256`.
+Classical search takes an expected `1/p` evaluations; quantum amplitude
+amplification can in principle use `O(1/sqrt(p))` coherent evaluations. Whether
+a quantum miner can implement RandomX economically, including its memory
+accesses and circuit depth, has not been established here. Memory hardness and
+difficulty retargeting do not prove quantum mining immunity or prevent an
+adversary from acquiring a majority of effective block-producing capacity.
 
 ---
 
@@ -537,9 +565,13 @@ part of the Borsh-encoded header, it is committed in the seal; and because the
 target is canonical, the subsequent check `seal ≤ T*` is against exactly the
 committed, required difficulty. Hence a miner can neither (a) declare a smaller
 difficulty to make the PoW cheaper — that is rejected before the PoW check — nor
-(b) declare one difficulty and be graded against another. Under A1, finding
-`nonce` with `pow_seal(header) ≤ T*` costs the expected `W(T*)` evaluations of
-the seal (RandomX on mainnet); there is no shortcut. ∎
+(b) declare one difficulty and be graded against another. This admission rule
+holds regardless of the miner's search algorithm. Under A1's **classical**
+uniform-seal model, fresh candidate search has expected cost
+`2^256/(T*+1)`, approximately the integer work score `W(T*)`. This is not a
+quantum lower bound: amplitude amplification can in principle reduce the
+number of coherent evaluations, subject to the unresolved practical costs
+stated under A1. ∎
 
 **Code:** `Target::{to_compact, from_compact}`
 ([`pow/target.rs`](../crates/pow/src/target.rs)); the `bits` rule in
@@ -568,8 +600,10 @@ increases `height(head)` by one and leaves ancestors' heights fixed, so each
 ancestor's confirmation count only grows; a reorg only occurs to a **strictly
 heavier** chain (Theorem 8), which an adversary can produce for the last `d`
 blocks only by exceeding the honest network's cumulative work over that span —
-the standard Nakamoto cost, exponentially small in `d` for a minority miner
-(A1). ∎
+the standard Nakamoto probability, exponentially small in `d` for a minority
+of effective block-producing capacity under the model (A1). Nominal classical
+hashrate is not a sufficient proxy for that capacity if a quantum miner gains
+a search advantage; no quantum economic security bound is established here. ∎
 
 **Code:** `confirmations`, `is_final`, `FINALITY_DEPTH`.
 **Machine-checked-by:**
@@ -767,30 +801,35 @@ monetary use. ∎
 
 ## Part VI — Proof of work
 
-### Lemma 4 (the proof of work is bound to the block — no rented or stolen work)
+### Lemma 4 (the proof-of-work preimage commits to every header field)
 
 Under Nakamoto consensus the proof-of-work preimage is the **entire block
 header** (`header.pow_preimage() = borsh(header)`,
 [`types/block.rs`](../crates/types/src/block.rs)), which commits to `prev_hash`,
 all three roots, the timestamp, the coinbase recipient (`proposer`), the
 difficulty `bits`, and the `nonce`. Borsh is an injective encoding, so each
-header maps to a unique preimage; hence under A1 a solution (a `nonce` making
-`seal(header) ≤ target`) is valid for **exactly that header** and nothing else:
+header maps to a unique preimage. A verifier recomputes the seal from that
+preimage rather than accepting a detached seal supplied by the miner:
 
-- it is bound to `prev_hash`, so it only extends that parent (next-block
-  freshness — a solution cannot be replayed onto a different branch or height);
-- it is bound to `proposer`, so the coinbase **cannot be stolen** — re-pointing
-  the reward changes the preimage and invalidates the work; and
-- it is bound to `bits`, so it cannot be re-graded against an easier target
-  (Theorem 9).
+- changing `prev_hash` or height changes the candidate, whose seal must be
+  recomputed and checked against the new branch's required target;
+- changing `proposer` changes the candidate, so the original seal cannot be
+  substituted as authorization for a different coinbase recipient; and
+- changing `bits` changes the candidate and must also pass the branch-required
+  difficulty check (Theorem 9).
 
-Changing any field forces the work to be redone. ∎
+Different preimages need not have different target-check results: an altered
+header can independently meet the target, without any hash collision. Under
+A1's uniform-seal model it is a fresh target-search candidate with success
+probability `(target+1)/2^256`; its search cost depends on the attack model
+described under A1. The commitment prevents detached-work substitution, not
+the production of another valid header. ∎
 **Machine-checked-by:**
-`blockchain::tests::block_claiming_easier_difficulty_is_rejected` (re-pointing
-the header's difficulty invalidates the seal) and
-`blockchain::tests::tampered_state_root_is_rejected` (any header change is
-caught); `pow::seal::tests::randomx_seal_is_deterministic_and_input_sensitive`
-(distinct preimages give distinct seals).
+`blockchain::tests::block_claiming_easier_difficulty_is_rejected` (the branch
+rejects easier declared difficulty) and
+`blockchain::tests::tampered_state_root_is_rejected` (execution checks the
+committed state root); `pow::seal::tests::randomx_seal_is_deterministic_and_input_sensitive`
+(fixed distinct test preimages produce distinct seals).
 
 ### Theorem 18 (difficulty–target correspondence, bounded retarget, compact fidelity)
 
@@ -1334,11 +1373,11 @@ keys (breaking A4a) **and** the ML-KEM shared secret (breaking A4b).
 **Proof.** Every application frame on the wire is
 `Noise_Enc(PQ_Enc(plaintext))`. The outer layer requires the X25519-derived
 Noise transport keys (A4a). The inner key is
-`Blake3(domain ‖ handshake_hash ‖ kem_secret)`: under A1, recovering it
-requires both inputs — the handshake hash is itself a function of the Noise
-handshake (A4a-protected), and `kem_secret` is the ML-KEM-768 decapsulation
-secret whose only wire exposure is the encapsulation ciphertext (A4b), itself
-transmitted *inside* the Noise channel. So with A4a broken (e.g. by a future
+`Blake3(domain ‖ handshake_hash ‖ kem_secret)`: the transcript hash binds the
+connection and is not assumed secret. The secret input is the ML-KEM-768
+shared secret, whose wire exposure is the encapsulation ciphertext (A4b),
+transmitted *inside* the Noise channel. Under the KDF and AEAD assumptions,
+with A4a broken (e.g. by a future
 quantum computer) the adversary obtains the outer plaintext = inner
 ciphertext and the KEM ciphertext, but the inner key still requires the
 ML-KEM secret (A4b); with A4b broken, the outer Noise layer stands (A4a). Per-direction keys are domain-separated; nonces are monotone
@@ -1358,13 +1397,22 @@ stack over a real socket.
 
 ### Remark 31.1 (authentication scope — honest)
 
-This hybridizes transport **confidentiality**. Channel *authentication* is
-the application-level signed `Hello` bound to the Noise handshake hash, whose
-signature scheme is the node's identity key: post-quantum exactly when the
-operator uses a hybrid (`V2`) identity key — available since Part XII with no
-further protocol change. An active quantum MITM at connection time is
-therefore defeated only for hybrid-keyed peers; recorded-traffic privacy
-(Theorem 31) holds for everyone. ∎
+Channel *authentication* is the signed `Hello` bound to a domain-separated
+hash of the Noise transcript and the exact ML-KEM encapsulation key and
+ciphertext. If X25519 is broken, an active attacker can alter KEM messages
+inside Noise; the earlier Noise-only binding did not detect that substitution.
+The complete binding closes this relay path while the binding hash and the
+hybrid (`V2`) identity signature assumptions hold. Protocol-v3 also signs the
+claimed account. Mainnet and PQ rehearsal admission require hybrid identities;
+legacy development identities remain classical-only. Old clients cannot authenticate with the corrected binding;
+a coordinated peer rollout is required, without fallback. This is separate
+from passive recorded-traffic protection (Theorem 31).
+
+**Regression checks:**
+`pq::tests::binding_covers_noise_and_each_exact_kem_message`,
+`message::tests::authentic_hybrid_hello_rejects_substituted_kem_transcripts_and_legacy_binding`,
+`link::tests::sealed_link_exposes_complete_binding_and_interoperates_in_both_directions`,
+`tcp::tests::honest_tcp_peers_share_complete_binding_and_exchange_hybrid_hellos`.
 
 ---
 
@@ -1375,6 +1423,9 @@ Blocks carry BIP-9/8 **version bits** in their hash-committed headers; the
 signal history, and the chain derives a [`PqSchedule`]
 ([`blockchain.rs:205`](../crates/chain/src/blockchain.rs) `resolved_pq`)
 enforced inside the STF ([`execution.rs:172`](../crates/runtime/src/execution.rs)).
+
+This policy must first be configured. The current baked mainnet preset does
+not schedule `pq-sunset`; these statements are conditional on its deployment.
 
 ### Theorem 32 (activation: deterministic, monotone, and guaranteed)
 
@@ -1401,38 +1452,40 @@ TypeScript header parity).
 
 ### Theorem 33 (sunset safety: bounded quantum exposure)
 
-Under the active schedule with rotation window `[R, S)`: (a) in the window,
-an account holding ≥ the threshold under a legacy (`V1`) key can execute
-exactly one kind of transaction — a `RotateKey` to a non-legacy key (a
-`V1 → V1` rotation is rejected, so the window cannot be ridden out);
-(b) at heights ≥ `S`, **no** legacy-signed transaction is admissible — by
-any account, for any action, rotation included; (c) hybrid-keyed accounts
-are unaffected at every phase; (d) the gates are *rejections* (consensus
-admission), enforced identically by producers and importers — a block
-smuggling a gated transaction is invalid.
+Under the active schedule with rotation window `[R, S)`, native holdings
+at or above the threshold require hybrid authority for ordinary actions.
+Retired authority may still migrate a single key or multisig policy to
+all-hybrid control before `S`. At and after `S`, legacy transaction envelopes
+are rejected and legacy secondary signatures authorize nothing. Intent-maker
+and vault holdings govern their respective restrictions, independently of a
+relayer. Retired keys cannot be reinstalled through rotation or policy changes.
 
-**Consequence.** After `S`, a quantum adversary who fully breaks Ed25519
-(falsifying A2a) gains **nothing actionable on-chain**: every account that
-rotated is protected by Theorem 30 (forgery also requires breaking ML-DSA),
-and every account that did not is frozen — its legacy key can authorize
-nothing, so forging it authorizes nothing. The honest trade-off is stated
-plainly: un-rotated funds are locked at the sunset, because a `V1` signature
-no longer constitutes proof of ownership; freezing is the protective choice,
-and any future recovery path is a governance decision outside this code.
+**Consequence.** Forging Ed25519 alone cannot revive retired account or
+multisig authority after `S`. Accounts or vaults without surviving hybrid
+authority are frozen; recovery is outside this policy. This does not establish
+the security of shielded notes, hash commitments, or mining against quantum
+attacks. Those have separate assumptions and outstanding review requirements.
 
-**Proof.** The gate sits in `apply_transaction` after authorization and
-before nonce consumption: (b) is the first check (`height ≥ S` ∧ legacy ⇒
-reject), so it dominates; (a) matches the action against
-`RotateKey { new_key }` with `new_key` non-legacy — every other action, and
-every rotation to a `V1` key, rejects; (c) the gate is conditioned on the
-transaction key being `V1Ed25519`, so `V2` transactions never enter it;
-(d) rejection makes any containing block fail `apply_transactions` on
-import (Theorem 15's re-execution), proven by the smuggled-block test. ∎
+**Argument.** `pq_requires_hybrid_authority` evaluates the protected account's
+native liquid-plus-vesting total. Outer-key gates run before nonce/fee mutation;
+fee deduction cannot evade the threshold. Intent settlement checks its owner's
+authority. Off-chain approvals count only surviving keys, except an all-hybrid
+policy migration before `S`; cached proposal indices are pruned against the
+current policy before threshold evaluation. New keys and policies cannot
+downgrade restricted authority. Hybrid actions satisfying these rules remain
+usable. Outer failures are block-invalidating errors; secondary failures are
+mineable failed receipts that do not perform the protected action. Producers
+and importers execute the same deterministic rules. ∎
 
 **Machine-checked-by:**
 `execution::tests::{pq_window_forces_rich_legacy_accounts_to_rotate_and_only_to_hybrid,
 pq_window_spares_small_legacy_accounts_until_the_sunset,
-pq_sunset_never_touches_hybrid_accounts}` (boundary heights exact);
+pq_sunset_never_touches_hybrid_accounts,
+pq_intent_owner_policy_cannot_be_bypassed_by_a_hybrid_solver,
+pq_multisig_rejects_legacy_approvals_and_preserves_hybrid_thresholds,
+pq_cached_multisig_approvals_are_retired_when_the_vault_requires_hybrid,
+pq_retired_account_cannot_install_a_legacy_key_or_multisig_policy,
+pq_legacy_multisig_can_migrate_only_before_sunset}` (boundary heights exact);
 `blockchain::tests::miner_signaled_pq_sunset_activates_and_enforces_end_to_end`
 (the full lifecycle over real produced/imported blocks: signaling →
 lock-in → activation → producer exclusion → smuggled-block rejection →
@@ -1440,7 +1493,8 @@ rotation → hybrid flow → freeze).
 
 ### Remark 33.1 (launch posture: PQ-native genesis)
 
-The chain has never been live, so no existing account needs this migration:
+Mainnet is live and its legacy accounts still require coordinated migration.
+Newly generated accounts already use hybrid authority:
 `sov-testnet gen` and `sov-wallet keygen` now derive **hybrid keys by
 default** — every genesis account (the miner identity included) is born
 post-quantum (machine-checked by

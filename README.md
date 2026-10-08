@@ -96,14 +96,26 @@ after every block: `sum(balances) + shielded + escrowed == mined`.
 
 ## Post-quantum & privacy
 
-- **Signatures** are hybrid **Ed25519 + ML-DSA-65** (FIPS-204): a transaction is valid
-  only if *both* verify, so it stays secure as long as *either* primitive holds. The
-  scheme is committed inside the signed payload, so there is no cross-scheme replay.
+- **Station signatures** use hybrid **Ed25519 + ML-DSA-65** (FIPS-204): both
+  components must verify. The scheme is committed inside the signed payload.
+  Legacy Ed25519 accounts are still accepted; mainnet has no scheduled key sunset.
 - **Transport** is Noise (XX) with a hybrid **X25519 + ML-KEM-768** (FIPS-203) key
-  exchange and ChaCha20-Poly1305 — encrypted and post-quantum from the first byte.
-- **Privacy** is an Orchard/Halo2 **shielded pool** (zk-SNARK, no trusted setup) with a
-  de-shield drain limiter as defense-in-depth. The shielded pool is *not* post-quantum
-  (Halo2/Pallas) — this is disclosed honestly; transparent funds are unaffected either way.
+  exchange and ChaCha20-Poly1305. Signed peer authentication now binds both
+  exchanges; older clients require a coordinated upgrade. Authentication also
+  requires a hybrid identity on mainnet and PQ rehearsal networks. Protocol-v3
+  Hello signs the claimed account as well as both key exchanges.
+- **Privacy** has an Orchard/Halo2 v1 pool and a STARK/ML-KEM v2 pool. V1 is
+  vulnerable to future quantum attacks. V2 uses post-quantum primitives, but its
+  external circuit audit and quantified quantum proof-soundness analysis remain
+  pending, even if its miner-signaled deployment is active. The current unmasked
+  v2 prover also lacks private-input protection, so new v2 activity is disabled
+  in Rust Station, RPC, and gossip. Recipient-bound v1 recovery and legacy
+  retirement are implemented on an isolated PQ rehearsal chain. Drain limits constrain
+  outflow; they do not establish note ownership or proof security.
+- **Hashing and mining** have distinct quantum search and collision margins;
+  256-bit output is not a blanket 128-bit quantum-security guarantee. See the
+  [current quantum posture](chain/docs/quantum-posture.md) and
+  [remaining migration requirements](chain/docs/quantum-migration.md).
 
 ---
 

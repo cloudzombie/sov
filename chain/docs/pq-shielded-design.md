@@ -1,16 +1,22 @@
+> **Current implementation quarantine (2026-10-08):** the default Winterfell
+> trace is unmasked and does not protect private inputs. New v2 proof creation
+> and broadcast in Rust Station, RPC admission, and gossip are disabled. The
+> PQ migration fork freezes the current suite at R; old block verification stays
+> available for replay. This document describes the intended construction, not
+> a completed confidentiality or quantum-security proof. See
+> [proof remediation](pq-proof-remediation.md).
+
 # PQ Shielded Pool ("pool v2") — Design & Prototype Increment
 
-**Status: consensus-grade CIRCUIT in tree (`chain/crates/shielded-pq`,
-crate `sov-shielded-pq`) — v0.2.0 program slices S1a (in-circuit value
-privacy, 4-in/4-out) and S1b (full domain separation) landed. NOT wired
-into consensus. Nothing here is in the trust path, and nothing here enters
-it before external audit and parameter review (v0.2.0 ships it DORMANT
-behind BIP-9 bit 2; see `notes/v0.2.0-program.md`).** This document updates the posture stated in
-[`quantum-posture.md`](quantum-posture.md): the shielded-pool exposure moves
-from *"disclosed gap, research track"* to *"prototype in tree"*. The
-disclosure there remains normative — Orchard privacy is still
-harvest-now-decrypt-later (HNDL) exposed, and this prototype does not change
-that for any data already on chain.
+**Status reviewed 2026-10-08:** circuit and runtime integration are in tree
+(`chain/crates/shielded-pq`, crate `sov-shielded-pq`). The baked mainnet preset
+arms bit 2 as of v0.2.5; actual activation follows committed miner signals.
+The external circuit audit and quantified quantum soundness review remain
+pending. Earlier statements that consensus integration is absent or that
+the deployment is universally dormant are superseded. The disclosure in
+[`quantum-posture.md`](quantum-posture.md) remains normative: Orchard privacy
+is harvest-now-decrypt-later exposed, and v2 cannot repair already published
+v1 ciphertext. The design below does not establish a quantum security level.
 
 ## 1. Threat model
 
@@ -35,12 +41,25 @@ trust path.
 
 | Component | Primitive | Why PQ |
 |---|---|---|
-| Note commitments | Domain-separated Rescue-Prime (`Rp64_256`, winter-crypto) over the Goldilocks field | Hash-based hiding/binding; Grover only halves margins |
+| Note commitments | Domain-separated Rescue-Prime (`Rp64_256`, winter-crypto) over the Goldilocks field | Hash assumptions without discrete log; quantum margins require separate analysis |
 | Commitment tree | Depth-20 Merkle over the same hash (own domain) | Same |
 | Nullifiers | PRF `nf = H_NF(nsk, rho)`; ownership via `owner_tag = H_TAG(nsk, 0)` | Same |
 | Spend proof | STARK (winterfell): FRI + Merkle commitments over Blake3 | Transparent (no trusted setup), hash-based soundness; no pairing/DLOG |
 | Note encryption | ML-KEM-768 (FIPS 203, `fips203`) + ChaCha20-Poly1305 | Lattice KEM — the same pair the P2P transport already ships |
 | Spend authorization | ML-DSA-65 (FIPS 204, `fips204`) | Lattice signature — the same crate the transparent layer's hybrid keys use |
+
+Hash-based does not mean unchanged security against a quantum adversary. For
+an ideal `n`-bit hash, generic quantum preimage search costs about `2^(n/2)`
+queries, while generic quantum collision search can cost about `2^(n/3)` with
+substantial resource assumptions ([quantum search](https://arxiv.org/abs/quant-ph/9605034),
+[collision search](https://arxiv.org/abs/quant-ph/9705002)). The four-element
+Rescue-Prime digest has approximately 256 bits of output space; this width
+does not establish 128-bit quantum collision resistance. Nor does the
+BLAKE3-256 STARK carrier establish a quantified quantum soundness level for
+Fiat–Shamir/FRI (PQV2-05). Extending BLAKE3's output alone adds no security,
+as its [authors' security notes](https://github.com/BLAKE3-team/BLAKE3/blob/master/c/README.md#security-notes)
+state. Concrete Rescue-Prime margins and QROM proof soundness remain audit
+requirements.
 
 Deliberate reuse: `fips203`/`fips204`/`chacha20poly1305`/`blake3` are already
 in the workspace's trust surface. The only genuinely new dependency is the
@@ -76,7 +95,7 @@ domain-separated Rescue-Prime merges, domains in `src/domains.rs`):
    values private.
 3. **Dummy slots**: value proven ZERO (asserted on the committed value
    register); the dummy's nullifier hash runs under a DISTINCT domain
-   (`DUMMY_NF`) so it can never collide with a real nullifier; its
+   (`DUMMY_NF`) so matching a real nullifier requires a hash collision; its
    Merkle/nullifier rows are unconstrained junk that the verifier never
    surfaces (dummy anchors/nullifiers/commitments are the zero digest by
    convention, enforced natively).
@@ -120,8 +139,11 @@ Every hash use has a distinct, named domain in ONE module
 commit-stage-2, merkle-node, nullifier, dummy-nullifier; capacity-element
 tagging, domain 0 reserved for the upstream pin) and blake3 `derive_key`
 domains (nsk, rho, auth-keygen, auth-sign, note-AEAD, detection-tag,
-bundle-digest, test). A test proves cross-domain outputs differ for
-identical inputs, for every pair, in both families. Note ciphertexts now
+bundle-digest, carrier-binding, test). Regression tests check that cross-domain
+outputs differ for fixed identical inputs, for every pair, in both families;
+they do not prove collision resistance or cryptographic independence. The
+Rescue domain slot separates full permutation inputs, while collision
+resistance of the projected digest remains a hash assumption. Note ciphertexts now
 carry the D7 4-byte detection checksum
 (`blake3_derive_key(detect, shared_secret)[..4]`), checked before any AEAD
 work so wallet trial-decapsulation scanning stays ~µs per foreign note.

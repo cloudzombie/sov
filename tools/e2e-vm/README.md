@@ -1,4 +1,4 @@
-# sov-e2e-vm — Live multi-node end-to-end harness (v0.2.0 program, W8 / S8a)
+# sov-e2e-vm — Live multi-node release harness
 
 One command stands up a **real, isolated, multi-node SOV blockchain** — real
 release `sov-rpcd` binaries, real P2P over TCP, real proof-of-work, real fees
@@ -6,12 +6,13 @@ and emission (`mainnet_like` policy, sha256d seal) — drives it through the W8
 lifecycle matrix, asserts every step, tears everything down deterministically,
 and emits a machine-readable JSON report plus a human summary.
 
-**Exit 0 only if no step failed.** Skips are allowed but each carries the exact
-reason and the program slice it waits on.
+**Release gate: exit 0 only if no step failed or skipped.** The release workflow
+passes `--require-complete`; an aborted dependency is a reported skip and fails
+the gate. The current matrix contains live checks for every step.
 
 ```
 cargo run --release --manifest-path tools/e2e-vm/Cargo.toml -- run \
-    [--backend local|ssh|container] [--ssh-config hosts.json] \
+    [--backend local|ssh|container] [--ssh-config hosts.json] [--require-complete] \
     [--bins DIR] [--run-dir DIR] [--report FILE] \
     [--base-rpc 18645] [--base-p2p 19645] [--keep]
 ```
@@ -42,26 +43,51 @@ nodes — the deployed bits are the tested bits.
 
 | # | step | status today |
 |---|------|--------------|
-| 1 | genesis determinism across nodes, ≠ mainnet/testnet pins, == harness pin | live |
-| 2 | P2P mesh (authed peers) + convergence + late-join sync to tip | live |
-| 3 | mining: +10 blocks, ≥3 distinct coinbase producers, tip agreement | live |
-| 4 | **shielded-v1 NEVER STRANDED** (law F8): shield 4 XUS into pool v1 *below* the signaling start height → drive `tx-domain` Defined→Started→LockedIn→Active on real miner signaling → SIGKILL node-4 + delete its snapshot + cold boot → then de-shield the pre-activation note under the post-activation `Bound` regime | live |
-| 5 | BIP-9 activation rehearsal: recounts the signaling from raw committed `version_bits` and checks it against the 9/10 threshold and the exact activation boundary | live |
-| 6 | shielded v1 lifecycle via the real `sov-wallet` CLI: shield 5 → z-balance → unshield 2 → z-send 1; pool/balance deltas EXACT (fees computed from on-chain receipts) | live |
-| 7 | restart/replay survival: SIGKILL node-4, delete `chainstate.snapshot`, cold boot must reproduce head hash + state root from `blocks.log`, then reconverge | live |
-| 8 | cross-node conformance: identical block hash + state root at sampled heights; identical supply at an aligned tip; total == mined; shielded == pool | live |
-| 9 | never-stranded across pool **v2** | **SKIP** — waits on W2 (`Action::ShieldedV2`, pool-v2 state, the bit-2 deployment row): there is no v2 pool to introduce yet. |
-| 10–14 | shield-v2 / z-send-v2 / unshield-v2 / v1→v2 migration / reorg-with-v2 | **SKIP** — waits on W2 (`Action::ShieldedV2` consensus wiring); no v2 action exists in current binaries. |
+| 1 | genesis determinism across nodes, differs from mainnet/testnet pins, matches harness pin | live |
+| 2 | P2P authenticated mesh, convergence, late-join synchronization | live |
+| 3 | mining: 10 more blocks, at least 3 coinbase producers, tip agreement | live |
+| 4 | pool-v2 quarantine while bit 2 is inactive: direct, tipped, timestamped, multisig-exec, deferred proposal and nested proposal RPC probes; exact privacy-policy rejection and unchanged accounts/pools/proposals/ready-and-queued mempool | live |
+| 5 | shielded-v1 recovery across tx-domain activation: real pre-fork note, real BIP-9 activation, snapshot-deleted cold boot, post-fork withdrawal | live |
+| 6 | independently recount raw miner signaling and verify 9/10 BIP-9 threshold/activation boundary | live |
+| 7 | real CLI pool-v1 lifecycle: shield 5, scan, withdraw 2, private send 1, with grain-exact pool/balance/fee deltas | live |
+| 8 | restart/replay survival: delete snapshot, reproduce pinned head/hash/state root from blocks.log, reconverge | live |
+| 9 | cross-node block/hash/state-root and aligned supply conformance | live |
+| 10 | pool-v1 note created before bit-2 activation remains spendable after activation; pool-v2 value stays zero | live |
+| 11 | direct v2 RPC quarantine with bit 2 active, no state changes | live |
+| 12 | tipped/timestamped/multisig-exec v2 quarantine with bit 2 active, no state changes | live |
+| 13 | direct/nested deferred v2 proposal quarantine with bit 2 active, no nonce/fee/proposal/state changes | live |
+| 14 | every node rejects every v2 carrier and reports privacy/security/creation flags false; real pool/anchor/nullifier/read-wallet agreement | live |
+| 15 | snapshot-deleted cold replay reproduces pinned block/state root and quarantine state, then refuses every v2 carrier again | live |
+
+v0.2.15 quarantines the current unmasked pool-v2 prover because it exposes
+private inputs. Bit-2 activation remains a real BIP-9 rehearsal, while new
+transaction admission stays closed. The probes deliberately use structurally
+valid JSON transactions with a zero signature and empty bundle: they require
+the **specific privacy-policy error before signature/proof verification**, so
+an invalid-signature, malformed-input, dormancy, or transport failure cannot
+make the release gate pass. No probe generates an unsafe private-input proof.
+The test reads exact account, pool, proposal and ready/queued mempool snapshots
+before and after every rejection; height and miner emission may advance during
+these read calls and are not treated as rejected-transaction mutations.
+
+Historical nonempty-v2 verifier, ledger disconnect/reorg and replay fixtures
+remain tested in `sov-shielded-pq`, `sov-state`, `sov-runtime` and `sov-chain`.
+The live harness cannot claim a new safe v2 send or migration until a reviewed
+replacement suite is implemented. Pool-v1 flows here use the existing
+unarmed-PQ-retirement rehearsal chain; they do not claim that Station permits
+new pool-v1 deposits on mainnet. Mainnet PQ retirement remains unarmed.
 
 ### The activation the harness drives
 
 `baked_deployments()` in `chain/crates/rpc/src/daemon.rs` now has a second arm
 next to the frozen mainnet preset: a chain id in the **reserved `sov-e2e-`
-namespace** (this harness's own) gets a *rehearsal* preset — `tx-domain` on bit 0,
-period 32, start 128, threshold 9/10, LOT off, grace `G = 0`, signal mask `0b1`.
-Same state machine, same threshold arithmetic, same code path as mainnet; only
-the heights are compressed so a real Defined→Started→LockedIn→Active runs inside
-one bounded harness run. `Started` at 128, `LockedIn` at 160, `Active` at 192.
+namespace** (this harness's own) gets a rehearsal preset: `tx-domain` on bit 0,
+period 32, start 384, threshold 9/10, LOT off, grace `G = 0`; `shielded-v2` on
+bit 2 starts at 512. The miner signal mask is `0b101`. With full signaling,
+`tx-domain` locks in at 416 and activates at 448; bit 2 locks in at 544 and
+activates at 576. The state machine and threshold arithmetic are shared with
+mainnet. The PQ sunset deployment is absent in this namespace; its dedicated
+66-block rehearsal and replay tests exercise migration/retirement separately.
 
 The mainnet arm is evaluated **first and unconditionally**, so the frozen mainnet
 preset can never be displaced; `sov-mainnet`, `sov-testnet-1`, `sov-test` and

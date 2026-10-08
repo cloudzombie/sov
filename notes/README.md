@@ -33,6 +33,7 @@ how we do not lose our place.
 
 - [STATUS.md](STATUS.md) — master state + next actions **(read first)**
 - [release-version-contract.md](release-version-contract.md) — how releases are versioned, cut, and proven
+- [release-v0.2.15.md](release-v0.2.15.md) — Rust quantum hardening, migration, proof quarantine and coordinated upgrade requirements
 - [station-ui-feature-map.md](station-ui-feature-map.md) — existing Station operations, UI locations, handlers, and preservation checks for the v0.2.14 refactor
 - [activation-tx-domain.md](activation-tx-domain.md) — cross-network replay hard fork runbook
 - [activation-pool-mining.md](activation-pool-mining.md) — stratum + `getBlockTemplate` pool rollout runbook

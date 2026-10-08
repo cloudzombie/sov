@@ -1,5 +1,6 @@
 //! The shielded pool: minting value into shielded notes, and verifying the
-//! Halo2 zero-knowledge proofs that authorize shielded actions.
+//! Halo2 zero-knowledge proofs and RedPallas signatures that authorize shielded
+//! actions.
 
 use std::sync::OnceLock;
 
@@ -10,6 +11,7 @@ use orchard::tree::Anchor;
 use orchard::value::NoteValue;
 use orchard::Bundle;
 use rand::rngs::OsRng;
+use sov_primitives::{AccountId, Hash, SigningDomain};
 
 use crate::keys::ShieldedAddress;
 use crate::ShieldedError;
@@ -18,6 +20,41 @@ use crate::ShieldedError;
 /// it is expensive (seconds), so it is cached here rather than rebuilt per block
 /// or threaded through every call site.
 static VERIFYING_KEY: OnceLock<VerifyingKey> = OnceLock::new();
+
+/// Existing SOV v1 builders authorize Orchard bundles using this digest. It is
+/// retained for wire compatibility; it does not bind the bundle to an outer SOV
+/// transaction or a transparent withdrawal recipient. Outer authentication,
+/// anchor checks, and nullifier checks remain necessary but do not supply the
+/// missing destination binding.
+const LEGACY_AUTHORIZATION_DIGEST: [u8; 32] = [0u8; 32];
+
+/// The exact transparent carrier receiving a withdrawal and paying its fee.
+/// Signatures bind the chain, account, nonce, and all Orchard bundle effects.
+pub struct ShieldedCarrier<'a> {
+    /// The branch-independent network identity.
+    pub domain: &'a SigningDomain,
+    /// The transparent account receiving the value and submitting the action.
+    pub account: &'a AccountId,
+    /// The carrier transaction nonce.
+    pub nonce: u64,
+}
+
+impl ShieldedCarrier<'_> {
+    pub(crate) fn digest(&self, commitment: [u8; 32]) -> [u8; 32] {
+        let mut bytes = b"sov:orchard:carrier:v1\0".to_vec();
+        for field in [
+            self.domain.chain_id().as_bytes(),
+            self.account.as_str().as_bytes(),
+        ] {
+            bytes.extend_from_slice(&(field.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(field);
+        }
+        bytes.extend_from_slice(self.domain.genesis().as_bytes());
+        bytes.extend_from_slice(&self.nonce.to_le_bytes());
+        bytes.extend_from_slice(&commitment);
+        *Hash::digest(&bytes).as_bytes()
+    }
+}
 
 /// The Orchard/Halo2 proving and verifying keys for the shielded circuit.
 ///
@@ -65,17 +102,79 @@ impl ShieldedBundle {
         *self.inner.value_balance()
     }
 
-    /// Verify the bundle's zero-knowledge proof against the circuit verifying
-    /// key. Returns `true` only if the proof is valid — this is the check a
-    /// validator runs before accepting a shielded action.
+    /// Verify the proof, every spend-authorizing signature (including dummy
+    /// actions), and the binding signature over the bundle's value balance.
+    ///
+    /// Signatures use the fixed zero digest used by all existing SOV v1
+    /// builders. This checks Orchard authorization and value conservation; the
+    /// caller must separately validate the outer transaction, anchor, and
+    /// nullifiers. The zero digest does not bind a transparent withdrawal
+    /// recipient; this method alone cannot make v1 withdrawals secure against
+    /// bundle reuse. Orchard v1 remains classical elliptic-curve cryptography.
     pub fn verify(&self, params: &ShieldedParams) -> bool {
+        self.verify_with_key(params.verifying_key(), &LEGACY_AUTHORIZATION_DIGEST)
+    }
+
+    /// Verify complete Orchard authorization against a process-wide,
+    /// lazily-built verifying key. Equivalent to [`Self::verify`], without
+    /// requiring the caller to hold [`ShieldedParams`].
+    pub fn verify_cached(&self) -> bool {
+        let vk = VERIFYING_KEY.get_or_init(VerifyingKey::build);
+        self.verify_with_key(vk, &LEGACY_AUTHORIZATION_DIGEST)
+    }
+
+    /// Verify complete authorization bound to the intended SOV carrier.
+    pub fn verify_for_carrier(
+        &self,
+        params: &ShieldedParams,
+        carrier: &ShieldedCarrier<'_>,
+    ) -> bool {
+        self.verify_with_key(
+            params.verifying_key(),
+            &carrier.digest(self.inner.commitment().into()),
+        )
+    }
+
+    /// Cached-key carrier verification used after the migration upgrade.
+    pub fn verify_for_carrier_cached(&self, carrier: &ShieldedCarrier<'_>) -> bool {
+        let vk = VERIFYING_KEY.get_or_init(VerifyingKey::build);
+        self.verify_with_key(vk, &carrier.digest(self.inner.commitment().into()))
+    }
+
+    fn verify_with_key(&self, vk: &VerifyingKey, digest: &[u8; 32]) -> bool {
+        // Use individual verification rather than randomized batch verification
+        // so consensus acceptance is deterministic. Match Orchard's upstream
+        // BatchValidator: check every action's authorization and the binding
+        // signature derived from cv_net commitments AND the public value balance.
+        for action in self.inner.actions().iter() {
+            if action.rk().verify(digest, action.authorization()).is_err() {
+                return false;
+            }
+        }
+        if self
+            .inner
+            .binding_validating_key()
+            .verify(digest, self.inner.authorization().binding_signature())
+            .is_err()
+        {
+            return false;
+        }
+        self.inner.verify_proof(vk).is_ok()
+    }
+
+    /// Reproduce historical SOV v1 consensus, which checked only the Halo2
+    /// proof and omitted both kinds of authorization signature.
+    ///
+    /// **Historical replay only:** a valid proof alone does not establish spend
+    /// authorization or bind the public value balance. New validation must use
+    /// [`Self::verify`] after the scheduled authorization upgrade.
+    pub fn verify_proof_only_legacy(&self, params: &ShieldedParams) -> bool {
         self.inner.verify_proof(params.verifying_key()).is_ok()
     }
 
-    /// Verify against a process-wide, lazily-built verifying key (built once on
-    /// first call, then cached). This is what the runtime uses, so it need not
-    /// hold or thread a [`ShieldedParams`] through consensus.
-    pub fn verify_cached(&self) -> bool {
+    /// Cached-key version of [`Self::verify_proof_only_legacy`], exclusively for
+    /// historical consensus replay before authorization enforcement activates.
+    pub fn verify_proof_only_legacy_cached(&self) -> bool {
         let vk = VERIFYING_KEY.get_or_init(VerifyingKey::build);
         self.inner.verify_proof(vk).is_ok()
     }
@@ -163,7 +262,7 @@ pub fn mint_to_shielded(
     let bundle = unauthorized
         .create_proof(&params.proving, &mut rng)
         .map_err(|e| ShieldedError::Prove(e.to_string()))?
-        .apply_signatures(rng, [0u8; 32], &[])
+        .apply_signatures(rng, LEGACY_AUTHORIZATION_DIGEST, &[])
         .map_err(|e| ShieldedError::Build(e.to_string()))?;
 
     Ok(ShieldedBundle { inner: bundle })

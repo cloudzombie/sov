@@ -1118,6 +1118,9 @@ fn baked_checkpoints(chain_id: &str) -> Vec<(u64, Hash)> {
 /// v0.1.99 mainnet node runs the identical consensus schedule (two nodes with different
 /// deployment heights, thresholds, or grace G would split at activation / at `H_a+G`).
 struct BakedDeployments {
+    /// Legacy authorization/pool-v1 retirement (bit 4). Canonical networks
+    /// remain unarmed until a published, coordinated upgrade schedule exists.
+    pq_sunset: Option<sov_chain::blockchain::PqDeploymentConfig>,
     /// The `tx-domain` hard-fork deployment (bit 0): chain-bound tx/intent signatures.
     tx_domain: sov_governance::Deployment,
     /// The `fee-auction` deployment (bit 1): the `Action::Tipped` envelope.
@@ -1153,6 +1156,15 @@ struct BakedDeployments {
 /// [`baked_deployments`] is tested FIRST regardless, so mainnet's release-pinned
 /// preset can never be displaced by this one.
 const E2E_REHEARSAL_CHAIN_PREFIX: &str = "sov-e2e-";
+
+/// Reserved for explicit, isolated post-quantum retirement rehearsals. The
+/// schedule is pinned in this binary, never supplied as mutable per-node flags.
+pub const PQ_REHEARSAL_CHAIN_PREFIX: &str = "sov-pq-rehearsal-";
+const PQ_REHEARSAL_PERIOD: u64 = 8;
+const PQ_REHEARSAL_START_HEIGHT: u64 = 32;
+const PQ_REHEARSAL_TIMEOUT_HEIGHT: u64 = 40;
+const PQ_REHEARSAL_ROTATION_HEIGHT: u64 = 48;
+const PQ_REHEARSAL_SUNSET_DELAY: u64 = 16;
 
 /// The E2E rehearsal net's `tx-domain` window length, in blocks. Small enough
 /// that `Defined → Started → LockedIn → Active` completes inside one bounded
@@ -1205,6 +1217,9 @@ fn baked_deployments(chain_id: &str) -> Option<BakedDeployments> {
     // MAINNET FIRST, unconditionally: nothing below can shadow the frozen preset.
     if chain_id.contains("mainnet") {
         return Some(mainnet_deployments());
+    }
+    if chain_id.starts_with(PQ_REHEARSAL_CHAIN_PREFIX) {
+        return Some(pq_rehearsal_deployments());
     }
     if chain_id.starts_with(E2E_REHEARSAL_CHAIN_PREFIX) {
         return Some(e2e_rehearsal_deployments());
@@ -1302,6 +1317,7 @@ fn mainnet_deployments() -> BakedDeployments {
     )
     .expect("baked mainnet tx-timestamp deployment is valid");
     BakedDeployments {
+        pq_sunset: None,
         tx_domain,
         fee_auction: Some(fee_auction),
         // Pool v2 is ARMED on mainnet as of 0.2.5: bit 2 rides a schedule with
@@ -1357,6 +1373,7 @@ fn e2e_rehearsal_deployments() -> BakedDeployments {
     )
     .expect("rehearsal shielded-v2 deployment is valid");
     BakedDeployments {
+        pq_sunset: None,
         tx_domain,
         fee_auction: None,
         shielded_v2: Some(shielded_v2),
@@ -1368,6 +1385,51 @@ fn e2e_rehearsal_deployments() -> BakedDeployments {
         // Signal readiness for bit 0 AND bit 2 (bit 1, fee-auction, is not
         // scheduled on this net).
         signal_mask: 0b101,
+    }
+}
+
+/// Strict, mandatory retirement rehearsal on a separate genesis. Transaction
+/// domains activate at height 24; PQ migration opens at R=48 and freezes all
+/// legacy authority and pool-v1 spends at S=64. The minimum activation guard
+/// and BIP-8 timeout make those heights independent of readiness votes.
+/// Pool v2 remains unarmed because its quantum proof soundness is unestablished.
+fn pq_rehearsal_deployments() -> BakedDeployments {
+    let threshold = sov_governance::Threshold::new(9, 10).expect("valid rehearsal threshold");
+    let tx_domain = sov_governance::Deployment::new(
+        "tx-domain",
+        sov_governance::BIT_TX_DOMAIN,
+        BlockHeight::new(8),
+        BlockHeight::new(16),
+        PQ_REHEARSAL_PERIOD,
+        threshold,
+        BlockHeight::new(24),
+        true,
+    )
+    .expect("valid rehearsal transaction-domain deployment");
+    let pq_sunset = sov_chain::blockchain::PqDeploymentConfig {
+        deployment: sov_governance::Deployment::new(
+            sov_governance::PQ_SUNSET_DEPLOYMENT,
+            sov_governance::BIT_PQ_SUNSET,
+            BlockHeight::new(PQ_REHEARSAL_START_HEIGHT),
+            BlockHeight::new(PQ_REHEARSAL_TIMEOUT_HEIGHT),
+            PQ_REHEARSAL_PERIOD,
+            threshold,
+            BlockHeight::new(PQ_REHEARSAL_ROTATION_HEIGHT),
+            true,
+        )
+        .expect("valid mandatory PQ retirement deployment"),
+        sunset_delay_blocks: PQ_REHEARSAL_SUNSET_DELAY,
+        // Every legacy account must rotate, including zero-balance accounts.
+        threshold_grains: 0,
+    };
+    BakedDeployments {
+        pq_sunset: Some(pq_sunset),
+        tx_domain,
+        fee_auction: None,
+        shielded_v2: None,
+        tx_timestamp: None,
+        grace_blocks: 0,
+        signal_mask: (1 << sov_governance::BIT_TX_DOMAIN) | (1 << sov_governance::BIT_PQ_SUNSET),
     }
 }
 
@@ -1388,6 +1450,9 @@ fn e2e_rehearsal_deployments() -> BakedDeployments {
 fn genesis_chain_with_baked_preset(genesis: &GenesisConfig) -> Result<Blockchain, ChainError> {
     let mut chain = Blockchain::new(genesis)?;
     if let Some(baked) = baked_deployments(&genesis.chain_id) {
+        if let Some(pq_sunset) = baked.pq_sunset {
+            chain.set_pq_deployment(pq_sunset);
+        }
         chain.set_tx_domain_deployment(baked.tx_domain);
         if let Some(fee_auction) = baked.fee_auction {
             chain.set_fee_auction_deployment(fee_auction);
@@ -2848,6 +2913,174 @@ mod tests {
         };
         assert_eq!(baked.grace_blocks, 576);
         assert_eq!(baked.signal_mask, 0b1111, "signals bits 0, 1, 2 AND 3");
+        assert!(
+            baked.pq_sunset.is_none(),
+            "canonical mainnet PQ retirement remains unarmed"
+        );
+    }
+
+    #[test]
+    fn pq_rehearsal_executes_rotation_sunset_and_cold_replay() {
+        use sov_types::{Action, SignedTransaction, Transaction};
+        let legacy = Keypair::from_seed([111; 32]);
+        let successor = Keypair::hybrid_from_seed([112; 32]);
+        let miner = Keypair::hybrid_from_seed([113; 32]);
+        let miner_id = miner.public_key().implicit_account_id();
+        let legacy_id = AccountId::new("legacy.sov").unwrap();
+        let genesis = GenesisConfig {
+            chain_id: "sov-pq-rehearsal-local".into(),
+            timestamp_ms: 1_000,
+            accounts: vec![
+                GenesisAccount {
+                    account: miner_id.clone(),
+                    key: miner.public_key(),
+                    balance: Balance::ZERO,
+                },
+                GenesisAccount {
+                    account: legacy_id.clone(),
+                    key: legacy.public_key(),
+                    balance: Balance::from_sov(100).unwrap(),
+                },
+            ],
+            mining: MiningPolicy::test(),
+            vesting: vec![],
+        };
+        let mut chain = genesis_chain_with_baked_preset(&genesis).unwrap();
+        let domain = chain.chain_domain();
+        let transfer = |key: &Keypair, nonce| {
+            SignedTransaction::sign_in(
+                Transaction {
+                    signer: legacy_id.clone(),
+                    public_key: key.public_key(),
+                    nonce,
+                    action: Action::Transfer {
+                        to: miner_id.clone(),
+                        amount: Balance::from_grains(1),
+                    },
+                },
+                key,
+                Some(&domain),
+            )
+            .unwrap()
+        };
+        let mut blocks = Vec::new();
+        for height in 1..=66 {
+            let timestamp = 1_000 + height * 1_000;
+            let transactions = match height {
+                47 => vec![transfer(&legacy, 0)],
+                48 => {
+                    let (_, rejected) = chain
+                        .build_candidate(vec![transfer(&legacy, 1)], timestamp)
+                        .unwrap();
+                    assert_eq!(rejected.len(), 1, "ordinary legacy authority retires at R");
+                    let proof = successor.sign(&sov_types::rotation_signing_bytes(
+                        &legacy_id,
+                        1,
+                        &successor.public_key(),
+                    ));
+                    vec![SignedTransaction::sign_in(
+                        Transaction {
+                            signer: legacy_id.clone(),
+                            public_key: legacy.public_key(),
+                            nonce: 1,
+                            action: Action::RotateKey {
+                                new_key: successor.public_key(),
+                                proof,
+                            },
+                        },
+                        &legacy,
+                        Some(&domain),
+                    )
+                    .unwrap()]
+                }
+                64 => vec![transfer(&successor, 2)],
+                _ => vec![],
+            };
+            let expected_count = transactions.len();
+            let block = chain.produce_block(transactions, timestamp).unwrap();
+            assert_eq!(block.transactions.len(), expected_count);
+            let receipts = chain.import_block(block.clone()).unwrap();
+            assert!(receipts.iter().all(|r| r.succeeded()));
+            blocks.push(block);
+            if height == 47 {
+                let status = crate::quantum_status(&chain);
+                assert_eq!(status["pqSunset"]["stage"], "rotation_only");
+                assert_eq!(status["pqSunset"]["rotationOnlyHeight"], 48);
+                assert_eq!(status["poolV1RecoveryAllowed"], true);
+            }
+            if height == 63 {
+                let status = crate::quantum_status(&chain);
+                assert_eq!(status["pqSunset"]["stage"], "sunset");
+                assert_eq!(status["legacyTransactionsAllowed"], false);
+                assert_eq!(status["poolV1SpendsAllowed"], false);
+                assert_eq!(status["poolV2CreationAllowed"], false);
+            }
+        }
+        assert_eq!(
+            chain.ledger().account(&legacy_id).key,
+            Some(successor.public_key())
+        );
+        assert_eq!(chain.ledger().account(&legacy_id).nonce, 3);
+        let mut replay = genesis_chain_with_baked_preset(&genesis).unwrap();
+        for block in blocks {
+            replay.import_block(block).unwrap();
+        }
+        assert_eq!(replay.head().hash(), chain.head().hash());
+        assert_eq!(replay.ledger().state_root(), chain.ledger().state_root());
+        assert_eq!(
+            crate::quantum_status(&replay),
+            crate::quantum_status(&chain)
+        );
+    }
+
+    #[test]
+    fn pq_rehearsal_has_mandatory_retirement_without_activating_unreviewed_v2() {
+        let baked = baked_deployments("sov-pq-rehearsal-local").unwrap();
+        let pq = baked.pq_sunset.as_ref().unwrap();
+        assert_eq!(pq.deployment.name, sov_governance::PQ_SUNSET_DEPLOYMENT);
+        assert_eq!(pq.deployment.bit, sov_governance::BIT_PQ_SUNSET);
+        assert_eq!(pq.threshold_grains, 0);
+        assert_eq!(pq.sunset_delay_blocks, 16);
+        assert!(pq.deployment.lockinontimeout);
+        assert!(baked.shielded_v2.is_none());
+        assert_eq!(baked.signal_mask, 0b10001);
+        struct Votes(bool);
+        impl sov_governance::MinerSignals for Votes {
+            fn signals(&self, _: BlockHeight, _: u8) -> bool {
+                self.0
+            }
+        }
+        use sov_governance::ThresholdState as S;
+        for signaling in [false, true] {
+            for (height, expected) in [
+                (31, S::Defined),
+                (32, S::Started),
+                (39, S::Started),
+                (40, S::LockedIn),
+                (47, S::LockedIn),
+                (48, S::Active),
+                (64, S::Active),
+            ] {
+                assert_eq!(
+                    sov_governance::state_at(
+                        &pq.deployment,
+                        BlockHeight::new(height),
+                        &Votes(signaling)
+                    ),
+                    expected,
+                    "mandatory PQ retirement height {height}, signaling {signaling}"
+                );
+            }
+            assert_eq!(
+                sov_governance::state_at(&baked.tx_domain, BlockHeight::new(24), &Votes(signaling)),
+                S::Active,
+                "transaction domains must activate before retirement"
+            );
+        }
+        let overlap = baked_deployments("sov-pq-rehearsal-mainnet").unwrap();
+        assert!(overlap.pq_sunset.is_none(), "canonical preset always wins");
+        assert_eq!(overlap.signal_mask, 0b1111);
+        assert!(baked_deployments("sov-testnet-1").is_none());
     }
 
     #[test]

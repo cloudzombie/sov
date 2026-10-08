@@ -1,73 +1,127 @@
-# SOV Quantum Posture — What Is Protected, What Is Not
+# SOV Quantum Posture — Current Protection and Remaining Gaps
 
-**Status: normative disclosure. Last verified against the working tree
-2026-06-16 — post-Nakamoto (consensus is pure proof-of-work: no validators, no
-BFT votes) and post-rebrand (ticker XUS).** This document states the chain's security
-posture against a cryptographically relevant quantum computer (CRQC) in
-plain language, including the one exposure that **no future code change can
-fix**. Every claim below maps to a theorem in [`proofs.md`](proofs.md) and a
-passing test.
+**Working-tree assessment: 2026-10-08.** SOV Station is the native Rust client
+in `node/`; it runs the Rust node and transport in process. This assessment
+describes code, not a remote node's current height or activation state. Mainnet
+is live; an independent audit of the integrated stack remains outstanding.
+Tests verify implementation behavior, not resistance to unknown attacks.
 
-## Protected today
+Post-quantum cryptography runs on ordinary computers. It does not put hashes,
+a wallet, or a blockchain into a physical quantum state. The threat here is a
+quantum computer that breaks conventional elliptic-curve cryptography,
+including ECDSA, Ed25519, X25519, and Orchard's curve assumptions. If every
+public-key primitive, including ML-DSA and ML-KEM, is broken, these mechanisms
+cannot guarantee survival either.
 
-| Surface | Mechanism | Proof |
+## Current Rust protection
+
+| Surface | Implementation | Qualification |
 |---|---|---|
-| **Money / account ownership** | Hybrid Ed25519+ML-DSA-65 keys (FIPS 204); forging requires breaking BOTH schemes. Genesis is PQ-native by default — every key `sov-testnet gen` mints is hybrid. | Theorems 30, 30.1; Remark 33.1 |
-| **Consensus / mining** | Pure Nakamoto proof-of-work: a block is authorized by hashpower, not signatures, so consensus is scheme-agnostic — a miner's coinbase account is hybrid-keyed with no consensus change. (The PoW hash itself is hash-secure; see the hashing row.) | Corollary 30.1; A1 |
-| **Legacy stragglers** | The miner-signaled `pq-sunset` (BIP-8, miners cannot veto): threshold accounts forced to rotate, then all legacy keys frozen — a forged Ed25519 signature authorizes nothing after the sunset. | Theorems 32–33 |
-| **P2P transport privacy** | Hybrid X25519 + ML-KEM-768 (FIPS 203) channel; recorded traffic requires breaking both. No harvest-now-decrypt-later for the wire. | Theorem 31 |
-| **All hashing** (state roots, tx ids, PoW, HTLC locks) | Blake3/SHA-256 — Grover only halves security margins; no break. | Standing assumption A1 |
-| **Supply, even if the zk proof system fails** | The turnstile: a forged shielded proof cannot mint SOV (conservation catches it), and the drain limiter caps pool outflow at `deshield_limit_grains` per `deshield_window_blocks` (mainnet-like preset: 21,000 XUS per ~day) — slow enough for governance to respond. | Theorems 5, 34 |
+| Station account keys | New generation, normal mnemonic/seed restoration, and signing use hybrid Ed25519 + ML-DSA-65. Account IDs commit to the full hybrid key. | Both signatures must verify. If Ed25519 is forgeable, ownership still depends on ML-DSA and hash/seed assumptions. Scheme-aware legacy seeded imports preserve the original account and encrypted recovery material. Ordinary signing/mining stays disabled; the explicit migration flow authorizes only rotation to a hybrid key before sunset. |
+| Peer traffic | Noise/X25519 plus an inner ML-KEM-768/ChaCha20-Poly1305 layer; no classical-only fallback. | Passive recordings remain protected while either encryption layer holds. Authentication needs the combined transcript binding and a hybrid identity. |
+| Peer authentication | Protocol-v3 signed Hello binds chain, genesis, claimed account, Noise transcript, and exact ML-KEM encapsulation key/ciphertext. | Corrected locally in this change. Old binaries sign only the Noise binding and cannot authenticate with corrected peers. A coordinated rollout is required. Mainnet and the PQ rehearsal namespace now refuse classical-only peer identities; legacy development networks retain compatibility. |
+| Legacy-key retirement | The runtime can retire legacy transaction, intent-owner, and multisig authority under a resolved `PqSchedule`. | **Not scheduled in the baked mainnet preset.** Default hybrid generation does not protect legacy balances. |
+| Supply | Transparent/shielded turnstiles and conservation constrain net issuance; drain limits constrain withdrawals. | Accounting defenses do not prove ownership, privacy, or proof soundness, and do not prevent theft within a pool. |
 
-## NOT protected — stated plainly
+NIST standardizes ML-DSA in [FIPS 204](https://csrc.nist.gov/pubs/fips/204/final)
+and ML-KEM in [FIPS 203](https://csrc.nist.gov/pubs/fips/203/final). These are
+public-key algorithms with assumptions different from elliptic-curve discrete
+logarithms. Standardization is not an audit of SOV's composition or libraries.
 
-**Shielded-pool privacy is harvest-now-decrypt-later exposed.** The Orchard
-shielded pool's note encryption and its Halo2 proof system rest on
-elliptic-curve assumptions (Pallas) that a CRQC breaks. Consequences:
+### Legacy migration is still required
 
-1. **Recorded chain data is forever.** Every shielded transaction ever
-   committed to the chain is public ciphertext. An adversary who archives the
-   chain today and obtains a CRQC later can decrypt **amounts, recipients,
-   and linkages of past shielded activity**. No future upgrade, migration, or
-   code change can retroactively re-encrypt data that is already public.
-   If your threat model includes a future quantum adversary, treat shielded
-   privacy as **time-limited**, with a horizon equal to the arrival of a
-   CRQC.
-2. **What this does NOT threaten:** funds. The supply turnstile (Theorem 5)
-   and the drain limiter (Theorem 34) hold regardless of the proof system's
-   soundness — a quantum adversary could deanonymize past activity and at
-   worst steal *within* the pool at a bounded rate, but can never inflate
-   SOV or touch transparent balances.
+The chain starts with `pq_deployment: None`; the daemon's mainnet preset arms
+transaction domains, fee auctions, shielded v2, and transaction timestamps,
+but does not call `set_pq_deployment`. Legacy Ed25519 authorization remains
+admissible under that schedule. Arming the sunset needs a coordinated,
+history-preserving upgrade and a published rotation window and recovery policy.
 
-**The long-term fix is a hash-based (STARK-class) shielded pool** — designed to
-be both post-quantum sound and post-quantum private. This is a research track:
-no production-audited construction with Orchard's maturity exists today, and
-this project does not ship imitations of one. SOV's own prototype is the
-dormant `shielded-pq` pool v2 (STARK/FRI over Rescue-Prime + Blake3, with
-ML-DSA-65 spend authorization and ML-KEM-768 note encryption). A precise note
-on what "post-quantum sound" does and does not yet mean for it (**PQV2-05**):
-using only hash-based primitives removes any Shor-breakable assumption — a real
-advantage over the curve-based v1 pool — but that alone does **not** establish a
-quantified post-quantum soundness *level*. The bit-security numbers derived for
-its FRI parameters (`chain/docs/pq-shielded-soundness.md` §10) are *classical*
-soundness bounds; the QROM soundness of the Fiat-Shamir-transformed proof, and
-the Grover erosion of its grinding and hash margins, are a separate analysis
-that has not been done. No "128-bit post-quantum" claim is warranted for pool
-v2 until that analysis (scoped in `notes/audit-scope-pq-pool.md` §9) is
-completed, and none may gate arming signal bit 2. Until the audited pool
-exists, the honest guidance for users is above.
+After sunset, no legacy signature may authorize an action, including one
+nested in a hybrid transaction. During rotation, the protected account's
+native holdings govern the restriction; a relayer's balance cannot bypass it.
+Multisig vaults must replace their policy before old approvals cease to count.
+A signature-only rotation after classical key recovery becomes practical
+cannot distinguish the owner from an attacker: migration must happen earlier.
+The current threshold measures native liquid plus vesting balances; it does
+not value tokens or other collateral.
 
-## Implementation caveats (also honest)
+## Hashing and mining
 
-- The PQ implementations (`fips203`, `fips204`) are pure-Rust and NIST
-  ACVP-vector-tested, but do **not** yet have the audit depth of
-  `ed25519-dalek`. This is exactly why every PQ use is a **hybrid
-  conjunction** — the classical, audited scheme must also pass. The chain
-  never trusts lattice cryptography alone.
-- Transport *authentication* (as opposed to privacy) is post-quantum only
-  for peers whose identity keys are hybrid — the generated default, but an
-  operator who hand-configures a legacy key keeps classical-only
-  authentication (Remark 31.1).
-- An external third-party audit of the whole stack, including the PQ
-  integration, remains open (tracked as the standing audit item) and is a
-  launch prerequisite. Nothing in this document substitutes for it.
+Canonical identifiers and Merkle/state commitments use **BLAKE3-256**. HTLCs
+use **SHA-256** for external-chain interoperability. Mainnet proof-of-work is
+**RandomX**, using BLAKE2b internally and a 256-bit final digest; development
+chains can use SHA-256d.
+
+For an ideal 256-bit digest, generic quantum preimage search takes approximately
+`2^128` oracle queries. Ideal quantum collision search can take approximately
+`2^(256/3)` (about `2^85`), subject to substantial memory and implementation
+requirements. These are asymptotic query estimates, not a practical break or a
+measured level for every construction. A 256-bit hash therefore does not
+justify blanket claims of 128-bit quantum security for every use. See the
+original [quantum search](https://arxiv.org/abs/quant-ph/9605034) and
+[quantum collision](https://arxiv.org/abs/quant-ph/9705002) papers.
+
+A conservative 128-bit generic quantum **collision** target needs a reviewed
+construction with at least 384-bit output, such as SHA3-384/512, and analysis
+of its composition. Longer BLAKE3 XOF output does not strengthen its internals
+([BLAKE3 security notes](https://github.com/BLAKE3-team/BLAKE3/blob/master/c/README.md#security-notes)).
+Changing current hashes changes roots, IDs, and address bindings: it requires
+a versioned consensus migration, not a constant swap.
+
+Quantum amplitude amplification can accelerate PoW target search in principle.
+RandomX memory hardness does not prove immunity. Coherent implementation costs
+and effects on mining economics remain unquantified. Difficulty adjustment
+alone does not prevent disproportionate effective work. Nakamoto consensus
+still requires an honest majority of effective mining capacity.
+
+## Shielded pools
+
+**Pool v1 (Orchard/Halo2) uses elliptic curves.** A sufficiently capable quantum
+adversary threatens its privacy, proof, and authorization assumptions. Recorded
+ciphertext cannot be retroactively protected. Drain limits bound withdrawals;
+they cannot make the remaining notes safe.
+
+The corrected v1 verifier checks the Halo2 proof, every RedPallas spend
+authorization, and the binding signature. The migration-window digest binds
+chain ID, genesis, transparent receiving account, transaction nonce, and
+Orchard's effects commitment. Modified recipients, nonces, domains, signatures,
+and public value balances are rejected. After R the runtime requires this
+bound authorization and prohibits new v1 deposits; at S it freezes every v1
+carrier. Explicit proof-only legacy APIs reproduce pre-R history. These
+consensus rules are armed on the fresh PQ rehearsal chain, **not mainnet**.
+Station blocks new v1 deposits and private transfers, and permits withdrawal
+only when the connected node reports an active bound recovery window.
+
+**Pool v2 uses PQ-oriented primitives:** ML-KEM-768 note encryption, ML-DSA-65
+spend authorization, and STARK/FRI over Rescue-Prime and BLAKE3. Its deployment
+is **armed in the baked mainnet preset as of 0.2.5**; actual activation depends
+on committed miner signals. Universally describing it as dormant is stale.
+Activation is not audit evidence. New v2 carriers are now refused by RPC and
+peer gossip; Station refuses all v2 proof creation and broadcast. The PQ
+migration fork also freezes the current v2 suite from R onward. Existing
+pre-fork block verification remains available for replay.
+
+The current prover uses an unmasked default Winterfell trace. Constant secret
+columns plus deterministic padding do not establish zero knowledge; published
+trace evaluations can reveal private inputs. This is an implementation
+confidentiality defect, independently of quantum attacks. Winterfell itself
+[documents the absence of perfect zero knowledge](https://github.com/facebook/winterfell#planned-features).
+The operational gates contain this defect; they do **not** repair the prover
+or restore privacy to previously published proofs. See
+[pq-proof-remediation.md](pq-proof-remediation.md).
+
+Its proof parameters have classical soundness analysis, not a quantified
+quantum-random-oracle-model (QROM) soundness level. The external circuit audit
+and QROM analysis remain pending, as disclosed in the daemon's arming preset
+and [audit scope](../../notes/audit-scope-pq-pool.md#9-post-quantum-qrom-soundness-of-the-proof--pqv2-05).
+“Uses post-quantum primitives” is justified; “proven 128-bit post-quantum
+shielded security” is not. The implementation stays quarantined until a reviewed replacement proves
+both confidentiality and the intended quantum soundness target.
+
+## Completing the migration
+
+[quantum-migration.md](quantum-migration.md) records the remaining upgrade work
+and verification gates. Existing history, genesis, hashes, and activation
+schedules must stay reproducible. The [rehearsal](pq-rehearsal.md) exercises a working rotation/sunset and
+cold replay. Client fixes do not arm a mainnet sunset or complete the pending
+proof audit.

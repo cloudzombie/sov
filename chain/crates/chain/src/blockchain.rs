@@ -1047,6 +1047,13 @@ impl Blockchain {
         self.pq_deployment = Some(config);
     }
 
+    /// The release-pinned post-quantum deployment and retirement parameters,
+    /// if armed. Read-only observability; consensus still resolves activation
+    /// from committed signals through [`Self::resolved_pq`].
+    pub fn pq_deployment_config(&self) -> Option<&PqDeploymentConfig> {
+        self.pq_deployment.as_ref()
+    }
+
     /// Schedule the miner-signaled `tx-domain` hard fork: once `deployment`
     /// activates under the BIP-9/8 state machine, transaction and intent
     /// signatures must bind to this chain's identity (`chain_id` + genesis),

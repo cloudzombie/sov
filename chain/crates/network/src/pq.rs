@@ -23,15 +23,41 @@
 //! survives. There is no fallback: a connection that cannot complete the KEM
 //! exchange is dropped (fail closed).
 //!
-//! Honest scope: this hybridizes *confidentiality*. Channel *authentication*
-//! is the signed application `Hello` over the channel binding — post-quantum
-//! exactly when the node's identity key is a hybrid key (p18-i1).
+//! Channel *authentication* is the signed application `Hello` over a separate
+//! binding of the Noise handshake hash **and both exact KEM messages**. If
+//! X25519 is broken, an active attacker can replace KEM messages inside Noise;
+//! binding only the earlier Noise transcript would let that attacker relay an
+//! authentic `Hello`. The complete binding detects either substitution and is
+//! post-quantum authenticated when the identity key is hybrid (p18-i1).
+//!
+//! The frame KDF above is retained. Peers using the old Noise-only `Hello`
+//! binding are rejected by application authentication, with no binding fallback;
+//! deploying this change therefore requires a coordinated peer upgrade.
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 
 /// The shared-secret length ML-KEM produces (FIPS 203).
 pub const KEM_SECRET_LEN: usize = fips203::SSK_LEN; // 32
+
+/// Bind an authenticated identity to the complete hybrid key exchange.
+///
+/// The Noise hash is length-framed; the ML-KEM-768 encapsulation key and
+/// ciphertext have fixed, distinct lengths and occur in their wire order.
+/// Hash the exact sent/received bytes, never a re-encoded representation.
+pub(crate) fn channel_binding(
+    noise_handshake_hash: &[u8],
+    encapsulation_key: &[u8; fips203::ml_kem_768::EK_LEN],
+    ciphertext: &[u8; fips203::ml_kem_768::CT_LEN],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sov:pq-channel-binding:ml-kem-768:v1");
+    hasher.update(&(noise_handshake_hash.len() as u64).to_be_bytes());
+    hasher.update(noise_handshake_hash);
+    hasher.update(encapsulation_key);
+    hasher.update(ciphertext);
+    *hasher.finalize().as_bytes()
+}
 
 /// Derive one direction's inner channel key.
 fn direction_key(domain: &str, handshake_hash: &[u8], kem_secret: &[u8; KEM_SECRET_LEN]) -> Key {
@@ -112,6 +138,22 @@ mod tests {
             PqChannel::new(hh, &secret, true),
             PqChannel::new(hh, &secret, false),
         )
+    }
+
+    #[test]
+    fn binding_covers_noise_and_each_exact_kem_message() {
+        let noise_hash = [1; 32];
+        let mut ek = [2; fips203::ml_kem_768::EK_LEN];
+        let mut ct = [3; fips203::ml_kem_768::CT_LEN];
+        let binding = channel_binding(&noise_hash, &ek, &ct);
+        assert_ne!(binding, noise_hash, "a Noise-only binding is never used");
+        assert_ne!(binding, channel_binding(&[4; 32], &ek, &ct));
+        assert_ne!(binding, channel_binding(&noise_hash[..31], &ek, &ct));
+        ek[0] ^= 1;
+        assert_ne!(binding, channel_binding(&noise_hash, &ek, &ct));
+        ek[0] ^= 1;
+        ct[fips203::ml_kem_768::CT_LEN - 1] ^= 1;
+        assert_ne!(binding, channel_binding(&noise_hash, &ek, &ct));
     }
 
     #[test]
