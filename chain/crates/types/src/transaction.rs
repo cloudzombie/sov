@@ -491,6 +491,10 @@ pub const TX_TIMESTAMP_MAX_AGE_MS: u64 = 30 * 60 * 1000;
 /// `Vec<u8>` encoding, untouched.
 pub const MAX_SHIELDED_V2_BUNDLE_BYTES: usize = 144 * 1024;
 
+/// Bound for explicitly version-2 hiding proofs. Version 1 and unknown suites
+/// keep their deployed cap. Execution still requires bit 5 and the backend.
+pub const MAX_SHIELDED_V2_SUITE2_BUNDLE_BYTES: usize = 2 * 1024 * 1024 + 16 * 1024;
+
 /// Size-capped Borsh decode for the [`Action::ShieldedV2`] payload (wired in
 /// via `#[borsh(deserialize_with)]`). Reads the exact same bytes as the
 /// default `Vec<u8>` decoder — the wire format is untouched — but rejects a
@@ -498,16 +502,28 @@ pub const MAX_SHIELDED_V2_BUNDLE_BYTES: usize = 144 * 1024;
 /// and only then reads exactly that many bytes.
 fn bounded_v2_bundle_bytes<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Vec<u8>> {
     let len = u32::deserialize_reader(reader)? as usize;
-    if len > MAX_SHIELDED_V2_BUNDLE_BYTES {
+    if len > MAX_SHIELDED_V2_SUITE2_BUNDLE_BYTES {
         return Err(borsh::io::Error::new(
             borsh::io::ErrorKind::InvalidData,
             "ShieldedV2 bundle exceeds MAX_SHIELDED_V2_BUNDLE_BYTES",
         ));
     }
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut version = [0u8; 1];
+    reader.read_exact(&mut version)?;
+    if version[0] != 2 && len > MAX_SHIELDED_V2_BUNDLE_BYTES {
+        return Err(borsh::io::Error::new(
+            borsh::io::ErrorKind::InvalidData,
+            "legacy/unknown ShieldedV2 bundle exceeds its 144 KiB cap",
+        ));
+    }
     // Bounded above, so this allocation is at most the cap; read_exact then
     // fails cleanly if the payload is truncated.
     let mut bundle = vec![0u8; len];
-    reader.read_exact(&mut bundle)?;
+    bundle[0] = version[0];
+    reader.read_exact(&mut bundle[1..])?;
     Ok(bundle)
 }
 
@@ -1143,6 +1159,24 @@ mod tests {
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(&vec![0xAAu8; have]);
         out
+    }
+
+    #[test]
+    fn only_explicit_suite2_gets_its_separate_decode_cap() {
+        let length = MAX_SHIELDED_V2_BUNDLE_BYTES + 1;
+        let mut bytes = v2_bytes(length as u32, length);
+        for version in [0, 1, 3, 255] {
+            bytes[5] = version;
+            assert!(borsh::from_slice::<Action>(&bytes).is_err());
+        }
+        bytes[5] = 2;
+        let decoded: Action = borsh::from_slice(&bytes).unwrap();
+        assert_eq!(borsh::to_vec(&decoded).unwrap(), bytes);
+        let oversized = v2_bytes(MAX_SHIELDED_V2_SUITE2_BUNDLE_BYTES as u32 + 1, 0);
+        assert!(
+            borsh::from_slice::<Action>(&oversized).is_err(),
+            "reject declared size before allocating or reading payload"
+        );
     }
 
     #[test]

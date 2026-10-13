@@ -149,6 +149,25 @@ pub const MAX_BLOCK_WEIGHT: u64 = 4 * 1024 * 1024;
 ///   transaction can never monopolize block space.
 pub const MAX_TX_WEIGHT: u64 = MAX_BLOCK_WEIGHT / 16;
 
+/// Version-2-only admission ceiling after bit-5 activation. Fits a minimum
+/// elastic block with header margin; legacy transactions retain MAX_TX_WEIGHT.
+pub const MAX_SUITE2_TX_WEIGHT: u64 = 2304 * 1024;
+/// Conservative verification allowance for the wider hiding proof profile.
+pub const SHIELDED_V2_SUITE2_VERIFY_WEIGHT: u64 = 128 * WEIGHT_UNITS_PER_VERIFY_MS;
+
+/// Identify an explicit version-2 carrier through action envelopes.
+pub fn is_suite2_action(mut action: &Action) -> bool {
+    loop {
+        match action {
+            Action::ShieldedV2 { bundle } => return bundle.first() == Some(&2),
+            Action::Tipped { inner, .. } | Action::Timestamped { inner, .. } => action = inner,
+            Action::MultisigExec { action: inner, .. }
+            | Action::ProposeMultisig { action: inner, .. } => action = inner,
+            _ => return false,
+        }
+    }
+}
+
 /// The verification-cost component of an action's weight, in weight units.
 ///
 /// **Zero for every action on mainnet today.** The recursion through the three
@@ -164,6 +183,9 @@ pub const MAX_TX_WEIGHT: u64 = MAX_BLOCK_WEIGHT / 16;
 /// cyclic `Action` unconstructable.
 pub fn verify_weight(action: &Action) -> u64 {
     match action {
+        Action::ShieldedV2 { bundle } if bundle.first() == Some(&2) => {
+            SHIELDED_V2_SUITE2_VERIFY_WEIGHT
+        }
         Action::ShieldedV2 { .. } => SHIELDED_V2_VERIFY_WEIGHT,
         // Carriers price whatever they carry — wrapping is never a discount.
         Action::Tipped { inner, .. } => verify_weight(inner),

@@ -88,6 +88,12 @@ impl Node {
     fn refresh_mempool_domain(&mut self) {
         let mode = self.chain.resolved_tx_domain_mode(self.chain.height() + 1);
         self.mempool.set_mode(mode);
+        self.mempool.set_suite2_active(
+            cfg!(feature = "zk-suite2")
+                && self
+                    .chain
+                    .shielded_v2_suite2_active(self.chain.height() + 1),
+        );
         self.mempool.set_chain_height(self.chain.height());
     }
 
@@ -362,6 +368,88 @@ impl Node {
                 account: stx.transaction.signer.to_string(),
             });
         }
+        // A fee-empty wallet may submit a direct hiding-suite withdrawal.
+        // Mirror execution's proof-backed funding exception without crediting
+        // any hypothetical payout to its mempool balance or later transfers.
+        let next_height = self.chain.height().saturating_add(1);
+        if cfg!(feature = "zk-suite2")
+            && self.chain.shielded_v2_active(next_height)
+            && self.chain.shielded_v2_suite2_active(next_height)
+            && matches!(&stx.transaction.action, Action::ShieldedV2 { bundle }
+                if bundle.first() == Some(&2))
+        {
+            let policy = self.chain.mining_policy();
+            let gas = sov_runtime::gas_for(&stx.transaction.action)
+                + sov_runtime::gas::envelope_gas(&stx.transaction.public_key);
+            let fee = sov_primitives::Balance::from_grains(
+                u128::from(gas)
+                    .checked_mul(policy.gas_price.grains())
+                    .ok_or(NodeError::Suite2FeeFunding(
+                        sov_runtime::ExecutionError::Overflow,
+                    ))?,
+            );
+            if account.balance.checked_sub(fee).is_none() {
+                // Preserve admission's cheap size/auth checks before asking
+                // the hiding verifier to do expensive proof work.
+                let weight = sov_types::weight::tx_weight(&stx);
+                let limit = sov_types::weight::MAX_SUITE2_TX_WEIGHT;
+                if weight > limit {
+                    return Err(NodeError::Mempool(MempoolError::TooLarge { weight, limit }));
+                }
+                if stx.transaction.nonce < account.nonce {
+                    return Err(NodeError::Mempool(MempoolError::Stale {
+                        current: account.nonce,
+                        got: stx.transaction.nonce,
+                    }));
+                }
+                if self.mempool.contains(&stx.id()) {
+                    return Err(NodeError::Mempool(MempoolError::Duplicate));
+                }
+                let mode = self.chain.resolved_tx_domain_mode(next_height);
+                if !stx.verify_signature_mode(&mode) {
+                    return Err(NodeError::Mempool(MempoolError::InvalidSignature));
+                }
+                let ctx = sov_runtime::BlockContext {
+                    height: next_height,
+                    prev_hash: self.chain.head().hash(),
+                    block_time_ms: self.chain.head().header.timestamp_ms,
+                    mining: policy,
+                    gas_price: policy.gas_price,
+                    // The funding verifier does not use coinbase identity;
+                    // payout identity is the separately supplied tx signer.
+                    miner: stx.transaction.signer.clone(),
+                    pq: self.chain.resolved_pq(next_height),
+                    tx_domain: mode,
+                    fee_auction_active: self.chain.fee_auction_active(next_height),
+                    shielded_v2_active: true,
+                    shielded_v2_suite2_active: true,
+                    tx_timestamp_active: self.chain.tx_timestamp_active(next_height),
+                    chain_domain: self.chain.chain_domain(),
+                };
+                let effects = sov_runtime::execution::verify_direct_suite2_withdrawal_for_fee(
+                    &stx.transaction.action,
+                    self.chain.ledger(),
+                    &ctx,
+                    &stx.transaction.signer,
+                    stx.transaction.nonce,
+                    account.balance,
+                )
+                .map_err(NodeError::Suite2FeeFunding)?;
+                let available = match effects {
+                    Some(effects) => account.balance.checked_add(effects.deshield_out).ok_or(
+                        NodeError::Suite2FeeFunding(sov_runtime::ExecutionError::Overflow),
+                    )?,
+                    None => account.balance,
+                };
+                if available.checked_sub(fee).is_none() {
+                    return Err(NodeError::Suite2FeeFunding(
+                        sov_runtime::ExecutionError::CannotAffordFee {
+                            account: stx.transaction.signer.to_string(),
+                        },
+                    ));
+                }
+            }
+        }
         self.mempool
             .insert(stx, account.nonce, account.balance)
             .map_err(NodeError::Mempool)
@@ -466,17 +554,34 @@ impl Node {
         // thin wrapper over it); taking the tracked form here changes no mempool
         // behavior — the orphaned set is consumed ONLY to keep the node-local
         // timing index honest across a reorg.
+        let old_head = self.chain.head().hash();
         let imported = self
             .chain
             .import_block_tracked(block.clone())
             .map_err(NodeError::Chain)?;
         let receipts = imported.receipts;
+        if self.chain.head().hash() == old_head
+            || self
+                .chain
+                .block_by_height(block.header.height.get())
+                .map(Block::hash)
+                != Some(block.hash())
+        {
+            // A losing mining race or a duplicate commits no transactions.
+            // Keep admission stamps, pending work and active timing intact.
+            return Ok(Produced { block, receipts });
+        }
         // Timing FIRST: the mempool still holds this block's transactions, so
         // their admission stamps are still readable. See `record_block_timing`.
         self.repair_timing_after_reorg(&imported.reverted_txs);
         self.record_block_timing(&block);
         for stx in &block.transactions {
             self.mempool.remove(&stx.id());
+        }
+        self.refresh_mempool_domain();
+        for stx in imported.reverted_txs {
+            let acct = self.chain.ledger().account(&stx.transaction.signer);
+            let _ = self.mempool.insert(stx, acct.nonce, acct.balance);
         }
         {
             let ledger = self.chain.ledger();
@@ -488,7 +593,6 @@ impl Node {
             self.mempool
                 .evict_stranded(|a| ledger.account(a).nonce, sov_mempool::STRANDED_TTL_MS);
         }
-        self.refresh_mempool_domain();
         Ok(Produced { block, receipts })
     }
 
@@ -515,10 +619,23 @@ impl Node {
             });
         }
 
+        let old_head = self.chain.head().hash();
         let imported = self
             .chain
             .import_block_tracked(block.clone())
             .map_err(NodeError::Chain)?;
+        if self.chain.head().hash() == old_head
+            || self
+                .chain
+                .block_by_height(block.header.height.get())
+                .map(Block::hash)
+                != Some(block.hash())
+        {
+            // Fully validated side branches are retained by the chain, but
+            // they did not include anything on the active ledger. They must
+            // not suppress transactions or rewrite node-local observations.
+            return Ok(imported.receipts);
+        }
         // Timing FIRST, before any pool mutation: the mempool still holds this
         // block's transactions, so their admission stamps are still readable.
         // See `record_block_timing`.
@@ -560,6 +677,9 @@ pub enum NodeError {
     /// A transaction was rejected by the mempool.
     #[error("mempool rejected transaction: {0}")]
     Mempool(MempoolError),
+    /// A direct activated hiding-suite withdrawal cannot safely fund its fee.
+    #[error("suite-2 withdrawal fee funding rejected: {0}")]
+    Suite2FeeFunding(sov_runtime::ExecutionError),
     /// Block production or import failed.
     #[error("chain error: {0}")]
     Chain(ChainError),
@@ -1195,6 +1315,12 @@ mod tests {
                 );
             }
         }
+        assert!(
+            node.mempool.contains(&orphan_tx),
+            "an orphaned valid payment returns to the pool"
+        );
+        let reminted = node.produce(1_300).unwrap().block;
+        assert!(reminted.transactions.iter().any(|tx| tx.id() == orphan_tx));
     }
 
     #[test]
@@ -1220,6 +1346,44 @@ mod tests {
             node.tx_timing(&side_tx).is_none(),
             "a side-branch block commits nothing, so it times nothing"
         );
+    }
+
+    #[test]
+    fn losing_side_branches_cannot_evict_pending_transactions() {
+        for self_mined in [false, true] {
+            let mut node = devnet_node();
+            node.produce(1_100).unwrap();
+            node.produce(1_200).unwrap();
+            let tx = usa_transfer("ecb.reserve.sov", 10, 0);
+            let tx_id = tx.id();
+            node.submit(tx.clone()).unwrap();
+            let old_head = node.chain().head().hash();
+            let admitted = node.mempool.first_seen(&tx_id);
+            let mut rival = devnet_node();
+            rival.submit(tx).unwrap();
+            let side = rival.produce(1_000).unwrap().block;
+            if self_mined {
+                node.commit_mined(side).unwrap();
+            } else {
+                node.import_block(side).unwrap();
+            }
+            assert_eq!(node.chain().head().hash(), old_head);
+            assert!(node.mempool.contains(&tx_id));
+            assert_eq!(
+                node.mempool
+                    .first_seen(&tx_id)
+                    .map(|stamp| (stamp.at_ms, stamp.at_height)),
+                admitted.map(|stamp| (stamp.at_ms, stamp.at_height))
+            );
+            assert!(node.tx_timing(&tx_id).is_none());
+            assert!(node
+                .produce(1_300)
+                .unwrap()
+                .block
+                .transactions
+                .iter()
+                .any(|tx| tx.id() == tx_id));
+        }
     }
 
     #[test]

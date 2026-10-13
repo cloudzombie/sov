@@ -192,10 +192,19 @@ jobs:
 
   macos:
     needs: [gate, e2e]
-    runs-on: macos-latest
+    # Pin an ARM64 runner instead of allowing -latest to change CPU/SDK silently.
+    runs-on: macos-15
+    env:
+      CARGO_BUILD_TARGET: aarch64-apple-darwin
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS: "-C target-cpu=apple-m1"
+      CFLAGS_aarch64_apple_darwin: "-march=armv8-a+crypto -mmacosx-version-min=11.0"
+      CXXFLAGS_aarch64_apple_darwin: "-march=armv8-a+crypto -mmacosx-version-min=11.0"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: |
@@ -203,14 +212,19 @@ jobs:
             chain
           cache-on-failure: true
       - name: Build GUI (release)
-        run: cargo build --release --manifest-path node/Cargo.toml
+        run: cargo build --locked --release --target aarch64-apple-darwin --manifest-path node/Cargo.toml
+      - name: Apple Silicon platform guards (ARM64 baseline and native deployment target)
+        run: |
+          python3 scripts/tests/macos-platform.test.py
+          python3 scripts/verify-macos-platform.py binary node/target/aarch64-apple-darwin/release/sov-station
+          python3 scripts/verify-macos-platform.py native node/target/aarch64-apple-darwin/release/build
       # ARTIFACT SELF-REPORT — see the Windows job. The .app's CFBundleShortVersionString
       # is written from the tag below; this proves the executable INSIDE it agrees.
       - name: Artifact self-report (built binary must state the tag)
         shell: bash
         run: |
-          scripts/verify-artifact-version.sh station  node/target/release/sov-station "${GITHUB_REF_NAME}"
-          scripts/verify-artifact-version.sh embedded node/target/release/sov-station "${GITHUB_REF_NAME}"
+          scripts/verify-artifact-version.sh station  node/target/aarch64-apple-darwin/release/sov-station "${GITHUB_REF_NAME}"
+          scripts/verify-artifact-version.sh embedded node/target/aarch64-apple-darwin/release/sov-station "${GITHUB_REF_NAME}"
       - name: Bundle .app + .dmg
         shell: bash
         run: |
@@ -221,7 +235,7 @@ jobs:
           VER_NUM="${VER#v}"
           STAGE="dist/stage"; APP="$STAGE/SOV Station.app"; MAC="$APP/Contents/MacOS"
           mkdir -p "$MAC" "$APP/Contents/Resources" dist
-          cp node/target/release/sov-station "$MAC/sov-station"
+          cp node/target/aarch64-apple-darwin/release/sov-station "$MAC/sov-station"
           chmod +x "$MAC/"*
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
@@ -242,12 +256,13 @@ jobs:
           # "About" panel read them, not the executable. Assert them before signing.
           scripts/verify-artifact-version.sh plist "$APP/Contents/Info.plist" "$VER"
           cp .github/STATION-README.txt "$STAGE/READ ME.txt" || true
-          # Ad-hoc sign the binary first, then the bundle (Apple Silicon requires a
-          # valid signature to run at all). --deep is deprecated and can corrupt the
-          # signature, so sign explicitly. Not notarized (no paid Apple account) — users
-          # clear quarantine with `xattr -cr` per the READ ME.
-          codesign --force --options runtime --sign - "$MAC/sov-station" || true
-          codesign --force --sign - "$APP" || true
+          # Sign the complete bundle after Info.plist is final. The app is ad-hoc
+          # signed, not notarized. RandomX MAP_JIT needs the narrow allow-jit
+          # entitlement with Hardened Runtime; signing failure is fatal.
+          codesign --force --options runtime --entitlements scripts/macos-station.entitlements.plist --sign - "$APP"
+          # --version cannot exercise JIT. Run upstream RandomX vectors through
+          # the actual signed executable, and verify its bound bundle/signature.
+          python3 scripts/verify-macos-platform.py bundle "$APP"
           ( cd "$STAGE" && ln -sf /Applications Applications )
           hdiutil create -volname "SOV Station" -srcfolder "$STAGE" -ov -format UDZO "dist/SOV-Station-${VER}-macOS.dmg"
       - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
@@ -375,27 +390,43 @@ jobs:
             `cb0272ff…`, live since midnight July 4, 2026). Create or import a wallet,
             hold and send XUS transparently, and optionally mine.
 
-            **v0.2.15 Rust security hardening:** new wallets use hybrid
+            **Rust security hardening:** new wallets use hybrid
             Ed25519 + ML-DSA-65 keys. Legacy keys have an explicit migration flow;
             shielded-v1 recovery is available only in a consensus-authorized
             recovery window with recipient-bound authorization. New Station
             shielded-v1 deposits/private sends are disabled. All new pool-v2
-            transaction admission and Station proof creation are disabled because
-            the current unmasked prover does not protect private inputs.
-            Historical block verification and wallet read/scan operations remain.
+            version-1 transaction admission and proof creation remain disabled.
+            Version 0.2.16 includes the context-bound hiding replacement, with
+            original-seed ownership proofs for existing notes. Mainnet bit-5
+            readiness starts at **27,648** (90% of a 288-block window); earliest
+            activation is **28,224**, with no forced lock-in. After activation,
+            deposits, mixed-key private sends and fee-funded withdrawals use
+            profile 2. Historical verification and wallet scanning remain.
+            Existing wallet seeds and notes are preserved; scans authenticate
+            receipts and roots, follow executed wrappers, and recover incomplete
+            caches without overwriting the originals.
+
+            The Apple Silicon build uses an explicit ARM64/M1 baseline and
+            macOS 11 deployment target for Rust and RandomX C/C++ code. The
+            native renderer uses Metal. Packaging verifies the complete signed
+            bundle and executes RandomX known-answer tests with JIT enabled.
 
             Peer authentication now binds the full Noise/ML-KEM transcript and
             claimed account using protocol v3. Older peers cannot authenticate
             with these binaries; operators must coordinate their upgrade.
-            Mainnet's PQ retirement deployment remains unarmed. This release
-            does **not** claim complete post-quantum protection: a reviewed
-            replacement privacy prover and coordinated mainnet activation are
-            still required.
+            Connect to **158.101.18.90:9645** in the peer field. Mainnet reset
+            is disabled; payout changes preserve history and prior encrypted
+            miner keys. Both Mining and Node tabs show measured live activity.
+            Native `diagnostics` and `--verify-history` commands provide evidence
+            without loading spending keys. Mainnet's separate legacy-key
+            retirement deployment remains unarmed. An independent proof audit
+            and exact quantum-security analysis remain pending.
 
             SOV is a young network — live, but new and **not yet independently
             audited**. Hold funds accordingly.
 
-            - **macOS:** `SOV-Station-*-macOS.dmg` (Apple Silicon). Unsigned —
+            - **macOS:** `SOV-Station-*-macOS.dmg` (Apple Silicon). Ad-hoc signed,
+              not notarized —
               right-click → Open the first time (Gatekeeper).
             - **Windows:** `SOV-Station-*-windows-x64.zip` — unzip and run
               `sov-station.exe`. Unsigned — SmartScreen → More info → Run anyway.

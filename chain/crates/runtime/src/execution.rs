@@ -88,11 +88,8 @@ pub struct BlockContext<'a> {
     /// Whether the miner-signaled `shielded-v2` deployment (signal bit 2, the
     /// post-quantum shielded pool) is `Active` at this block's height.
     ///
-    /// **`false` on every chain that exists today** — bit 2 is DEFINED but NOT
-    /// ARMED (D13), so no chain schedules it and no height resolves to `true`.
-    /// While `false`, [`Action::ShieldedV2`] is a HARD, block-invalidating
-    /// [`ExecutionError::FeatureInactive`] wherever it appears (top level or
-    /// inside any carrier) — byte-identical dormant behavior.
+    /// Resolved from this block's branch signals. Mainnet has scheduled bit 2
+    /// since v0.2.5; pre-activation history still resolves to `false`.
     ///
     /// When `true`, the full pool-v2 path runs: decode + `proof_version` gate,
     /// carrier-bound ML-DSA-65 authorization, STARK verification, anchor ring,
@@ -100,6 +97,9 @@ pub struct BlockContext<'a> {
     /// limiter ([`crate::shielded_v2`]). Resolved per block height, so
     /// historical (pre-activation) blocks always validate under `false`.
     pub shielded_v2_active: bool,
+    /// Whether bit 5 enables the context-bound hiding proof suite at this
+    /// block's height. Independent of bit 2; historical suite 1 is unchanged.
+    pub shielded_v2_suite2_active: bool,
     /// Whether the miner-signaled `tx-timestamp` deployment (signal bit 3) is
     /// `Active` at this block's height.
     ///
@@ -388,7 +388,13 @@ fn check_shielded_retirement(
     }
     let mut node = action;
     loop {
-        if matches!(node, Action::ShieldedV2 { .. }) {
+        if let Action::ShieldedV2 { bundle } = node {
+            if cfg!(feature = "zk-suite2")
+                && ctx.shielded_v2_suite2_active
+                && bundle.first() == Some(&sov_shielded_pq::wire::PROOF_VERSION_V2)
+            {
+                return Ok(());
+            }
             return Err(ExecutionError::PqShieldedV2Unreviewed);
         }
         if let Action::Shielded { bundle } = node {
@@ -433,6 +439,44 @@ fn verify_shielded_v1_for_context(
         // authorization. Never silently revalidate old receipts more strictly.
         bundle.verify_proof_only_legacy_cached()
     }
+}
+
+/// Verify the one post-activation action that can fund its intrinsic fee from
+/// a pool withdrawal. The returned gross payout is never an unverified credit:
+/// carrier authentication, the hiding proof and every current ledger check
+/// have already passed. Wrappers and deposits retain ordinary prefunded fees.
+pub fn verify_direct_suite2_withdrawal_for_fee(
+    action: &Action,
+    ledger: &Ledger,
+    ctx: &BlockContext<'_>,
+    signer: &AccountId,
+    nonce: u64,
+    signer_balance: Balance,
+) -> Result<Option<crate::shielded_v2::V2Effects>, ExecutionError> {
+    if !(cfg!(feature = "zk-suite2") && ctx.shielded_v2_active && ctx.shielded_v2_suite2_active) {
+        return Ok(None);
+    }
+    let Action::ShieldedV2 { bundle } = action else {
+        return Ok(None);
+    };
+    if bundle.first() != Some(&sov_shielded_pq::wire::PROOF_VERSION_V2) {
+        return Ok(None);
+    }
+    let effects = crate::shielded_v2::verify_bundle_for_carrier_with_suite2(
+        bundle,
+        ledger,
+        ctx.mining,
+        ctx.height,
+        &ctx.chain_domain,
+        signer,
+        nonce,
+        signer_balance,
+        true,
+    )?;
+    if effects.shield_in != Balance::ZERO || effects.deshield_out == Balance::ZERO {
+        return Ok(None);
+    }
+    Ok(Some(effects))
 }
 
 /// Apply one signed transaction to `ledger` in `ctx`, returning its [`Receipt`].
@@ -684,11 +728,33 @@ pub fn apply_transaction(
     } else {
         Balance::ZERO
     };
+    // A direct activated suite-2 withdrawal may pay this SAME fee from its
+    // verified gross payout. Historical actions and every carrier retain the
+    // prefunded path. Verify before any nonce, pool or balance is committed.
+    let mut fee_funded_withdrawal = None;
     if intrinsic_fee != Balance::ZERO && signer.balance.checked_sub(intrinsic_fee).is_none() {
-        return Err(ExecutionError::CannotAffordFee {
-            account: tx.signer.to_string(),
-        });
+        fee_funded_withdrawal = verify_direct_suite2_withdrawal_for_fee(
+            &tx.action,
+            ledger,
+            ctx,
+            &tx.signer,
+            tx.nonce,
+            signer.balance,
+        )?;
+        let available = match &fee_funded_withdrawal {
+            Some(effects) => signer
+                .balance
+                .checked_add(effects.deshield_out)
+                .ok_or(ExecutionError::Overflow)?,
+            None => signer.balance,
+        };
+        if available.checked_sub(intrinsic_fee).is_none() {
+            return Err(ExecutionError::CannotAffordFee {
+                account: tx.signer.to_string(),
+            });
+        }
     }
+    let defer_intrinsic_fee = fee_funded_withdrawal.is_some();
 
     // Admitted: consume the nonce regardless of whether the action succeeds.
     let tx_nonce = tx.nonce;
@@ -704,10 +770,12 @@ pub fn apply_transaction(
     // Reserve the intrinsic fee up front (paid even if the action then fails).
     let mut fee_paid = Balance::ZERO;
     if intrinsic_fee != Balance::ZERO {
-        signer.balance = signer
-            .balance
-            .checked_sub(intrinsic_fee)
-            .ok_or(ExecutionError::Overflow)?;
+        if !defer_intrinsic_fee {
+            signer.balance = signer
+                .balance
+                .checked_sub(intrinsic_fee)
+                .ok_or(ExecutionError::Overflow)?;
+        }
         fee_paid = intrinsic_fee;
     }
 
@@ -843,12 +911,9 @@ pub fn apply_transaction(
             }
             // ── Post-quantum shielded pool v2 (v0.2.0 slice S2c) ─────────────
             //
-            // DORMANT TODAY: `ctx.shielded_v2_active` is false on every chain
-            // (bit 2 is defined but unarmed, D13), and the dormant-variant gate
-            // above has already hard-rejected this transaction before reaching
-            // here — so on any chain that exists today this arm is unreachable
-            // and the `!active` branch below is defense in depth, not the live
-            // path. Genesis and every KAT vector stay byte-identical.
+            // Historical and activated pool state are preserved. The new
+            // hiding proof has its own independent activation; production
+            // admission does not permit unsafe historical proof generation.
             //
             // When the deployment IS active, this is the whole pool-v2 path.
             // Two properties are load-bearing:
@@ -871,16 +936,20 @@ pub fn apply_transaction(
                         feature: "shielded-v2",
                     });
                 }
-                let effects = crate::shielded_v2::verify_bundle_for_carrier(
-                    bundle,
-                    ledger,
-                    ctx.mining,
-                    ctx.height,
-                    &ctx.chain_domain,
-                    &tx.signer,
-                    tx_nonce,
-                    signer.balance,
-                )?;
+                let effects = match fee_funded_withdrawal.take() {
+                    Some(effects) => effects,
+                    None => crate::shielded_v2::verify_bundle_for_carrier_with_suite2(
+                        bundle,
+                        ledger,
+                        ctx.mining,
+                        ctx.height,
+                        &ctx.chain_domain,
+                        &tx.signer,
+                        tx_nonce,
+                        signer.balance,
+                        ctx.shielded_v2_suite2_active,
+                    )?,
+                };
                 // Everything below is pre-validated; each `?` is an
                 // impossible-by-construction guard, not a live branch.
                 ledger
@@ -907,6 +976,12 @@ pub fn apply_transaction(
                         .balance
                         .checked_add(effects.deshield_out)
                         .ok_or(ExecutionError::Overflow)?;
+                    if defer_intrinsic_fee {
+                        signer.balance = signer
+                            .balance
+                            .checked_sub(intrinsic_fee)
+                            .ok_or(ExecutionError::Overflow)?;
+                    }
                     if let Some((start, spent)) = effects.window_update {
                         ledger.set_deshield_v2_window(start, spent);
                     }
@@ -2674,6 +2749,7 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            shielded_v2_suite2_active: false,
             tx_timestamp_active: false,
             block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
@@ -2694,6 +2770,7 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            shielded_v2_suite2_active: false,
             tx_timestamp_active: false,
             block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
@@ -2743,6 +2820,7 @@ mod tests {
             tx_domain: mode,
             fee_auction_active: false,
             shielded_v2_active: false,
+            shielded_v2_suite2_active: false,
             tx_timestamp_active: false,
             block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
@@ -3082,6 +3160,7 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: true,
             shielded_v2_active: false,
+            shielded_v2_suite2_active: false,
             tx_timestamp_active: false,
             block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
@@ -3973,6 +4052,7 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            shielded_v2_suite2_active: false,
             tx_timestamp_active: false,
             block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
@@ -4106,6 +4186,7 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            shielded_v2_suite2_active: false,
             tx_timestamp_active: false,
             block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
@@ -4176,6 +4257,7 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            shielded_v2_suite2_active: false,
             tx_timestamp_active: false,
             block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
@@ -4858,6 +4940,7 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            shielded_v2_suite2_active: false,
             tx_timestamp_active: false,
             block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
@@ -6162,6 +6245,7 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            shielded_v2_suite2_active: false,
             tx_timestamp_active: false,
             block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(
@@ -6969,6 +7053,7 @@ mod tests {
             tx_domain: sov_primitives::TxDomainMode::Legacy,
             fee_auction_active: false,
             shielded_v2_active: false,
+            shielded_v2_suite2_active: false,
             tx_timestamp_active: false,
             block_time_ms: TEST_BLOCK_TIME_MS,
             chain_domain: sov_primitives::SigningDomain::new(

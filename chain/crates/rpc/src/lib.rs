@@ -101,9 +101,9 @@ pub use client::{RpcClient, RpcClientError};
 
 pub mod daemon;
 pub use daemon::{
-    keystore_fingerprint_of, keystore_stored_fingerprint, BlockLog, ChainSpec, CheckpointSpec,
-    Daemon, DaemonError, DaemonHandle, Keystore, KeystoreEntry, NodeConfig, PolicyPreset,
-    SpecAccount, PQ_REHEARSAL_CHAIN_PREFIX,
+    keystore_fingerprint_of, keystore_stored_fingerprint, verify_history, BlockLog, ChainSpec,
+    CheckpointSpec, Daemon, DaemonError, DaemonHandle, Keystore, KeystoreEntry, NodeConfig,
+    PolicyPreset, SpecAccount, PQ_REHEARSAL_CHAIN_PREFIX, SUITE2_REHEARSAL_CHAIN_PREFIX,
 };
 
 pub mod p2p;
@@ -826,6 +826,7 @@ fn quantum_status(chain: &sov_chain::Blockchain) -> Value {
     } else {
         "allowed"
     };
+    let suite2_allowed = suite2_admission_allowed(chain);
     json!({
         "height": height,
         "evaluatedHeight": evaluated_height,
@@ -863,7 +864,14 @@ fn quantum_status(chain: &sov_chain::Blockchain) -> Value {
         "v2Active": chain.shielded_v2_active(evaluated_height),
         "v2ProofSecurityEstablished": false,
         "v2PrivacyEstablished": false,
-        "poolV2CreationAllowed": false,
+        "poolV2CreationAllowed": suite2_allowed,
+        "poolV2SpendsAllowed": suite2_allowed,
+        "poolV2RecoveryAllowed": suite2_allowed,
+        "poolV2HistoricalReplaySupported": true,
+        "poolV2HistoricalProofVersions": if cfg!(feature = "zk-suite2") { vec![1u8,2] } else { vec![1u8] },
+        "poolV2AcceptedNewProofVersions": if suite2_allowed { vec![2u8] } else { vec![] },
+        "poolV2Suite2ParameterId": suite2_parameter_id(),
+        "poolV2WriteBlockReason": if suite2_allowed { Value::Null } else { json!("replacement_proof_not_activated") },
         "fullyPostQuantum": false,
         "signatureScheme": "Ed25519 + ML-DSA-65 (hybrid)",
         "hash": {
@@ -880,15 +888,74 @@ fn quantum_status(chain: &sov_chain::Blockchain) -> Value {
 /// The deployed v2 verifier stays available for block-log replay, but creating
 /// new unmasked Winterfell proofs exposes private inputs. Both RPC and gossip
 /// must refuse new carriers, including proposals that defer their execution.
+#[cfg(test)]
 pub(crate) fn safe_new_transaction(action: &Action) -> bool {
+    safe_new_transaction_for_suite2(action, false)
+}
+
+/// The replacement is usable only when this build contains its verifier and
+/// both independently deployed consensus rules are active for the next block.
+/// Merely installing the client does not arm a deployment or change history.
+pub(crate) fn suite2_admission_allowed(chain: &sov_chain::Blockchain) -> bool {
+    cfg!(feature = "zk-suite2")
+        && chain.shielded_v2_active(chain.height().saturating_add(1))
+        && chain.shielded_v2_suite2_active(chain.height().saturating_add(1))
+}
+
+fn suite2_parameter_id() -> Option<u32> {
+    #[cfg(feature = "zk-suite2")]
+    {
+        Some(sov_shielded_pq::zk_suite2::PARAMETER_ID)
+    }
+    #[cfg(not(feature = "zk-suite2"))]
+    {
+        None
+    }
+}
+
+pub(crate) fn safe_new_transaction_for_suite2(action: &Action, suite2: bool) -> bool {
     let mut action = action;
     loop {
         action = match action {
-            Action::ShieldedV2 { .. } => return false,
+            Action::ShieldedV2 { bundle } => return suite2 && bundle.first() == Some(&2),
             Action::MultisigExec { action, .. } | Action::ProposeMultisig { action, .. } => action,
             Action::Tipped { inner, .. } | Action::Timestamped { inner, .. } => inner,
             _ => return true,
         };
+    }
+}
+
+fn decode_submitted_transaction(params: &Value) -> Result<SignedTransaction, RpcError> {
+    if let Some(encoded) = params.get("borshBase64") {
+        use base64::Engine;
+        if params.as_object().is_none_or(|object| object.len() != 1) {
+            return Err(RpcError::invalid_params("ambiguous compact transaction"));
+        }
+        let text = encoded
+            .as_str()
+            .ok_or_else(|| RpcError::invalid_params("borshBase64 must be a string"))?;
+        let byte_cap = sov_types::weight::MAX_SUITE2_TX_WEIGHT as usize;
+        if text.len() > byte_cap.div_ceil(3) * 4 {
+            return Err(RpcError::invalid_params(
+                "compact transaction exceeds size limit",
+            ));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .map_err(|_| RpcError::invalid_params("invalid canonical transaction base64"))?;
+        if bytes.len() > byte_cap
+            || base64::engine::general_purpose::STANDARD.encode(&bytes) != text
+        {
+            return Err(RpcError::invalid_params(
+                "noncanonical or oversized compact transaction",
+            ));
+        }
+        borsh::from_slice(&bytes).map_err(|e| {
+            RpcError::invalid_params(format!("invalid bounded transaction bytes: {e}"))
+        })
+    } else {
+        serde_json::from_value(params.clone())
+            .map_err(|e| RpcError::invalid_params(format!("invalid SignedTransaction: {e}")))
     }
 }
 
@@ -928,10 +995,8 @@ fn call(
             // the privately-held share understated by the same amount. Both
             // figures feed explorers and dashboards.
             //
-            // This is byte-identical on every chain today, because
-            // `shielded_v2_value` is exactly zero until the (unarmed)
-            // `shielded-v2` deployment activates — which is precisely why it is
-            // correct to fix here, before it can ever misreport.
+            // A nonempty historical pool continues to count toward supply even
+            // when this node refuses new transactions using its proof suite.
             let shielded_total = shielded
                 .checked_add(shielded_v2)
                 .ok_or_else(|| RpcError::server("shielded supply overflow"))?;
@@ -1256,11 +1321,28 @@ fn call(
             } else {
                 limit.saturating_sub(spent_now).min(pool)
             };
+            let suite2_allowed = suite2_admission_allowed(c);
             Ok(json!({
                 "active": c.shielded_v2_active(height),
                 "proofSecurityEstablished": false,
                 "privacyEstablished": false,
-                "creationAllowed": false,
+                "creationAllowed": suite2_allowed,
+                // Admission and historical state are separate capabilities.
+                // Existing notes remain readable and part of total supply,
+                // even though this proof suite cannot safely authorize a new
+                // private send or an independent-owner recovery withdrawal.
+                "spendsAllowed": suite2_allowed,
+                "recoveryAllowed": suite2_allowed,
+                "scanSupported": true,
+                "historicalReplaySupported": true,
+                "historicalProofVersions": if cfg!(feature = "zk-suite2") { vec![1u8,2] } else { vec![1u8] },
+                "acceptedNewProofVersions": if suite2_allowed { vec![2u8] } else { vec![] },
+                "suite2Compiled": cfg!(feature = "zk-suite2"),
+                "suite2Active": c.shielded_v2_suite2_active(height.saturating_add(1)),
+                "suite2ParameterId": suite2_parameter_id(),
+                "experimentalSuite2": c.chain_id().starts_with(SUITE2_REHEARSAL_CHAIN_PREFIX),
+                "legacyKeyExposureRecoveryEstablished": false,
+                "writeBlockReason": if suite2_allowed { Value::Null } else { json!("replacement_proof_not_activated") },
                 "poolValue": to_value(l.shielded_v2_value()),
                 "noteCount": v2.note_count(),
                 "nullifierCount": v2.nullifier_count(),
@@ -1813,9 +1895,11 @@ fn call(
             }))
         }
         "sov_submitTransaction" => {
-            let stx: SignedTransaction = serde_json::from_value(params.clone())
-                .map_err(|e| RpcError::invalid_params(format!("invalid SignedTransaction: {e}")))?;
-            if !safe_new_transaction(&stx.transaction.action) {
+            let stx = decode_submitted_transaction(params)?;
+            if !safe_new_transaction_for_suite2(
+                &stx.transaction.action,
+                suite2_admission_allowed(node.chain()),
+            ) {
                 return Err(RpcError::server("pool-v2 transactions disabled: the current proof implementation does not protect private inputs; historical block verification remains available"));
             }
             let tx_id = stx.id();
@@ -2242,6 +2326,51 @@ fn call(
 #[cfg(test)]
 mod quantum_admission_tests {
     use super::*;
+
+    #[test]
+    fn compact_transaction_round_trips_exact_signing_and_wire_bytes() {
+        use base64::Engine;
+        let key = sov_crypto::Keypair::hybrid_from_seed([73; 32]);
+        let stx = SignedTransaction::sign(
+            sov_types::Transaction {
+                signer: key.public_key().implicit_account_id(),
+                public_key: key.public_key(),
+                nonce: 3,
+                action: Action::ShieldedV2 {
+                    bundle: vec![2; 1_200_000],
+                },
+            },
+            &key,
+        )
+        .unwrap();
+        let bytes = borsh::to_vec(&stx).unwrap();
+        let params =
+            json!({"borshBase64": base64::engine::general_purpose::STANDARD.encode(&bytes)});
+        assert_eq!(decode_submitted_transaction(&params).unwrap(), stx);
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(decode_submitted_transaction(&json!({
+            "borshBase64": base64::engine::general_purpose::STANDARD.encode(trailing)
+        }))
+        .is_err());
+        assert!(decode_submitted_transaction(&json!({
+            "borshBase64":params["borshBase64"], "transaction":{}
+        }))
+        .is_err());
+        for bad in [
+            json!(null),
+            json!(0),
+            json!("!!"),
+            json!("AA"),
+            json!("AB=="),
+        ] {
+            assert!(decode_submitted_transaction(&json!({"borshBase64":bad})).is_err());
+        }
+        assert!(decode_submitted_transaction(&json!({
+            "borshBase64":"A".repeat(sov_types::weight::MAX_SUITE2_TX_WEIGHT as usize * 4 / 3 + 5)
+        }))
+        .is_err());
+    }
 
     #[test]
     fn v2_admission_is_closed_inside_every_carrier() {

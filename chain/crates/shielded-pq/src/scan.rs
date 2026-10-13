@@ -453,6 +453,17 @@ impl PqNoteStore {
             .count()
     }
 
+    /// Values of authenticated owned notes whose position-bound nullifier has
+    /// not been spent. Wallets use this to quote the exact input-limited maximum
+    /// without reconstructing private spending keys while rendering the UI.
+    pub fn unspent_values(&self) -> impl Iterator<Item = u64> + '_ {
+        self.data
+            .owned
+            .iter()
+            .filter(|note| !self.spent.contains(&note.nullifier))
+            .map(|note| note.value)
+    }
+
     /// The unspent notes with their tree positions, in chain order. Each is
     /// reconstructed from stored parts plus the wallet key, so a note is
     /// spendable after a restart with no re-decryption.

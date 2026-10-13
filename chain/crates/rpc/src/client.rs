@@ -54,6 +54,38 @@ pub struct RpcClient {
     timeout: Duration,
 }
 
+// A 4 MiB maximum block expands to less than 24 MiB even when every byte is
+// represented as a JSON u8. Bound untrusted responses before JSON decoding;
+// a read timeout alone does not bound a selected RPC's memory consumption.
+const MAX_RPC_RESPONSE_BYTES: usize = 24 * 1024 * 1024;
+
+fn validate_canonical_domain(chain_id: &str, genesis: Hash) -> Result<(), RpcClientError> {
+    let expected = match chain_id {
+        "sov-mainnet" => Some(crate::ChainSpec::MAINNET_GENESIS_HASH),
+        "sov-testnet-1" => Some(crate::ChainSpec::TESTNET_GENESIS_HASH),
+        _ => None,
+    };
+    if expected.is_some_and(|expected| genesis.to_hex() != expected) {
+        return Err(RpcClientError::Malformed(
+            "canonical chain name has a different genesis; refused fake-chain identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_bounded_response(reader: impl Read) -> Result<Vec<u8>, RpcClientError> {
+    let mut raw = Vec::new();
+    reader
+        .take(MAX_RPC_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut raw)?;
+    if raw.len() > MAX_RPC_RESPONSE_BYTES {
+        return Err(RpcClientError::Malformed(
+            "RPC response exceeds size limit".into(),
+        ));
+    }
+    Ok(raw)
+}
+
 impl RpcClient {
     /// A client targeting `addr` (`host:port`), with a 30s default timeout.
     pub fn new(addr: impl Into<String>) -> Self {
@@ -93,8 +125,7 @@ impl RpcClient {
         stream.write_all(&body)?;
         stream.flush()?;
 
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw)?;
+        let raw = read_bounded_response(stream)?;
         let text = String::from_utf8_lossy(&raw);
         let split = text
             .find("\r\n\r\n")
@@ -207,6 +238,7 @@ impl RpcClient {
         let genesis = Hash::from_hex(genesis_hex).map_err(|e| {
             RpcClientError::Malformed(format!("bad genesis in signing domain: {e}"))
         })?;
+        validate_canonical_domain(chain_id, genesis)?;
         Ok(Some(SigningDomain::new(chain_id, genesis)))
     }
 
@@ -227,6 +259,7 @@ impl RpcClient {
             .ok_or_else(|| RpcClientError::Malformed("chain domain missing genesis".into()))?;
         let genesis = Hash::from_hex(genesis_hex)
             .map_err(|e| RpcClientError::Malformed(format!("bad genesis in chain domain: {e}")))?;
+        validate_canonical_domain(chain_id, genesis)?;
         Ok(SigningDomain::new(chain_id, genesis))
     }
 
@@ -272,7 +305,14 @@ impl RpcClient {
 
     /// Submit an already-signed transaction; returns its id.
     pub fn submit_transaction(&self, stx: &SignedTransaction) -> Result<Hash, RpcClientError> {
-        let result = self.call("sov_submitTransaction", serde_json::to_value(stx)?)?;
+        let params = if sov_types::weight::is_suite2_action(&stx.transaction.action) {
+            use base64::Engine;
+            let bytes = borsh::to_vec(stx).map_err(|e| RpcClientError::Malformed(e.to_string()))?;
+            json!({"borshBase64":base64::engine::general_purpose::STANDARD.encode(bytes)})
+        } else {
+            serde_json::to_value(stx)?
+        };
+        let result = self.call("sov_submitTransaction", params)?;
         let tx_id = result
             .get("txId")
             .and_then(Value::as_str)
@@ -372,22 +412,12 @@ impl RpcClient {
                 })?;
                 self.transfer_shielded(keypair, from, &recipient, amount, params)
             }
-            // Pool v2 (post-quantum). The receiver TYPE exists so unified
-            // addresses carrying one parse and round-trip, but there is no
-            // height on any chain at which a v2 spend may execute: signal bit 2
-            // is defined and NOT armed, and `Action::ShieldedV2` is a hard
-            // `FeatureInactive` reject everywhere.
-            //
-            // Refuse loudly. Falling back to the address's transparent receiver
-            // would silently pay a DIFFERENT recipient than the one the sender
-            // chose, and downgrade privacy without their consent — the same
-            // rule the shielded arm above enforces, and the reason that arm
-            // demands an explicit prover rather than quietly going transparent.
+            // This generic helper has no pool-v2 note store or proof builder.
+            // The native wallet constructs an explicit activated-suite proof.
+            // Never silently route a chosen private address transparently.
             Receiver::ShieldedV2(_) => Err(RpcClientError::Malformed(
-                "recipient routes to the post-quantum shielded pool (v2), which is not \
-                 active on any chain yet — refusing to send. Paying the address's \
-                 transparent receiver instead would pay a different recipient and \
-                 downgrade privacy without your consent."
+                "recipient routes to shielded pool v2 and requires the native wallet's \
+                 activated replacement prover and note store."
                     .into(),
             )),
         }
@@ -404,6 +434,34 @@ impl RpcClient {
 mod tests {
     use super::*;
     use sov_types::{Action, Transaction};
+
+    #[test]
+    fn canonical_names_cannot_be_reused_for_fake_chain_domains() {
+        for (name, pin) in [
+            ("sov-mainnet", crate::ChainSpec::MAINNET_GENESIS_HASH),
+            ("sov-testnet-1", crate::ChainSpec::TESTNET_GENESIS_HASH),
+        ] {
+            assert!(validate_canonical_domain(name, Hash::from_hex(pin).unwrap()).is_ok());
+            assert!(validate_canonical_domain(name, Hash::digest(b"private clone")).is_err());
+        }
+        assert!(validate_canonical_domain(
+            "sov-suite2-rehearsal-local",
+            Hash::digest(b"explicitly distinct local chain")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rpc_response_is_bounded_before_decoding() {
+        let exact =
+            read_bounded_response(std::io::repeat(b'0').take(MAX_RPC_RESPONSE_BYTES as u64))
+                .expect("maximum response");
+        assert_eq!(exact.len(), MAX_RPC_RESPONSE_BYTES);
+        assert!(matches!(
+            read_bounded_response(std::io::repeat(b'0')),
+            Err(RpcClientError::Malformed(message)) if message.contains("size limit")
+        ));
+    }
 
     /// Cross-implementation KAT for the `tx-domain` BOUND signing preimage.
     ///

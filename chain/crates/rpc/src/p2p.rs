@@ -111,6 +111,22 @@ fn short_hash(h: &Hash) -> String {
     }
 }
 
+fn authenticated_peer_identity(
+    message: &NetMessage,
+    config: &P2pConfig,
+    binding: &[u8],
+) -> Option<AccountId> {
+    if !config.allows_identity(message) {
+        return None;
+    }
+    message
+        .authenticated_account(&config.chain_id, &config.genesis_hash, binding)
+        .and_then(|_| match message {
+            NetMessage::Hello { public_key, .. } => Some(public_key.implicit_account_id()),
+            _ => None,
+        })
+}
+
 /// The identity and chain binding a node presents in its handshake.
 pub struct P2pConfig {
     /// The network/chain id this node belongs to.
@@ -127,6 +143,9 @@ impl P2pConfig {
     fn requires_hybrid_identity(&self) -> bool {
         self.chain_id.contains("mainnet")
             || self.chain_id.starts_with(crate::PQ_REHEARSAL_CHAIN_PREFIX)
+            || self
+                .chain_id
+                .starts_with(crate::SUITE2_REHEARSAL_CHAIN_PREFIX)
     }
 
     fn allows_identity(&self, msg: &NetMessage) -> bool {
@@ -703,13 +722,54 @@ fn survivor(candidates: &[(SocketAddr, Vec<u8>)]) -> Option<SocketAddr> {
         .map(|(p, _)| *p)
 }
 
-/// An outstanding [`GetBlock`](NetMessage::GetBlock) awaiting a response, used to
-/// detect a stalled peer. Cleared as soon as any block response arrives.
+/// An outstanding sync request. Only its peer's matching response can clear it;
+/// checkpoint-linkage requests have separate timers.
 struct InFlight {
     /// The peer the request was sent to.
     peer: SocketAddr,
     /// When it was sent (for the [`BLOCK_REQUEST_TIMEOUT`] stall check).
     since: Instant,
+    request: SyncRequest,
+}
+
+#[derive(Clone)]
+enum SyncRequest {
+    Block(u64),
+    Blocks { start: u64, count: u16 },
+    Headers(Vec<Hash>),
+    Linkage(u64),
+}
+impl SyncRequest {
+    fn matches(&self, message: &NetMessage) -> bool {
+        match (self, message) {
+            (Self::Block(height), NetMessage::BlockResponse(block)) => block
+                .as_ref()
+                .is_none_or(|block| block.header.height.get() == *height),
+            (Self::Blocks { start, count }, NetMessage::BlocksResponse(blocks)) => {
+                blocks.len() <= *count as usize
+                    && blocks
+                        .first()
+                        .is_none_or(|block| block.header.height.get() == *start)
+                    && blocks.windows(2).all(|pair| {
+                        pair[1].header.height.get() == pair[0].header.height.get().saturating_add(1)
+                            && pair[1].header.prev_hash == pair[0].hash()
+                    })
+            }
+            (Self::Headers(locator), NetMessage::Headers(headers)) => {
+                headers.len() <= HEADERS_BATCH
+                    && headers
+                        .first()
+                        .is_none_or(|header| locator.contains(&header.prev_hash))
+            }
+            (Self::Linkage(height), NetMessage::Headers(headers)) => {
+                headers.len() <= HEADERS_BATCH
+                    && headers
+                        .first()
+                        .is_some_and(|header| header.height.get() == *height)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// What kind of import work a [`VerifyJob`] carries, which decides what the worker
@@ -907,6 +967,13 @@ struct SyncState {
     /// a reply lands, BEFORE the blocks are queued for verification, so local
     /// verification time is never charged to the peer that answered.
     inflight: Option<InFlight>,
+    /// Checkpoint proofs cannot cancel a concurrent block-body request.
+    linkage_requests: HashMap<SocketAddr, InFlight>,
+    /// Bound cheap, requested replies that never produce verified new blocks.
+    no_progress_replies: HashMap<SocketAddr, u32>,
+    /// Monotonic, newly verified requested body progress, including a side
+    /// branch that has not yet accumulated enough work to become canonical.
+    verified_sync_height: HashMap<SocketAddr, u64>,
     /// Set while a catch-up batch is being verified off-thread. See [`Verifying`].
     verifying: Option<Verifying>,
     /// The verifier thread + its job/report channels.
@@ -962,8 +1029,10 @@ struct PeerStatus {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ImportOutcome {
-    /// Accepted and newly added to the chain (extended, stored, or reorged onto).
+    /// Newly accepted on the active chain (extended or reorged onto).
     New,
+    /// Fully validated and stored on a losing side branch, not active progress.
+    SideBranch,
     /// Already known — a no-op (e.g. a duplicate in a batch).
     Known,
     /// Did not connect to a known parent — the ordinary "walk back to a common
@@ -1126,6 +1195,11 @@ impl BlockImporter {
             }
         }
         let lock_ms = started.elapsed().as_millis();
+        let canonical = n
+            .chain()
+            .block_by_height(block.header.height.get())
+            .map(Block::hash)
+            == Some(block.hash());
         drop(n);
         // A head move to a block that does NOT simply extend the prior head is a REORG —
         // we abandoned our current tip for a competing branch. NEVER silent: log both
@@ -1154,7 +1228,11 @@ impl BlockImporter {
                 ),
             );
         }
-        ImportOutcome::New
+        if canonical {
+            ImportOutcome::New
+        } else {
+            ImportOutcome::SideBranch
+        }
     }
 }
 
@@ -1309,9 +1387,32 @@ impl SyncState {
             announced,
             elapsed,
         } = report;
+        if outcomes
+            .iter()
+            .any(|(_, outcome)| *outcome == ImportOutcome::New)
+        {
+            self.sync_strikes.remove(&peer);
+            self.no_progress_replies.remove(&peer);
+        }
+        if mode != VerifyMode::Announced {
+            if let Some(height) = outcomes
+                .iter()
+                .filter(|(_, outcome)| {
+                    matches!(outcome, ImportOutcome::New | ImportOutcome::SideBranch)
+                })
+                .map(|(height, _)| *height)
+                .max()
+            {
+                let prior = self.verified_sync_height.entry(peer).or_default();
+                if height > *prior {
+                    *prior = height;
+                    self.no_progress_replies.remove(&peer);
+                }
+            }
+        }
         if mode == VerifyMode::Announced {
             match outcomes.first().map(|(_, o)| *o) {
-                Some(ImportOutcome::New) => {
+                Some(ImportOutcome::New | ImportOutcome::SideBranch) => {
                     if let Some(block) = announced {
                         tcp.broadcast(&NetMessage::NewBlock(block)); // forward once
                     }
@@ -1330,7 +1431,7 @@ impl SyncState {
                 return;
             };
             match outcome {
-                ImportOutcome::New | ImportOutcome::Known => {
+                ImportOutcome::New | ImportOutcome::SideBranch | ImportOutcome::Known => {
                     self.bt_step.remove(&peer); // ancestor found → forward mode
                     self.advance_or_done(peer, h);
                 }
@@ -1356,7 +1457,9 @@ impl SyncState {
         let mut invalid = false;
         for (h, outcome) in &outcomes {
             match outcome {
-                ImportOutcome::New | ImportOutcome::Known => last_ok = Some(*h),
+                ImportOutcome::New | ImportOutcome::SideBranch | ImportOutcome::Known => {
+                    last_ok = Some(*h)
+                }
                 ImportOutcome::Rejected => rejected = Some(*h),
                 ImportOutcome::Invalid => invalid = true,
             }
@@ -1401,7 +1504,7 @@ impl SyncState {
                 && tcp.send(
                     peer,
                     &NetMessage::GetHeaders {
-                        locator,
+                        locator: locator.clone(),
                         stop: Hash::ZERO,
                     },
                 )
@@ -1412,6 +1515,7 @@ impl SyncState {
                 self.inflight = Some(InFlight {
                     peer,
                     since: Instant::now(),
+                    request: SyncRequest::Headers(locator),
                 });
                 p2p_log(
                     &self.log,
@@ -1469,13 +1573,9 @@ impl SyncState {
         // relays a Hello from another channel). Only peers that prove same-chain
         // membership and key control are trusted with any chain data.
         let binding = tcp.peer_handshake_hash(&peer);
-        let authed_account = binding.as_ref().and_then(|b| {
-            if !config.allows_identity(&msg) {
-                return None;
-            }
-            msg.authenticated_account(&config.chain_id, &config.genesis_hash, b)
-                .cloned()
-        });
+        let authed_account = binding
+            .as_ref()
+            .and_then(|binding| authenticated_peer_identity(&msg, config, binding));
         if authed_account.is_none() {
             if let NetMessage::Hello {
                 chain_id,
@@ -1494,7 +1594,7 @@ impl SyncState {
                 } else if spoofed_implicit {
                     "implicit account id does not derive from its public key (spoof)".to_string()
                 } else {
-                    "invalid key signature or encrypted-channel binding".to_string()
+                    "invalid signature or channel binding; protocol-v2 / v0.2.14 peers require a coordinated upgrade to protocol v3".to_string()
                 };
                 // An implicit-id spoof is deliberate misbehavior (a valid key claiming
                 // an implicit id it does not own), not a benign wrong-network peer —
@@ -1530,7 +1630,7 @@ impl SyncState {
             // reopens it (`local_addr` only knows our bind address, not our reachable
             // one), drop the link, and never register it as a peer. (Two distinct nodes
             // sharing one account identity is a misconfiguration and is treated the same.)
-            if account == config.account {
+            if account == config.keypair.public_key().implicit_account_id() {
                 tcp.mark_self_addr(peer);
                 tcp.disconnect(&peer);
                 self.last_recv.remove(&peer);
@@ -1542,6 +1642,7 @@ impl SyncState {
             }
             let first_time = self.authenticated.insert(peer);
             self.identity.insert(peer, account.clone());
+            tcp.mark_authenticated(peer);
             if first_time {
                 // Reciprocate, bound to this same channel, so the peer authenticates
                 // us and learns our height.
@@ -1594,6 +1695,38 @@ impl SyncState {
             return; // untrusted: ignore until it completes the handshake
         }
 
+        if matches!(
+            &msg,
+            NetMessage::BlockResponse(_) | NetMessage::BlocksResponse(_) | NetMessage::Headers(_)
+        ) {
+            let linkage = self
+                .linkage_requests
+                .get(&peer)
+                .is_some_and(|flight| flight.request.matches(&msg));
+            if linkage {
+                self.linkage_requests.remove(&peer);
+            } else {
+                if !self
+                    .inflight
+                    .as_ref()
+                    .is_some_and(|flight| flight.peer == peer && flight.request.matches(&msg))
+                {
+                    // Unsolicited, late, wrong-peer and wrong-range replies do
+                    // not cancel another peer's timer or alter sync cursors.
+                    return;
+                }
+                self.inflight = None;
+                self.stalled_logged = false;
+            }
+            let replies = self.no_progress_replies.entry(peer).or_default();
+            *replies = replies.saturating_add(1);
+            if *replies > 256 {
+                tcp.penalize_peer(peer, INVALID_BLOCK_PENALTY);
+                tcp.disconnect(&peer);
+                return;
+            }
+        }
+
         match msg {
             NetMessage::Status {
                 height,
@@ -1623,12 +1756,14 @@ impl SyncState {
                 }
             }
             NetMessage::NewTransaction(stx) => {
-                if !crate::safe_new_transaction(&stx.transaction.action) {
-                    return;
-                }
                 let accepted = node
                     .lock()
-                    .map(|mut n| n.submit(stx.clone()).is_ok())
+                    .map(|mut n| {
+                        crate::safe_new_transaction_for_suite2(
+                            &stx.transaction.action,
+                            crate::suite2_admission_allowed(n.chain()),
+                        ) && n.submit(stx.clone()).is_ok()
+                    })
                     .unwrap_or(false);
                 if accepted {
                     tcp.broadcast(&NetMessage::NewTransaction(stx)); // forward once
@@ -1706,19 +1841,7 @@ impl SyncState {
                 // block is queued for verification, so the peer that answered is never
                 // charged for our verification time. What the result means for the
                 // backtrack walk is decided in `apply_verify_report`.
-                self.inflight = None;
-                self.stalled_logged = false; // a reply arrived — clear the stall latch
-                                             // A DELIVERED block substantiates this peer's advertised chain, so any
-                                             // stall strikes it accrued while briefly slow are forgiven. Without
-                                             // this, a peer whose strikes reached STATUS_MAX_STRIKES could never
-                                             // recover: strikes were only cleared by `advance_or_done`, which only
-                                             // runs for a peer that gets SELECTED — and a struck-out peer is never
-                                             // selected again (`status_actionable`), a deadlock that permanently
-                                             // disqualified the only honest heavier peer after a transient stall
-                                             // (the mainnet sync-reorg wedge). A liar that advertises a chain but
-                                             // never answers still accrues strikes and stays disqualified — the
-                                             // invariant this counter exists for is preserved.
-                self.sync_strikes.remove(&peer);
+                // Only successfully validated canonical progress forgives strikes.
                 self.submit_verify(
                     node,
                     VerifyJob {
@@ -1730,18 +1853,14 @@ impl SyncState {
             }
             NetMessage::BlockResponse(None) => {
                 // The peer does not have the requested height: stop waiting on it.
-                self.inflight = None;
-                self.stalled_logged = false;
             }
             NetMessage::BlocksResponse(blocks) => {
                 // A batch of consecutive blocks (forward catch-up). The network timer
                 // is cleared HERE, the instant the reply lands and BEFORE any of it is
                 // verified — the peer did its part; the CPU-bound part is ours and is
                 // never charged back to it as a stall.
-                self.inflight = None;
-                self.stalled_logged = false; // a reply arrived — clear the stall latch
-                                             // A peer must never return more than we ask for ([`SYNC_BATCH`]); a
-                                             // larger batch is a memory/CPU amplification — penalize and ignore it.
+                // Response count and range were correlated above. Retain the
+                // server cap defensively before handing work to the verifier.
                 if blocks.len() > SYNC_BATCH as usize {
                     tcp.penalize_peer(peer, OVERSIZE_RESPONSE_PENALTY);
                     return;
@@ -1750,13 +1869,6 @@ impl SyncState {
                     self.sync_next.remove(&peer); // at/past the peer's head
                     return;
                 }
-                // A delivered (non-empty) batch substantiates the peer's claim: forgive
-                // its stall strikes so a briefly-slow peer can recover eligibility (see
-                // the identical clearing in the BlockResponse arm for the rationale —
-                // the strike deadlock behind the mainnet sync-reorg wedge). An EMPTY
-                // response deliberately does not clear: delivering nothing
-                // substantiates nothing.
-                self.sync_strikes.remove(&peer);
                 // Hand the whole batch to the verifier thread and go straight back to
                 // servicing the socket. This is the line that ends the outage: for the
                 // seconds-to-minutes this batch takes to validate, we keep announcing,
@@ -1799,8 +1911,6 @@ impl SyncState {
                 // sequence: resume the EXISTING forward batched download from just
                 // past the fork point — the whole point of the locator is that this
                 // took one round-trip instead of a one-block-per-round-trip crawl.
-                self.inflight = None;
-                self.stalled_logged = false; // a reply arrived — clear the stall latch
                 if headers.len() > HEADERS_BATCH {
                     // More than we ever serve — an amplification an honest peer never
                     // sends (mirrors the oversized-BlocksResponse rule).
@@ -1846,19 +1956,9 @@ impl SyncState {
                 match headers_fork_point(node, &headers) {
                     Some(fork) => {
                         self.bt_step.remove(&peer); // forward mode
-                                                    // A valid, attached headers reply substantiates the peer just
-                                                    // like a delivered block batch does: forgive its stall strikes
-                                                    // (see the BlockResponse arm — the strike deadlock behind the
-                                                    // mainnet sync-reorg wedge). Without this, the fork point below
-                                                    // is resolved and logged, but a struck-out peer is never asked
-                                                    // to serve the download it just enabled.
-                        self.sync_strikes.remove(&peer);
+                                                    // Headers are only a download hint. Their bodies must
+                                                    // validate before resetting strikes or global progress.
                         self.sync_next.insert(peer, fork + 1);
-                        // Remember it GLOBALLY, not just for this connection. The fork
-                        // point is a fact about OUR chain; every honest peer shares it.
-                        // Surviving peer churn is what stops a reconnect from re-running
-                        // the locator exchange — the endless "fork point" churn.
-                        self.resume_from = Some(fork + 1);
                         p2p_log(
                             &self.log,
                             format!(
@@ -1933,7 +2033,6 @@ impl SyncState {
         // Real forward progress from this peer substantiates its claim: clear any
         // accrued stall strikes so an honest-but-briefly-slow peer never trips the
         // unsubstantiated-claim bound.
-        self.sync_strikes.remove(&peer);
         // Everything up to `h` is now on our own chain, so `h + 1` is a proven
         // common ancestor for ANY honest peer — remember it across peer churn.
         self.resume_from = Some(h.saturating_add(1));
@@ -1963,6 +2062,11 @@ impl SyncState {
         self.first_seen.retain(|p, _| connected.contains(p));
         self.last_recv.retain(|p, _| connected.contains(p));
         self.sync_strikes.retain(|p, _| connected.contains(p));
+        self.linkage_requests.retain(|p, _| connected.contains(p));
+        self.no_progress_replies
+            .retain(|p, _| connected.contains(p));
+        self.verified_sync_height
+            .retain(|p, _| connected.contains(p));
     }
 
     /// Collapse MULTIPLE live connections to the SAME node identity down to exactly
@@ -2083,13 +2187,36 @@ impl SyncState {
             };
             if !locator.is_empty() {
                 for peer in connected.iter().take(1) {
-                    tcp.send(
-                        *peer,
-                        &NetMessage::GetHeaders {
-                            locator: locator.clone(),
-                            stop: pin_hash,
-                        },
-                    );
+                    if !self.authenticated.contains(peer)
+                        || self
+                            .linkage_requests
+                            .get(peer)
+                            .is_some_and(|flight| flight.since.elapsed() < BLOCK_REQUEST_TIMEOUT)
+                    {
+                        continue;
+                    }
+                    let start = node
+                        .lock()
+                        .ok()
+                        .map(|node| node.chain().linkage_progress().0.max(1));
+                    if let Some(start) = start.filter(|_| {
+                        tcp.send(
+                            *peer,
+                            &NetMessage::GetHeaders {
+                                locator: locator.clone(),
+                                stop: pin_hash,
+                            },
+                        )
+                    }) {
+                        self.linkage_requests.insert(
+                            *peer,
+                            InFlight {
+                                peer: *peer,
+                                since: Instant::now(),
+                                request: SyncRequest::Linkage(start),
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -2303,6 +2430,14 @@ impl SyncState {
             self.inflight = Some(InFlight {
                 peer,
                 since: Instant::now(),
+                request: if backtracking {
+                    SyncRequest::Block(height)
+                } else {
+                    SyncRequest::Blocks {
+                        start: height,
+                        count: SYNC_BATCH,
+                    }
+                },
             });
         } else {
             // The peer dropped between selection and send; clear so the next tick
@@ -2552,6 +2687,65 @@ fn local_status(node: &Mutex<Node>) -> Option<PeerStatus> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn named_claims_cannot_spoof_transport_identity_or_self_detection() {
+        let owner = Keypair::hybrid_from_seed([91; 32]);
+        let attacker = Keypair::hybrid_from_seed([92; 32]);
+        let genesis = Hash::digest(b"identity regression chain");
+        let binding = [9; 32];
+        let name = AccountId::new("oracle.sov").unwrap();
+        let config = P2pConfig {
+            chain_id: "sov-mainnet".into(),
+            genesis_hash: genesis,
+            account: name.clone(),
+            keypair: Keypair::hybrid_from_seed([93; 32]),
+        };
+        let honest = NetMessage::hello("sov-mainnet", genesis, name.clone(), &binding, &owner);
+        let spoof = NetMessage::hello("sov-mainnet", genesis, name, &binding, &attacker);
+        let identity = authenticated_peer_identity(&honest, &config, &binding).unwrap();
+        let fake = authenticated_peer_identity(&spoof, &config, &binding).unwrap();
+        assert_eq!(identity, owner.public_key().implicit_account_id());
+        assert_ne!(identity, fake);
+        assert_ne!(fake, config.keypair.public_key().implicit_account_id());
+        assert!(authenticated_peer_identity(&honest, &config, &[10; 32]).is_none());
+        let wrong_genesis = P2pConfig {
+            genesis_hash: Hash::digest(b"fake chain"),
+            ..config
+        };
+        assert!(authenticated_peer_identity(&honest, &wrong_genesis, &binding).is_none());
+    }
+
+    #[test]
+    fn sync_reply_types_and_ranges_must_match_the_original_request() {
+        let single = SyncRequest::Block(10);
+        assert!(single.matches(&NetMessage::BlockResponse(None)));
+        assert!(!single.matches(&NetMessage::BlocksResponse(vec![])));
+        assert!(!single.matches(&NetMessage::Headers(vec![])));
+        let batch = SyncRequest::Blocks {
+            start: 10,
+            count: 2,
+        };
+        assert!(batch.matches(&NetMessage::BlocksResponse(vec![])));
+        assert!(!batch.matches(&NetMessage::BlockResponse(None)));
+        let header = sov_types::Block::assemble(
+            sov_primitives::BlockHeight::new(10),
+            Hash::digest(b"parent"),
+            Hash::ZERO,
+            Hash::ZERO,
+            1000,
+            AccountId::new("miner.sov").unwrap(),
+            vec![],
+        )
+        .header;
+        assert!(
+            !SyncRequest::Headers(vec![Hash::digest(b"different parent")])
+                .matches(&NetMessage::Headers(vec![header.clone()]))
+        );
+        assert!(SyncRequest::Headers(vec![header.prev_hash])
+            .matches(&NetMessage::Headers(vec![header.clone()])));
+        assert!(!SyncRequest::Linkage(11).matches(&NetMessage::Headers(vec![header])));
+    }
+
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
@@ -2708,17 +2902,167 @@ mod tests {
     }
 
     #[test]
-    fn an_answered_request_is_no_longer_in_flight() {
-        // A block response clears the in-flight marker so the next round picks the
-        // best peer afresh rather than treating the responder as stalled.
+    fn verified_side_branch_can_download_beyond_reply_limit_without_forgiving_stall_claims() {
+        let tcp = TcpNode::bind("127.0.0.1:0").unwrap();
+        let node = Mutex::new(Node::new(mined_chain(3), 1024, 256));
+        let peer = addr(7998);
+        let mut state = SyncState::new(None, None);
+        state.sync_strikes.insert(peer, 2);
+        for height in 1..=300 {
+            state.no_progress_replies.insert(peer, 1);
+            state.apply_verify_report(
+                &tcp,
+                &node,
+                VerifyReport {
+                    peer,
+                    mode: VerifyMode::Batch,
+                    outcomes: vec![(height, ImportOutcome::SideBranch)],
+                    announced: None,
+                    elapsed: Duration::from_millis(1),
+                },
+            );
+            assert!(!state.no_progress_replies.contains_key(&peer));
+            assert_eq!(
+                state.sync_strikes[&peer], 2,
+                "side branch does not substantiate a claimed canonical tip"
+            );
+        }
+        assert_eq!(state.verified_sync_height[&peer], 300);
+        for outcome in [ImportOutcome::Known, ImportOutcome::SideBranch] {
+            state.no_progress_replies.insert(peer, 255);
+            state.apply_verify_report(
+                &tcp,
+                &node,
+                VerifyReport {
+                    peer,
+                    mode: VerifyMode::Batch,
+                    outcomes: vec![(300, outcome)],
+                    announced: None,
+                    elapsed: Duration::from_millis(1),
+                },
+            );
+            assert_eq!(
+                state.no_progress_replies[&peer], 255,
+                "repeated or non-advancing bodies cannot reset the limit"
+            );
+        }
+        state.retain_connected(&HashSet::new());
+        assert!(state.verified_sync_height.is_empty());
+    }
+
+    #[test]
+    fn unsolicited_or_wrong_range_replies_cannot_cancel_another_peers_request() {
+        let tcp = TcpNode::bind("127.0.0.1:0").unwrap();
+        let node = Mutex::new(Node::new(mined_chain(3), 1024, 256));
+        let config = P2pConfig {
+            chain_id: "sov-test".into(),
+            genesis_hash: node
+                .lock()
+                .unwrap()
+                .chain()
+                .block_by_height(0)
+                .unwrap()
+                .hash(),
+            account: AccountId::new("local.sov").unwrap(),
+            keypair: Keypair::from_seed([155; 32]),
+        };
         let mut s = SyncState::new(None, None);
+        let requested = addr(7003);
+        let other = addr(7004);
+        s.authenticated.extend([requested, other]);
+        s.sync_strikes.insert(requested, 2);
+        s.resume_from = Some(1);
         s.inflight = Some(InFlight {
-            peer: addr(7003),
+            peer: requested,
             since: Instant::now(),
+            request: SyncRequest::Blocks { start: 1, count: 2 },
         });
-        // Mirror what handle() does on receiving a (None) block response.
-        s.inflight = None;
+        let original_timer = s.inflight.as_ref().unwrap().since;
+        let wrong_height = node
+            .lock()
+            .unwrap()
+            .chain()
+            .block_by_height(2)
+            .unwrap()
+            .clone();
+        for (peer, message) in [
+            (other, NetMessage::BlocksResponse(vec![])),
+            (requested, NetMessage::BlockResponse(None)),
+            (requested, NetMessage::Headers(vec![])),
+            (requested, NetMessage::BlocksResponse(vec![wrong_height])),
+        ] {
+            s.handle(&tcp, &node, &config, peer, message);
+            let flight = s
+                .inflight
+                .as_ref()
+                .expect("unmatched reply preserves request");
+            assert_eq!(flight.peer, requested);
+            assert_eq!(flight.since, original_timer);
+            assert_eq!(s.resume_from, Some(1));
+            assert_eq!(s.sync_strikes[&requested], 2);
+            assert!(s.no_progress_replies.is_empty());
+        }
+        s.handle(
+            &tcp,
+            &node,
+            &config,
+            requested,
+            NetMessage::BlocksResponse(vec![]),
+        );
         assert!(s.inflight.is_none());
+        assert_eq!(s.no_progress_replies[&requested], 1);
+        assert_eq!(
+            s.sync_strikes[&requested], 2,
+            "empty reply is not validated progress"
+        );
+    }
+
+    #[test]
+    fn matched_headers_cannot_erase_stall_strikes_or_poison_global_resume_height() {
+        let tcp = TcpNode::bind("127.0.0.1:0").unwrap();
+        let node = Mutex::new(Node::new(mined_chain(3), 1024, 256));
+        let genesis = node
+            .lock()
+            .unwrap()
+            .chain()
+            .block_by_height(0)
+            .unwrap()
+            .hash();
+        let config = P2pConfig {
+            chain_id: "sov-test".into(),
+            genesis_hash: genesis,
+            account: AccountId::new("local.sov").unwrap(),
+            keypair: Keypair::from_seed([156; 32]),
+        };
+        let peer = addr(7005);
+        let header = node
+            .lock()
+            .unwrap()
+            .chain()
+            .block_by_height(1)
+            .unwrap()
+            .header
+            .clone();
+        let mut s = SyncState::new(None, None);
+        s.authenticated.insert(peer);
+        s.sync_strikes.insert(peer, 2);
+        s.resume_from = Some(2);
+        s.inflight = Some(InFlight {
+            peer,
+            since: Instant::now(),
+            request: SyncRequest::Headers(vec![genesis]),
+        });
+        s.handle(
+            &tcp,
+            &node,
+            &config,
+            peer,
+            NetMessage::Headers(vec![header]),
+        );
+        assert!(s.inflight.is_none());
+        assert_eq!(s.resume_from, Some(2));
+        assert_eq!(s.sync_strikes[&peer], 2);
+        assert_eq!(s.no_progress_replies[&peer], 1);
     }
 
     #[test]

@@ -50,3 +50,6 @@ panic = "abort"
 # release profile above — the shipped binary — is unchanged.
 [profile.test]
 debug = "line-tables-only"
+# Real privacy-proof regressions exercise the shipped arithmetic with assertions
+# enabled; unoptimized field operations otherwise take tens of minutes per proof.
+opt-level = 2

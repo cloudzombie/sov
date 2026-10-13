@@ -64,6 +64,8 @@ jobs:
           persist-credentials: false
       - name: Guard tests (every failure path must fire)
         run: scripts/tests/release-contract.test.sh
+      - name: Apple Silicon artifact guard fixtures
+        run: python3 scripts/tests/macos-platform.test.py
 
   # Platform-agnostic checks: run once on Linux.
   lint:
@@ -117,6 +119,29 @@ jobs:
         run: cargo build --workspace
       - name: Tests
         run: cargo test --workspace
+
+  suite2:
+    name: hiding proof candidate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6
+        with:
+          workspaces: chain
+      - name: Hiding proof, context binding and bounded codec
+        run: cargo test --release --locked --manifest-path chain/Cargo.toml -p sov-shielded-pq --features zk-suite2
+      - name: Historical notes through activation, RPC and cold replay
+        run: cargo test --release --locked --manifest-path chain/Cargo.toml -p sov-rpc --features zk-suite2 --test suite2_recovery --test suite2_fee_funding
+      - name: Shipped verifier hostile frames (panic-abort release)
+        run: cargo run --release --locked --manifest-path chain/Cargo.toml -p sov-shielded-pq --features zk-suite2 --example verify_hostile_frames
+      - name: Candidate clippy
+        run: cargo clippy --locked --manifest-path chain/Cargo.toml -p sov-rpc --features zk-suite2 --all-targets -- -D warnings
 
   # The SOV Station desktop app (node/) is a SEPARATE cargo workspace the `test`
   # job above does NOT cover. This job gates it (fmt · clippy · tests) so a broken

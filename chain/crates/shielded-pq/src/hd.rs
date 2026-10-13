@@ -40,9 +40,11 @@
 //! blake3's `derive_key` mode gives full cryptographic context separation,
 //! so compromise of any one of these reveals nothing about the others or
 //! about the leaf. Because the whole subtree is a pure function of the
-//! leaf, **the 24-word phrase alone restores every v2 key, every v2
-//! address, and every note's `rho`** — no additional backup exists or is
-//! needed. This is pinned by cross-checked vectors in
+//! leaf, the phrase restores every v2 key and address. Existing deterministic
+//! rho derivation remains available for historical notes and vectors. New
+//! wallet outputs use OS randomness: their rho is restored by decrypting the
+//! on-chain note ciphertext with the phrase-derived KEM key. Key derivation is
+//! pinned by cross-checked vectors in
 //! `chain/crates/shielded/tests/pq_wallet_vectors.rs` and
 //! `sdk/vectors/pq-shielded-v2-key.json`.
 //!
@@ -96,12 +98,22 @@ fn expand(domain: &str, leaf: &[u8; 32]) -> Zeroizing<[u8; 32]> {
 /// is secret except [`PqShieldedKey::address`].
 pub struct PqShieldedKey {
     spend: SpendingKey,
+    spend_seed: Zeroizing<[u8; 32]>,
     kem: EncryptionKeypair,
     auth: AuthKeypair,
     rho_seed: Zeroizing<[u8; 32]>,
 }
 
 impl PqShieldedKey {
+    /// Derive independent suite-2 receiving/spending keys from the same leaf.
+    /// Historical suite-1 derivation is unchanged, so both key sets must be
+    /// scanned during migration. New domains prevent an old disclosed NSK from
+    /// becoming the spending key of newly received suite-2 notes.
+    pub fn from_leaf_seed_suite2(leaf: &[u8; 32]) -> Self {
+        let suite2_leaf = expand("sov-shielded-pq:hd-suite2:v1", leaf);
+        Self::from_leaf_seed(&suite2_leaf)
+    }
+
     /// Derive the whole v2 key set from a 32-byte BIP-44 leaf seed
     /// (`sov_wallet::HdWallet::derive_seed(account, index)`).
     ///
@@ -117,6 +129,7 @@ impl PqShieldedKey {
         let rho_seed = expand(B3_HD_RHO, leaf);
         PqShieldedKey {
             spend: SpendingKey::from_seed(&spend_seed),
+            spend_seed,
             kem: EncryptionKeypair::from_kem_seeds(&kem_d, &kem_z),
             auth: AuthKeypair::from_seed(&auth_seed),
             rho_seed,
@@ -126,6 +139,12 @@ impl PqShieldedKey {
     /// The spend key (`nsk`) — derives nullifiers and the owner tag.
     pub fn spend_key(&self) -> &SpendingKey {
         &self.spend
+    }
+
+    /// Secret seed preimage needed by the replacement ownership circuit.
+    /// Never log or serialize it; expose only to the local hiding prover.
+    pub fn spending_seed_preimage(&self) -> &[u8; 32] {
+        &self.spend_seed
     }
 
     /// The ML-KEM-768 note-encryption keypair — trial-decapsulates incoming
@@ -144,9 +163,9 @@ impl PqShieldedKey {
         self.spend.owner_tag()
     }
 
-    /// This wallet's deterministic `rho` for output note `index`. Recovering
-    /// the phrase recovers every `rho` the wallet ever used, so change notes
-    /// it created are reproducible without any other backup.
+    /// Historical deterministic `rho` derivation, preserved for old notes and
+    /// vectors. New wallet outputs use fresh entropy and are restored by
+    /// decrypting their on-chain ciphertexts.
     pub fn rho(&self, index: u64) -> PqDigest {
         derive_rho(&self.rho_seed, index)
     }

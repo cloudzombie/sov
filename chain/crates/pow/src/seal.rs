@@ -49,11 +49,28 @@ thread_local! {
     /// This thread's LIGHT RandomX VM (cache-only, ~256 MiB), paired with the key it
     /// was built for. Used for VERIFICATION — one hash per block — so a non-mining node
     /// (RPC, explorer, small seed VPS) stays lean. Built lazily, rebuilt on key change.
-    static RANDOMX_VM_LIGHT: RefCell<Option<(Vec<u8>, RandomXVM)>> = const { RefCell::new(None) };
+    static RANDOMX_VM_LIGHT: RefCell<Option<CachedRandomXVm>> = const { RefCell::new(None) };
     /// This thread's FAST RandomX VM (full ~2 GiB dataset, FLAG_FULL_MEM), for the
     /// MINING hot loop — roughly 10× the hash rate of light mode. Built lazily on the
     /// single mining thread; the ~2 GiB dataset is allocated once per key.
-    static RANDOMX_VM_FAST: RefCell<Option<(Vec<u8>, RandomXVM)>> = const { RefCell::new(None) };
+    static RANDOMX_VM_FAST: RefCell<Option<CachedRandomXVm>> = const { RefCell::new(None) };
+}
+
+struct CachedRandomXVm {
+    key: Vec<u8>,
+    vm: RandomXVM,
+    /// The flags actually passed to this successfully exercised VM, rather than
+    /// a separate CPU capability probe that could disagree with the chosen VM.
+    uses_jit: bool,
+}
+
+/// Whether this thread's initialized production RandomX verifier uses JIT.
+///
+/// Returns `None` before the first RandomX seal. Release self-tests inspect this
+/// after checking known answers, so an interpreter-only build cannot claim to
+/// have exercised the signed app's JIT entitlement.
+pub fn randomx_verifier_uses_jit() -> Option<bool> {
+    RANDOMX_VM_LIGHT.with(|cell| cell.borrow().as_ref().map(|entry| entry.uses_jit))
 }
 
 /// Bytes the FLAG_FULL_MEM RandomX dataset needs (~2080 MiB), plus headroom for the
@@ -101,7 +118,7 @@ fn parse_mem_available_kb(meminfo: &str) -> Option<u64> {
 /// catching an allocation failure: on Linux the dataset alloc overcommits and the OOM
 /// killer SIGKILLs the process mid-population, so the `Err` fallback below never fires on
 /// a starved box. The `Ok`/`Err` chain is still kept as a second line of defense.
-fn build_randomx_vm(key: &[u8], fast: bool) -> RandomXVM {
+fn build_randomx_vm(key: &[u8], fast: bool) -> CachedRandomXVm {
     if fast && host_has_ram_for_fast_dataset() {
         let flags = RandomXFlag::get_recommended_flags() | RandomXFlag::FLAG_FULL_MEM;
         // Each step can fail on a RAM-constrained host; on ANY failure fall through to
@@ -109,14 +126,22 @@ fn build_randomx_vm(key: &[u8], fast: bool) -> RandomXVM {
         if let Ok(cache) = RandomXCache::new(flags, key) {
             if let Ok(dataset) = RandomXDataset::new(flags, cache, 0) {
                 if let Ok(vm) = RandomXVM::new(flags, None, Some(dataset)) {
-                    return vm;
+                    return CachedRandomXVm {
+                        key: key.to_vec(),
+                        vm,
+                        uses_jit: flags.contains(RandomXFlag::FLAG_JIT),
+                    };
                 }
             }
         }
     }
     let flags = RandomXFlag::get_recommended_flags();
     let cache = RandomXCache::new(flags, key).expect("RandomX cache initialization");
-    RandomXVM::new(flags, Some(cache), None).expect("RandomX VM initialization")
+    CachedRandomXVm {
+        key: key.to_vec(),
+        vm: RandomXVM::new(flags, Some(cache), None).expect("RandomX VM initialization"),
+        uses_jit: flags.contains(RandomXFlag::FLAG_JIT),
+    }
 }
 
 /// Hash `input` with this thread's RandomX VM for `key`, building/rebuilding it as
@@ -131,14 +156,14 @@ fn randomx_hash(key: &[u8], input: &[u8], fast: bool) -> [u8; 32] {
     tls.with(|cell| {
         let mut slot = cell.borrow_mut();
         let needs_build = match slot.as_ref() {
-            Some((existing_key, _)) => existing_key.as_slice() != key,
+            Some(entry) => entry.key.as_slice() != key,
             None => true,
         };
         if needs_build {
-            *slot = Some((key.to_vec(), build_randomx_vm(key, fast)));
+            *slot = Some(build_randomx_vm(key, fast));
         }
-        let (_, vm) = slot.as_ref().expect("VM is present after build");
-        let digest = vm.calculate_hash(input).expect("RandomX hash");
+        let entry = slot.as_ref().expect("VM is present after build");
+        let digest = entry.vm.calculate_hash(input).expect("RandomX hash");
         let mut out = [0u8; 32];
         out.copy_from_slice(&digest);
         out

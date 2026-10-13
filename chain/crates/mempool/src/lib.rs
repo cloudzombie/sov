@@ -99,6 +99,14 @@ pub enum MempoolError {
         /// The per-transaction ceiling ([`sov_types::weight::MAX_TX_WEIGHT`]).
         limit: u64,
     },
+    /// Admission or replacement would exceed the bounded pool memory budget.
+    #[error("mempool weight {weight} would exceed the limit {limit}; wait for space")]
+    WeightLimit {
+        /// Projected weight of the relevant pool region after admission.
+        weight: u64,
+        /// The combined pool budget or its queued-region share.
+        limit: u64,
+    },
     /// The signature did not verify.
     #[error("invalid transaction signature")]
     InvalidSignature,
@@ -226,6 +234,14 @@ fn base_outflow(action: &Action) -> u128 {
         // never execute. `Tipped` never nests (rejected at decode and execution), so
         // this recursion is depth-1 in practice and decode-bounded regardless.
         Action::Tipped { tip, inner } => tip.grains().saturating_add(base_outflow(inner)),
+        // These carriers execute their child from the same signer balance.
+        // ProposeMultisig deliberately stays below: it records a proposal and
+        // does not execute its transfer during this transaction.
+        Action::Timestamped { inner, .. } => base_outflow(inner),
+        Action::MultisigExec { action, .. } => base_outflow(action),
+        // A pooled shielded withdrawal is not transparent balance yet. Its
+        // gross payout may fund its OWN verified runtime fee, but it never
+        // funds a following transfer before the withdrawal is committed.
         _ => 0,
     }
 }
@@ -243,7 +259,7 @@ pub fn effective_tip(stx: &SignedTransaction) -> Balance {
     }
 }
 
-/// Default ceiling on the READY pool's total weight.
+/// Default ceiling on the READY and QUEUED pool's combined total weight.
 ///
 /// Sized so the pool holds a useful backlog of the LARGEST transactions the
 /// chain permits — 64 MiB is roughly sixteen blocks at `MAX_BLOCK_WEIGHT` —
@@ -455,11 +471,13 @@ pub struct Mempool {
     /// admission timestamp (Unix millis) for TTL eviction. Entries here are
     /// NOT in `by_id`/`by_sender` and never consume ready capacity.
     queued: BTreeMap<(AccountId, u64), QueuedTx>,
+    /// Running queued-region weight, maintained by its insert/remove helpers.
+    queued_weight_total: u64,
     /// Global bound on `queued` (side-table memory cap).
     queued_capacity: usize,
     /// Per-sender bound on `queued`.
     max_queued_per_sender: usize,
-    /// Ceiling on the READY region's total weight — the byte bound `capacity`
+    /// Ceiling on READY + QUEUED total weight — the byte bound `capacity`
     /// never was. A transaction COUNT stops being a memory bound the moment
     /// transaction sizes differ by three orders of magnitude, which is exactly
     /// what pool v2 introduces (a ~104 KB shielded bundle beside a ~300 byte
@@ -481,6 +499,8 @@ pub struct Mempool {
     /// signatures at the door — matching what block execution enforces at each
     /// stage of the rollout.
     mode: TxDomainMode,
+    /// Tip-resolved admission policy for independently activated suite 2.
+    suite2_active: bool,
 }
 
 impl Mempool {
@@ -502,11 +522,13 @@ impl Mempool {
             capacity,
             max_per_sender: max_per_sender.max(1),
             queued: BTreeMap::new(),
+            queued_weight_total: 0,
             queued_capacity: default_queued_capacity(capacity),
             max_queued_per_sender: MAX_QUEUED_PER_SENDER,
             max_weight: DEFAULT_MAX_POOL_WEIGHT,
             weight_total: 0,
             mode: TxDomainMode::Legacy,
+            suite2_active: false,
         }
     }
 
@@ -531,6 +553,12 @@ impl Mempool {
     /// block execution does.
     pub fn set_mode(&mut self, mode: TxDomainMode) {
         self.mode = mode;
+    }
+
+    /// Resolve the larger version-2-only admission ceiling from the next
+    /// block's activation state. No legacy transaction limit changes.
+    pub fn set_suite2_active(&mut self, active: bool) {
+        self.suite2_active = active;
     }
 
     /// Tell the pool the node's current chain height, so each admission can be
@@ -804,11 +832,14 @@ impl Mempool {
         // This is admission POLICY, not consensus: it changes what this node
         // relays, never which blocks it accepts.
         let weight = tx_weight(&stx);
-        if weight > MAX_TX_WEIGHT {
-            return Err(MempoolError::TooLarge {
-                weight,
-                limit: MAX_TX_WEIGHT,
-            });
+        let limit =
+            if self.suite2_active && sov_types::weight::is_suite2_action(&stx.transaction.action) {
+                sov_types::weight::MAX_SUITE2_TX_WEIGHT
+            } else {
+                MAX_TX_WEIGHT
+            };
+        if weight > limit {
+            return Err(MempoolError::TooLarge { weight, limit });
         }
         let signer = stx.transaction.signer.clone();
         let admitted = self.insert_inner(stx, current_nonce, balance)?;
@@ -890,8 +921,13 @@ impl Mempool {
                 });
             }
             // Replace atomically: pool size and the sender's slot count are
-            // unchanged, so neither the capacity auction nor the per-sender cap
-            // applies, and the gap-free invariant is untouched (same slot).
+            // unchanged, but the payload may grow by megabytes. Check memory
+            // before removing the incumbent, so refusal preserves its nonce.
+            self.check_total_weight(
+                self.total_weight()
+                    .saturating_sub(tx_weight(&self.by_id[&old_id]))
+                    .saturating_add(weight),
+            )?;
             self.remove(&old_id);
             self.admit_ready(slot, id, stx);
             return Ok(Admitted::Ready);
@@ -963,7 +999,7 @@ impl Mempool {
         let new_rate = fee_rate(new_tip, weight);
         let mut budget = self.by_id.len().saturating_add(1);
         while self.by_id.len() >= self.capacity
-            || self.weight_total.saturating_add(weight) > self.max_weight
+            || self.total_weight().saturating_add(weight) > self.max_weight
         {
             budget = match budget.checked_sub(1) {
                 Some(b) if b > 0 => b,
@@ -1030,6 +1066,74 @@ impl Mempool {
         self.by_id.values().map(tx_weight).sum()
     }
 
+    fn total_weight(&self) -> u64 {
+        self.weight_total.saturating_add(self.queued_weight_total)
+    }
+
+    fn check_total_weight(&self, weight: u64) -> Result<(), MempoolError> {
+        if weight > self.max_weight {
+            return Err(MempoolError::WeightLimit {
+                weight,
+                limit: self.max_weight,
+            });
+        }
+        Ok(())
+    }
+
+    // Future-nonce work cannot pin the entire budget while the ready region
+    // is empty. Reserve three quarters of memory for mineable transactions.
+    fn check_queued_weight(&self, weight: u64) -> Result<(), MempoolError> {
+        let limit = self.max_weight / 4;
+        if weight > limit {
+            return Err(MempoolError::WeightLimit { weight, limit });
+        }
+        self.check_total_weight(self.weight_total.saturating_add(weight))
+    }
+
+    /// The only way a transaction enters the queued region. Replacements first
+    /// remove their incumbent; promotion can restore the original timestamps.
+    fn admit_queued(&mut self, slot: (AccountId, u64), queued: QueuedTx) {
+        self.queued_weight_total = self
+            .queued_weight_total
+            .saturating_add(tx_weight(&queued.stx));
+        let previous = self.queued.insert(slot, queued);
+        debug_assert!(
+            previous.is_none(),
+            "queued replacement must remove its incumbent"
+        );
+        self.assert_queued_weight();
+    }
+
+    fn remove_queued(&mut self, slot: &(AccountId, u64)) -> Option<QueuedTx> {
+        let queued = self.queued.remove(slot)?;
+        self.queued_weight_total = self
+            .queued_weight_total
+            .saturating_sub(tx_weight(&queued.stx));
+        self.assert_queued_weight();
+        Some(queued)
+    }
+
+    fn retain_queued<F: FnMut(&(AccountId, u64), &mut QueuedTx) -> bool>(&mut self, mut keep: F) {
+        self.queued.retain(|slot, queued| {
+            let retained = keep(slot, queued);
+            if !retained {
+                self.queued_weight_total = self
+                    .queued_weight_total
+                    .saturating_sub(tx_weight(&queued.stx));
+            }
+            retained
+        });
+        self.assert_queued_weight();
+    }
+
+    fn assert_queued_weight(&self) {
+        debug_assert_eq!(
+            self.queued_weight_total,
+            self.queued.values().map(|q| tx_weight(&q.stx)).sum::<u64>(),
+            "queued_weight_total drifted from the pool's real contents"
+        );
+    }
+
     /// Park a future-nonce transaction in the queued region, DoS-bounded:
     /// - affordability counts the signer's READY + QUEUED outflow, so the queued
     ///   region never holds an obvious overspend;
@@ -1088,7 +1192,13 @@ impl Mempool {
                     committed,
                 });
             }
-            self.queued.insert(
+            self.check_queued_weight(
+                self.queued_weight_total
+                    .saturating_sub(tx_weight(&old.stx))
+                    .saturating_add(tx_weight(&stx)),
+            )?;
+            self.remove_queued(&slot);
+            self.admit_queued(
                 slot,
                 QueuedTx {
                     stx,
@@ -1110,6 +1220,11 @@ impl Mempool {
                 committed,
             });
         }
+        // Plan every displacement before changing the pool. A closer nonce
+        // or higher bid still cannot replace a small entry with a payload that
+        // exceeds the memory budget; refusal preserves all incumbents.
+        let mut displaced = BTreeSet::new();
+        let mut projected = self.queued_weight_total;
         // Per-sender bound: displace the sender's own furthest-future entry only
         // for a strictly closer-to-mineable newcomer.
         if self.queued_count(&signer) >= self.max_queued_per_sender {
@@ -1125,14 +1240,17 @@ impl Mempool {
                     limit: self.max_queued_per_sender,
                 });
             }
-            self.queued.remove(&(signer.clone(), furthest));
+            let victim = (signer.clone(), furthest);
+            projected = projected.saturating_sub(tx_weight(&self.queued[&victim].stx));
+            displaced.insert(victim);
         }
         // Global bound: strictly outbid the cheapest queued entry or be refused.
-        if self.queued.len() >= self.queued_capacity {
+        if self.queued.len().saturating_sub(displaced.len()) >= self.queued_capacity {
             let new_tip = effective_tip(&stx).grains();
             let victim = self
                 .queued
                 .iter()
+                .filter(|(slot, _)| !displaced.contains(*slot))
                 .map(|(slot, q)| (effective_tip(&q.stx).grains(), slot.clone()))
                 .fold(None::<(u128, (AccountId, u64))>, |best, cand| match best {
                     // `<=` keeps the LAST minimal key in iteration order — the
@@ -1146,9 +1264,14 @@ impl Mempool {
                     limit: self.queued_capacity,
                 });
             }
-            self.queued.remove(&victim.1);
+            projected = projected.saturating_sub(tx_weight(&self.queued[&victim.1].stx));
+            displaced.insert(victim.1);
         }
-        self.queued.insert(
+        self.check_queued_weight(projected.saturating_add(tx_weight(&stx)))?;
+        for victim in displaced {
+            self.remove_queued(&victim);
+        }
+        self.admit_queued(
             slot,
             QueuedTx {
                 stx,
@@ -1178,7 +1301,7 @@ impl Mempool {
         loop {
             let expected = current_nonce.saturating_add(self.sender_count(signer) as u64);
             let slot = (signer.clone(), expected);
-            let Some(q) = self.queued.remove(&slot) else {
+            let Some(q) = self.remove_queued(&slot) else {
                 break;
             };
             let queued_at_ms = q.queued_at_ms;
@@ -1192,11 +1315,12 @@ impl Mempool {
                 }
                 Err(
                     MempoolError::Full { .. }
+                    | MempoolError::WeightLimit { .. }
                     | MempoolError::BelowFloor { .. }
                     | MempoolError::SenderLimit { .. },
                 ) => {
                     // Transient: put it back exactly as it was and retry later.
-                    self.queued.insert(
+                    self.admit_queued(
                         slot,
                         QueuedTx {
                             stx: q.stx,
@@ -1273,8 +1397,7 @@ impl Mempool {
         // Queued entries whose nonce the chain has moved past can never be
         // promoted — the account consumed that nonce (mined it here or elsewhere,
         // or a reorg replayed past it). Drop them on the same tick.
-        self.queued
-            .retain(|(signer, nonce), _| *nonce >= current_nonce(signer));
+        self.retain_queued(|(signer, nonce), _| *nonce >= current_nonce(signer));
     }
 
     /// Prune both stale AND now-unaffordable transactions. Run after every committed
@@ -1360,8 +1483,7 @@ impl Mempool {
         // so the identical TTL applies: a queued entry whose gap has not filled
         // within `ttl_millis` is dropped and its sender self-heals.
         let before = self.queued.len();
-        self.queued
-            .retain(|_, q| now.saturating_sub(q.queued_at_ms) < ttl_millis);
+        self.retain_queued(|_, q| now.saturating_sub(q.queued_at_ms) < ttl_millis);
         evicted + (before - self.queued.len())
     }
 
@@ -3379,6 +3501,111 @@ mod tests {
         assert!(pool.is_empty(), "nothing oversized enters the pool");
     }
 
+    #[test]
+    fn larger_suite2_admission_requires_activation_and_never_widens_legacy() {
+        let key = Keypair::from_seed([9; 32]);
+        let make = |version| {
+            let mut bundle = vec![0; MAX_TX_WEIGHT as usize];
+            bundle[0] = version;
+            SignedTransaction::sign(
+                Transaction {
+                    signer: id("usa.reserve.sov"),
+                    public_key: key.public_key(),
+                    nonce: 0,
+                    action: Action::ShieldedV2 { bundle },
+                },
+                &key,
+            )
+            .unwrap()
+        };
+        let mut pool = Mempool::new(100);
+        assert!(matches!(
+            pool.insert(make(2), 0, big()),
+            Err(MempoolError::TooLarge {
+                limit: MAX_TX_WEIGHT,
+                ..
+            })
+        ));
+        pool.set_suite2_active(true);
+        assert!(matches!(
+            pool.insert(make(1), 0, big()),
+            Err(MempoolError::TooLarge {
+                limit: MAX_TX_WEIGHT,
+                ..
+            })
+        ));
+        assert!(pool.insert(make(2), 0, big()).is_ok());
+    }
+
+    #[test]
+    fn a_pending_suite2_withdrawal_does_not_fund_following_transfers() {
+        let key = Keypair::hybrid_from_seed([44; 32]);
+        let signer = id("empty.sov");
+        let signed = |nonce, action| {
+            SignedTransaction::sign(
+                Transaction {
+                    signer: signer.clone(),
+                    public_key: key.public_key(),
+                    nonce,
+                    action,
+                },
+                &key,
+            )
+            .unwrap()
+        };
+        let mut pool = Mempool::new(100);
+        pool.set_suite2_active(true);
+        // The node verifies the proof. This component treats the carrier as
+        // opaque and must not manufacture balance from anything inside it.
+        pool.insert(
+            signed(0, Action::ShieldedV2 { bundle: vec![2] }),
+            0,
+            Balance::ZERO,
+        )
+        .unwrap();
+        let transfer = || Action::Transfer {
+            to: id("receiver.sov"),
+            amount: Balance::from_grains(1),
+        };
+        for (action, expected_outflow) in [
+            (transfer(), 1),
+            (
+                Action::Timestamped {
+                    created_at_ms: 1,
+                    inner: Box::new(transfer()),
+                },
+                1,
+            ),
+            (
+                Action::Timestamped {
+                    created_at_ms: 1,
+                    inner: Box::new(Action::Tipped {
+                        tip: Balance::from_grains(7),
+                        inner: Box::new(transfer()),
+                    }),
+                },
+                8,
+            ),
+            (
+                Action::MultisigExec {
+                    action: Box::new(transfer()),
+                    approvals: vec![],
+                },
+                1,
+            ),
+        ] {
+            assert_eq!(
+                pool.insert(signed(1, action), 0, Balance::ZERO),
+                Err(MempoolError::Insufficient {
+                    available: 0,
+                    committed: expected_outflow,
+                })
+            );
+        }
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.next_nonce(&signer, 0), 1);
+    }
+
     /// A transaction exactly AT the limit is admitted — the check is `>`, not
     /// `>=`. An off-by-one here would silently make the last legal size
     /// unrelayable.
@@ -3455,6 +3682,258 @@ mod tests {
         }
         assert!(pool.is_empty());
         assert_eq!(pool.weight_total, 0, "an empty pool weighs exactly zero");
+    }
+
+    // Mempool resource policy checks the signed carrier's weight; a real proof
+    // is deliberately unnecessary here because verification belongs to runtime.
+    fn large_suite2(
+        seed: [u8; 32],
+        from: &str,
+        nonce: u64,
+        tip: u128,
+        payload_bytes: usize,
+    ) -> SignedTransaction {
+        let kp = Keypair::from_seed(seed);
+        let mut bundle = vec![0; payload_bytes];
+        bundle[0] = 2;
+        SignedTransaction::sign(
+            Transaction {
+                signer: id(from),
+                public_key: kp.public_key(),
+                nonce,
+                action: Action::Tipped {
+                    tip: Balance::from_grains(tip),
+                    inner: Box::new(Action::ShieldedV2 { bundle }),
+                },
+            },
+            &kp,
+        )
+        .unwrap()
+    }
+
+    fn assert_pool_weight(pool: &Mempool) {
+        assert_eq!(pool.weight_total, pool.recompute_weight());
+        assert_eq!(
+            pool.queued_weight_total,
+            pool.queued.values().map(|q| tx_weight(&q.stx)).sum::<u64>()
+        );
+        assert!(pool.total_weight() <= pool.max_weight);
+        assert!(pool.queued_weight_total <= pool.max_weight / 4);
+    }
+
+    #[test]
+    fn ready_rbf_checks_combined_weight_before_removing_the_incumbent() {
+        let old = tipped([1; 32], "usa.reserve.sov", 0, 1);
+        let old_id = old.id();
+        let replacement = large_suite2([1; 32], "usa.reserve.sov", 0, 1_001, 2 * 1024 * 1024);
+        let replacement_id = replacement.id();
+        let queued = large_suite2([2; 32], "ecb.reserve.sov", 5, 1, 256 * 1024);
+        let filler = tx([3; 32], "boj.reserve.sov", 0);
+        let projected = tx_weight(&replacement) + tx_weight(&queued) + tx_weight(&filler);
+        let mut pool = Mempool::new(100);
+        pool.set_suite2_active(true);
+        pool.max_weight = projected - 1;
+        pool.insert(old, 0, big()).unwrap();
+        pool.insert(queued, 0, big()).unwrap();
+        pool.insert(filler, 0, big()).unwrap();
+        let first_seen = pool.first_seen(&old_id);
+        let total_before = pool.total_weight();
+
+        assert_eq!(
+            pool.insert(replacement.clone(), 0, big()),
+            Err(MempoolError::WeightLimit {
+                weight: projected,
+                limit: projected - 1,
+            })
+        );
+        assert!(pool.contains(&old_id));
+        assert!(!pool.contains(&replacement_id));
+        assert_eq!(pool.first_seen(&old_id), first_seen);
+        assert_eq!(pool.total_weight(), total_before);
+        assert_pool_weight(&pool);
+
+        pool.max_weight = projected;
+        assert_eq!(pool.insert(replacement, 0, big()), Ok(Admitted::Ready));
+        assert!(!pool.contains(&old_id));
+        assert!(pool.contains(&replacement_id));
+        assert_eq!(
+            pool.total_weight(),
+            projected,
+            "exactly at the cap is allowed"
+        );
+        pool.insert(tipped([1; 32], "usa.reserve.sov", 0, 2_001), 0, big())
+            .unwrap();
+        assert!(
+            pool.total_weight() < projected,
+            "shrinking RBF releases memory"
+        );
+        assert_pool_weight(&pool);
+    }
+
+    #[test]
+    fn queued_rbf_has_an_inclusive_weight_bound_and_preserves_refused_entries() {
+        let old = large_suite2([1; 32], "usa.reserve.sov", 5, 1, 2 * 1024 * 1024);
+        let slot = (id("usa.reserve.sov"), 5);
+        let old_id = old.id();
+        let exact = tx_weight(&old);
+        let mut pool = Mempool::new(100);
+        pool.set_suite2_active(true);
+        pool.max_weight = 4 * exact;
+        assert_eq!(pool.insert(old, 0, big()), Ok(Admitted::Queued));
+        let stamp = pool.first_seen(&old_id);
+        assert_eq!(pool.queued_weight_total, exact);
+
+        let over = large_suite2([1; 32], "usa.reserve.sov", 5, 1_001, 2 * 1024 * 1024 + 1);
+        assert_eq!(
+            pool.insert(over, 0, big()),
+            Err(MempoolError::WeightLimit {
+                weight: exact + 1,
+                limit: exact
+            })
+        );
+        assert_eq!(pool.queued[&slot].stx.id(), old_id);
+        assert_eq!(pool.first_seen(&old_id), stamp);
+        assert_eq!(pool.queued_weight_total, exact);
+
+        let smaller = large_suite2([1; 32], "usa.reserve.sov", 5, 1_001, 2 * 1024 * 1024 - 1);
+        assert_eq!(pool.insert(smaller, 0, big()), Ok(Admitted::Queued));
+        assert_eq!(pool.queued_weight_total, exact - 1);
+        assert_pool_weight(&pool);
+    }
+
+    #[test]
+    fn queued_weight_limit_plans_sender_and_global_evictions_atomically() {
+        let old = tipped([1; 32], "usa.reserve.sov", 9, 1);
+        let old_id = old.id();
+        let other = tipped([2; 32], "ecb.reserve.sov", 9, 1);
+        let other_id = other.id();
+        let mut pool = Mempool::new(100).with_queue_limits(2, 1);
+        pool.set_suite2_active(true);
+        pool.max_weight = 4 * (tx_weight(&old) + tx_weight(&other));
+        pool.insert(old, 0, big()).unwrap();
+        pool.insert(other, 0, big()).unwrap();
+        let before = pool.queued_weight_total;
+
+        // A closer nonce qualifies to displace this sender's entry, but cannot
+        // remove it before the much larger incoming carrier passes the cap.
+        let closer = large_suite2([1; 32], "usa.reserve.sov", 8, 1, 2 * 1024 * 1024);
+        assert!(matches!(
+            pool.insert(closer, 0, big()),
+            Err(MempoolError::WeightLimit { .. })
+        ));
+        assert!(pool.first_seen(&old_id).is_some());
+        assert_eq!(pool.queued_weight_total, before);
+
+        // The same applies to a high-bid third sender displacing a global
+        // victim. Neither incumbent disappears if the new payload is refused.
+        let bidder = large_suite2([3; 32], "boj.reserve.sov", 8, 2_000, 2 * 1024 * 1024);
+        assert!(matches!(
+            pool.insert(bidder, 0, big()),
+            Err(MempoolError::WeightLimit { .. })
+        ));
+        assert!(pool.first_seen(&old_id).is_some());
+        assert!(pool.first_seen(&other_id).is_some());
+        assert_eq!(pool.queued_weight_total, before);
+        assert_pool_weight(&pool);
+    }
+
+    #[test]
+    fn queued_weight_is_shared_with_ready_and_released_on_every_lifecycle_path() {
+        let queued = large_suite2([1; 32], "usa.reserve.sov", 2, 0, 2 * 1024 * 1024);
+        let queued_id = queued.id();
+        let exact = tx_weight(&queued);
+        let mut pool = Mempool::new(100);
+        pool.set_suite2_active(true);
+        pool.max_weight = 4 * exact;
+        pool.insert(queued, 0, big()).unwrap();
+        // Only one large future-nonce carrier fits the reserved queued share,
+        // despite 64 queued count slots remaining available.
+        assert!(matches!(
+            pool.insert(
+                large_suite2([2; 32], "ecb.reserve.sov", 2, 0, 2 * 1024 * 1024),
+                0,
+                big()
+            ),
+            Err(MempoolError::WeightLimit { .. })
+        ));
+        assert_pool_weight(&pool);
+
+        for (seed, from) in [
+            ([2; 32], "ecb.reserve.sov"),
+            ([3; 32], "boj.reserve.sov"),
+            ([4; 32], "rba.reserve.sov"),
+        ] {
+            pool.insert(large_suite2(seed, from, 0, 0, 2 * 1024 * 1024), 0, big())
+                .unwrap();
+        }
+        assert_eq!(pool.total_weight(), pool.max_weight);
+        assert!(matches!(
+            pool.insert(tx([5; 32], "rbc.reserve.sov", 0), 0, big()),
+            Err(MempoolError::Full { .. })
+        ));
+        assert_eq!(
+            pool.len(),
+            3,
+            "ready admission counts the queued region's memory"
+        );
+        assert_pool_weight(&pool);
+
+        let snapshot = pool.snapshot();
+        let mut restored = Mempool::new(100);
+        restored.set_suite2_active(true);
+        restored.max_weight = pool.max_weight;
+        // Restore only the future-nonce carrier for the lifecycle assertions.
+        restored.restore(
+            snapshot
+                .into_iter()
+                .filter(|stx| stx.id() == queued_id)
+                .collect(),
+            |_| 0,
+            |_| big(),
+        );
+        assert_eq!(restored.queued_weight_total, exact);
+        assert_pool_weight(&restored);
+
+        // A failed promotion restores the queued entry and its original stamp.
+        let stamp = restored.first_seen(&queued_id);
+        restored.max_per_sender = 1;
+        restored
+            .insert(tx([1; 32], "usa.reserve.sov", 1), 1, big())
+            .unwrap();
+        assert_eq!(restored.queued_weight_total, exact);
+        assert_eq!(restored.first_seen(&queued_id), stamp);
+        assert_pool_weight(&restored);
+
+        // Once the gap-filler is mined, promotion moves its weight rather than
+        // charging it twice. Pruning releases the weight completely.
+        restored.prune(|_| 2, |_| big());
+        assert_eq!(restored.queued_weight_total, 0);
+        assert_eq!(restored.weight_total, exact);
+        assert!(restored.contains(&queued_id));
+        assert_pool_weight(&restored);
+        restored.prune_stale(|_| 3);
+        assert_eq!(restored.total_weight(), 0);
+
+        let snapshot: Vec<_> = pool
+            .snapshot()
+            .into_iter()
+            .filter(|stx| stx.id() == queued_id)
+            .collect();
+        restored.restore(snapshot.clone(), |_| 0, |_| big());
+        restored.prune_stale(|_| 3);
+        assert_eq!(
+            restored.total_weight(),
+            0,
+            "stale queued entry releases memory"
+        );
+        restored.restore(snapshot, |_| 0, |_| big());
+        assert_eq!(restored.evict_stranded(|_| 0, 0), 1);
+        assert_eq!(
+            restored.total_weight(),
+            0,
+            "TTL eviction releases queued memory"
+        );
+        assert_pool_weight(&restored);
     }
 
     /// The pool's WEIGHT bound admits fewer transactions than its COUNT bound

@@ -31,10 +31,16 @@ use sov_shielded::{
 use sov_shielded_pq::bundle::SpendBundle;
 use sov_shielded_pq::hd::PqShieldedKey;
 use sov_shielded_pq::scan::PqNoteStore;
-use sov_shielded_pq::wallet::{authorize_for_carrier, build_shield, build_spend};
-use sov_shielded_pq::wire::decode_bundle;
+#[cfg(test)]
+use sov_shielded_pq::wallet::build_shield;
+#[cfg(feature = "zk-suite2")]
+use sov_shielded_pq::wallet::{build_shield_suite2, build_spend_suite2_mixed};
+#[cfg(test)]
 use sov_shielded_pq::wire::encode_bundle;
-use sov_types::{Action, SignedTransaction, Transaction};
+#[cfg(feature = "zk-suite2")]
+use sov_shielded_pq::wire::encode_bundle_for_suite;
+use sov_shielded_pq::wire::{decode_bundle_for_suite, PROOF_VERSION_V2};
+use sov_types::{Action, Block, ExecutionStatus, Receipt, SignedTransaction, Transaction};
 use sov_wallet::{generate_mnemonic, HdWallet};
 use zeroize::Zeroize;
 
@@ -285,6 +291,12 @@ struct ShieldedV2Info {
     deshield_window_blocks: u64,
     window_resets_at: u64,
     height: u64,
+    suite2_active: bool,
+    suite2_compiled: bool,
+    suite2_profile: u64,
+    creation_allowed: bool,
+    spends_allowed: bool,
+    accepted_new_versions: Vec<u64>,
 }
 
 /// Which shielded pool a surface is describing. The two are NOT interchangeable and
@@ -303,9 +315,7 @@ enum Pool {
 }
 
 const V2_PROOF_SECURITY_NOTE: &str =
-    "Pool v2 uses post-quantum primitives, but its proof audit and \
-    quantum soundness review are pending. Security of hidden amounts and note linkages remains \
-    unverified, even when this pool is active. New v2 proofs are disabled because the current trace is unmasked and may expose private inputs.";
+    "Pool v2 uses post-quantum primitives; independent proof audit and quantum soundness review remain pending. Station preserves existing notes and uses the context-bound hiding replacement only when this chain activates compatible suite 2. Legacy proof creation remains disabled. New receiving keys are independent of historical keys.";
 
 // No remote RPC flag can establish the soundness of this proof implementation.
 // This release has no reviewed quantum-security proof/parameter allowlist.
@@ -362,9 +372,9 @@ fn quantum_status(value: &Value) -> Option<QuantumStatus> {
 
 fn quantum_policy_disclosure(status: Option<&QuantumStatus>) -> String {
     let Some(status) = status else {
-        return "Node policy: unavailable — this view does not verify legacy-key acceptance or peer upgrade requirements. Local restrictions on new shielded deposits still apply.".into();
+        return "Node policy: unavailable — this view does not verify legacy-key acceptance. Legacy proof creation remains disabled; pool-v2 writes require the activated compatible replacement suite.".into();
     };
-    format!("Connected node reports height {} / next block {}: sunset {}; legacy transactions {}; legacy migration {}. Rotation-only height {}; sunset height {}; pool v1 {}. Remote v2 proof-review claim {}; locally established {}. New shielded deposits remain disabled in this build.",
+    format!("Connected node reports height {} / next block {}: sunset {}; legacy transactions {}; legacy migration {}. Rotation-only height {}; sunset height {}; pool v1 {}. Remote v2 proof-review claim {}; locally established {}. New pool-v1 deposits remain disabled. Pool-v2 writes require the connected chain to activate the locally supported suite-2 replacement; an RPC review claim alone does not enable them.",
         status.height, status.evaluated_height, status.sunset_stage, status.legacy_policy,
         if status.migration_allowed { "allowed" } else { "disabled" },
         status.rotation_height.map(|h| h.to_string()).unwrap_or_else(|| "uncommitted".into()),
@@ -375,7 +385,7 @@ fn quantum_policy_disclosure(status: Option<&QuantumStatus>) -> String {
 fn quantum_deposit_allowed(pool: Pool) -> Result<(), &'static str> {
     match pool {
         Pool::V1 => Err("new pool-v1 deposits are disabled: Orchard/Halo2 privacy is not post-quantum; ask for a transparent hybrid account address"),
-        Pool::V2 if !LOCAL_V2_QUANTUM_PROOF_REVIEW_ESTABLISHED => Err("new pool-v2 deposits are disabled: this Station build has no established quantum proof-security review"),
+        Pool::V2 if !cfg!(feature = "zk-suite2") => Err("this Station build does not include the pool-v2 replacement prover"),
         Pool::V2 => Ok(()),
     }
 }
@@ -2183,6 +2193,31 @@ fn shielded_v2_info(v: &Value) -> Option<ShieldedV2Info> {
             .and_then(Value::as_u64)
             .unwrap_or(0),
         height: v.get("height").and_then(Value::as_u64).unwrap_or(0),
+        suite2_active: v
+            .get("suite2Active")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        suite2_compiled: v
+            .get("suite2Compiled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        suite2_profile: v
+            .get("suite2ParameterId")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        creation_allowed: v
+            .get("creationAllowed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        spends_allowed: v
+            .get("spendsAllowed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        accepted_new_versions: v
+            .get("acceptedNewProofVersions")
+            .and_then(Value::as_array)
+            .map(|versions| versions.iter().filter_map(Value::as_u64).collect())
+            .unwrap_or_default(),
     })
 }
 
@@ -2420,6 +2455,9 @@ struct LoadedWallet {
     /// their backup now. Nothing can be sent to it until bit 2 arms, and every surface
     /// that shows it says so.
     shielded_v2: String,
+    /// The original v2 address remains recoverable and scanned. It is not reused
+    /// for new receiving because old proof traces may have exposed its NSK.
+    legacy_shielded_v2: String,
     /// The v2 owner tag (32-byte hex) — the short, human-checkable fingerprint of the
     /// v2 address. At ~1,957 characters the address itself cannot be compared by eye;
     /// this can.
@@ -2462,8 +2500,10 @@ impl LoadedWallet {
             .unwrap_or_default();
         // Pool v2 (post-quantum). Same derivation the CLI's `z2-address` uses, so the
         // station and the wallet binary always agree on what a seed controls.
-        let pqkey = PqShieldedKey::from_leaf_seed(&seed);
+        let pqkey = PqShieldedKey::from_leaf_seed_suite2(&seed);
         let shielded_v2 = encode_shielded_v2(&pqkey.address());
+        let legacy_shielded_v2 =
+            encode_shielded_v2(&PqShieldedKey::from_leaf_seed(&seed).address());
         let v2_owner_tag = hex_lower(&pqkey.owner_tag().to_bytes());
         Ok(LoadedWallet {
             label,
@@ -2473,6 +2513,7 @@ impl LoadedWallet {
             shielded,
             unified,
             shielded_v2,
+            legacy_shielded_v2,
             v2_owner_tag,
             mnemonic,
             operate_as: None,
@@ -2499,6 +2540,7 @@ impl LoadedWallet {
             // A watch-only wallet holds no seed, so it cannot derive a v2 address.
             // Left empty and rendered as "not derivable" — never as a placeholder.
             shielded_v2: String::new(),
+            legacy_shielded_v2: String::new(),
             v2_owner_tag: String::new(),
             mnemonic: None,
             operate_as: None,
@@ -2512,20 +2554,41 @@ impl LoadedWallet {
         seed: [u8; 32],
         mnemonic: Option<String>,
     ) -> Result<Self, String> {
+        // Transparent signing retirement does not retire the note-viewing keys.
+        // These addresses depend only on the seed, so a legacy account must keep
+        // finding the very same v1 and v2 notes it received before an upgrade.
         let key = Keypair::from_seed(seed).public_key();
-        let mut wallet = Self::watch_only(label, &key.to_string())?;
-        wallet.seed = seed;
-        wallet.mnemonic = mnemonic;
+        let mut wallet = Self::from_seed(label, seed, mnemonic)?;
+        wallet.account = key.implicit_account_id().to_string();
+        wallet.public_key = key.to_string();
+        let zkey = ShieldedKey::from_seed(seed).ok_or("shielded key derivation failed")?;
+        wallet.unified = AccountId::new(&wallet.account)
+            .ok()
+            .and_then(|id| UnifiedAddress::new(Some(id), Some(zkey.address())).ok())
+            .map(|address| address.encode())
+            .unwrap_or_default();
+        wallet.watch_only = true;
         wallet.legacy_recovery = true;
         Ok(wallet)
     }
 
     fn from_keystore_entry(entry: &KeystoreEntry) -> Result<Self, String> {
+        let operating_account = entry
+            .operate_as
+            .as_ref()
+            .map(|name| {
+                AccountId::new(name)
+                    .map(|id| id.to_string())
+                    .map_err(|e| format!("invalid saved operating account: {e}"))
+            })
+            .transpose()?;
         if let Some(key) = &entry.public_key {
             if !entry.seed_hex.is_empty() {
                 return Err("ambiguous entry contains both a seed and a watch-only key".into());
             }
-            return Self::watch_only(entry.account.clone(), key);
+            let mut wallet = Self::watch_only(entry.account.clone(), key)?;
+            wallet.operate_as = operating_account;
+            return Ok(wallet);
         }
         let mut seed = hex_decode32(&entry.seed_hex)?;
         let result = match entry.scheme.as_deref() {
@@ -2538,7 +2601,10 @@ impl LoadedWallet {
             Some(_) => Err("unsupported wallet signing scheme; encrypted entry retained".into()),
         };
         seed.zeroize();
-        result
+        result.map(|mut wallet| {
+            wallet.operate_as = operating_account;
+            wallet
+        })
     }
 
     fn keystore_entry(&self) -> KeystoreEntry {
@@ -2560,6 +2626,7 @@ impl LoadedWallet {
             ),
             mnemonic: self.mnemonic.clone(),
             public_key: public_only.then(|| self.public_key.clone()),
+            operate_as: self.operate_as.clone(),
         }
     }
 
@@ -2579,6 +2646,12 @@ impl LoadedWallet {
     /// the seed controls, so a scan must not be filed under a name that can move.
     fn scan_key(&self) -> String {
         self.account.clone()
+    }
+
+    /// A retained legacy seed still owns its notes, even while ordinary
+    /// transparent signing is disabled until its account authority is migrated.
+    fn has_note_key(&self) -> bool {
+        !self.watch_only || self.legacy_recovery
     }
 }
 
@@ -2604,6 +2677,9 @@ impl Drop for LoadedWallet {
 struct ActionState {
     busy: bool,
     message: String,
+    pending_journal: Option<PathBuf>,
+    pending_outbox: Option<Arc<Mutex<Vec<SentTx>>>>,
+    journal_required: bool,
 }
 
 /// The selected wallet's scanned shielded-pool view (recomputed on demand by
@@ -2706,15 +2782,31 @@ enum V2Intent<'a> {
 /// The ordering is deliberate: conditions that are true of the whole pool come
 /// first, then wallet state, then the specific request. A user is told the most
 /// fundamental blocker rather than a downstream symptom of it.
-fn quantum_v2_activity_allowed() -> Result<(), &'static str> {
-    if !LOCAL_V2_QUANTUM_PROOF_REVIEW_ESTABLISHED {
-        return Err("pool-v2 proof creation and broadcast are disabled: the current proof trace is unmasked and does not protect private inputs");
+fn quantum_v2_activity_allowed(info: Option<&ShieldedV2Info>) -> Result<(), &'static str> {
+    if !cfg!(feature = "zk-suite2") {
+        return Err("this Station build does not include the pool-v2 replacement prover; legacy unmasked proofs remain disabled");
+    }
+    let info =
+        info.ok_or("pool-v2 write policy is unavailable; legacy unmasked proofs remain disabled")?;
+    if !info.active
+        || !info.suite2_active
+        || !info.suite2_compiled
+        || info.suite2_profile != 2
+        || !info.creation_allowed
+        || !info.spends_allowed
+        || info.accepted_new_versions != [2]
+    {
+        return Err("pool-v2 writes require this chain's activated, compatible suite-2 replacement; legacy unmasked proofs remain disabled");
     }
     Ok(())
 }
 
-fn v2_allows(g: &V2Guard, intent: V2Intent<'_>) -> Result<(), &'static str> {
-    quantum_v2_activity_allowed()?;
+fn v2_allows(
+    g: &V2Guard,
+    intent: V2Intent<'_>,
+    info: Option<&ShieldedV2Info>,
+) -> Result<(), &'static str> {
+    quantum_v2_activity_allowed(info)?;
     v2_request_valid(g, intent)
 }
 
@@ -2828,11 +2920,67 @@ fn v2_request_valid(g: &V2Guard, intent: V2Intent<'_>) -> Result<(), &'static st
 }
 
 /// Which pool-v2 action a worker is running. The three share one worker.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum V2Action {
     Shield,
     Deshield,
     Send,
+}
+
+/// Every admitted direct suite-2 transaction is lighter than this versioned
+/// ceiling. Treat the entire weight as payload bytes for a conservative gas
+/// bound; verification weight and signing-envelope bytes only add headroom.
+fn v2_fee_ceiling(gas_price: u128) -> Result<u128, &'static str> {
+    let gas = sov_runtime::gas::INTRINSIC_GAS
+        + sov_runtime::gas::SHIELDED_V2_VERIFY_GAS
+        + sov_types::weight::MAX_SUITE2_TX_WEIGHT * sov_runtime::gas::CALLDATA_GAS_PER_BYTE
+        + sov_runtime::gas::hybrid_envelope_gas();
+    u128::from(gas)
+        .checked_mul(gas_price)
+        .ok_or("pool-v2 fee ceiling overflow")
+}
+
+fn approved_v2_fee(exact: u128, approved: u128) -> Result<(), String> {
+    if exact > approved {
+        return Err("the exact pool-v2 fee exceeds the reviewed maximum; nothing was broadcast — review again".into());
+    }
+    Ok(())
+}
+
+fn v2_worker_available(action_busy: bool, scanning: bool) -> Result<(), &'static str> {
+    if action_busy {
+        return Err("another wallet action is running — wait and review again");
+    }
+    if scanning {
+        return Err("the selected wallet's pool-v2 scan is still running — wait and review again");
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct PendingV2Action {
+    what: V2Action,
+    wallet_account: String,
+    carrier_account: String,
+    network: Network,
+    rpc: String,
+    recipient: String,
+    gross_amount: u128,
+    approved_fee: u128,
+    legacy_recovery: bool,
+}
+
+fn v2_carrier_account(wallet: &LoadedWallet, what: V2Action) -> Result<String, &'static str> {
+    if wallet.legacy_recovery && what == V2Action::Deshield {
+        return Ok(Keypair::hybrid_from_seed(wallet.seed)
+            .public_key()
+            .implicit_account_id()
+            .to_string());
+    }
+    if wallet.watch_only {
+        return Err("public-only wallets cannot sign; a retained legacy seed can recover existing private notes with De-shield to hybrid account");
+    }
+    Ok(wallet.effective_account())
 }
 
 impl V2Action {
@@ -2867,9 +3015,70 @@ struct ShieldedV2View {
     scanning: bool,
     account: String,
     balance: u64, // unspent pool-v2 balance, in grains
+    legacy_balance: u64,
+    suite2_balance: u64,
+    /// Maximum covered by the four largest spendable input notes in one proof.
+    spendable_grains: Option<u64>,
     notes: usize, // unspent v2 note count
     scanned_height: u64,
     message: String,
+}
+
+struct V2WalletStores {
+    legacy: PqNoteStore,
+    suite2: PqNoteStore,
+}
+
+impl V2WalletStores {
+    fn balance(&self) -> u64 {
+        self.legacy.balance().saturating_add(self.suite2.balance())
+    }
+    fn unspent_count(&self) -> usize {
+        self.legacy.unspent_count() + self.suite2.unspent_count()
+    }
+    fn scanned_height(&self) -> u64 {
+        self.legacy.scanned_height()
+    }
+    fn spendable_balance(&self) -> u64 {
+        let mut amounts: Vec<_> = self
+            .legacy
+            .unspent_values()
+            .chain(self.suite2.unspent_values())
+            .collect();
+        amounts.sort_unstable_by(|a, b| b.cmp(a));
+        amounts
+            .into_iter()
+            .take(sov_shielded_pq::air::NUM_SLOTS)
+            .fold(0u64, |sum, value| sum.saturating_add(value))
+    }
+}
+
+fn scan_store_v2(rpc: &str, seed: [u8; 32]) -> Result<V2WalletStores, String> {
+    let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(15));
+    let domain = client.chain_domain().map_err(|error| error.to_string())?;
+    let mut legacy = scan_store_v2_for_key(rpc, seed, false)?;
+    let suite2 = scan_store_v2_for_key(rpc, seed, true)?;
+    // The node may add a block between the two cached traversals. Catch the
+    // older store up before publishing a combined balance and spend witnesses.
+    if legacy.scanned_height() < suite2.scanned_height() {
+        legacy = scan_store_v2_for_key(rpc, seed, false)?;
+    }
+    validate_v2_store_pair(&legacy, &suite2)?;
+    validate_scan_origin(&client, &domain, legacy.tip_checkpoint())?;
+    Ok(V2WalletStores { legacy, suite2 })
+}
+
+fn validate_v2_store_pair(legacy: &PqNoteStore, suite2: &PqNoteStore) -> Result<(), String> {
+    if legacy.scanned_height() != suite2.scanned_height()
+        || legacy.root() != suite2.root()
+        || legacy.tip_checkpoint() != suite2.tip_checkpoint()
+        || legacy.commitment_count() != suite2.commitment_count()
+    {
+        return Err(
+            "the chain changed during the two-key scan; scan again to align both note sets".into(),
+        );
+    }
+    Ok(())
 }
 
 impl ShieldedV2View {
@@ -2909,7 +3118,11 @@ impl ShieldedV2View {
             scanned: mine && self.scanned_height > 0,
             notes: if mine { self.notes } else { 0 },
             busy: busy || self.scanning,
-            balance_grains: if mine { self.balance as u128 } else { 0 },
+            balance_grains: if mine {
+                self.spendable_grains.unwrap_or(self.balance) as u128
+            } else {
+                0
+            },
             window_budget,
             // Filled in by `with_transparent` at the paint site, which is the only
             // place that has read the transparent balance.
@@ -3585,8 +3798,8 @@ struct PendingSend {
     /// point: a pool spend cannot be constructed without naming its pool, so the
     /// confirm screen can never omit which pool moves.
     source: SendSource,
-    /// The public/v1 fee estimate captured at review time. Pool-v2 fees depend
-    /// on the completed STARK bundle and are shown as unknown in its review.
+    /// The public/v1 exact route estimate, or the approved suite-2 maximum fee.
+    /// Suite-2 submission checks the completed proof fee against this ceiling.
     fee_grains: u128,
     /// The blockspace-auction bid this send will carry, captured at review time so
     /// the modal shows the SAME number that gets signed — not a figure that could
@@ -3933,6 +4146,7 @@ pub struct Station {
     receive_kind: ReceiveKind,      // which address the Receive view shows
     wallet_view: WalletView,        // presentation only; transaction state stays independent
     pending_send: Option<PendingSend>, // a send awaiting confirmation (review modal)
+    pending_v2_action: Option<PendingV2Action>,
     // ── Blockspace auction (v0.1.98) ────────────────────────────────────────
     // Every send this session, with the nonce and recipient needed to REBUILD it
     // at the same slot for a replace-by-fee bump. Shared with the poller, which
@@ -4013,6 +4227,7 @@ pub struct Station {
     names_by_account: Arc<Mutex<HashMap<String, Vec<String>>>>,
     names_refreshed_at: Option<Instant>, // last SNS-cache refresh (for periodic re-poll)
     shielded_scan_for: String,           // account auto-scanned for the shielded pool (debounce)
+    shielded_v2_scan_for: String,        // chain/account/head last auto-scanned for pool v2
     rescan_armed: bool, // "Rescan from scratch" confirmation is open (destructive cache wipe)
     action: Arc<Mutex<ActionState>>,
     params: Arc<Mutex<Option<Arc<ShieldedParams>>>>,
@@ -4319,7 +4534,7 @@ impl Station {
         let mut station = Station {
             snapshot,
             config,
-            outbox,
+            outbox: outbox.clone(),
             send_tip: String::new(),
             send_tip_edited: false,
             pending_bump: None,
@@ -4351,6 +4566,7 @@ impl Station {
             receive_kind: ReceiveKind::Account,
             wallet_view: WalletView::Overview,
             pending_send: None,
+            pending_v2_action: None,
             block_detail: None,
             vault_ui: VaultUi::default(),
             wallets_dirty: false,
@@ -4402,8 +4618,16 @@ impl Station {
             names_by_account: Arc::new(Mutex::new(HashMap::new())),
             names_refreshed_at: None,
             shielded_scan_for: String::new(),
+            shielded_v2_scan_for: String::new(),
             rescan_armed: false,
-            action: Arc::new(Mutex::new(ActionState::default())),
+            action: Arc::new(Mutex::new(ActionState {
+                pending_journal: station_dir()
+                    .ok()
+                    .map(|dir| dir.join("pending-submissions.json")),
+                pending_outbox: Some(outbox.clone()),
+                journal_required: true,
+                ..Default::default()
+            })),
             params: Arc::new(Mutex::new(None)),
             shielded: Arc::new(Mutex::new(ScannedPools::default())),
             shielded_v2: Arc::new(Mutex::new(ScannedPools::default())),
@@ -4445,7 +4669,7 @@ impl Station {
         // on the Wallet tab (where you create/import one) rather than the Node tab
         // with a silently-greyed "Start". With a wallet present, the app IS the node:
         // bring the embedded node up automatically (closing the app stops it). Safe —
-        // `build_and_run_node` refuses to touch a chain mined to a different wallet.
+        // Selecting a future payout retains chain history and prior encrypted keys.
         if station.wallets.is_empty() {
             station.tab = Tab::Wallet;
         } else if station.network.is_sandbox() {
@@ -4459,6 +4683,11 @@ impl Station {
         if let Ok(mut c) = self.config.lock() {
             if !c.accounts.contains(&wallet.account) {
                 c.accounts.push(wallet.account.clone());
+            }
+            if let Some(account) = &wallet.operate_as {
+                if !c.accounts.contains(account) {
+                    c.accounts.push(account.clone());
+                }
             }
             // A NON-watch wallet's own id is the implicit account derived from the seed on
             // this machine — provably the operator's and spendable — so it is eligible for
@@ -4614,6 +4843,17 @@ impl Station {
             );
         }
         !watch
+    }
+
+    fn require_note_key(&self) -> bool {
+        let available = self
+            .wallets
+            .get(self.selected)
+            .is_some_and(LoadedWallet::has_note_key);
+        if !available {
+            self.set_action("this public-only wallet has no note-viewing seed — restore its encrypted backup or recovery phrase to scan private balances");
+        }
+        available
     }
 
     /// Build an UNSIGNED transfer for the active wallet's account and put its JSON
@@ -4809,6 +5049,8 @@ impl Station {
                 c.mining_accounts.push(name);
             }
         }
+        self.wallets_dirty = true;
+        self.auto_save();
     }
 
     /// Stop operating a linked named account; revert to the wallet's own id.
@@ -4817,6 +5059,8 @@ impl Station {
             w.operate_as = None;
         }
         self.operate_msg.clear();
+        self.wallets_dirty = true;
+        self.auto_save();
     }
 
     fn migrate_legacy_wallet(&mut self, ctx: &egui::Context) {
@@ -4835,7 +5079,7 @@ impl Station {
         let account = wallet.effective_account();
         let network = self.network;
         let rpc = self.rpc_field.clone();
-        let successor = match LoadedWallet::from_seed(
+        let mut successor = match LoadedWallet::from_seed(
             format!("{} (hybrid migration)", wallet.label),
             *seed,
             wallet.mnemonic.clone(),
@@ -4846,6 +5090,7 @@ impl Station {
                 return;
             }
         };
+        successor.operate_as = Some(account.clone());
         if !self
             .wallets
             .iter()
@@ -4855,6 +5100,20 @@ impl Station {
             self.auto_save();
             if self.wallets_dirty {
                 self.set_action("rotation refused: encrypted hybrid backup could not be saved");
+                return;
+            }
+        } else {
+            if let Some(existing) = self
+                .wallets
+                .iter_mut()
+                .find(|w| w.account == successor.account && !w.watch_only)
+            {
+                existing.operate_as = Some(account.clone());
+            }
+            self.wallets_dirty = true;
+            self.auto_save();
+            if self.wallets_dirty {
+                self.set_action("rotation refused: linked account authority could not be saved in the encrypted backup");
                 return;
             }
         }
@@ -5127,7 +5386,11 @@ impl Station {
                     to,
                     amount,
                     SendSource::Pool(selected),
-                    snap.fee_shielded_grains,
+                    if pool == Pool::V2 {
+                        v2_fee_ceiling(snap.gas_price_grains)?
+                    } else {
+                        snap.fee_shielded_grains
+                    },
                 )
             }
         };
@@ -5149,8 +5412,18 @@ impl Station {
     fn clear_transaction_reviews(&mut self) {
         self.legacy_migration_review = None;
         self.pending_send = None;
+        self.pending_v2_action = None;
         self.pending_bump = None;
         self.pool_selection.clear();
+    }
+
+    fn reset_pool_views(&mut self) {
+        // Detach the maps, rather than clearing them in place: scans already in
+        // flight keep their old Arc and cannot repopulate the new chain's view.
+        self.shielded = Arc::new(Mutex::new(ScannedPools::default()));
+        self.shielded_v2 = Arc::new(Mutex::new(ScannedPools::default()));
+        self.shielded_scan_for.clear();
+        self.shielded_v2_scan_for.clear();
     }
 
     fn expired_review(&mut self, why: &str) {
@@ -5244,7 +5517,7 @@ impl Station {
         let now = now_ms();
         let mut bump_target: Option<SentTx> = None;
         ui.add_space(sp::L);
-        ui.label(egui::RichText::new("This session's sends").strong());
+        ui.label(egui::RichText::new("Tracked sends").strong());
         ui.add_space(sp::S);
         card(ui, |ui| {
             // Newest first — the one you are worried about is the one you just sent.
@@ -5260,9 +5533,13 @@ impl Station {
                     };
                     state_chip(ui, glyph, t.state.label(), col);
                     ui.label(
-                        num(format!("{} XUS", xus(&t.amount_grains.to_string())))
-                            .size(ty::SMALL)
-                            .color(palette::text()),
+                        num(if t.to == "privacy transaction (restored)" {
+                            "private amount retained in wallet history".into()
+                        } else {
+                            format!("{} XUS", xus(&t.amount_grains.to_string()))
+                        })
+                        .size(ty::SMALL)
+                        .color(palette::text()),
                     );
                     ui.label(
                         egui::RichText::new(format!("→ {}", short_id(&t.to)))
@@ -5584,7 +5861,7 @@ impl Station {
     /// unspent pool balance. The pool is private, so this trial-decrypts every
     /// shielded bundle with the wallet's key — only the holder can.
     fn scan_shielded(&self, ctx: &egui::Context) {
-        if !self.require_signing() {
+        if !self.require_note_key() {
             return; // watch-only has no shielded viewing key (no seed)
         }
         let Some(w) = self.wallets.get(self.selected) else {
@@ -5632,7 +5909,7 @@ impl Station {
     /// [`Self::scan_shielded`]; the two views are independent so a v1 scan
     /// failure can never blank a v2 balance (or the reverse).
     fn scan_shielded_v2(&self, ctx: &egui::Context) {
-        if !self.require_signing() {
+        if !self.require_note_key() {
             return; // watch-only has no spend key
         }
         let Some(w) = self.wallets.get(self.selected) else {
@@ -5663,6 +5940,9 @@ impl Station {
                     Ok(store) => {
                         v.account = account.clone();
                         v.balance = store.balance();
+                        v.spendable_grains = Some(store.spendable_balance());
+                        v.legacy_balance = store.legacy.balance();
+                        v.suite2_balance = store.suite2.balance();
                         v.notes = store.unspent_count();
                         v.scanned_height = store.scanned_height();
                         v.message = format!("scanned to height {}", store.scanned_height());
@@ -5681,7 +5961,7 @@ impl Station {
     /// receipt-status filter existed) is cleanly rebuilt from the canonical chain. The
     /// on-chain shielded pool is untouched — this only rebuilds local wallet state.
     fn rescan_shielded(&mut self, ctx: &egui::Context) {
-        if !self.require_signing() {
+        if !self.require_note_key() {
             return; // watch-only has no shielded viewing key (no seed)
         }
         let Some(w) = self.wallets.get(self.selected) else {
@@ -5694,7 +5974,24 @@ impl Station {
             .public_key()
             .implicit_account_id()
             .to_string();
-        if let Ok(path) = note_store_path(&store_id) {
+        let rpc = self
+            .config
+            .lock()
+            .map(|c| c.rpc.clone())
+            .unwrap_or_default();
+        let path = RpcClient::new(rpc)
+            .with_timeout(Duration::from_secs(8))
+            .chain_domain()
+            .map_err(|e| e.to_string())
+            .and_then(|domain| note_store_path(&store_id, &domain));
+        let path = match path {
+            Ok(path) => path,
+            Err(e) => {
+                self.set_action(&format!("could not identify this chain's note cache: {e}"));
+                return;
+            }
+        };
+        {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 // Already gone ⇒ nothing to wipe; a fresh scan rebuilds it anyway.
@@ -5777,21 +6074,6 @@ impl Station {
         });
     }
 
-    /// Shield transparent value INTO pool v2 (post-quantum).
-    fn shield_v2(&self, ctx: &egui::Context) -> bool {
-        self.run_v2_action(ctx, V2Action::Shield)
-    }
-
-    /// De-shield value OUT of pool v2 to this wallet's transparent account.
-    fn deshield_v2(&self, ctx: &egui::Context) -> bool {
-        self.run_v2_action(ctx, V2Action::Deshield)
-    }
-
-    /// Fully-private pool-v2 transfer to another `xusq1…` address.
-    fn send_private_v2(&self, ctx: &egui::Context) -> bool {
-        self.run_v2_action(ctx, V2Action::Send)
-    }
-
     /// The one worker behind all three pool-v2 actions. They differ only in
     /// which builder runs and what the log line says, so they share a single
     /// spawn/action/rescan path — one place for the locking discipline rather
@@ -5800,14 +6082,158 @@ impl Station {
     /// passed every guard and is now in flight. The caller uses that to clear the
     /// amount field, so a second click cannot re-fire the SAME amount, while a
     /// validation refusal leaves what was typed intact.
-    fn run_v2_action(&self, ctx: &egui::Context, what: V2Action) -> bool {
+    fn review_v2_action(&mut self, what: V2Action) {
+        let Some(wallet) = self.wallets.get(self.selected) else {
+            return;
+        };
+        let carrier = match v2_carrier_account(wallet, what) {
+            Ok(account) => account,
+            Err(why) => {
+                self.set_action(why);
+                return;
+            }
+        };
+        let amount = match what {
+            V2Action::Shield => &self.shield_v2_amount_in,
+            V2Action::Deshield => &self.deshield_v2_amount_in,
+            V2Action::Send => &self.private_v2_amount,
+        };
+        let Some(gross_amount) = parse_xus(amount).filter(|amount| *amount > 0) else {
+            self.set_action("enter an amount greater than zero");
+            return;
+        };
+        let snapshot = self
+            .snapshot
+            .lock()
+            .map(|snapshot| snapshot.clone())
+            .unwrap_or_default();
+        if let Err(why) = quantum_v2_activity_allowed(snapshot.shielded_v2.as_ref()) {
+            self.set_action(why);
+            return;
+        }
+        let approved_fee = match v2_fee_ceiling(snapshot.gas_price_grains) {
+            Ok(fee) => fee,
+            Err(why) => {
+                self.set_action(why);
+                return;
+            }
+        };
+        self.pending_v2_action = Some(PendingV2Action {
+            what,
+            wallet_account: wallet.account.clone(),
+            carrier_account: carrier,
+            network: self.network,
+            rpc: self
+                .config
+                .lock()
+                .map(|config| config.rpc.clone())
+                .unwrap_or_default(),
+            recipient: if what == V2Action::Shield {
+                self.shield_v2_to.trim().into()
+            } else {
+                String::new()
+            },
+            gross_amount,
+            approved_fee,
+            legacy_recovery: wallet.legacy_recovery,
+        });
+    }
+
+    fn show_v2_review(&mut self, ctx: &egui::Context) {
+        let Some(review) = self.pending_v2_action.clone() else {
+            return;
+        };
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new(if review.legacy_recovery { "Recover existing private notes to a hybrid account" } else { "Review pool-v2 transaction" })
+            .collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.label(format!("{} · {}", review.network.label(), review.what.noun()));
+                ui.label(format!("Public signing/receiving account: {}", review.carrier_account));
+                if review.legacy_recovery {
+                    ui.label("Your original transparent account and note keys remain in the backup. This recovery uses the same saved seed to sign through its hybrid account; withdrawn value goes to that account.");
+                }
+                ui.label(format!("{} amount: {} XUS", if review.what == V2Action::Deshield { "Gross withdrawal" } else { "Pool" }, grains_to_xus_plain(review.gross_amount)));
+                if !review.recipient.is_empty() { ui.label(format!("Recipient: {}", truncate_middle(&review.recipient, 22, 12))); }
+                ui.label(format!("Maximum network fee: {} XUS", grains_to_xus_plain(review.approved_fee)));
+                if review.what == V2Action::Deshield {
+                    ui.label(format!("Minimum received after fee: {} XUS", grains_to_xus_plain(review.gross_amount.saturating_sub(review.approved_fee))));
+                    ui.label("The exact fee is deducted from the verified gross withdrawal. No public prefunding or extra deposit is required.");
+                } else { ui.label("The public account pays the exact network fee in addition to the amount."); }
+                ui.label("Station builds a hiding proof, checks its exact fee against this maximum, and refuses to broadcast if the reviewed terms or nonce changed.");
+                ui.horizontal(|ui| { confirm = ui.button("Confirm and prove").clicked(); cancel = ui.button("Cancel").clicked(); });
+            });
+        if cancel {
+            self.pending_v2_action = None;
+        }
+        if confirm {
+            self.pending_v2_action = None;
+            let valid = self.wallets.get(self.selected).is_some_and(|wallet| {
+                wallet.account == review.wallet_account
+                    && v2_carrier_account(wallet, review.what).ok().as_ref()
+                        == Some(&review.carrier_account)
+            }) && self.network == review.network
+                && self
+                    .config
+                    .lock()
+                    .map(|config| config.rpc == review.rpc)
+                    .unwrap_or(false)
+                && match review.what {
+                    V2Action::Shield => {
+                        parse_xus(&self.shield_v2_amount_in) == Some(review.gross_amount)
+                            && self.shield_v2_to.trim() == review.recipient
+                    }
+                    V2Action::Deshield => {
+                        parse_xus(&self.deshield_v2_amount_in) == Some(review.gross_amount)
+                    }
+                    V2Action::Send => false,
+                };
+            if !valid {
+                self.set_action("the reviewed wallet, account, network, amount or recipient changed — review again");
+                return;
+            }
+            if self.run_v2_action(ctx, review.what, review.approved_fee) {
+                match review.what {
+                    V2Action::Shield => self.shield_v2_amount_in.clear(),
+                    V2Action::Deshield => self.deshield_v2_amount_in.clear(),
+                    V2Action::Send => {}
+                }
+            }
+        }
+    }
+
+    fn run_v2_action(&mut self, ctx: &egui::Context, what: V2Action, approved_fee: u128) -> bool {
+        let action_busy = self.action.lock().map(|action| action.busy).unwrap_or(true);
+        let scanning = self
+            .wallets
+            .get(self.selected)
+            .and_then(|wallet| {
+                self.shielded_v2
+                    .lock()
+                    .ok()
+                    .map(|views| views.view_for(&wallet.scan_key()).scanning)
+            })
+            .unwrap_or(true);
+        if let Err(why) = v2_worker_available(action_busy, scanning) {
+            // Keep another worker's busy flag set; a refused stale review must
+            // never mark a still-running proof as idle.
+            if let Ok(mut action) = self.action.lock() {
+                action.message = why.into();
+            }
+            return false;
+        }
         if matches!(what, V2Action::Shield) {
             if let Err(why) = quantum_deposit_allowed(Pool::V2) {
                 finish(&self.action, why);
                 return false;
             }
         }
-        if !self.require_signing() {
+        let write_policy = self
+            .snapshot
+            .lock()
+            .map(|s| s.shielded_v2.clone())
+            .unwrap_or(None);
+        if let Err(why) = quantum_v2_activity_allowed(write_policy.as_ref()) {
+            finish(&self.action, why);
             return false;
         }
         // Dormancy is re-checked HERE, at submit, against the state observed at
@@ -5829,12 +6255,48 @@ impl Station {
             return false;
         };
         let seed = w.seed;
-        let account = w.effective_account();
+        let account = match v2_carrier_account(w, what) {
+            Ok(account) => account,
+            Err(why) => {
+                finish(&self.action, why);
+                return false;
+            }
+        };
+        let legacy_recovery = w.legacy_recovery;
+        let recovery_label = w.label.clone();
+        let recovery_phrase = w.mnemonic.clone();
         // The wallet whose pool-v2 view this spend changes. Keyed by its own
         // implicit id: the notes belong to the SEED, so filing the post-spend
         // re-scan under a linked named account would strand the result where no
         // wallet's view can find it.
         let scan_key = w.scan_key();
+        if legacy_recovery {
+            let previous = self.selected;
+            if !self
+                .wallets
+                .iter()
+                .any(|wallet| wallet.account == account && !wallet.watch_only)
+            {
+                let successor = match LoadedWallet::from_seed(
+                    format!("{recovery_label} (private recovery)"),
+                    seed,
+                    recovery_phrase,
+                ) {
+                    Ok(wallet) => wallet,
+                    Err(error) => {
+                        finish(&self.action, &error);
+                        return false;
+                    }
+                };
+                self.register_wallet(successor);
+                self.auto_save();
+                self.selected = previous;
+                if self.wallets_dirty {
+                    finish(&self.action, "recovery refused: hybrid receiving wallet could not be saved in the encrypted backup");
+                    return false;
+                }
+            }
+        }
         let field = match what {
             V2Action::Shield => &self.shield_v2_amount_in,
             V2Action::Deshield => &self.deshield_v2_amount_in,
@@ -5883,15 +6345,27 @@ impl Station {
                         );
                     }
                     match what {
-                        V2Action::Shield => {
-                            shield_v2_amount(&rpc, seed, &account, &shield_to, grains, &action)
-                        }
+                        V2Action::Shield => shield_v2_amount(
+                            &rpc,
+                            seed,
+                            &account,
+                            &shield_to,
+                            grains,
+                            approved_fee,
+                            &action,
+                        ),
                         V2Action::Deshield => {
-                            deshield_v2_amount(&rpc, seed, &account, grains, &action)
+                            deshield_v2_amount(&rpc, seed, &account, grains, approved_fee, &action)
                         }
-                        V2Action::Send => {
-                            zsend_v2_amount(&rpc, seed, &account, &to, grains, &action)
-                        }
+                        V2Action::Send => zsend_v2_amount(
+                            &rpc,
+                            seed,
+                            &account,
+                            &to,
+                            grains,
+                            approved_fee,
+                            &action,
+                        ),
                     }
                 });
             match result {
@@ -5917,13 +6391,13 @@ impl Station {
                         V2Action::Send => truncate_middle(&to, 14, 8),
                     };
                     if let Ok(mut o) = outbox.lock() {
-                        o.push(SentTx {
+                        let mut sent = SentTx {
                             txid: sub.txid.clone(),
                             chain_id: chain_id.into(),
                             rpc: rpc.clone(),
                             from_account: account.clone(),
                             to: counterparty.clone(),
-                            amount_grains: grains,
+                            amount_grains: sub.withdrawal_net.unwrap_or(grains),
                             nonce: sub.nonce,
                             tip_grains: 0,
                             shielded_route: true,
@@ -5935,14 +6409,30 @@ impl Station {
                             },
                             note: match &sub.status {
                                 ReceiptStatus::Rejected(why) => why.clone(),
-                                _ => String::new(),
+                                _ => sub.delivery_note.clone(),
                             },
-                        });
+                        };
+                        if let Some(existing) = o.iter_mut().find(|entry| {
+                            entry.txid == sent.txid && entry.chain_id == sent.chain_id
+                        }) {
+                            if !existing.state.is_pending() && sent.state.is_pending() {
+                                sent.state = existing.state;
+                                sent.note = existing.note.clone();
+                            }
+                            *existing = sent;
+                        } else {
+                            o.push(sent);
+                        }
                     }
                     match &sub.status {
                         ReceiptStatus::Confirmed => {
                             let line = match what {
                                 V2Action::Send => pool_send_receipt(Pool::V2, grains, &sub.txid),
+                                V2Action::Deshield => format!(
+                                    "{} · {} XUS received after the network fee (tx {short_tx})",
+                                    what.done(),
+                                    grains_to_xus_plain(sub.withdrawal_net.unwrap_or(grains))
+                                ),
                                 _ => format!("{} (tx {short_tx})", what.done()),
                             };
                             finish(&action, &format!("{line} — updating pool-v2 balance…"));
@@ -5957,6 +6447,9 @@ impl Station {
                                     let v = m.entry_mut(&scan_key);
                                     v.account = scan_key.clone();
                                     v.balance = store.balance();
+                                    v.spendable_grains = Some(store.spendable_balance());
+                                    v.legacy_balance = store.legacy.balance();
+                                    v.suite2_balance = store.suite2.balance();
                                     v.notes = store.unspent_count();
                                     v.scanned_height = store.scanned_height();
                                     v.message =
@@ -5978,7 +6471,14 @@ impl Station {
                         // time. Saying "failed" here invited a resend — a second
                         // transaction for one intended action.
                         ReceiptStatus::Pending => {
-                            let line = v2_status_line(what, &sub.status, &short_tx);
+                            let line = if sub.delivery_note.is_empty() {
+                                v2_status_line(what, &sub.status, &short_tx)
+                            } else {
+                                format!(
+                                    "{} (tx {short_tx}); Station is tracking its receipt",
+                                    sub.delivery_note
+                                )
+                            };
                             finish(&action, &line);
                             record(&activity, &line);
                         }
@@ -6117,11 +6617,7 @@ impl Station {
             .to_encrypted_json(&self.passphrase)
         {
             Ok(json) => {
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                if std::fs::write(&path, &json).is_ok() {
-                    restrict_to_owner(&path);
+                if write_private_atomic(&path, json.as_bytes()).is_ok() {
                     self.wallets_dirty = false;
                     // Reveal the passphrase fingerprint ONCE, right after the store is
                     // first sealed (the code is bound to this envelope's salt, so it
@@ -6156,6 +6652,7 @@ impl Station {
                         && saved.scheme == entry.scheme
                         && saved.mnemonic == entry.mnemonic
                         && saved.public_key == entry.public_key
+                        && saved.operate_as == entry.operate_as
                 }) {
                     self.retained_entries.push(entry.clone());
                 }
@@ -6219,9 +6716,25 @@ impl Station {
                 self.passphrase_set = true; // verified via migration
                 self.unlock_error.clear();
                 // Re-encrypt under the passphrase, then remove the device key.
+                // Retain the original envelope before replacement, including
+                // the rare case where rename succeeds but directory sync fails.
+                let backup = path.with_extension(format!(
+                    "legacy-{}.backup",
+                    Hash::digest(text.as_bytes()).to_hex()
+                ));
+                if let Err(e) = write_private_atomic(&backup, text.as_bytes()) {
+                    self.wallets_dirty = true;
+                    self.set_action(&format!("wallet opened, but migration backup could not be saved: {e}; the original wallet and device key were kept"));
+                    return;
+                }
+                self.wallets_dirty = true;
                 self.auto_save();
-                remove_legacy_device_key();
-                self.set_action("wallet migrated to passphrase encryption");
+                if !self.wallets_dirty {
+                    remove_legacy_device_key();
+                    self.set_action("wallet migrated to passphrase encryption");
+                } else {
+                    self.set_action(&format!("wallet opened, but passphrase migration was not confirmed; the original encrypted backup at {} and its device key were kept", backup.display()));
+                }
                 return;
             }
         }
@@ -7637,12 +8150,15 @@ impl Station {
         }
     }
 
-    /// Wipe the local node's chain entirely — back to genesis (height 0). Stops
-    /// the node first. The next "Start local node" rebuilds a fresh chain from
-    /// the current spec, mining to the active wallet. Use after a genesis change
-    /// (e.g. binding tax keys) or to clear coins mined to an old account.
+    /// Restart a sandbox from genesis while retaining its old data as a backup.
+    /// Mainnet history must never be deleted through the wallet.
     fn reset_local_chain(&mut self) {
+        if !self.network.is_sandbox() {
+            self.node_status = "Mainnet reset is disabled. Keep the existing history and reconnect to a verified peer.".into();
+            return;
+        }
         self.stop_local_node();
+        self.reset_pool_views();
         let dir = match local_node_dir(self.network.data_subdir()) {
             Ok(d) => d,
             Err(e) => {
@@ -7650,16 +8166,26 @@ impl Station {
                 return;
             }
         };
-        match std::fs::remove_dir_all(&dir) {
+        let backup = dir.with_file_name(format!(
+            "{}-backup-{}",
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("sandbox-chain"),
+            now_ms()
+        ));
+        match std::fs::rename(&dir, &backup) {
             Ok(()) => {
-                self.node_status =
-                    "local chain wiped — Start local node to mine a fresh chain from genesis"
-                        .to_string()
+                self.node_status = format!(
+                    "sandbox archived at {} — start the node to create a fresh sandbox",
+                    backup.display()
+                )
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.node_status = "no local chain to wipe — already clean".to_string()
+                self.node_status = "no sandbox chain to archive".to_string()
             }
-            Err(e) => self.node_status = format!("could not wipe local chain: {e}"),
+            Err(e) => {
+                self.node_status = format!("could not archive sandbox chain; history retained: {e}")
+            }
         }
     }
 
@@ -7673,6 +8199,7 @@ impl Station {
         }
         self.clear_transaction_reviews();
         self.stop_local_node();
+        self.reset_pool_views();
         self.network = to;
         self.peer_addr = read_saved_peer(to);
         let rpc = to.default_rpc().to_string();
@@ -7829,6 +8356,8 @@ impl eframe::App for Station {
                 ui.label("RPC");
                 ui.add(egui::TextEdit::singleline(&mut self.rpc_field).desired_width(220.0));
                 if ui.button("Connect").clicked() {
+                    self.clear_transaction_reviews();
+                    self.reset_pool_views();
                     if let Ok(mut c) = self.config.lock() {
                         c.rpc = self.rpc_field.trim().to_string();
                     }
@@ -7856,12 +8385,10 @@ impl eframe::App for Station {
                     if btn.clicked() {
                         self.start_local_node();
                     }
-                    if ui
+                    if self.network.is_sandbox() && ui
                         .button("Reset local chain")
                         .on_hover_text(
-                            "Wipe THIS machine's local chain back to genesis (height 0). \
-                             Only affects local data — on mainnet the node simply re-syncs \
-                             from peers afterward.",
+                            "Archive this sandbox's history and create a new sandbox. The backup is retained.",
                         )
                         .clicked()
                     {
@@ -8405,8 +8932,341 @@ impl BeatState {
     }
 }
 
+#[derive(Clone, Default)]
+struct ActivityHistory {
+    sampled_ms: u64,
+    rates: std::collections::VecDeque<(u64, f64)>,
+    head: String,
+    changed_ms: u64,
+}
+
+impl ActivityHistory {
+    fn observe(&mut self, s: &Snapshot, now: u64) {
+        let fresh = s.online && now.saturating_sub(s.updated_ms) < 15_000;
+        let hashing = s.local_hashrate > 0 && !s.syncing;
+        if (fresh || hashing) && now.saturating_sub(self.sampled_ms) >= 500 {
+            self.sampled_ms = now;
+            self.rates.push_back((now, s.local_hashrate as f64));
+            while self.rates.len() > 96 {
+                self.rates.pop_front();
+            }
+            if !self.head.is_empty() && self.head != s.head_hash {
+                self.changed_ms = now;
+            }
+            self.head = s.head_hash.clone();
+        }
+        while self
+            .rates
+            .front()
+            .is_some_and(|(time, _)| now.saturating_sub(*time) > 48_000)
+        {
+            self.rates.pop_front();
+        }
+    }
+}
+
+/// Native operator console, following XUS Miner's status rail and telemetry
+/// tiles. The history contains observed rates; motion indicates current work.
+fn mining_activity_console(ui: &mut egui::Ui, s: &Snapshot) {
+    let now = now_ms();
+    let key = egui::Id::new("station-native-activity").with(&s.chain_id);
+    let mut history = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<ActivityHistory>(key))
+        .unwrap_or_default();
+    let fresh = s.online && now.saturating_sub(s.updated_ms) < 15_000;
+    let hashing = s.local_hashrate > 0 && !s.syncing;
+    history.observe(s, now);
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(key, history.clone()));
+    let time = ui.input(|input| input.time);
+    let changed = now.saturating_sub(history.changed_ms) < 4_000;
+    card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("LIVE MINING / NODE ACTIVITY")
+                    .small()
+                    .strong(),
+            );
+            state_chip(
+                ui,
+                "●",
+                if hashing {
+                    "HASHING"
+                } else if fresh && s.syncing {
+                    "SYNCING"
+                } else if fresh {
+                    "CONNECTED"
+                } else {
+                    "AWAITING TELEMETRY"
+                },
+                if hashing {
+                    palette::mining()
+                } else {
+                    palette::text_dim()
+                },
+            );
+            if changed {
+                state_chip(ui, "◆", "HEAD UPDATED", palette::mining());
+            }
+        });
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!(
+                "Local work: {}",
+                if hashing {
+                    fmt_hashrate(s.local_hashrate as f64)
+                } else {
+                    "no measured hash rate".into()
+                }
+            ));
+            ui.separator();
+            ui.label(format!(
+                "Peers: {}",
+                s.peers
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "—".into())
+            ));
+            ui.separator();
+            ui.label(format!(
+                "Queued: {}",
+                s.mempool
+                    .map(|count| format!("{count} tx"))
+                    .unwrap_or_else(|| "—".into())
+            ));
+        });
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width().max(80.0), 76.0),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 5.0, palette::text_dim().gamma_multiply(0.07));
+        let max = history
+            .rates
+            .iter()
+            .map(|(_, rate)| *rate)
+            .fold(1.0_f64, f64::max);
+        if history.rates.len() > 1 {
+            let points: Vec<_> = history
+                .rates
+                .iter()
+                .map(|(sampled, rate)| {
+                    egui::pos2(
+                        rect.right()
+                            - now.saturating_sub(*sampled) as f32 / 48_000.0 * rect.width(),
+                        rect.bottom() - 5.0 - (*rate / max) as f32 * (rect.height() - 14.0),
+                    )
+                })
+                .collect();
+            painter.add(egui::Shape::line(
+                points,
+                egui::Stroke::new(2.0, palette::mining()),
+            ));
+        }
+        if hashing || (fresh && s.syncing) {
+            let x = rect.left() + ((time * 0.4).fract() as f32) * rect.width();
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(2.0, palette::accent_hi().gamma_multiply(0.55)),
+            );
+        }
+        ui.label(
+            egui::RichText::new(
+                "Measured local hash rate · up to 48 seconds · one sample every 500 ms",
+            )
+            .small()
+            .weak(),
+        );
+        ui.horizontal_wrapped(|ui| {
+            for block in s.blocks.iter().take(6).rev() {
+                egui::Frame::none()
+                    .fill(palette::accent_hi().gamma_multiply(0.12))
+                    .inner_margin(egui::Margin::same(7.0))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(format!("#{}", block.height)).strong());
+                        ui.label(egui::RichText::new(format!("{} tx", block.tx_count)).small());
+                    });
+            }
+            if hashing {
+                let pulse = (0.6 + 0.3 * (time * 3.0).sin()) as f32;
+                egui::Frame::none()
+                    .stroke(egui::Stroke::new(
+                        1.5,
+                        palette::mining().gamma_multiply(pulse),
+                    ))
+                    .inner_margin(egui::Margin::same(7.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "NEXT #{}",
+                                s.height.unwrap_or(0).saturating_add(1)
+                            ))
+                            .strong(),
+                        );
+                        ui.label(egui::RichText::new("proof of work active").small());
+                    });
+            }
+        });
+        if fresh && s.syncing {
+            if let (Some(height), Some(best)) = (s.height, s.best_peer_height) {
+                ui.add(
+                    egui::ProgressBar::new((height as f64 / best.max(1) as f64).min(1.0) as f32)
+                        .text(format!(
+                            "Synchronizing {height} / {best} · {} blocks behind",
+                            best.saturating_sub(height)
+                        ))
+                        .animate(true),
+                );
+            }
+        }
+        ui.label(
+            egui::RichText::new(format!(
+                "Last sealed nonce: {} · target: {}",
+                s.head_nonce
+                    .map(|nonce| nonce.to_string())
+                    .unwrap_or_else(|| "—".into()),
+                s.head_bits
+                    .map(|bits| format!("{bits:08x}"))
+                    .unwrap_or_else(|| "—".into())
+            ))
+            .small()
+            .weak(),
+        );
+    });
+    if hashing || fresh {
+        ui.ctx().request_repaint_after(Duration::from_millis(200));
+    }
+}
+
+#[cfg(test)]
+mod native_activity_tests {
+    use super::*;
+
+    #[test]
+    fn measured_history_expires_stale_samples_and_does_not_invent_head_updates() {
+        let mut history = ActivityHistory::default();
+        let mut snapshot = Snapshot {
+            online: true,
+            updated_ms: 100_000,
+            head_hash: "first".into(),
+            local_hashrate: 1200,
+            ..Default::default()
+        };
+        history.observe(&snapshot, 100_000);
+        assert_eq!(
+            history.rates.iter().copied().collect::<Vec<_>>(),
+            vec![(100_000, 1200.0)]
+        );
+        assert_eq!(
+            history.changed_ms, 0,
+            "initial observation is not a newly mined block"
+        );
+        snapshot.head_hash = "second".into();
+        history.observe(&snapshot, 100_100);
+        assert_eq!(history.rates.len(), 1, "samples are rate limited");
+        history.observe(&snapshot, 100_500);
+        assert_eq!(history.changed_ms, 100_500);
+        snapshot.local_hashrate = 0;
+        snapshot.online = false;
+        history.observe(&snapshot, 149_000);
+        assert!(
+            history.rates.is_empty(),
+            "old samples expire without generating idle activity"
+        );
+        assert_eq!(history.head, "second");
+    }
+
+    #[test]
+    fn console_paints_actual_activity_and_stale_sync_without_fabricated_progress() {
+        let render = |snapshot: &Snapshot| {
+            let context = egui::Context::default();
+            let mut text = String::new();
+            for _ in 0..2 {
+                let output = context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(380.0, 900.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |context| {
+                        egui::CentralPanel::default()
+                            .show(context, |ui| mining_activity_console(ui, snapshot));
+                    },
+                );
+                fn collect(shape: &egui::Shape, text: &mut String) {
+                    match shape {
+                        egui::Shape::Text(shape) => {
+                            text.push_str(shape.galley.text());
+                            text.push('\n');
+                        }
+                        egui::Shape::Vec(shapes) => {
+                            for shape in shapes {
+                                collect(shape, text);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                text.clear();
+                for shape in output.shapes {
+                    collect(&shape.shape, &mut text);
+                }
+            }
+            text
+        };
+        let active = Snapshot {
+            online: true,
+            updated_ms: now_ms(),
+            local_hashrate: 1500,
+            height: Some(77),
+            peers: Some(2),
+            mempool: Some(3),
+            head_nonce: Some(42),
+            head_bits: Some(0x207fffff),
+            blocks: vec![BlockRow {
+                height: 77,
+                tx_count: 2,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let text = render(&active);
+        for actual in [
+            "HASHING",
+            "1.50 kH/s",
+            "NEXT #78",
+            "Peers: 2",
+            "Queued: 3 tx",
+            "#77",
+            "2 tx",
+            "Last sealed nonce: 42",
+        ] {
+            assert!(
+                text.contains(actual),
+                "missing actual activity {actual:?}: {text}"
+            );
+        }
+        let stale = Snapshot {
+            online: true,
+            syncing: true,
+            updated_ms: 0,
+            height: Some(77),
+            best_peer_height: Some(100),
+            ..Default::default()
+        };
+        let text = render(&stale);
+        assert!(text.contains("AWAITING TELEMETRY"));
+        assert!(!text.contains("Synchronizing 77"));
+        assert!(!text.contains("NEXT #"));
+    }
+}
+
 fn node_panel(ui: &mut egui::Ui, s: &Snapshot) {
     ui.label(egui::RichText::new("Node").size(ty::TITLE).strong());
+    ui.add_space(sp::M);
+    mining_activity_console(ui, s);
     ui.add_space(sp::M);
 
     // ── STATUS BAND ───────────────────────────────────────────────────────────
@@ -9034,6 +9894,8 @@ fn external_miner_card(ui: &mut egui::Ui, s: &Snapshot, m: &ExternalMinerFacts) 
 
 fn mining_panel(ui: &mut egui::Ui, s: &Snapshot) {
     ui.label(egui::RichText::new("Mining").size(ty::TITLE).strong());
+    mining_activity_console(ui, s);
+    ui.add_space(sp::M);
     ui.label(
         egui::RichText::new(
             "Proof of work: a miner hashes the block header with a changing nonce until the seal \
@@ -11454,10 +12316,16 @@ impl Station {
         // The pool-v2 address + its owner tag, cloned alongside `sel` (kept out of that
         // tuple so the existing destructuring is untouched). Empty for a watch-only
         // wallet, which holds no seed to derive them from.
-        let (v2_addr, v2_tag) = self
+        let (v2_addr, v2_tag, legacy_v2_addr) = self
             .wallets
             .get(self.selected)
-            .map(|w| (w.shielded_v2.clone(), w.v2_owner_tag.clone()))
+            .map(|w| {
+                (
+                    w.shielded_v2.clone(),
+                    w.v2_owner_tag.clone(),
+                    w.legacy_shielded_v2.clone(),
+                )
+            })
             .unwrap_or_default();
         let mut do_set_operate = false;
         let mut do_clear_operate = false;
@@ -11927,7 +12795,20 @@ impl Station {
                     );
                 } else {
                     let v2_state = PoolState::classify_v2(s.online, s.shielded_v2.as_ref());
+                    ui.label("Fresh suite-2 receiving address — original receiving keys are still scanned separately.");
                     v2_address_block(ui, &v2_addr, &v2_tag, v2_state, &mut did_copy);
+                    if !legacy_v2_addr.is_empty() {
+                        ui.collapsing("Original pool-v2 address · existing-note recovery", |ui| {
+                            ui.label("Keep this address with historical records. Use the fresh address above for new payments; Station continues scanning notes received at this original address.");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new(truncate_middle(&legacy_v2_addr, 20, 12)).monospace());
+                                if ui.button("Copy original address").clicked() {
+                                    ui.output_mut(|o| o.copied_text = legacy_v2_addr.clone());
+                                    did_copy = true;
+                                }
+                            });
+                        });
+                    }
                 }
             } else if recv_addr.is_empty() {
                 empty_hint(
@@ -12326,6 +13207,9 @@ impl Station {
                 .map(|m| m.view_for(&account))
                 .unwrap_or_default();
             let v2_own = v2v.own_figures(&account);
+            if v2_own.is_some() {
+                ui.label(format!("Pool v2 key sets: {} XUS in original notes · {} XUS in fresh suite-2 notes. Both remain part of your private balance.", grains_to_xus_plain(v2v.legacy_balance as u128), grains_to_xus_plain(v2v.suite2_balance as u128)));
+            }
             let pool_summaries = [
                 (Pool::V1, PoolState::classify_v1(snap.online, snap.shielded_v1_available), v1_own),
                 (Pool::V2, PoolState::classify_v2(snap.online, snap.shielded_v2.as_ref()), v2_own),
@@ -12692,7 +13576,7 @@ impl Station {
                 ui.add_space(sp::S);
                 let sel_balance: u128 = match sel {
                     Pool::V1 => sv.balance as u128,
-                    Pool::V2 => v2v.balance as u128,
+                    Pool::V2 => v2v.spendable_grains.unwrap_or(v2v.balance) as u128,
                 };
                 let sel_state = match sel {
                     Pool::V1 => {
@@ -12863,6 +13747,7 @@ impl Station {
                                 to: &priv_to_text,
                                 amount: priv_grains,
                             },
+                            snap.shielded_v2.as_ref(),
                         );
                         let dispatch = private_send_dispatch(sel, v2_state);
                         let why: String = if w_watch_only {
@@ -12937,7 +13822,7 @@ impl Station {
                                         // not wired on this route yet, so the bid is
                                         // honestly zero rather than a number the send
                                         // would not actually carry.
-                                        fee_grains: s.fee_shielded_grains,
+                                        fee_grains: if dispatch_pool == Pool::V2 { v2_fee_ceiling(s.gas_price_grains).unwrap_or(u128::MAX) } else { s.fee_shielded_grains },
                                         tip_grains: 0,
                                     });
                                 }
@@ -12995,6 +13880,7 @@ impl Station {
                         to: &self.shield_v2_to,
                         amount: parse_xus(&self.shield_v2_amount_in),
                     },
+                    snap.shielded_v2.as_ref(),
                 ));
                 // DE-SHIELD OUT — bounded by balance AND the window budget.
                 let deshield_v = v2_allows(
@@ -13002,6 +13888,7 @@ impl Station {
                     V2Intent::Deshield {
                         amount: parse_xus(&self.deshield_v2_amount_in),
                     },
+                    snap.shielded_v2.as_ref(),
                 );
                 let v2_cap = guard.deshield_cap();
 
@@ -13058,7 +13945,7 @@ impl Station {
                         );
                         ui.end_row();
 
-                        ui.label(egui::RichText::new("De-shield out").weak());
+                        ui.label(egui::RichText::new("Gross withdrawal").weak());
                         ui.horizontal_wrapped(|ui| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.deshield_v2_amount_in)
@@ -13077,7 +13964,7 @@ impl Station {
                                 }
                             });
                             ui.add_enabled_ui(deshield_v.is_ok(), |ui| {
-                                if ui.button("De-shield").clicked() {
+                                if ui.button(if self.wallets.get(self.selected).is_some_and(|wallet| wallet.legacy_recovery) { "Recover to hybrid account" } else { "Review withdrawal" }).clicked() {
                                     do_deshield_v2 = true;
                                 }
                             });
@@ -13420,7 +14307,7 @@ impl Station {
                                     tip_grains: p.tip_grains,
                                 };
                                 let fee_str = if p.pool() == Some(Pool::V2) {
-                                    "Not available until the STARK proof is built; paid by your public account".to_string()
+                                    format!("At most {} XUS · exact fee checked after proving, paid by your public account", xus(&p.fee_grains.to_string()))
                                 } else if cost.fee_grains == 0 {
                                     "0 XUS  ·  no network fee".to_string()
                                 } else {
@@ -13804,7 +14691,7 @@ impl Station {
                     SendSource::Transparent => self.send(&ctx, review.tip_grains),
                     SendSource::Pool(Pool::V1) => self.send_private(&ctx),
                     SendSource::Pool(Pool::V2) => {
-                        if self.send_private_v2(&ctx) {
+                        if self.run_v2_action(&ctx, V2Action::Send, review.fee_grains) {
                             self.private_v2_amount.clear();
                         }
                     }
@@ -13821,36 +14708,54 @@ impl Station {
         // second click cannot re-fire the same amount at an already-submitted
         // action — while a refusal (bad amount, guard veto) leaves what was typed
         // alone instead of eating it.
-        if do_shield_v2 && self.shield_v2(&ctx) {
-            self.shield_v2_amount_in.clear();
+        if do_shield_v2 {
+            self.review_v2_action(V2Action::Shield);
         }
-        if do_deshield_v2 && self.deshield_v2(&ctx) {
-            self.deshield_v2_amount_in.clear();
+        if do_deshield_v2 {
+            self.review_v2_action(V2Action::Deshield);
         }
+        self.show_v2_review(&ctx);
         if do_rescan {
             self.rescan_shielded(&ctx);
         }
-        // Auto-scan the shielded pool the first time a (spendable) wallet is shown,
-        // so its private balance + notes appear WITHOUT a manual "Scan pool" — this
-        // is what lets "Send privately" enable on its own (you never need to
-        // de-shield to send). Debounced to once per account; skipped for watch-only
-        // (no seed → no viewing key) and while a scan is already running.
-        if !do_scan {
-            if let Some((acct, key, watch)) = self
+        // Both pools follow the canonical head without requiring the operator to
+        // know which pool a payment used. Legacy signing retirement does not
+        // disable note discovery; only a public-only entry lacks a viewing seed.
+        let scan_snapshot = self.snapshot.lock().map(|s| s.clone()).unwrap_or_default();
+        if scan_snapshot.online && scan_snapshot.chain_id == self.network.chain_id() {
+            if let Some((key, has_seed)) = self
                 .wallets
                 .get(self.selected)
-                .map(|w| (w.effective_account(), w.scan_key(), w.watch_only))
+                .map(|w| (w.scan_key(), w.has_note_key()))
             {
-                // Busy is per WALLET: another wallet's scan still running must not
-                // stop this one from starting, and must not be mistaken for it.
-                let scanning = self
+                let scan_head = format!(
+                    "{}:{}:{}",
+                    self.network.chain_id(),
+                    key,
+                    scan_snapshot.head_hash
+                );
+                let scanning_v1 = self
                     .shielded
                     .lock()
                     .map(|m| m.view_for(&key).scanning)
                     .unwrap_or(false);
-                if !watch && self.shielded_scan_for != acct && !scanning {
-                    self.shielded_scan_for = acct;
+                if has_seed && !do_scan && self.shielded_scan_for != scan_head && !scanning_v1 {
+                    self.shielded_scan_for = scan_head.clone();
                     self.scan_shielded(&ctx);
+                }
+                let scanning_v2 = self
+                    .shielded_v2
+                    .lock()
+                    .map(|m| m.view_for(&key).scanning)
+                    .unwrap_or(false);
+                if has_seed
+                    && !do_scan_v2
+                    && scan_snapshot.shielded_v2.is_some()
+                    && self.shielded_v2_scan_for != scan_head
+                    && !scanning_v2
+                {
+                    self.shielded_v2_scan_for = scan_head;
+                    self.scan_shielded_v2(&ctx);
                 }
             }
         }
@@ -14523,21 +15428,109 @@ fn send_payment(
     })
 }
 
-/// Path to a wallet's encrypted incremental note cache, keyed by its stable
-/// implicit id (per seed). `<home>/.sov-station/notes/<id>.store`.
-fn note_store_path(store_id: &str) -> Result<PathBuf, String> {
+/// Revision 2 rebuilds indexes made by the old scanner, which could permanently
+/// skip wrapped transactions or incomplete receipt replies. Old files are kept;
+/// the canonical chain reconstructs the notes without changing wallet keys.
+fn note_store_path(
+    store_id: &str,
+    domain: &sov_primitives::SigningDomain,
+) -> Result<PathBuf, String> {
+    let chain = Hash::digest(&domain.frame(b"sov-station:notes-chain:v2", &[])).to_hex();
     Ok(station_dir()?
         .join("notes")
-        .join(format!("{store_id}.store")))
+        .join(format!("{store_id}.{chain}.scan2.store")))
 }
 
 /// As [`note_store_path`], for the POOL-V2 note cache. A distinct suffix, because
 /// the two pools are separate value spaces with different note formats — loading
 /// one as the other must be impossible, not merely unlikely.
-fn note_store_v2_path(store_id: &str) -> Result<PathBuf, String> {
+fn note_store_v2_path(
+    store_id: &str,
+    domain: &sov_primitives::SigningDomain,
+) -> Result<PathBuf, String> {
+    let chain = Hash::digest(&domain.frame(b"sov-station:notes-chain:v2", &[])).to_hex();
     Ok(station_dir()?
         .join("notes")
-        .join(format!("{store_id}.v2.store")))
+        .join(format!("{store_id}.{chain}.scan2.v2.store")))
+}
+
+/// Resolve only carriers that execute their child. A successful proposal stores
+/// intent, so its inner shielded action must never create phantom notes here.
+fn executed_note_action(mut action: &Action) -> &Action {
+    loop {
+        match action {
+            Action::Timestamped { inner, .. } | Action::Tipped { inner, .. } => {
+                action = inner;
+            }
+            Action::MultisigExec { action: inner, .. } => action = inner,
+            _ => return action,
+        }
+    }
+}
+
+/// A missing receipt is an RPC gap, never evidence that the transaction failed.
+/// Check the entire block before advancing either note index. The header commits
+/// both the transactions and their outcomes, including wrapper execution.
+fn validated_scan_receipts(block: &Block, value: Value) -> Result<Vec<Receipt>, String> {
+    let receipts: Vec<Receipt> = serde_json::from_value(value)
+        .map_err(|e| format!("incomplete block receipts; scan will retry: {e}"))?;
+    if receipts.len() != block.transactions.len()
+        || receipts
+            .iter()
+            .zip(&block.transactions)
+            .any(|(receipt, tx)| receipt.tx_id != tx.id())
+    {
+        return Err(
+            "block receipts do not cover this block in transaction order; scan will retry".into(),
+        );
+    }
+    if sov_types::compute_tx_root(&block.transactions) != block.header.tx_root
+        || sov_types::receipts_root(&receipts) != block.header.receipts_root
+    {
+        return Err(
+            "block transactions or receipts do not match the committed roots; scan will retry"
+                .into(),
+        );
+    }
+    Ok(receipts)
+}
+
+fn v1_scan_bundles(block: &Block, receipts: &[Receipt]) -> Result<Vec<ShieldedBundle>, String> {
+    block
+        .transactions
+        .iter()
+        .zip(receipts)
+        .filter(|(_, receipt)| matches!(receipt.status, ExecutionStatus::Success))
+        .filter_map(
+            |(tx, _)| match executed_note_action(&tx.transaction.action) {
+                Action::Shielded { bundle } => {
+                    Some(ShieldedBundle::from_bytes(bundle).map_err(|e| {
+                        format!("successful pool-v1 bundle could not be decoded: {e}")
+                    }))
+                }
+                _ => None,
+            },
+        )
+        .collect()
+}
+
+fn v2_scan_bundles(block: &Block, receipts: &[Receipt]) -> Result<Vec<SpendBundle>, String> {
+    block
+        .transactions
+        .iter()
+        .zip(receipts)
+        .filter(|(_, receipt)| matches!(receipt.status, ExecutionStatus::Success))
+        .filter_map(
+            |(tx, _)| match executed_note_action(&tx.transaction.action) {
+                Action::ShieldedV2 { bundle } => Some(
+                    decode_bundle_for_suite(*bundle.first().unwrap_or(&0), bundle).map_err(|e| {
+                        format!("successful pool-v2 bundle could not be decoded: {e}")
+                    }),
+                ),
+                _ => None,
+            },
+        )
+        .collect()
 }
 
 /// Encrypt `plaintext` with the 32-byte device `key` (ChaCha20-Poly1305, random
@@ -14633,6 +15626,53 @@ fn canonical_hash(client: &RpcClient, height: u64) -> Result<Option<[u8; 32]>, S
         .map(|b| *b.hash().as_bytes()))
 }
 
+fn validate_scan_parent(block: &Block, height: u64, parent: Hash) -> Result<(), String> {
+    if block.header.height.get() != height || block.header.prev_hash != parent {
+        return Err("the node changed branches during the note scan; scan will retry".into());
+    }
+    Ok(())
+}
+
+fn validate_scan_origin(
+    client: &RpcClient,
+    domain: &sov_primitives::SigningDomain,
+    tip: Option<(u64, [u8; 32])>,
+) -> Result<(), String> {
+    if client.chain_domain().map_err(|e| e.to_string())? != *domain {
+        return Err(
+            "the node changed chain identity during the note scan; reconnect and scan again".into(),
+        );
+    }
+    if let Some((height, hash)) = tip {
+        if canonical_hash(client, height)? != Some(hash) {
+            return Err("the chain reorganized during the note scan; scan will retry".into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_v2_scan_snapshot(store: &PqNoteStore, info: &Value) -> Result<bool, String> {
+    let height = info
+        .get("height")
+        .and_then(Value::as_u64)
+        .ok_or("node did not report its pool-v2 snapshot height")?;
+    if height != store.scanned_height() {
+        return Ok(false);
+    }
+    let count = info
+        .get("noteCount")
+        .and_then(Value::as_u64)
+        .ok_or("node did not report its pool-v2 commitment count")?;
+    let root = info
+        .get("anchor")
+        .and_then(Value::as_str)
+        .ok_or("node did not report its pool-v2 anchor")?;
+    if count != store.commitment_count() || root != hex_lower(&store.root().to_bytes()) {
+        return Err("pool-v2 scan does not match the canonical commitment count and anchor; no balance was replaced".into());
+    }
+    Ok(true)
+}
+
 /// Incrementally scan for `seed`'s shielded notes, persisting an encrypted
 /// [`NoteStore`] so each call only fetches + decrypts the **new** blocks since
 /// last time (not the whole chain). Loads the cached store (decrypting with the
@@ -14651,7 +15691,8 @@ fn scan_store(rpc: &str, seed: [u8; 32]) -> Result<NoteStore, String> {
         .public_key()
         .implicit_account_id()
         .to_string();
-    let path = note_store_path(&store_id)?;
+    let domain = client.chain_domain().map_err(|e| e.to_string())?;
+    let path = note_store_path(&store_id, &domain)?;
     let dkey = notes_cache_key(&seed);
 
     let mut store = std::fs::read(&path)
@@ -14692,43 +15733,27 @@ fn scan_store(rpc: &str, seed: [u8; 32]) -> Result<NoteStore, String> {
             // A missing block at h<=tip is a transient RPC gap; stop here and
             // resume next scan rather than desync the contiguous height.
             .ok_or_else(|| format!("block {h} unavailable; will resume"))?;
-        // Fetch this block's receipts (transaction order, 1:1 with `block.transactions`)
-        // so we ingest ONLY shielded bundles whose transaction actually APPLIED. A
-        // shielded tx can be mined but rejected during execution (a Failed receipt);
-        // ingesting its bundle would credit the wallet notes the chain never accepted,
-        // corrupting the store. A missing/short receipt list ⇒ that tx is treated as
-        // unconfirmed and skipped (fail-closed), never ingested unverified.
-        let receipts = client
+        let parent = store
+            .tip_checkpoint()
+            .map(|(_, hash)| Hash::from_bytes(hash))
+            .unwrap_or_else(|| domain.genesis());
+        validate_scan_parent(&block, h, parent)?;
+        let value = client
             .call("sov_getBlockReceipts", json!({ "height": h }))
             .map_err(|e| e.to_string())?;
-        let receipts = receipts.as_array();
-        let bundles: Vec<ShieldedBundle> = block
-            .transactions
-            .iter()
-            .enumerate()
-            .filter_map(|(i, stx)| match &stx.transaction.action {
-                Action::Shielded { bundle }
-                    if receipts
-                        .and_then(|rs| rs.get(i))
-                        .map(receipt_succeeded)
-                        .unwrap_or(false) =>
-                {
-                    ShieldedBundle::from_bytes(bundle).ok()
-                }
-                _ => None,
-            })
-            .collect();
+        let receipts = validated_scan_receipts(&block, value)?;
+        let bundles = v1_scan_bundles(&block, &receipts)?;
         let refs: Vec<&ShieldedBundle> = bundles.iter().collect();
         store.ingest_block(&zkey, h, *block.hash().as_bytes(), &refs);
+        if h % 100 == 0 {
+            write_private_atomic(&path, &encrypt_blob(&dkey, &store.to_bytes())?)?;
+        }
     }
 
     // Persist the updated cache (encrypted, owner-only).
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
+    validate_scan_origin(&client, &domain, store.tip_checkpoint())?;
     let enc = encrypt_blob(&dkey, &store.to_bytes())?;
-    std::fs::write(&path, &enc).map_err(|e| e.to_string())?;
-    restrict_to_owner(&path);
+    write_private_atomic(&path, &enc)?;
     Ok(store)
 }
 
@@ -14740,14 +15765,22 @@ fn scan_store(rpc: &str, seed: [u8; 32]) -> Result<NoteStore, String> {
 /// secret until a decapsulation happens, so every v2 ciphertext must be
 /// trial-decapsulated. That cost is why the cache matters here even more than
 /// it does for v1.
-fn scan_store_v2(rpc: &str, seed: [u8; 32]) -> Result<PqNoteStore, String> {
+fn scan_store_v2_for_key(rpc: &str, seed: [u8; 32], suite2: bool) -> Result<PqNoteStore, String> {
     let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(15));
-    let key = PqShieldedKey::from_leaf_seed(&seed);
+    let key = if suite2 {
+        PqShieldedKey::from_leaf_seed_suite2(&seed)
+    } else {
+        PqShieldedKey::from_leaf_seed(&seed)
+    };
     let store_id = Keypair::hybrid_from_seed(seed)
         .public_key()
         .implicit_account_id()
         .to_string();
-    let path = note_store_v2_path(&store_id)?;
+    let domain = client.chain_domain().map_err(|e| e.to_string())?;
+    let mut path = note_store_v2_path(&store_id, &domain)?;
+    if suite2 {
+        path = path.with_extension("suite2.store");
+    }
     let dkey = notes_cache_key(&seed);
 
     let mut store = std::fs::read(&path)
@@ -14775,43 +15808,56 @@ fn scan_store_v2(rpc: &str, seed: [u8; 32]) -> Result<PqNoteStore, String> {
         }
     }
 
-    for h in (store.scanned_height() + 1)..=tip {
-        let block = client
-            .block_by_height(h)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("block {h} unavailable; will resume"))?;
-        // Fail-closed on receipts exactly as v1 does: a v2 bundle whose
-        // transaction did not APPLY must never credit the wallet.
-        let receipts = client
-            .call("sov_getBlockReceipts", json!({ "height": h }))
+    let mut scan_tip = tip;
+    let mut complete = false;
+    // Catch up a bounded number of times when a new block arrives while the
+    // initial history scan is running. Never compare roots from different heights.
+    for _ in 0..3 {
+        for h in (store.scanned_height() + 1)..=scan_tip {
+            let block = client
+                .block_by_height(h)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("block {h} unavailable; will resume"))?;
+            let parent = store
+                .tip_checkpoint()
+                .map(|(_, hash)| Hash::from_bytes(hash))
+                .unwrap_or_else(|| domain.genesis());
+            validate_scan_parent(&block, h, parent)?;
+            let value = client
+                .call("sov_getBlockReceipts", json!({ "height": h }))
+                .map_err(|e| e.to_string())?;
+            let receipts = validated_scan_receipts(&block, value)?;
+            let bundles = v2_scan_bundles(&block, &receipts)?;
+            let refs: Vec<&SpendBundle> = bundles.iter().collect();
+            store.ingest_block(&key, h, *block.hash().as_bytes(), &refs);
+            if h % 100 == 0 {
+                write_private_atomic(&path, &encrypt_blob(&dkey, &store.to_bytes())?)?;
+            }
+        }
+        validate_scan_origin(&client, &domain, store.tip_checkpoint())?;
+        let info = client
+            .call("sov_getShieldedV2Info", json!({}))
             .map_err(|e| e.to_string())?;
-        let receipts = receipts.as_array();
-        let bundles: Vec<SpendBundle> = block
-            .transactions
-            .iter()
-            .enumerate()
-            .filter_map(|(i, stx)| match &stx.transaction.action {
-                Action::ShieldedV2 { bundle }
-                    if receipts
-                        .and_then(|rs| rs.get(i))
-                        .map(receipt_succeeded)
-                        .unwrap_or(false) =>
-                {
-                    decode_bundle(bundle).ok()
-                }
-                _ => None,
-            })
-            .collect();
-        let refs: Vec<&SpendBundle> = bundles.iter().collect();
-        store.ingest_block(&key, h, *block.hash().as_bytes(), &refs);
+        if validate_v2_scan_snapshot(&store, &info)? {
+            complete = true;
+            break;
+        }
+        scan_tip = info
+            .get("height")
+            .and_then(Value::as_u64)
+            .ok_or("node did not report its pool-v2 snapshot height")?;
+        if scan_tip < store.scanned_height() {
+            return Err("the chain reorganized during the pool-v2 scan; scan will retry".into());
+        }
+    }
+    if !complete {
+        return Err(
+            "the chain advanced during the pool-v2 scan; scan again to finish catching up".into(),
+        );
     }
 
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
     let enc = encrypt_blob(&dkey, &store.to_bytes())?;
-    std::fs::write(&path, &enc).map_err(|e| e.to_string())?;
-    restrict_to_owner(&path);
+    write_private_atomic(&path, &enc)?;
     Ok(store)
 }
 
@@ -14822,6 +15868,7 @@ fn scan_store_v2(rpc: &str, seed: [u8; 32]) -> Result<PqNoteStore, String> {
 /// tagged object nested under `status`: `{"status":"success"}` on success, or
 /// `{"status":"failed","reason":…}` on a rejected-but-included transaction. Anything
 /// else (unmined, malformed) is treated as not-yet-successful.
+#[cfg(test)]
 fn receipt_succeeded(v: &Value) -> bool {
     v.get("status")
         .and_then(|s| s.get("status"))
@@ -15109,65 +16156,138 @@ fn deshield_amount(
     Ok(txid.to_hex())
 }
 
-/// Submit a pool-v2 bundle inside a carrier transaction signed by `account`.
-///
-/// The carrier binding is the step that makes a bundle admissible at all:
-/// consensus verifies the bundle's ML-DSA authorization over
-/// `carrier_sighash(digest, {signer, nonce})`, so the bundle must be bound to
-/// the exact `{signer, nonce}` this transaction uses — and can therefore never
-/// be lifted onto another transaction. It happens here because the nonce is
-/// only known now, after proving.
+/// The carrier identity is fixed before proving; selecting a fresh nonce after
+/// proof generation would invalidate suite 2's transcript and owner authorization.
+#[cfg(feature = "zk-suite2")]
+struct V2CarrierPlan {
+    account: AccountId,
+    chain: sov_primitives::SigningDomain,
+    nonce: u64,
+}
+
+#[cfg(feature = "zk-suite2")]
+fn prepare_v2_carrier(client: &RpcClient, account: &str) -> Result<V2CarrierPlan, String> {
+    require_v2_live(client)?;
+    let account = AccountId::new(account).map_err(|e| e.to_string())?;
+    let chain = client.chain_domain().map_err(|e| e.to_string())?;
+    let nonce = client.next_nonce(&account).map_err(|e| e.to_string())?;
+    Ok(V2CarrierPlan {
+        account,
+        chain,
+        nonce,
+    })
+}
+
+#[cfg(feature = "zk-suite2")]
 fn submit_v2_bundle(
     client: &RpcClient,
     seed: [u8; 32],
-    account: &str,
-    mut bundle: SpendBundle,
+    bundle: SpendBundle,
+    plan: &V2CarrierPlan,
+    approved_fee: u128,
     action: &Arc<Mutex<ActionState>>,
 ) -> Result<V2Submitted, String> {
-    quantum_v2_activity_allowed().map_err(str::to_string)?;
-    let key = PqShieldedKey::from_leaf_seed(&seed);
+    require_v2_live(client)?;
+    if client.chain_domain().map_err(|e| e.to_string())? != plan.chain {
+        return Err("the node changed chain identity while proving; nothing was broadcast".into());
+    }
+    if client
+        .next_nonce(&plan.account)
+        .map_err(|e| e.to_string())?
+        != plan.nonce
+    {
+        return Err(
+            "this account's nonce changed while proving; nothing was broadcast — review and retry"
+                .into(),
+        );
+    }
     let kp = Keypair::hybrid_from_seed(seed);
-    let from = AccountId::new(account).map_err(|e| e.to_string())?;
-    let nonce = client.next_nonce(&from).map_err(|e| e.to_string())?;
-    let domain = client.signing_domain().map_err(|e| e.to_string())?;
-    // The bundle's ML-DSA carrier authorization binds this chain's {chain_id,
-    // genesis} (PQV2-06 cross-network replay protection) in addition to the
-    // carrier {signer, nonce}. The domain is the chain's own identity, sourced
-    // from the node (not the tx-domain deployment state), so the binding holds
-    // regardless of activation ordering.
-    let chain_domain = client.chain_domain().map_err(|e| e.to_string())?;
-    authorize_for_carrier(
-        &mut bundle,
-        &key,
-        chain_domain.chain_id(),
-        chain_domain.genesis().as_bytes(),
-        account,
-        nonce,
+    let tx_action = Action::ShieldedV2 {
+        bundle: encode_bundle_for_suite(PROOF_VERSION_V2, &bundle).map_err(|e| e.to_string())?,
+    };
+    let price_info = client
+        .call(
+            "sov_estimateFee",
+            json!({ "kind": "transfer", "publicKey": kp.public_key().to_string() }),
+        )
+        .map_err(|e| format!("fee policy unavailable: {e}"))?;
+    let gas_price: u128 = price_info
+        .get("gasPriceGrains")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok())
+        .ok_or("node did not report its gas price")?;
+    let fee = u128::from(
+        sov_runtime::gas::gas_for(&tx_action) + sov_runtime::gas::envelope_gas(&kp.public_key()),
     )
-    .map_err(|e| e.to_string())?;
+    .checked_mul(gas_price)
+    .ok_or("transaction fee overflow")?;
+    approved_v2_fee(fee, approved_fee)?;
+    let gross = u128::from(bundle.public_inputs.transparent_out);
+    if gross > 0 && gross <= fee {
+        return Err(format!(
+            "gross withdrawal must exceed the exact {} XUS network fee; nothing was broadcast",
+            grains_to_xus_plain(fee)
+        ));
+    }
+    let domain = client.signing_domain().map_err(|e| e.to_string())?;
     let tx = Transaction {
-        signer: from,
+        signer: plan.account.clone(),
         public_key: kp.public_key(),
-        nonce,
-        action: Action::ShieldedV2 {
-            bundle: encode_bundle(&bundle),
-        },
+        nonce: plan.nonce,
+        action: tx_action,
     };
     let stx = SignedTransaction::sign_in(tx, &kp, domain.as_ref()).map_err(|e| e.to_string())?;
-    // PAST THIS LINE THE TRANSACTION IS ON THE NETWORK. Everything above can fail
-    // safely (nothing was broadcast, the nonce is untouched, a retry is correct);
-    // everything below must never be reported as a failure, because a retry would
-    // then be a SECOND transaction for one intended action.
-    let txid = client.submit_transaction(&stx).map_err(|e| e.to_string())?;
-    begin(action, "submitted — in the mempool, waiting to be mined…");
-    // A short opportunistic wait so the common fast case still confirms inline;
-    // on timeout this reports PENDING, never failure, and the outbox poller keeps
-    // tracking the receipt to a real terminal state.
+    let txid = stx.id();
+    let journal = action
+        .lock()
+        .map_err(|_| "wallet action state unavailable")?
+        .clone();
+    if journal.journal_required && journal.pending_journal.is_none() {
+        return Err("cannot locate durable submission journal; nothing was broadcast".into());
+    }
+    if let Some(path) = &journal.pending_journal {
+        let pending = PendingSubmission {
+            txid: txid.to_hex(),
+            chain_id: plan.chain.chain_id().into(),
+            genesis: plan.chain.genesis().to_hex(),
+            from_account: plan.account.to_string(),
+            nonce: plan.nonce,
+            submitted_ms: now_ms(),
+        };
+        journal_pending_submission(path, &pending)?;
+        if let Some(outbox) = &journal.pending_outbox {
+            if let Ok(mut entries) = outbox.lock() {
+                entries.push(pending.restored_send());
+            }
+        }
+    }
+    let delivery_note = match client.submit_transaction(&stx) {
+        Ok(reported) if reported == txid => String::new(),
+        Err(sov_rpc::RpcClientError::Rpc { code, message }) => {
+            if let Some(path) = &journal.pending_journal { let _ = remove_pending_submissions(path, &[txid.to_hex()]); }
+            if let Some(outbox) = &journal.pending_outbox {
+                if let Ok(mut entries) = outbox.lock() { entries.retain(|entry| entry.txid != txid.to_hex()); }
+            }
+            return Err(format!("node rejected submission ({code}): {message}"));
+        }
+        Ok(_) => "submission response named an unexpected transaction; delivery is unknown — do not resend".into(),
+        Err(error) => format!("submission response was lost ({error}); delivery is unknown — do not resend"),
+    };
+    begin(
+        action,
+        if delivery_note.is_empty() {
+            "submitted — waiting for a receipt…"
+        } else {
+            &delivery_note
+        },
+    );
     let status = await_receipt_status(client, &txid, V2_INLINE_WAIT_SECS);
     Ok(V2Submitted {
         txid: txid.to_hex(),
-        nonce,
+        nonce: plan.nonce,
         status,
+        withdrawal_net: (gross > 0).then(|| gross - fee),
+        delivery_note,
     })
 }
 
@@ -15214,119 +16334,175 @@ fn v2_not_broadcast_line(what: V2Action, err: &str) -> String {
 /// once `submit_transaction` succeeded — so holding one of these means a retry
 /// would double-submit. An `Err` from [`submit_v2_bundle`] means the opposite:
 /// nothing was broadcast and retrying is safe.
+#[derive(Debug)]
 struct V2Submitted {
     txid: String,
     /// The nonce slot it occupies, so the outbox can resolve supersession.
     nonce: u64,
     status: ReceiptStatus,
+    withdrawal_net: Option<u128>,
+    delivery_note: String,
 }
 
-/// Refuse before spending ~25 s proving if pool v2 is not live on this chain.
+/// Check locally supported suite and the node's exact activated parameter set.
 fn require_v2_live(client: &RpcClient) -> Result<(), String> {
-    quantum_v2_activity_allowed().map_err(str::to_string)?;
     let info = client
         .call("sov_getShieldedV2Info", json!({}))
         .map_err(|e| e.to_string())?;
-    if info.get("active").and_then(Value::as_bool) == Some(true) {
-        return Ok(());
-    }
-    Err(
-        "pool v2 is not active on this chain (consensus signal bit 2 is unarmed), \
-         so every v2 spend would be rejected. This is the deployment being dormant, \
-         not a problem with this wallet."
-            .to_string(),
-    )
+    let info = shielded_v2_info(&info).ok_or("node returned an invalid pool-v2 policy")?;
+    quantum_v2_activity_allowed(Some(&info)).map_err(str::to_string)
 }
 
-/// Shield transparent value INTO pool v2 (a real STARK, no input notes).
 fn shield_v2_amount(
     rpc: &str,
     seed: [u8; 32],
     account: &str,
     to: &str,
-    amount_grains: u128,
+    amount: u128,
+    approved_fee: u128,
     action: &Arc<Mutex<ActionState>>,
 ) -> Result<V2Submitted, String> {
-    quantum_deposit_allowed(Pool::V2).map_err(str::to_string)?;
-    let amount = u64::try_from(amount_grains).map_err(|_| "amount too large".to_string())?;
-    let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(180));
-    require_v2_live(&client)?;
-    let key = PqShieldedKey::from_leaf_seed(&seed);
-    // Blank means "to myself"; otherwise shield into the named pool-v2
-    // address. Re-checked here, not just in the UI, so no caller can bypass it.
-    let dest = if to.trim().is_empty() {
-        key.address()
-    } else {
-        decode_shielded_v2(to.trim())
-            .map_err(|e| format!("the shield recipient is not a pool-v2 (xusq1…) address: {e}"))?
-    };
-    begin(action, "proving the pool-v2 shield (STARK, ~25s)…");
-    let bundle = build_shield(&key, &dest, amount, 0).map_err(|e| e.to_string())?;
-    submit_v2_bundle(&client, seed, account, bundle, action)
+    execute_v2_action(
+        rpc,
+        seed,
+        account,
+        to,
+        amount,
+        V2Action::Shield,
+        approved_fee,
+        action,
+    )
 }
 
-/// De-shield value OUT of pool v2 back to `account`; change returns shielded.
 fn deshield_v2_amount(
     rpc: &str,
     seed: [u8; 32],
     account: &str,
-    amount_grains: u128,
+    amount: u128,
+    approved_fee: u128,
     action: &Arc<Mutex<ActionState>>,
 ) -> Result<V2Submitted, String> {
-    let amount = u64::try_from(amount_grains).map_err(|_| "amount too large".to_string())?;
-    let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(180));
-    require_v2_live(&client)?;
-    // The live per-window drain budget: a de-shield over it would be mined and
-    // REJECTED, which reads as value "stuck" in the pool. Fail fast instead.
-    if let Some(budget) = deshieldable_v2_now(&client) {
-        if amount_grains > budget {
-            return Err(format!(
-                "only {} XUS can be de-shielded from pool v2 in the current window \
-                 (per-window drain limit) — reduce the amount or wait for the window to reset",
-                grains_to_xus_plain(budget),
-            ));
-        }
-    }
-    let key = PqShieldedKey::from_leaf_seed(&seed);
-    begin(action, "scanning pool v2 for spendable notes…");
-    let store = scan_store_v2(rpc, seed)?;
-    if store.unspent_count() == 0 {
-        return Err("no unspent pool-v2 notes to de-shield".to_string());
-    }
-    begin(action, "proving the pool-v2 de-shield (STARK, ~25s)…");
-    let built = build_spend(&key, &store, None, amount, 0).map_err(|e| e.to_string())?;
-    submit_v2_bundle(&client, seed, account, built.bundle, action)
+    execute_v2_action(
+        rpc,
+        seed,
+        account,
+        "",
+        amount,
+        V2Action::Deshield,
+        approved_fee,
+        action,
+    )
 }
 
-/// Fully-private pool-v2 transfer to another `xusq1…` address.
 fn zsend_v2_amount(
     rpc: &str,
     seed: [u8; 32],
     account: &str,
     to: &str,
-    amount_grains: u128,
+    amount: u128,
+    approved_fee: u128,
     action: &Arc<Mutex<ActionState>>,
 ) -> Result<V2Submitted, String> {
-    let amount = u64::try_from(amount_grains).map_err(|_| "amount too large".to_string())?;
-    // A pool-v1 address here would pay the wrong recipient in the wrong value
-    // space, so it is REFUSED rather than coerced.
-    let to_addr = decode_shielded_v2(to.trim()).map_err(|e| {
-        format!("not a pool-v2 (xusq1…) address: {e}. Pool v1 addresses (xus1…) cannot receive here — the pools are separate value spaces.")
-    })?;
-    let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(180));
-    require_v2_live(&client)?;
-    let key = PqShieldedKey::from_leaf_seed(&seed);
-    begin(action, "scanning pool v2 for spendable notes…");
-    let store = scan_store_v2(rpc, seed)?;
-    if store.unspent_count() == 0 {
-        return Err("no unspent pool-v2 notes to send".to_string());
-    }
-    begin(
+    execute_v2_action(
+        rpc,
+        seed,
+        account,
+        to,
+        amount,
+        V2Action::Send,
+        approved_fee,
         action,
-        "proving the private pool-v2 transfer (STARK, ~25s)…",
-    );
-    let built = build_spend(&key, &store, Some(&to_addr), amount, 0).map_err(|e| e.to_string())?;
-    submit_v2_bundle(&client, seed, account, built.bundle, action)
+    )
+}
+
+// Keep the reviewed amount, fee ceiling, chain/account and action explicit at
+// this one proving seam; no term may be silently re-read after confirmation.
+#[allow(clippy::too_many_arguments)]
+fn execute_v2_action(
+    rpc: &str,
+    seed: [u8; 32],
+    account: &str,
+    to: &str,
+    amount_grains: u128,
+    what: V2Action,
+    approved_fee: u128,
+    action: &Arc<Mutex<ActionState>>,
+) -> Result<V2Submitted, String> {
+    let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(300));
+    require_v2_live(&client)?;
+    #[cfg(not(feature = "zk-suite2"))]
+    {
+        let _ = (seed, account, to, amount_grains, what, approved_fee, action);
+        Err("replacement prover unavailable".into())
+    }
+    #[cfg(feature = "zk-suite2")]
+    {
+        let amount = u64::try_from(amount_grains).map_err(|_| "amount too large".to_string())?;
+        if amount == 0 {
+            return Err("enter an amount greater than zero".into());
+        }
+        let fresh = PqShieldedKey::from_leaf_seed_suite2(&seed);
+        let recipient = match what {
+            V2Action::Shield if to.trim().is_empty() => Some(fresh.address()),
+            V2Action::Shield | V2Action::Send => Some(
+                decode_shielded_v2(to.trim())
+                    .map_err(|e| format!("invalid pool-v2 address: {e}"))?,
+            ),
+            V2Action::Deshield => None,
+        };
+        if matches!(what, V2Action::Deshield) {
+            let budget =
+                deshieldable_v2_now(&client).ok_or("node did not report its withdrawal budget")?;
+            if amount_grains > budget {
+                return Err("gross withdrawal exceeds this window's pool-v2 budget".into());
+            }
+        }
+        let stores = if matches!(what, V2Action::Shield) {
+            None
+        } else {
+            begin(
+                action,
+                "scanning original and replacement pool-v2 note keys…",
+            );
+            Some(scan_store_v2(rpc, seed)?)
+        };
+        let plan = prepare_v2_carrier(&client, account)?;
+        let genesis = plan.chain.genesis();
+        let carrier = sov_shielded_pq::carrier::CarrierContext {
+            chain_id: plan.chain.chain_id().as_bytes(),
+            genesis: genesis.as_bytes(),
+            signer: plan.account.as_str().as_bytes(),
+            nonce: plan.nonce,
+        };
+        begin(
+            action,
+            "proving the context-bound hiding suite-2 transaction…",
+        );
+        let bundle = if let Some(stores) = stores {
+            let legacy = PqShieldedKey::from_leaf_seed(&seed);
+            build_spend_suite2_mixed(
+                &[(&legacy, &stores.legacy), (&fresh, &stores.suite2)],
+                &fresh,
+                recipient.as_ref(),
+                amount,
+                0,
+                &fresh.address(),
+                &carrier,
+            )
+            .map_err(|e| e.to_string())?
+            .bundle
+        } else {
+            build_shield_suite2(
+                &fresh,
+                recipient.as_ref().expect("shield recipient checked"),
+                amount,
+                0,
+                &carrier,
+            )
+            .map_err(|e| e.to_string())?
+        };
+        submit_v2_bundle(&client, seed, bundle, &plan, approved_fee, action)
+    }
 }
 
 /// The node's live pool-v2 de-shield budget for this window, in grains.
@@ -15522,10 +16698,7 @@ fn keystore_path() -> Result<PathBuf, String> {
 
 fn write_keystore(json: &str) -> Result<String, String> {
     let path = keystore_path()?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(&path, format!("{json}\n")).map_err(|e| e.to_string())?;
+    write_private_atomic(&path, format!("{json}\n").as_bytes())?;
     Ok(path.display().to_string())
 }
 
@@ -15558,6 +16731,42 @@ fn restrict_to_owner(path: &Path) {
     {
         let _ = path; // NTFS ACLs already default to the owning user.
     }
+}
+
+/// Replace encrypted wallet/cache data only after the complete new file is on
+/// disk. A failed write leaves the previous backup intact. On Unix the temporary
+/// file starts owner-only, rather than exposing secret data before chmod.
+fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let dir = path.parent().ok_or("wallet file has no parent directory")?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let mut random = [0u8; 16];
+    sov_crypto::fill_secure(&mut random).map_err(|e| e.to_string())?;
+    let temp = dir.join(format!(".sov-write-{}.tmp", hex_lower(&random)));
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp).map_err(|e| e.to_string())?;
+        file.write_all(bytes).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        drop(file);
+        std::fs::rename(&temp, path).map_err(|e| e.to_string())?;
+        restrict_to_owner(path);
+        #[cfg(unix)]
+        std::fs::File::open(dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
+    }
+    result
 }
 
 /// Read a LEGACY device key (64 hex chars) if one exists — read-only, never
@@ -16349,19 +17558,19 @@ fn build_and_run_node(
     }
     let node_dir = ensure_durable_node_dir(net)?;
 
-    // Safety: never silently destroy a chain. If this chain was mined to a DIFFERENT
-    // wallet, refuse rather than wiping it — the user selects that wallet, or uses
-    // "Reset local chain" to wipe deliberately. (A real chain is never silently
-    // erased from under you.)
+    // Selecting another payout wallet changes future rewards, never history.
+    // Retain the previous encrypted miner key before replacing its configuration.
     let marker = node_dir.join("miner.txt");
     let prev = std::fs::read_to_string(&marker).unwrap_or_default();
     if !prev.trim().is_empty() && prev.trim() != account {
-        return Err(format!(
-            "this local chain was mined to a different wallet ({}…); starting as {}… would wipe \
-             it. Select that wallet, or use “Reset local chain” to start fresh deliberately.",
-            &prev.trim()[..prev.trim().len().min(12)],
-            &account[..account.len().min(12)],
-        ));
+        push_log(
+            logs,
+            format!(
+                "payout selection changed from {} to {}; existing chain history is retained",
+                truncate_middle(prev.trim(), 12, 6),
+                truncate_middle(account, 12, 6)
+            ),
+        );
     }
 
     // One-time setup, entirely IN-PROCESS — no external helper binary, so a shipped
@@ -16400,12 +17609,40 @@ fn build_and_run_node(
             scheme: Some("hybrid65".to_string()),
             mnemonic: None,
             public_key: None,
+            operate_as: None,
         }],
     }
     .to_encrypted_json(passphrase)
     .map_err(|e| format!("encrypt miner keystore: {e}"))?;
     let ks_path = node_dir.join("node-1/keystore.json");
-    std::fs::write(&ks_path, keystore_json)
+    if !prev.trim().is_empty() && prev.trim() != account && ks_path.exists() {
+        let mut prior = std::fs::read_to_string(&ks_path)
+            .map_err(|error| format!("read prior miner key for backup: {error}"))?;
+        let document: Value = serde_json::from_str(&prior)
+            .map_err(|error| format!("prior miner key is unreadable; retained: {error}"))?;
+        if document.get("encrypted").and_then(Value::as_bool) != Some(true) {
+            let mut old = Keystore::from_encrypted_or_plain(&prior, Some(passphrase))
+                .map_err(|error| format!("prior miner key cannot be safely backed up: {error}"))?;
+            prior.zeroize();
+            prior = old
+                .to_encrypted_json(passphrase)
+                .map_err(|error| format!("encrypt prior miner backup: {error}"))?;
+            for entry in &mut old.miners {
+                entry.seed_hex.zeroize();
+                if let Some(phrase) = &mut entry.mnemonic {
+                    phrase.zeroize();
+                }
+            }
+        }
+        let backup = node_dir.join(format!("miner-key-backups/keystore-{}.json", now_ms()));
+        write_private_atomic(&backup, prior.as_bytes())?;
+        prior.zeroize();
+        push_log(
+            logs,
+            format!("prior encrypted miner key retained at {}", backup.display()),
+        );
+    }
+    write_private_atomic(&ks_path, keystore_json.as_bytes())
         .map_err(|e| format!("could not set miner keystore: {e}"))?;
     restrict_to_owner(&ks_path);
     let _ = std::fs::write(&marker, account);
@@ -16442,49 +17679,55 @@ fn build_and_run_node(
     } else {
         format!("127.0.0.1:{rpc_port}")
     };
-    // Seed/bootstrap peer (Bitcoin `addnode` style), scoped to THIS network. Replace
-    // the persisted operator list on every start—even when empty—so a legacy testnet
-    // peer can never survive in the mainnet node config. Stable spec seeds are merged
-    // into the in-memory list below.
+    // Preserve this network directory's configured peers. Add a valid operator
+    // selection without deleting an existing route to the live network.
     let peer = peer.trim();
-    config.bootstrap_peers = match normalize_peer_addr(peer, &rpc_port) {
-        PeerAddr::Empty => Vec::new(),
-        PeerAddr::Ok(addr) => vec![addr],
+    let selected_peer = match normalize_peer_addr(peer, &rpc_port) {
+        PeerAddr::Empty => None,
+        PeerAddr::Ok(addr) => Some(addr),
         PeerAddr::Corrected { addr, why } => {
             push_log(logs, format!("seed peer: {why} — dialing {addr} instead"));
-            vec![addr]
+            Some(addr)
         }
         PeerAddr::Unusable(why) => {
             push_log(logs, format!("seed peer IGNORED: {why}"));
-            Vec::new()
+            None
         }
     };
+    if let Some(addr) = selected_peer {
+        if !config.bootstrap_peers.contains(&addr) {
+            config.bootstrap_peers.insert(0, addr);
+        }
+    }
     let cfg_path = node_dir.join("node-1/node-config.json");
     let mut persisted: Value = serde_json::from_str(&read(&cfg_path)?)
         .map_err(|e| format!("node-config persistence: {e}"))?;
     persisted["bootstrap_peers"] = json!(config.bootstrap_peers.clone());
-    std::fs::write(
+    write_private_atomic(
         &cfg_path,
         serde_json::to_string_pretty(&persisted)
-            .map_err(|e| format!("serialize node-config: {e}"))?,
+            .map_err(|e| format!("serialize node-config: {e}"))?
+            .as_bytes(),
     )
     .map_err(|e| format!("persist network-scoped peers: {e}"))?;
-    // Always refresh chain-spec.json from the EMBEDDED spec, so a new build's spec
-    // changes take effect on an EXISTING chain instead of being frozen at first-run.
-    // testnet-1's genesis is frozen (hash 5e9f3cc5…) and the de-shield limiter params
-    // are NOT genesis-header fields, so this never alters the genesis ⇒ the persisted
-    // chain still resumes, no reset. (`sov-testnet join` writes chain-spec.json as a
-    // verbatim passthrough of the spec, so the embedded spec IS the on-disk content —
-    // this just keeps the two consistent across upgrades.)
-    let spec_text = embedded_spec(spec_filename)?;
-    std::fs::write(node_dir.join("chain-spec.json"), spec_text)
-        .map_err(|e| format!("refresh chain-spec: {e}"))?;
-    let spec = ChainSpec::from_json(&read(&node_dir.join("chain-spec.json"))?)
-        .map_err(|e| format!("chain-spec: {e}"))?;
+    // setup_node_dir wrote the initial spec. Keep an existing, genesis-verified
+    // spec and its operator seeds; newer bundled seeds are added in memory.
+    let existing_spec = node_dir.join("chain-spec.json");
+    let spec_path = if existing_spec.exists() {
+        existing_spec
+    } else {
+        node_dir.join(spec_filename)
+    };
+    let spec = ChainSpec::from_json(&read(&spec_path)?).map_err(|e| format!("chain-spec: {e}"))?;
     // Merge the spec's baked-in seed peers into the bootstrap set (dedup, after any
     // operator-typed peer), so a fresh node can find the network off its LAN even with
     // no peer typed in. mDNS still covers same-LAN discovery.
-    for s in &spec.seeds {
+    let bundled = ChainSpec::from_json(embedded_spec(spec_filename)?)
+        .map_err(|error| format!("bundled chain-spec: {error}"))?;
+    if spec.chain_id != bundled.chain_id {
+        return Err("the local chain spec belongs to a different network; history retained".into());
+    }
+    for s in spec.seeds.iter().chain(&bundled.seeds) {
         if !config.bootstrap_peers.contains(s) {
             config.bootstrap_peers.push(s.clone());
         }
@@ -16702,6 +17945,17 @@ pub fn run(rpc: String) -> Result<(), String> {
     }));
 
     let options = eframe::NativeOptions {
+        // Use Apple's supported graphics API on Apple Silicon. Metal selects
+        // capabilities at runtime, rather than compiling for a specific M chip.
+        #[cfg(target_os = "macos")]
+        renderer: eframe::Renderer::Wgpu,
+        #[cfg(target_os = "macos")]
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            supported_backends: eframe::wgpu::Backends::METAL,
+            ..Default::default()
+        },
+        #[cfg(not(target_os = "macos"))]
+        renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 800.0])
             .with_min_inner_size([720.0, 480.0])
@@ -16709,9 +17963,13 @@ pub fn run(rpc: String) -> Result<(), String> {
         ..Default::default()
     };
 
-    // Sends this session, shared with the poller so their pending/confirmed state
-    // stays live without the UI thread ever making an RPC call.
-    let outbox: Arc<Mutex<Vec<SentTx>>> = Arc::new(Mutex::new(Vec::new()));
+    // Restore public submission identifiers before polling or offering a resend.
+    let pending_path = station_dir()?.join("pending-submissions.json");
+    let restored = load_pending_submissions(&pending_path)?
+        .iter()
+        .map(PendingSubmission::restored_send)
+        .collect();
+    let outbox: Arc<Mutex<Vec<SentTx>>> = Arc::new(Mutex::new(restored));
 
     let poll_snap = snapshot.clone();
     let poll_cfg = config.clone();
@@ -16743,6 +18001,159 @@ pub fn run(rpc: String) -> Result<(), String> {
 /// to read the work list and to write results back — never across an RPC call.
 // The caller has polled this client's chain id. A different node on that same
 // chain can confirm a payment; its original RPC remains provenance metadata.
+static PENDING_JOURNAL_LOCK: Mutex<()> = Mutex::new(());
+
+/// Only fields already public in the carrier are retained. Private amounts,
+/// note witnesses, recipients, keys and recovery phrases never enter this file.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingSubmission {
+    txid: String,
+    chain_id: String,
+    genesis: String,
+    from_account: String,
+    nonce: u64,
+    submitted_ms: u64,
+}
+
+impl PendingSubmission {
+    fn restored_send(&self) -> SentTx {
+        SentTx {
+            txid: self.txid.clone(),
+            chain_id: self.chain_id.clone(),
+            rpc: String::new(),
+            from_account: self.from_account.clone(),
+            to: "privacy transaction (restored)".into(),
+            amount_grains: 0,
+            nonce: self.nonce,
+            tip_grains: 0,
+            shielded_route: true,
+            submitted_ms: self.submitted_ms,
+            state: SendState::Pending,
+            note: "Delivery may be unknown. Check its receipt; do not resend.".into(),
+        }
+    }
+}
+
+fn load_pending_submissions(path: &Path) -> Result<Vec<PendingSubmission>, String> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "read submission journal; original retained: {error}"
+            ))
+        }
+    };
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read submission journal: {error}"))?;
+    if bytes.len() > 1024 * 1024 {
+        return Err("submission journal is oversized; original retained".into());
+    }
+    let entries: Vec<PendingSubmission> = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("submission journal is unreadable; original retained: {error}"))?;
+    if entries.len() > 1024 {
+        return Err("too many unresolved submission records; original retained".into());
+    }
+    for entry in &entries {
+        if Hash::from_hex(&entry.txid).is_err()
+            || Hash::from_hex(&entry.genesis).is_err()
+            || AccountId::new(&entry.from_account).is_err()
+            || entry.chain_id.len() > 128
+            || ChainSpec::hardcoded_genesis_pin(&entry.chain_id)
+                .is_some_and(|pin| pin != entry.genesis)
+        {
+            return Err("invalid submission record; original retained".into());
+        }
+    }
+    Ok(entries)
+}
+
+fn journal_pending_submission(path: &Path, pending: &PendingSubmission) -> Result<(), String> {
+    let _guard = PENDING_JOURNAL_LOCK
+        .lock()
+        .map_err(|_| "submission journal unavailable")?;
+    let mut entries = load_pending_submissions(path)?;
+    if entries.iter().any(|entry| {
+        entry.chain_id == pending.chain_id
+            && entry.genesis == pending.genesis
+            && entry.from_account == pending.from_account
+            && entry.nonce == pending.nonce
+    }) {
+        return Err("a durable pending submission already occupies this nonce; check its receipt before sending again".into());
+    }
+    if entries.len() >= 1024 {
+        return Err("submission journal is full; resolve pending receipts before sending".into());
+    }
+    entries.push(pending.clone());
+    write_private_atomic(
+        path,
+        &serde_json::to_vec(&entries).map_err(|error| error.to_string())?,
+    )
+}
+
+fn remove_pending_submissions(path: &Path, ids: &[String]) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let _guard = PENDING_JOURNAL_LOCK
+        .lock()
+        .map_err(|_| "submission journal unavailable")?;
+    let mut entries = load_pending_submissions(path)?;
+    entries.retain(|entry| !ids.contains(&entry.txid));
+    write_private_atomic(
+        path,
+        &serde_json::to_vec(&entries).map_err(|error| error.to_string())?,
+    )
+}
+
+#[cfg(test)]
+mod pending_journal_tests {
+    use super::*;
+
+    #[test]
+    fn pending_public_identity_survives_restart_blocks_duplicate_nonce_and_preserves_bad_file() {
+        let dir = std::env::temp_dir().join(format!("sov-pending-journal-{}", std::process::id()));
+        let path = dir.join("pending.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let pending = PendingSubmission {
+            txid: Hash::digest(b"pending").to_hex(),
+            chain_id: "sov-mainnet".into(),
+            genesis: ChainSpec::MAINNET_GENESIS_HASH.into(),
+            from_account: "wallet.sov".into(),
+            nonce: 9,
+            submitted_ms: 10,
+        };
+        journal_pending_submission(&path, &pending).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert!(journal_pending_submission(&path, &pending).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let entries = load_pending_submissions(&path).unwrap();
+        let restored = entries[0].restored_send();
+        assert_eq!(restored.txid, pending.txid);
+        assert_eq!(restored.nonce, 9);
+        assert!(restored.state.is_pending());
+        assert_eq!(
+            restored.amount_grains, 0,
+            "private amount is not stored in a public identifier journal"
+        );
+        assert!(restored.note.contains("do not resend"));
+        let bytes = std::str::from_utf8(&original).unwrap();
+        for secret_field in ["amount", "seed", "recipient", "witness", "mnemonic"] {
+            assert!(!bytes.contains(secret_field));
+        }
+        remove_pending_submissions(&path, &[pending.txid]).unwrap();
+        assert!(load_pending_submissions(&path).unwrap().is_empty());
+        std::fs::write(&path, b"unreadable old record").unwrap();
+        assert!(journal_pending_submission(&path, &entries[0]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"unreadable old record");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 fn refresh_outbox(client: &RpcClient, outbox: &Arc<Mutex<Vec<SentTx>>>, chain_id: &str) {
     let pending: Vec<(String, String, u64)> = match outbox.lock() {
         Ok(o) => o
@@ -16786,6 +18197,10 @@ fn refresh_outbox(client: &RpcClient, outbox: &Arc<Mutex<Vec<SentTx>>>, chain_id
                 }
             }
         }
+    }
+    if let Ok(dir) = station_dir() {
+        let ids: Vec<_> = settled.into_iter().map(|(id, _, _)| id).collect();
+        let _ = remove_pending_submissions(&dir.join("pending-submissions.json"), &ids);
     }
 }
 
@@ -17112,7 +18527,7 @@ mod tests {
 
     /// Take the lock, ignoring poisoning: a panic in one env test must not cascade
     /// into unrelated failures in the others.
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -17366,7 +18781,7 @@ mod tests {
         let src = include_str!("gui.rs");
         // Scan the SHIPPING code only — this test module necessarily mentions the
         // pattern it is looking for, and would otherwise flag itself.
-        let shipping = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let shipping = src.split("#[cfg(test)]\nmod tests {").next().unwrap_or(src);
         let offenders: Vec<&str> = shipping
             .lines()
             .map(str::trim)
@@ -17486,13 +18901,16 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_embeds_both_independent_relay_seeds() {
+    fn mainnet_embeds_oracle_and_preserves_frozen_genesis() {
         let spec = ChainSpec::from_json(MAINNET_SPEC).expect("mainnet spec parses");
         assert_eq!(
             spec.seeds,
-            vec!["137.184.83.91:9645", "164.92.141.24:9645"],
-            "every updated mainnet node must bootstrap through the live relay hosts \
-             (SFO relay-2 + Frankfurt; the retired NYC relay-1 64.225.10.34 was removed)"
+            vec![
+                "158.101.18.90:9645",
+                "137.184.83.91:9645",
+                "164.92.141.24:9645"
+            ],
+            "the verified Oracle endpoint is tried before the historical relays"
         );
         let genesis = spec
             .to_genesis_config_verified()
@@ -17523,6 +18941,7 @@ mod tests {
                 scheme: Some("hybrid65".to_string()),
                 mnemonic: Some("abandon ability able".to_string()),
                 public_key: None,
+                operate_as: None,
             }],
         }
     }
@@ -18417,11 +19836,11 @@ mod tests {
                     "{state:?}: {surface}"
                 );
                 assert!(
-                    surface.contains("hidden amounts and note linkages"),
+                    surface.contains("context-bound hiding replacement"),
                     "{state:?}: {surface}"
                 );
                 assert!(
-                    surface.contains("unverified, even when this pool is active"),
+                    surface.contains("only when this chain activates compatible suite 2"),
                     "{state:?}: {surface}"
                 );
             }
@@ -22041,12 +23460,14 @@ mod quantum_release_policy_tests {
 
     #[test]
     fn active_pool_cannot_override_local_confidentiality_gate() {
-        assert!(quantum_v2_activity_allowed()
+        assert!(quantum_v2_activity_allowed(None)
             .unwrap_err()
             .contains("unmasked"));
-        for pool in [Pool::V1, Pool::V2] {
-            assert!(quantum_deposit_allowed(pool).is_err());
-        }
+        assert!(quantum_deposit_allowed(Pool::V1).is_err());
+        assert_eq!(
+            quantum_deposit_allowed(Pool::V2).is_ok(),
+            cfg!(feature = "zk-suite2")
+        );
         let guard = V2Guard {
             pool_active: true,
             for_this_wallet: true,
@@ -22068,7 +23489,9 @@ mod quantum_release_policy_tests {
                 amount: Some(1),
             },
         ] {
-            assert!(v2_allows(&guard, intent).unwrap_err().contains("unmasked"));
+            assert!(v2_allows(&guard, intent, None)
+                .unwrap_err()
+                .contains("unmasked"));
         }
     }
 
@@ -22103,6 +23526,7 @@ mod quantum_release_policy_tests {
             scheme: None,
             mnemonic: Some("original recovery phrase".into()),
             public_key: None,
+            operate_as: None,
         };
         let wallet = LoadedWallet::from_keystore_entry(&entry).unwrap();
         assert!(wallet.watch_only && wallet.legacy_recovery);
@@ -22131,5 +23555,976 @@ mod quantum_release_policy_tests {
             ..entry
         };
         assert!(LoadedWallet::from_keystore_entry(&invalid).is_err());
+    }
+}
+
+#[cfg(test)]
+mod wallet_note_recovery_tests {
+    use super::*;
+    use sov_primitives::{BlockHeight, SigningDomain};
+    use sov_shielded_pq::encrypt::encrypt_note;
+    use sov_shielded_pq::note::Note;
+
+    fn scan_bundle(key: &PqShieldedKey, value: u64) -> SpendBundle {
+        // A structural historical wire fixture suffices for scanning: consensus
+        // validates proofs, while this wallet authenticates accepted receipts.
+        // Keep its dummy pattern/proof frame; replace the note carriers so this
+        // test exercises actual ML-KEM decapsulation of the restored seed.
+        static FRAME: std::sync::OnceLock<SpendBundle> = std::sync::OnceLock::new();
+        let mut bundle = FRAME
+            .get_or_init(|| {
+                let fixture_key = PqShieldedKey::from_leaf_seed(&[196; 32]);
+                build_shield(&fixture_key, &fixture_key.address(), 1, 0).unwrap()
+            })
+            .clone();
+        let note = Note::new(value, key.owner_tag(), key.rho(0)).unwrap();
+        bundle.public_inputs.output_commitments[0] = note.commitment();
+        bundle.output_ciphertexts[0] = Some(encrypt_note(key.address().kem_ek(), &note).unwrap());
+        bundle
+    }
+
+    fn scan_block(actions: Vec<(Action, bool)>) -> (Block, Vec<Receipt>) {
+        let key = Keypair::hybrid_from_seed([112; 32]);
+        let transactions: Vec<_> = actions
+            .iter()
+            .enumerate()
+            .map(|(nonce, (action, _))| {
+                SignedTransaction::sign(
+                    Transaction {
+                        signer: key.public_key().implicit_account_id(),
+                        public_key: key.public_key(),
+                        nonce: nonce as u64,
+                        action: action.clone(),
+                    },
+                    &key,
+                )
+                .unwrap()
+            })
+            .collect();
+        let receipts: Vec<_> = transactions
+            .iter()
+            .zip(actions)
+            .map(|(tx, (_, applied))| Receipt {
+                tx_id: tx.id(),
+                status: if applied {
+                    ExecutionStatus::Success
+                } else {
+                    ExecutionStatus::Failed {
+                        reason: "rejected".into(),
+                    }
+                },
+                gas_used: 0,
+                return_data: vec![],
+                events: vec![],
+                timing: None,
+            })
+            .collect();
+        let block = Block::assemble(
+            BlockHeight::new(1),
+            Hash::digest(b"note-scan-genesis"),
+            Hash::ZERO,
+            sov_types::receipts_root(&receipts),
+            10,
+            key.public_key().implicit_account_id(),
+            transactions,
+        );
+        (block, receipts)
+    }
+
+    #[test]
+    fn legacy_encrypted_wallet_keeps_both_note_addresses_and_viewing_seed() {
+        let entry = KeystoreEntry {
+            account: "Old account with pool notes".into(),
+            seed_hex: hex_lower(&[101; 32]),
+            scheme: None,
+            mnemonic: Some("original recovery phrase".into()),
+            public_key: None,
+            operate_as: None,
+        };
+        let encrypted = Keystore {
+            miners: vec![entry],
+        }
+        .to_encrypted_json("preserve my original funds")
+        .unwrap();
+        let restored =
+            Keystore::from_encrypted_or_plain(&encrypted, Some("preserve my original funds"))
+                .unwrap();
+        let wallet = LoadedWallet::from_keystore_entry(&restored.miners[0]).unwrap();
+        let hybrid = LoadedWallet::from_seed("Comparison".into(), [101; 32], None).unwrap();
+        assert!(wallet.watch_only && wallet.legacy_recovery && wallet.has_note_key());
+        assert_eq!(wallet.shielded, hybrid.shielded);
+        assert_eq!(wallet.shielded_v2, hybrid.shielded_v2);
+        assert_eq!(wallet.v2_owner_tag, hybrid.v2_owner_tag);
+        assert_ne!(wallet.account, hybrid.account);
+        let saved = Keystore {
+            miners: vec![wallet.keystore_entry()],
+        }
+        .to_encrypted_json("preserve my original funds")
+        .unwrap();
+        let again =
+            Keystore::from_encrypted_or_plain(&saved, Some("preserve my original funds")).unwrap();
+        let again = LoadedWallet::from_keystore_entry(&again.miners[0]).unwrap();
+        assert_eq!(again.account, wallet.account);
+        assert_eq!(again.shielded_v2, wallet.shielded_v2);
+        assert!(again.has_note_key());
+        let public_only =
+            LoadedWallet::watch_only("Public only".into(), &wallet.public_key).unwrap();
+        assert!(!public_only.has_note_key());
+    }
+
+    #[test]
+    fn accepted_wrapped_v2_notes_are_found_without_crediting_proposals_or_failures() {
+        let key = PqShieldedKey::from_leaf_seed(&[113; 32]);
+        let action = Action::ShieldedV2 {
+            bundle: encode_bundle(&scan_bundle(&key, 30)),
+        };
+        for wrapped in [
+            action.clone(),
+            Action::Tipped {
+                tip: Balance::from_grains(1),
+                inner: Box::new(action.clone()),
+            },
+            Action::Timestamped {
+                created_at_ms: 1,
+                inner: Box::new(action.clone()),
+            },
+            Action::MultisigExec {
+                action: Box::new(action.clone()),
+                approvals: vec![],
+            },
+            Action::Timestamped {
+                created_at_ms: 1,
+                inner: Box::new(Action::Tipped {
+                    tip: Balance::from_grains(1),
+                    inner: Box::new(action.clone()),
+                }),
+            },
+        ] {
+            let (block, receipts) = scan_block(vec![(wrapped, true)]);
+            let receipts =
+                validated_scan_receipts(&block, serde_json::to_value(receipts).unwrap()).unwrap();
+            assert_eq!(v2_scan_bundles(&block, &receipts).unwrap().len(), 1);
+        }
+        let proposal = Action::ProposeMultisig {
+            account: AccountId::new("treasury.reserve.sov").unwrap(),
+            action: Box::new(action.clone()),
+        };
+        let (block, receipts) = scan_block(vec![(proposal, true), (action, false)]);
+        assert!(v2_scan_bundles(&block, &receipts).unwrap().is_empty());
+    }
+
+    #[test]
+    fn incomplete_mismatched_or_uncommitted_receipts_cannot_advance_a_scan() {
+        let key = PqShieldedKey::from_leaf_seed(&[114; 32]);
+        let action = Action::ShieldedV2 {
+            bundle: encode_bundle(&scan_bundle(&key, 30)),
+        };
+        let (block, receipts) = scan_block(vec![(action.clone(), true), (action, true)]);
+        assert!(validated_scan_receipts(&block, Value::Null).is_err());
+        assert!(validated_scan_receipts(&block, json!([])).is_err());
+        assert!(
+            validated_scan_receipts(&block, serde_json::to_value(&receipts[..1]).unwrap()).is_err()
+        );
+        let mut wrong_order = receipts.clone();
+        wrong_order.reverse();
+        assert!(
+            validated_scan_receipts(&block, serde_json::to_value(wrong_order).unwrap()).is_err()
+        );
+        let mut forged = receipts.clone();
+        forged[0].status = ExecutionStatus::Failed {
+            reason: "tampered".into(),
+        };
+        assert!(validated_scan_receipts(&block, serde_json::to_value(forged).unwrap()).is_err());
+        let mut bad_block = block.clone();
+        bad_block.header.tx_root = Hash::ZERO;
+        assert!(
+            validated_scan_receipts(&bad_block, serde_json::to_value(&receipts).unwrap()).is_err()
+        );
+        let mut malformed = serde_json::to_value(&receipts).unwrap();
+        malformed[0]["status"] = json!({"status":"pending"});
+        assert!(validated_scan_receipts(&block, malformed).is_err());
+        assert!(validated_scan_receipts(&block, serde_json::to_value(receipts).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn restored_v2_notes_keep_balance_positions_and_spend_witness_after_encrypted_reload() {
+        let seed = [115; 32];
+        let wallet = LoadedWallet::from_seed("Existing v2 wallet".into(), seed, None).unwrap();
+        let encrypted = Keystore {
+            miners: vec![wallet.keystore_entry()],
+        }
+        .to_encrypted_json("portable original v2 wallet")
+        .unwrap();
+        let restored =
+            Keystore::from_encrypted_or_plain(&encrypted, Some("portable original v2 wallet"))
+                .unwrap();
+        let restored = LoadedWallet::from_keystore_entry(&restored.miners[0]).unwrap();
+        let key = PqShieldedKey::from_leaf_seed(&restored.seed);
+        let bundles = [scan_bundle(&key, 30), scan_bundle(&key, 70)];
+        let mut store = PqNoteStore::new(0);
+        store.ingest_block(&key, 1, [1; 32], &[&bundles[0], &bundles[1]]);
+        assert_eq!(store.balance(), 100);
+        assert_eq!(
+            store.unspent_count(),
+            2,
+            "historical same-rho notes have distinct positions and remain spendable"
+        );
+        let enc = encrypt_blob(&notes_cache_key(&seed), &store.to_bytes()).unwrap();
+        let bytes = decrypt_blob(&notes_cache_key(&restored.seed), &enc).unwrap();
+        let reloaded = PqNoteStore::from_bytes(&bytes).unwrap();
+        assert_eq!(reloaded.balance(), 100);
+        assert_eq!(reloaded.commitment_count(), 2);
+        assert_eq!(reloaded.root(), store.root());
+        for (note, position) in reloaded.unspent(&key) {
+            let (path, anchor) = reloaded
+                .witness(position)
+                .expect("existing note retains its spend witness");
+            assert_eq!(path.compute_root(note.commitment()), anchor);
+        }
+        let info = json!({"height":1,"noteCount":2,"anchor":hex_lower(&store.root().to_bytes()),"creationAllowed":false,"scanSupported":true});
+        assert!(validate_v2_scan_snapshot(&reloaded, &info).unwrap());
+        let mut wrong = info.clone();
+        wrong["noteCount"] = json!(3);
+        assert!(validate_v2_scan_snapshot(&reloaded, &wrong).is_err());
+        wrong = info.clone();
+        wrong["anchor"] = json!("00");
+        assert!(validate_v2_scan_snapshot(&reloaded, &wrong).is_err());
+        wrong = info;
+        wrong["height"] = json!(2);
+        assert!(!validate_v2_scan_snapshot(&reloaded, &wrong).unwrap());
+    }
+
+    #[test]
+    fn encrypted_linked_authority_and_independent_receiving_keys_survive_restart() {
+        let mut wallet =
+            LoadedWallet::from_seed("Migrated account".into(), [120; 32], None).unwrap();
+        let original = Keypair::from_seed([120; 32])
+            .public_key()
+            .implicit_account_id()
+            .to_string();
+        wallet.operate_as = Some(original.clone());
+        let envelope = Keystore {
+            miners: vec![wallet.keystore_entry()],
+        }
+        .to_encrypted_json("persistent linked authority")
+        .unwrap();
+        assert!(
+            !envelope.contains(&original),
+            "linked authority belongs inside encryption"
+        );
+        let restored =
+            Keystore::from_encrypted_or_plain(&envelope, Some("persistent linked authority"))
+                .unwrap();
+        let loaded = LoadedWallet::from_keystore_entry(&restored.miners[0]).unwrap();
+        assert_eq!(loaded.effective_account(), original);
+        assert_eq!(loaded.account, wallet.account);
+        assert_eq!(loaded.shielded_v2, wallet.shielded_v2);
+        assert_eq!(loaded.legacy_shielded_v2, wallet.legacy_shielded_v2);
+        assert_ne!(loaded.shielded_v2, loaded.legacy_shielded_v2);
+        let mut invalid = restored.miners[0].clone();
+        invalid.operate_as = Some(String::new());
+        assert!(LoadedWallet::from_keystore_entry(&invalid).is_err());
+        let mut historical = serde_json::to_value(restored.miners[0].clone()).unwrap();
+        historical.as_object_mut().unwrap().remove("operate_as");
+        let old: KeystoreEntry = serde_json::from_value(historical).unwrap();
+        assert!(LoadedWallet::from_keystore_entry(&old)
+            .unwrap()
+            .operate_as
+            .is_none());
+    }
+
+    #[test]
+    fn legacy_note_recovery_selects_a_hybrid_carrier_without_relabeling_original_identity() {
+        let wallet =
+            LoadedWallet::legacy_from_seed("Original account".into(), [121; 32], None).unwrap();
+        let original = wallet.account.clone();
+        let recovery = v2_carrier_account(&wallet, V2Action::Deshield).unwrap();
+        assert_eq!(
+            recovery,
+            Keypair::hybrid_from_seed([121; 32])
+                .public_key()
+                .implicit_account_id()
+                .to_string()
+        );
+        assert_ne!(recovery, original);
+        assert_eq!(wallet.account, original);
+        assert!(wallet.watch_only && wallet.has_note_key());
+        assert!(v2_carrier_account(&wallet, V2Action::Send).is_err());
+        let watch = LoadedWallet::watch_only("Public only".into(), &wallet.public_key).unwrap();
+        assert!(v2_carrier_account(&watch, V2Action::Deshield).is_err());
+    }
+
+    #[test]
+    fn activated_suite2_exact_parameter_policy_is_required_for_wallet_proving() {
+        let compatible = ShieldedV2Info {
+            active: true,
+            suite2_active: true,
+            suite2_compiled: true,
+            suite2_profile: 2,
+            creation_allowed: true,
+            spends_allowed: true,
+            accepted_new_versions: vec![2],
+            ..Default::default()
+        };
+        assert_eq!(
+            quantum_v2_activity_allowed(Some(&compatible)).is_ok(),
+            cfg!(feature = "zk-suite2")
+        );
+        for mutate in [
+            (|info: &mut ShieldedV2Info| info.suite2_active = false) as fn(&mut ShieldedV2Info),
+            |info| info.suite2_profile = 1,
+            |info| info.accepted_new_versions = vec![1, 2],
+            |info| info.creation_allowed = false,
+            |info| info.spends_allowed = false,
+            |info| info.suite2_compiled = false,
+        ] {
+            let mut rejected = compatible.clone();
+            mutate(&mut rejected);
+            assert!(quantum_v2_activity_allowed(Some(&rejected)).is_err());
+        }
+        assert!(quantum_v2_activity_allowed(None).is_err());
+        assert!(approved_v2_fee(100, 99).is_err());
+        assert!(approved_v2_fee(100, 100).is_ok());
+        assert!(v2_fee_ceiling(u128::MAX).is_err());
+    }
+
+    #[cfg(feature = "zk-suite2")]
+    #[test]
+    fn rust_wallet_scans_old_and_fresh_notes_sends_and_recovers_via_real_activated_rpc() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _env = tests::env_guard();
+        let dir =
+            std::env::temp_dir().join(format!("sov-station-suite2-wallet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let previous_dir = std::env::var("SOV_STATION_DIR").ok();
+        std::env::set_var("SOV_STATION_DIR", &dir);
+        struct Cleanup {
+            dir: PathBuf,
+            old: Option<String>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                match self.old.take() {
+                    Some(old) => std::env::set_var("SOV_STATION_DIR", old),
+                    None => std::env::remove_var("SOV_STATION_DIR"),
+                };
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+        let _cleanup = Cleanup {
+            dir: dir.clone(),
+            old: previous_dir,
+        };
+        let funding_key = Keypair::hybrid_from_seed([129; 32]);
+        let funding = AccountId::new("funding.sov").unwrap();
+        let spec = ChainSpec::from_json(&json!({
+            "chain_id":"sov-suite2-rehearsal-station-wallet", "timestamp_ms":1_000,
+            "policy":"test", "difficulty_leading_zeros":0, "deshield_window_blocks":0,
+            "accounts":[{"account":funding.as_str(),"public_key":funding_key.public_key().to_string(),"balance":"100000000000"}]
+        }).to_string()).unwrap();
+        let mut genesis = spec.to_genesis_config().unwrap();
+        genesis.mining.gas_price = Balance::from_grains(1);
+        let daemon = Daemon::new(
+            &genesis,
+            dir.join("chain"),
+            128,
+            32,
+            vec![(funding.clone(), funding_key)],
+        )
+        .unwrap();
+        let shared = daemon.node();
+        shared.lock().unwrap().set_coinbase(funding.clone());
+        let server = sov_rpc::RpcServer::new(shared.clone())
+            .start("127.0.0.1:0", 2)
+            .unwrap();
+        let rpc = server.local_addr().to_string();
+        let client = RpcClient::new(rpc.clone());
+        for _ in 0..24 {
+            let mut node = shared.lock().unwrap();
+            let time = (node.chain().height() + 2) * 1_000;
+            node.produce(time).unwrap();
+        }
+        let legacy_wallet =
+            LoadedWallet::legacy_from_seed("Existing shielded funds".into(), [130; 32], None)
+                .unwrap();
+        let old_key = PqShieldedKey::from_leaf_seed(&legacy_wallet.seed);
+        let funding_pq = PqShieldedKey::from_leaf_seed(&[129; 32]);
+        let mut old_deposit =
+            build_shield(&funding_pq, &old_key.address(), 100_000_000, 0).unwrap();
+        let chain = client.chain_domain().unwrap();
+        sov_shielded_pq::wallet::authorize_for_carrier(
+            &mut old_deposit,
+            &funding_pq,
+            chain.chain_id(),
+            chain.genesis().as_bytes(),
+            funding.as_str(),
+            0,
+        )
+        .unwrap();
+        {
+            let mut node = shared.lock().unwrap();
+            let key = Keypair::hybrid_from_seed([129; 32]);
+            let tx = SignedTransaction::sign_in(
+                Transaction {
+                    signer: funding.clone(),
+                    public_key: key.public_key(),
+                    nonce: 0,
+                    action: Action::ShieldedV2 {
+                        bundle: encode_bundle(&old_deposit),
+                    },
+                },
+                &key,
+                node.chain()
+                    .resolved_tx_domain(node.chain().height() + 1)
+                    .as_ref(),
+            )
+            .unwrap();
+            let block = node.chain().produce_block(vec![tx], 26_000).unwrap();
+            node.import_block(block).unwrap();
+            for _ in node.chain().height()..48 {
+                let time = (node.chain().height() + 2) * 1_000;
+                node.produce(time).unwrap();
+            }
+        }
+        require_v2_live(&client).unwrap();
+        let recovered = scan_store_v2(&rpc, legacy_wallet.seed).unwrap();
+        assert_eq!(recovered.legacy.balance(), 100_000_000);
+        assert_eq!(recovered.suite2.balance(), 0);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop = stopped.clone();
+        let mining_node = shared.clone();
+        let miner = std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                {
+                    let mut node = mining_node.lock().unwrap();
+                    if node.mempool_len() > 0 {
+                        let time = (node.chain().height() + 2) * 1_000;
+                        node.produce(time).unwrap();
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        struct StopNode {
+            stopped: Arc<AtomicBool>,
+            miner: Option<std::thread::JoinHandle<()>>,
+            server: Option<sov_rpc::RpcHandle>,
+        }
+        impl Drop for StopNode {
+            fn drop(&mut self) {
+                self.stopped.store(true, Ordering::Relaxed);
+                if let Some(miner) = self.miner.take() {
+                    miner.join().unwrap();
+                }
+                if let Some(server) = self.server.take() {
+                    server.shutdown();
+                }
+            }
+        }
+        let _running = StopNode {
+            stopped,
+            miner: Some(miner),
+            server: Some(server),
+        };
+        let state = Arc::new(Mutex::new(ActionState::default()));
+        let cap = v2_fee_ceiling(1).unwrap();
+        let fresh_address = encode_shielded_v2(
+            &PqShieldedKey::from_leaf_seed_suite2(&legacy_wallet.seed).address(),
+        );
+        let shield = shield_v2_amount(
+            &rpc,
+            [129; 32],
+            funding.as_str(),
+            &fresh_address,
+            80_000_000,
+            cap,
+            &state,
+        )
+        .unwrap();
+        assert_eq!(shield.status, ReceiptStatus::Confirmed);
+        let combined = scan_store_v2(&rpc, legacy_wallet.seed).unwrap();
+        assert_eq!(combined.legacy.balance(), 100_000_000);
+        assert_eq!(combined.suite2.balance(), 80_000_000);
+        let recipient = PqShieldedKey::from_leaf_seed_suite2(&[131; 32]);
+        let own_shield = shield_v2_amount(
+            &rpc,
+            [129; 32],
+            funding.as_str(),
+            "",
+            30_000_000,
+            cap,
+            &state,
+        )
+        .unwrap();
+        assert_eq!(own_shield.status, ReceiptStatus::Confirmed);
+        let sent = zsend_v2_amount(
+            &rpc,
+            [129; 32],
+            funding.as_str(),
+            &encode_shielded_v2(&recipient.address()),
+            10_000_000,
+            cap,
+            &state,
+        )
+        .unwrap();
+        assert_eq!(sent.status, ReceiptStatus::Confirmed);
+        let received = scan_store_v2(&rpc, [131; 32]).unwrap();
+        assert_eq!(received.suite2.balance(), 10_000_000);
+        assert_eq!(received.legacy.balance(), 0);
+        let next_nonce = client.next_nonce(&funding).unwrap();
+        let too_low = shield_v2_amount(&rpc, [129; 32], funding.as_str(), "", 1_000_000, 0, &state)
+            .unwrap_err();
+        assert!(
+            too_low.contains("reviewed maximum"),
+            "unapproved fee is refused: {too_low}"
+        );
+        assert_eq!(client.next_nonce(&funding).unwrap(), next_nonce);
+        // Withdraw old note ownership through a new hybrid implicit carrier with
+        // zero public prefunding. The original transparent identity is unchanged.
+        let carrier = v2_carrier_account(&legacy_wallet, V2Action::Deshield).unwrap();
+        assert_eq!(
+            client
+                .balance(&AccountId::new(&carrier).unwrap())
+                .unwrap()
+                .grains(),
+            0
+        );
+        let withdrawal =
+            deshield_v2_amount(&rpc, legacy_wallet.seed, &carrier, 50_000_000, cap, &state)
+                .unwrap();
+        assert_eq!(withdrawal.status, ReceiptStatus::Confirmed);
+        let net = withdrawal.withdrawal_net.unwrap();
+        assert!(net > 0 && net <= 50_000_000);
+        assert!(50_000_000 - net <= cap);
+        assert_eq!(
+            client
+                .balance(&AccountId::new(&carrier).unwrap())
+                .unwrap()
+                .grains(),
+            net
+        );
+        let after = scan_store_v2(&rpc, legacy_wallet.seed).unwrap();
+        assert_eq!(after.balance(), 130_000_000);
+        assert_eq!(after.legacy.balance(), 0);
+        assert_eq!(
+            after.suite2.balance(),
+            130_000_000,
+            "old change uses the independent fresh receiving key"
+        );
+        let original = legacy_wallet.account.clone();
+        assert_ne!(carrier, original);
+        assert_eq!(legacy_wallet.account, original);
+        let block = client.head().unwrap();
+        let tx = block.transactions.first().unwrap();
+        let exact = u128::from(
+            sov_runtime::gas::gas_for(&tx.transaction.action)
+                + sov_runtime::gas::envelope_gas(&tx.transaction.public_key),
+        );
+        assert!(exact <= cap);
+        assert_eq!(50_000_000 - net, exact);
+    }
+
+    #[test]
+    fn combined_balance_and_maximum_proof_spend_are_distinct_across_both_key_sets() {
+        let seed = [140; 32];
+        let old = PqShieldedKey::from_leaf_seed(&seed);
+        let fresh = PqShieldedKey::from_leaf_seed_suite2(&seed);
+        let mut legacy = PqNoteStore::new(0);
+        let mut suite2 = PqNoteStore::new(0);
+        for (index, value) in [60, 50, 40, 30, 20, 10].into_iter().enumerate() {
+            let key = if index % 2 == 0 { &old } else { &fresh };
+            let bundle = scan_bundle(key, value);
+            let height = index as u64 + 1;
+            let hash = [height as u8; 32];
+            legacy.ingest_block(&old, height, hash, &[&bundle]);
+            suite2.ingest_block(&fresh, height, hash, &[&bundle]);
+        }
+        validate_v2_store_pair(&legacy, &suite2).unwrap();
+        let stores = V2WalletStores { legacy, suite2 };
+        assert_eq!(stores.balance(), 210);
+        assert_eq!(stores.unspent_count(), 6);
+        assert_eq!(
+            stores.spendable_balance(),
+            180,
+            "MAX covers the globally largest four, not all six notes"
+        );
+        let view = ShieldedV2View {
+            account: "owner".into(),
+            balance: stores.balance(),
+            legacy_balance: stores.legacy.balance(),
+            suite2_balance: stores.suite2.balance(),
+            spendable_grains: Some(stores.spendable_balance()),
+            notes: stores.unspent_count(),
+            scanned_height: stores.scanned_height(),
+            ..Default::default()
+        };
+        assert_eq!(
+            view.own_figures("owner"),
+            Some((210, 6, 6)),
+            "display the complete owned balance"
+        );
+        let guard = view.guard("owner", true, false, Some(170));
+        assert_eq!(guard.balance_grains, 180);
+        assert_eq!(
+            guard.deshield_cap(),
+            170,
+            "withdrawal MAX also respects the window budget"
+        );
+        let destination = encode_shielded_v2(&fresh.address());
+        assert!(v2_request_valid(
+            &guard,
+            V2Intent::Send {
+                to: &destination,
+                amount: Some(180)
+            }
+        )
+        .is_ok());
+        assert!(v2_request_valid(
+            &guard,
+            V2Intent::Send {
+                to: &destination,
+                amount: Some(181)
+            }
+        )
+        .is_err());
+        assert!(v2_request_valid(&guard, V2Intent::Deshield { amount: Some(171) }).is_err());
+        assert_eq!(view.own_figures("another owner"), None);
+    }
+
+    #[test]
+    fn two_key_scan_rejects_equal_commitment_root_with_different_withdrawal_branches() {
+        let seed = [141; 32];
+        let old = PqShieldedKey::from_leaf_seed(&seed);
+        let fresh = PqShieldedKey::from_leaf_seed_suite2(&seed);
+        let deposits = [scan_bundle(&old, 30), scan_bundle(&fresh, 50)];
+        let mut legacy = PqNoteStore::new(0);
+        let mut suite2 = PqNoteStore::new(0);
+        legacy.ingest_block(&old, 1, [1; 32], &[&deposits[0], &deposits[1]]);
+        suite2.ingest_block(&fresh, 1, [1; 32], &[&deposits[0], &deposits[1]]);
+        let (old_note, old_position) = legacy.unspent(&old)[0];
+        let (fresh_note, fresh_position) = suite2.unspent(&fresh)[0];
+        let mut old_withdrawal = scan_bundle(&old, 1);
+        old_withdrawal.public_inputs.output_dummy = [true; 4];
+        old_withdrawal.public_inputs.output_commitments =
+            [sov_shielded_pq::hash::PqDigest::ZERO; 4];
+        old_withdrawal.output_ciphertexts = [None, None, None, None];
+        old_withdrawal.public_inputs.input_dummy[0] = false;
+        old_withdrawal.public_inputs.nullifiers[0] =
+            old.spend_key().nullifier(old_note.rho, old_position);
+        let mut fresh_withdrawal = old_withdrawal.clone();
+        fresh_withdrawal.public_inputs.nullifiers[0] =
+            fresh.spend_key().nullifier(fresh_note.rho, fresh_position);
+        legacy.ingest_block(&old, 2, [2; 32], &[&old_withdrawal]);
+        suite2.ingest_block(&fresh, 2, [3; 32], &[&fresh_withdrawal]);
+        assert_eq!(legacy.scanned_height(), suite2.scanned_height());
+        assert_eq!(legacy.root(), suite2.root());
+        assert_eq!(legacy.commitment_count(), suite2.commitment_count());
+        assert_ne!(legacy.tip_checkpoint(), suite2.tip_checkpoint());
+        assert!(
+            validate_v2_store_pair(&legacy, &suite2).is_err(),
+            "do not publish a false zero by combining nullifiers from two branches"
+        );
+    }
+
+    fn test_station(network: Network) -> Station {
+        let mut station = Station::new(
+            Arc::new(Mutex::new(Snapshot::default())),
+            Arc::new(Mutex::new(Config {
+                rpc: "127.0.0.1:0".into(),
+                accounts: vec![],
+                mining_accounts: vec![],
+            })),
+            Arc::new(Mutex::new(vec![])),
+        );
+        station.network = network;
+        station
+    }
+
+    struct WalletFixtureDir {
+        dir: PathBuf,
+        previous: Option<String>,
+    }
+    impl WalletFixtureDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "sov-wallet-{name}-{}-{}",
+                std::process::id(),
+                now_ms()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let previous = std::env::var("SOV_STATION_DIR").ok();
+            std::env::set_var("SOV_STATION_DIR", &dir);
+            Self { dir, previous }
+        }
+    }
+    impl Drop for WalletFixtureDir {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(old) => std::env::set_var("SOV_STATION_DIR", old),
+                None => std::env::remove_var("SOV_STATION_DIR"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn stale_v2_review_cannot_start_overlapping_proofs_or_clear_an_existing_busy_flag() {
+        let _env = tests::env_guard();
+        let _fixture = WalletFixtureDir::new("stale-proof-review");
+        let mut station = test_station(Network::Mainnet);
+        let wallet =
+            LoadedWallet::legacy_from_seed("Recovery wallet".into(), [144; 32], None).unwrap();
+        let account = wallet.scan_key();
+        station.register_wallet(wallet);
+        station.action.lock().unwrap().busy = true;
+        assert!(!station.run_v2_action(&egui::Context::default(), V2Action::Deshield, 0));
+        assert!(
+            station.action.lock().unwrap().busy,
+            "refusing a stale review must not mark another proof idle"
+        );
+        assert_eq!(
+            station.wallets.len(),
+            1,
+            "no recovery carrier is created while a worker is busy"
+        );
+        station.action.lock().unwrap().busy = false;
+        station
+            .shielded_v2
+            .lock()
+            .unwrap()
+            .entry_mut(&account)
+            .scanning = true;
+        assert!(!station.run_v2_action(&egui::Context::default(), V2Action::Deshield, 0));
+        assert!(!station.action.lock().unwrap().busy);
+        assert_eq!(station.wallets.len(), 1);
+        assert!(
+            !autosave_path().unwrap().exists(),
+            "a refused overlapping action writes no wallet backup"
+        );
+        assert!(v2_worker_available(false, false).is_ok());
+    }
+
+    #[test]
+    fn mainnet_reset_refusal_preserves_history_keys_and_scanned_state() {
+        let _env = tests::env_guard();
+        let _fixture = WalletFixtureDir::new("mainnet-reset");
+        let dir = local_node_dir("mainnet").unwrap();
+        std::fs::create_dir_all(dir.join("node-1/data")).unwrap();
+        let history = dir.join("node-1/data/blocks.log");
+        let keys = dir.join("node-1/keystore.json");
+        std::fs::write(&history, b"authoritative history fixture").unwrap();
+        std::fs::write(&keys, b"prior encrypted key fixture").unwrap();
+        let mut station = test_station(Network::Mainnet);
+        station
+            .shielded_v2
+            .lock()
+            .unwrap()
+            .entry_mut("owner")
+            .balance = 17;
+        let old_views = station.shielded_v2.clone();
+        station.reset_local_chain();
+        assert!(station.node_status.contains("Mainnet reset is disabled"));
+        assert_eq!(
+            std::fs::read(&history).unwrap(),
+            b"authoritative history fixture"
+        );
+        assert_eq!(
+            std::fs::read(&keys).unwrap(),
+            b"prior encrypted key fixture"
+        );
+        assert!(
+            Arc::ptr_eq(&old_views, &station.shielded_v2),
+            "refusal does not replace a live wallet view"
+        );
+        assert_eq!(
+            station
+                .shielded_v2
+                .lock()
+                .unwrap()
+                .view_for("owner")
+                .balance,
+            17
+        );
+    }
+
+    #[test]
+    fn sandbox_reset_archives_history_and_keys_instead_of_deleting_them() {
+        let _env = tests::env_guard();
+        let fixture = WalletFixtureDir::new("sandbox-reset");
+        let dir = local_node_dir("testnet").unwrap();
+        std::fs::create_dir_all(dir.join("node-1/data")).unwrap();
+        std::fs::write(
+            dir.join("node-1/data/blocks.log"),
+            b"sandbox historical block fixture",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("node-1/keystore.json"),
+            b"sandbox encrypted key fixture",
+        )
+        .unwrap();
+        let mut station = test_station(Network::Testnet);
+        let old_views = station.shielded_v2.clone();
+        station.reset_local_chain();
+        assert!(station.node_status.contains("sandbox archived"));
+        assert!(!dir.exists());
+        let archive = std::fs::read_dir(&fixture.dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("node-testnet-backup-")
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::read(archive.join("node-1/data/blocks.log")).unwrap(),
+            b"sandbox historical block fixture"
+        );
+        assert_eq!(
+            std::fs::read(archive.join("node-1/keystore.json")).unwrap(),
+            b"sandbox encrypted key fixture"
+        );
+        assert!(
+            !Arc::ptr_eq(&old_views, &station.shielded_v2),
+            "fresh sandbox cannot retain the old chain's balances"
+        );
+    }
+
+    #[test]
+    fn payout_change_keeps_prior_encrypted_miner_key_and_existing_history() {
+        let _env = tests::env_guard();
+        let _fixture = WalletFixtureDir::new("payout-key-backup");
+        let dir = ensure_durable_node_dir("testnet").unwrap();
+        setup_node_dir(&dir, "testnet-1.json").unwrap();
+        let mut prior_spec: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("testnet-1.json")).unwrap()).unwrap();
+        prior_spec["seeds"] = json!(["192.0.2.9:9645"]);
+        std::fs::write(
+            dir.join("chain-spec.json"),
+            serde_json::to_vec_pretty(&prior_spec).unwrap(),
+        )
+        .unwrap();
+        let passphrase = "payout backup must stay encrypted";
+        let old_key = Keypair::hybrid_from_seed([142; 32]);
+        let old_account = old_key.public_key().implicit_account_id().to_string();
+        let old_envelope = Keystore {
+            miners: vec![KeystoreEntry {
+                account: old_account.clone(),
+                seed_hex: hex_lower(&[142; 32]),
+                scheme: Some("hybrid65".into()),
+                mnemonic: None,
+                public_key: None,
+                operate_as: None,
+            }],
+        }
+        .to_encrypted_json(passphrase)
+        .unwrap();
+        std::fs::write(dir.join("miner.txt"), &old_account).unwrap();
+        write_private_atomic(&dir.join("node-1/keystore.json"), old_envelope.as_bytes()).unwrap();
+        let config_path = dir.join("node-1/node-config.json");
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["p2p_addr"] = json!("127.0.0.1:not-a-port");
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        let data = dir.join(config["data_dir"].as_str().unwrap());
+        std::fs::create_dir_all(&data).unwrap();
+        let history = data.join("existing-history.fixture");
+        std::fs::write(
+            &history,
+            b"existing chain history must survive payout selection",
+        )
+        .unwrap();
+        let before_spec = std::fs::read(dir.join("chain-spec.json")).unwrap();
+        let new_key = Keypair::hybrid_from_seed([143; 32]);
+        let new_account = new_key.public_key().implicit_account_id().to_string();
+        let logs = Arc::new(Mutex::new(vec![]));
+        let error = build_and_run_node(
+            "testnet-1.json",
+            "testnet",
+            &new_account,
+            [143; 32],
+            "",
+            passphrase,
+            false,
+            &logs,
+        )
+        .err()
+        .expect("invalid fixture socket stops before starting any listener");
+        assert!(
+            error.contains("p2p bind"),
+            "fixture stops before opening network: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&history).unwrap(),
+            b"existing chain history must survive payout selection"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("chain-spec.json")).unwrap(),
+            before_spec
+        );
+        let backups: Vec<_> = std::fs::read_dir(dir.join("miner-key-backups"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let saved = std::fs::read_to_string(&backups[0]).unwrap();
+        assert_eq!(
+            saved, old_envelope,
+            "retain the exact encrypted original envelope"
+        );
+        assert!(!saved.contains(&hex_lower(&[142; 32])));
+        let old = Keystore::from_encrypted_or_plain(&saved, Some(passphrase)).unwrap();
+        assert_eq!(old.miners[0].seed_hex, hex_lower(&[142; 32]));
+        assert_eq!(old.miners[0].account, old_account);
+        let current = Keystore::from_encrypted_or_plain(
+            &std::fs::read_to_string(dir.join("node-1/keystore.json")).unwrap(),
+            Some(passphrase),
+        )
+        .unwrap();
+        assert_eq!(current.miners[0].seed_hex, hex_lower(&[143; 32]));
+        assert_eq!(current.miners[0].account, new_account);
+    }
+
+    #[test]
+    fn note_cache_revision_is_scoped_to_chain_id_genesis_and_pool() {
+        let main = SigningDomain::new("sov-mainnet", Hash::digest(b"main"));
+        let test = SigningDomain::new("sov-testnet-1", Hash::digest(b"main"));
+        let reset = SigningDomain::new("sov-mainnet", Hash::digest(b"different genesis"));
+        let path = note_store_v2_path("owner", &main).unwrap();
+        assert_ne!(path, note_store_v2_path("owner", &test).unwrap());
+        assert_ne!(path, note_store_v2_path("owner", &reset).unwrap());
+        assert_ne!(path, note_store_path("owner", &main).unwrap());
+        assert!(path.to_string_lossy().ends_with(".scan2.v2.store"));
+    }
+
+    #[test]
+    fn private_atomic_write_failure_preserves_the_prior_encrypted_file() {
+        let dir = std::env::temp_dir().join(format!("sov-wallet-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("wallets.auto");
+        write_private_atomic(&file, b"original encrypted backup").unwrap();
+        write_private_atomic(&file, b"complete replacement").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"complete replacement");
+        let target_directory = dir.join("occupied");
+        std::fs::create_dir(&target_directory).unwrap();
+        assert!(write_private_atomic(&target_directory, b"must fail").is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"complete replacement");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
+            "no partial temp files survive"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

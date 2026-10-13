@@ -30,6 +30,17 @@ type Logs = Arc<Mutex<Vec<String>>>;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if args.get(1).is_some_and(|arg| arg == "--verify-history") {
+        if args.len() != 4 {
+            eprintln!("usage: sov-rpcd --verify-history <chain-spec.json> <blocks.log>");
+            process::exit(2);
+        }
+        if let Err(error) = verify_history(&args[2], &args[3]) {
+            eprintln!("sov-rpcd history audit: {error}");
+            process::exit(1);
+        }
+        return;
+    }
     if args.len() != 4 {
         eprintln!(
             "usage: {} <node-config.json> <chain-spec.json> <keystore.json>",
@@ -41,6 +52,15 @@ fn main() {
         eprintln!("sov-rpcd: {e}");
         process::exit(1);
     }
+}
+
+fn verify_history(spec_path: &str, log_path: &str) -> Result<(), Box<dyn Error>> {
+    let spec = ChainSpec::from_json(&fs::read_to_string(spec_path)?)?;
+    let report = sov_rpc::verify_history(&spec, log_path, &mut |done, total| {
+        eprintln!("history verified {done}/{total}");
+    })?;
+    println!("{}", serde_json::to_string(&report)?);
+    Ok(())
 }
 
 /// Append an operational line to the shared log (drained to stdout by the background thread),

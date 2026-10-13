@@ -471,6 +471,11 @@ pub struct KeystoreEntry {
     /// Optional and omitted when absent, so seeded entries are byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
+    /// Station's linked operating account. Its presence does not grant authority;
+    /// transactions still require the key currently committed by consensus.
+    /// Kept inside Station's encrypted wallet envelope, absent for CLI miners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operate_as: Option<String>,
 }
 
 /// An encrypted keystore envelope: the plaintext keystore JSON sealed with
@@ -849,6 +854,82 @@ fn load_blocks(path: &Path) -> io::Result<Vec<Block>> {
     Ok(blocks)
 }
 
+/// Read-only, fully validated history audit. This never opens an append handle,
+/// loads a wallet/snapshot, enables assumevalid, starts a listener or mines.
+/// Unlike normal crash recovery, an audit rejects any damaged/truncated tail.
+pub fn verify_history(
+    spec: &ChainSpec,
+    log_path: impl AsRef<Path>,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<serde_json::Value, DaemonError> {
+    let genesis = spec.to_genesis_config_verified()?;
+    let data = fs::read(log_path)?;
+    let records = read_records(&data);
+    let intact_bytes: usize = records
+        .iter()
+        .map(|payload| 4 + Hash::LEN + payload.len())
+        .sum();
+    if intact_bytes != data.len() {
+        return Err(DaemonError::config(
+            "history audit found a damaged or truncated record; original log retained",
+        ));
+    }
+    let blocks: Vec<Block> = records
+        .iter()
+        .map(|payload| {
+            borsh::from_slice(payload).map_err(|error| {
+                DaemonError::config(format!("history block decoding failed: {error}"))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let mut chain = genesis_chain_with_baked_preset(&genesis)?;
+    let genesis_hash = chain.head().hash();
+    let heights: std::collections::HashMap<_, _> = blocks
+        .iter()
+        .map(|block| (block.hash(), block.header.height.get()))
+        .collect();
+    for block in &blocks {
+        let height = block.header.height.get();
+        let parent_height = if block.header.prev_hash == genesis_hash {
+            Some(0)
+        } else {
+            heights.get(&block.header.prev_hash).copied()
+        };
+        if height == 0 || parent_height.is_none_or(|parent| parent.checked_add(1) != Some(height)) {
+            return Err(DaemonError::config(
+                "history contains a disconnected or invalid-height record; original log retained",
+            ));
+        }
+    }
+    chain.replay_log_verified(&blocks, on_progress)?;
+    for (height, expected) in baked_checkpoints(&genesis.chain_id) {
+        if height <= chain.height()
+            && chain
+                .block_by_height(height)
+                .is_none_or(|block| block.hash() != expected)
+        {
+            return Err(DaemonError::config(format!(
+                "verified history disagrees with canonical checkpoint at {height}"
+            )));
+        }
+    }
+    let ledger = chain.ledger();
+    let pool = ledger.shielded_v2();
+    let supply = ledger
+        .total_supply()
+        .ok_or_else(|| DaemonError::config("verified history supply overflow"))?;
+    Ok(serde_json::json!({
+        "version": env!("SOV_VERSION"), "fullyVerified": true, "verificationScope": "canonicalChain", "assumevalid": false,
+        "chainId": chain.chain_id(), "genesis": chain.chain_domain().genesis().to_hex(),
+        "height": chain.height(), "headHash": chain.head().hash().to_hex(),
+        "stateRoot": ledger.state_root().to_hex(), "records": blocks.len(),
+        "totalSupplyGrains": supply.grains().to_string(),
+        "poolV2": { "poolValue": ledger.shielded_v2_value().grains().to_string(),
+            "anchor": hex::encode(pool.root().to_bytes()), "noteCount": pool.note_count(),
+            "nullifierCount": pool.nullifier_count() },
+    }))
+}
+
 /// Path of the chainstate snapshot within a data dir.
 fn snapshot_path(dir: &Path) -> PathBuf {
     dir.join("chainstate.snapshot")
@@ -1133,6 +1214,8 @@ struct BakedDeployments {
     /// release gate must not report green over untested v2 steps). `None` for
     /// any preset that schedules no pool-v2 fork.
     shielded_v2: Option<sov_governance::Deployment>,
+    /// Independently activated hiding proof suite, armed on mainnet in 0.2.16.
+    shielded_v2_suite2: Option<sov_governance::Deployment>,
     /// The `tx-timestamp` deployment (bit 3): the `Action::Timestamped` bounded
     /// creation-time envelope. ARMED on MAINNET as of 0.2.6 (`Some`), on a
     /// schedule with real fleet lead time
@@ -1142,8 +1225,8 @@ struct BakedDeployments {
     /// The tx-domain grace window `G` in blocks — consensus-critical once armed,
     /// baked here so no per-node divergence is possible.
     grace_blocks: u64,
-    /// The version-bits mask this node's mined blocks commit (mainnet 0.2.6:
-    /// bits 0, 1, 2 and 3 — it signals readiness for all four deployments).
+    /// The version-bits mask this node's mined blocks commit (mainnet 0.2.16:
+    /// bits 0, 1, 2, 3 and 5).
     signal_mask: u32,
 }
 
@@ -1160,6 +1243,8 @@ const E2E_REHEARSAL_CHAIN_PREFIX: &str = "sov-e2e-";
 /// Reserved for explicit, isolated post-quantum retirement rehearsals. The
 /// schedule is pinned in this binary, never supplied as mutable per-node flags.
 pub const PQ_REHEARSAL_CHAIN_PREFIX: &str = "sov-pq-rehearsal-";
+/// Reserved isolated network for the opt-in hiding-proof replacement.
+pub const SUITE2_REHEARSAL_CHAIN_PREFIX: &str = "sov-suite2-rehearsal-";
 const PQ_REHEARSAL_PERIOD: u64 = 8;
 const PQ_REHEARSAL_START_HEIGHT: u64 = 32;
 const PQ_REHEARSAL_TIMEOUT_HEIGHT: u64 = 40;
@@ -1218,6 +1303,10 @@ fn baked_deployments(chain_id: &str) -> Option<BakedDeployments> {
     if chain_id.contains("mainnet") {
         return Some(mainnet_deployments());
     }
+    #[cfg(feature = "zk-suite2")]
+    if chain_id.starts_with(SUITE2_REHEARSAL_CHAIN_PREFIX) {
+        return Some(suite2_rehearsal_deployments());
+    }
     if chain_id.starts_with(PQ_REHEARSAL_CHAIN_PREFIX) {
         return Some(pq_rehearsal_deployments());
     }
@@ -1251,8 +1340,14 @@ const MAINNET_SHIELDED_V2_START_HEIGHT: u64 = 14_976;
 /// `start + 288`), `Active` one period after that (`start + 576`).
 const MAINNET_TX_TIMESTAMP_START_HEIGHT: u64 = 17_280;
 
-/// The release-pinned mainnet activation preset (bits 0, 1, 2, and — as of
-/// 0.2.6 — 3). These values are consensus-coordinating: two nodes with different heights,
+/// Pool-v2 hiding-proof replacement readiness window. Oracle's independently
+/// inspected canonical head was 27,393 on 2026-10-12. The next 288-block
+/// boundary leaves release/upgrade lead time; 90% committed readiness is
+/// required, without lock-in on timeout. Earliest activation is 28,224.
+const MAINNET_SHIELDED_V2_SUITE2_START_HEIGHT: u64 = 27_648;
+
+/// The release-pinned mainnet activation preset (bits 0, 1, 2, 3 and 5).
+/// These values are consensus-coordinating: two nodes with different heights,
 /// thresholds, or grace `G` would split at activation / at `H_a + G`.
 fn mainnet_deployments() -> BakedDeployments {
     // 90% of a 288-block (~12h) window; all heights are exact window boundaries
@@ -1316,6 +1411,17 @@ fn mainnet_deployments() -> BakedDeployments {
         false,
     )
     .expect("baked mainnet tx-timestamp deployment is valid");
+    let suite2 = sov_governance::Deployment::new(
+        sov_governance::SHIELDED_V2_SUITE2_DEPLOYMENT,
+        sov_governance::BIT_SHIELDED_V2_SUITE2,
+        BlockHeight::new(MAINNET_SHIELDED_V2_SUITE2_START_HEIGHT),
+        BlockHeight::new(MAINNET_SHIELDED_V2_SUITE2_START_HEIGHT + 3 * 288),
+        288,
+        threshold,
+        BlockHeight::new(MAINNET_SHIELDED_V2_SUITE2_START_HEIGHT + 288),
+        false,
+    )
+    .expect("baked mainnet hiding-proof replacement deployment is valid");
     BakedDeployments {
         pq_sunset: None,
         tx_domain,
@@ -1329,9 +1435,14 @@ fn mainnet_deployments() -> BakedDeployments {
         shielded_v2: Some(shielded_v2),
         // Bit 3 is ARMED on mainnet as of 0.2.6, and `signal_mask` below sets
         // bit 3 so mainnet nodes broadcast their readiness vote.
+        shielded_v2_suite2: Some(suite2),
         tx_timestamp: Some(tx_timestamp),
         grace_blocks: 576,
-        signal_mask: 0b1111,
+        signal_mask: if cfg!(feature = "zk-suite2") {
+            0b101111
+        } else {
+            0b1111
+        },
     }
 }
 
@@ -1380,6 +1491,7 @@ fn e2e_rehearsal_deployments() -> BakedDeployments {
         // The rehearsal net does not exercise bit 3 (its own dedicated
         // activation tests live in `sov-chain`), so it schedules none and does
         // not signal it — `Action::Timestamped` stays a hard reject there.
+        shielded_v2_suite2: None,
         tx_timestamp: None,
         grace_blocks: 0,
         // Signal readiness for bit 0 AND bit 2 (bit 1, fee-auction, is not
@@ -1427,10 +1539,44 @@ fn pq_rehearsal_deployments() -> BakedDeployments {
         tx_domain,
         fee_auction: None,
         shielded_v2: None,
+        shielded_v2_suite2: None,
         tx_timestamp: None,
         grace_blocks: 0,
         signal_mask: (1 << sov_governance::BIT_TX_DOMAIN) | (1 << sov_governance::BIT_PQ_SUNSET),
     }
+}
+
+#[cfg(feature = "zk-suite2")]
+fn suite2_rehearsal_deployments() -> BakedDeployments {
+    let mut baked = pq_rehearsal_deployments();
+    let threshold = sov_governance::Threshold::new(9, 10).expect("valid threshold");
+    let deployment = |name: &str, bit, start, active| {
+        sov_governance::Deployment::new(
+            name,
+            bit,
+            BlockHeight::new(start),
+            BlockHeight::new(start + 8),
+            8,
+            threshold,
+            BlockHeight::new(active),
+            true,
+        )
+        .expect("valid suite2 rehearsal")
+    };
+    baked.shielded_v2 = Some(deployment(sov_governance::SHIELDED_V2_DEPLOYMENT, 2, 8, 24));
+    baked.shielded_v2_suite2 = Some(deployment(
+        sov_governance::SHIELDED_V2_SUITE2_DEPLOYMENT,
+        5,
+        32,
+        48,
+    ));
+    baked
+        .pq_sunset
+        .as_mut()
+        .expect("PQ rehearsal schedule")
+        .deployment = deployment(sov_governance::PQ_SUNSET_DEPLOYMENT, 4, 48, 64);
+    baked.signal_mask |= (1 << 2) | (1 << 5);
+    baked
 }
 
 /// A fresh [`Blockchain`] from `genesis` with the network's baked governance
@@ -1459,6 +1605,9 @@ fn genesis_chain_with_baked_preset(genesis: &GenesisConfig) -> Result<Blockchain
         }
         if let Some(shielded_v2) = baked.shielded_v2 {
             chain.set_shielded_v2_deployment(shielded_v2);
+        }
+        if let Some(suite2) = baked.shielded_v2_suite2 {
+            chain.set_shielded_v2_suite2_deployment(suite2);
         }
         if let Some(tx_timestamp) = baked.tx_timestamp {
             chain.set_tx_timestamp_deployment(tx_timestamp);
@@ -2796,6 +2945,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn read_only_history_audit_checks_consensus_and_refuses_damaged_tails() {
+        let spec = ChainSpec::from_json(r#"{"chain_id":"sov-history-audit-test","timestamp_ms":1000,"policy":"test","accounts":[]}"#).unwrap();
+        let genesis = spec.to_genesis_config_verified().unwrap();
+        let mut chain = genesis_chain_with_baked_preset(&genesis).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("sov-verified-history-{}.log", std::process::id()));
+        let mut file = fs::File::create(&path).unwrap();
+        let mut last_block = None;
+        for height in 1..=4 {
+            let block = chain.produce_block(vec![], 1_000 + height * 1_000).unwrap();
+            chain.import_block(block.clone()).unwrap();
+            append_record(&mut file, &borsh::to_vec(&block).unwrap()).unwrap();
+            last_block = Some(block);
+        }
+        drop(file);
+        let original = fs::read(&path).unwrap();
+        let mut progress = Vec::new();
+        let report = verify_history(&spec, &path, &mut |done, total| {
+            progress.push((done, total))
+        })
+        .unwrap();
+        assert_eq!(report["fullyVerified"], true);
+        assert_eq!(report["assumevalid"], false);
+        assert_eq!(report["height"], 4);
+        assert_eq!(report["headHash"], chain.head().hash().to_hex());
+        assert_eq!(report["stateRoot"], chain.ledger().state_root().to_hex());
+        assert_eq!(progress, vec![(0, 4), (4, 4)]);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original,
+            "audit never rewrites history"
+        );
+        let mut torn = original.clone();
+        torn.push(1);
+        fs::write(&path, &torn).unwrap();
+        assert!(verify_history(&spec, &path, &mut |_, _| {}).is_err());
+        assert_eq!(fs::read(&path).unwrap(), torn);
+        let mut invalid = last_block.unwrap();
+        invalid.header.state_root = Hash::digest(b"forged state");
+        let mut file = fs::File::create(&path).unwrap();
+        append_record(&mut file, &borsh::to_vec(&invalid).unwrap()).unwrap();
+        drop(file);
+        let forged = fs::read(&path).unwrap();
+        assert!(verify_history(&spec, &path, &mut |_, _| {}).is_err());
+        assert_eq!(fs::read(&path).unwrap(), forged);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn clamp_block_timestamp_lifts_to_parent_and_mtp_but_never_lowers_a_leading_clock() {
         // Steady state: the wall clock is already ahead of both the parent and the
         // median-time-past — return it UNCHANGED so the normal/KAT production path is
@@ -2912,10 +3110,72 @@ mod tests {
             )
         };
         assert_eq!(baked.grace_blocks, 576);
-        assert_eq!(baked.signal_mask, 0b1111, "signals bits 0, 1, 2 AND 3");
+        assert_eq!(
+            baked.signal_mask,
+            if cfg!(feature = "zk-suite2") {
+                0b101111
+            } else {
+                0b1111
+            },
+            "signals bits 0, 1, 2, 3 and 5"
+        );
         assert!(
             baked.pq_sunset.is_none(),
             "canonical mainnet PQ retirement remains unarmed"
+        );
+    }
+
+    #[test]
+    fn mainnet_suite2_requires_future_committed_readiness_without_forced_activation() {
+        use sov_governance::ThresholdState as S;
+        struct Votes(bool);
+        impl sov_governance::MinerSignals for Votes {
+            fn signals(&self, _: BlockHeight, bit: u8) -> bool {
+                self.0 && bit == sov_governance::BIT_SHIELDED_V2_SUITE2
+            }
+        }
+        let baked = mainnet_deployments();
+        let deployment = baked.shielded_v2_suite2.as_ref().unwrap();
+        assert_eq!(
+            deployment.name,
+            sov_governance::SHIELDED_V2_SUITE2_DEPLOYMENT
+        );
+        assert_eq!(deployment.bit, 5);
+        assert_eq!(deployment.start_height.get(), 27_648);
+        assert_eq!(deployment.min_activation_height.get(), 27_936);
+        assert_eq!(deployment.timeout_height.get(), 28_512);
+        assert_eq!(deployment.period, 288);
+        assert_eq!(
+            deployment.threshold,
+            sov_governance::Threshold::new(9, 10).unwrap()
+        );
+        assert!(!deployment.lockinontimeout);
+        for (height, expected) in [
+            (0, S::Defined),
+            (27_393, S::Defined),
+            (27_647, S::Defined),
+            (27_648, S::Started),
+            (27_935, S::Started),
+            (27_936, S::LockedIn),
+            (28_223, S::LockedIn),
+            (28_224, S::Active),
+        ] {
+            assert_eq!(
+                sov_governance::state_at(deployment, BlockHeight::new(height), &Votes(true)),
+                expected
+            );
+        }
+        assert_eq!(
+            sov_governance::state_at(deployment, BlockHeight::new(28_224), &Votes(false)),
+            S::Started
+        );
+        assert_eq!(
+            sov_governance::state_at(deployment, BlockHeight::new(28_512), &Votes(false)),
+            S::Failed
+        );
+        assert!(
+            baked.pq_sunset.is_none(),
+            "separate legacy retirement is not inferred from pool repair"
         );
     }
 
@@ -3079,7 +3339,14 @@ mod tests {
         }
         let overlap = baked_deployments("sov-pq-rehearsal-mainnet").unwrap();
         assert!(overlap.pq_sunset.is_none(), "canonical preset always wins");
-        assert_eq!(overlap.signal_mask, 0b1111);
+        assert_eq!(
+            overlap.signal_mask,
+            if cfg!(feature = "zk-suite2") {
+                0b101111
+            } else {
+                0b1111
+            }
+        );
         assert!(baked_deployments("sov-testnet-1").is_none());
     }
 
@@ -3208,7 +3475,14 @@ mod tests {
         // resolves to the frozen mainnet preset (the mainnet arm is tested first).
         let both = baked_deployments("sov-e2e-mainnet").expect("mainnet arm wins");
         assert_eq!(both.tx_domain.period, 288);
-        assert_eq!(both.signal_mask, 0b1111);
+        assert_eq!(
+            both.signal_mask,
+            if cfg!(feature = "zk-suite2") {
+                0b101111
+            } else {
+                0b1111
+            }
+        );
         // And the canonical ids are untouched by the new namespace.
         assert!(baked_deployments("sov-testnet-1").is_none());
     }
@@ -3222,7 +3496,7 @@ mod tests {
         // a preset-less chain cannot replay a post-activation Tipped log is
         // `sov-chain`'s `post_activation_tipped_log_cold_replays_only_with_the_
         // deployment_installed`.) Observable here without mining to height 10944:
-        // the installed signal mask stamps `version_bits = 0b1111` on the very first
+        // the installed signal mask stamps `version_bits = 0b101111` on the first
         // produced block, and a non-mainnet chain stays untouched (bits 0).
         let genesis_for = |chain_id: &str| GenesisConfig {
             chain_id: chain_id.into(),
@@ -3240,7 +3514,12 @@ mod tests {
             .expect("mainnet chain builds");
         let block = mainnet.produce_block(vec![], 2_000).unwrap();
         assert_eq!(
-            block.header.version_bits, 0b1111,
+            block.header.version_bits,
+            if cfg!(feature = "zk-suite2") {
+                0b101111
+            } else {
+                0b1111
+            },
             "the baked signal mask is live on the FIRST produced block — the preset \
              is installed at construction, before any replay could run"
         );
@@ -3554,6 +3833,7 @@ mod tests {
                 scheme: None,
                 mnemonic: None,
                 public_key: None,
+                operate_as: None,
             }],
         };
         let enc = ks

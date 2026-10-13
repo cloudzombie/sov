@@ -395,6 +395,7 @@ fn stf_vector() -> Value {
         // they stay byte-identical across the `fee-auction` deployment.
         fee_auction_active: false,
         shielded_v2_active: false,
+        shielded_v2_suite2_active: false,
         tx_timestamp_active: false,
         // Only the (dormant) `tx-timestamp` path reads the block clock, so this
         // value can never reach a KAT vector; a fixed placeholder keeps the

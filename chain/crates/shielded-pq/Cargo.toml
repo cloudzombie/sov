@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "PROTOTYPE post-quantum shielded pool core for SOV: hash-based note commitments (Rescue-Prime), a STARK (winterfell) spend proof for Merkle membership + nullifier derivation, ML-KEM-768 note encryption, ML-DSA-65 spend authorization. NOT wired into consensus; NOT in the trust path."
+description = "SOV pool-v2 historical proof/state and an opt-in context-bound hiding STARK replacement; ML-KEM-768 notes and ML-DSA-65 carrier authorization."
 
 [dependencies]
 # STARK proof system (pure Rust, no elliptic curves). winterfell re-exports
@@ -27,6 +27,28 @@ thiserror.workspace = true
 # chain does; secret material is zeroized with the same crate the GUI uses.
 borsh.workspace = true
 zeroize = { version = "1", features = ["zeroize_derive"] }
+getrandom = "0.2"
+
+# Explicit opt-in replacement proof research; historical Winterfell decoding
+# and consensus verification remain unchanged unless callers select suite 2.
+p3-air = { version = "=0.8.0", optional = true }
+p3-challenger = { version = "=0.8.0", optional = true }
+p3-commit = { version = "=0.8.0", optional = true }
+p3-dft = { version = "=0.8.0", optional = true }
+p3-field = { version = "=0.8.0", optional = true }
+p3-fri = { version = "=0.8.0", optional = true }
+p3-goldilocks = { version = "=0.8.0", optional = true }
+p3-matrix = { version = "=0.8.0", optional = true }
+p3-merkle-tree = { version = "=0.8.0", optional = true }
+p3-symmetric = { version = "=0.8.0", optional = true }
+p3-uni-stark = { version = "=0.8.0", optional = true }
+rand = { version = "0.10", optional = true }
+postcard = { version = "1", default-features = false, features = ["alloc"], optional = true }
+serde = { version = "1", optional = true }
+tiny-keccak = { version = "2", features = ["keccak"], optional = true }
+
+[features]
+zk-suite2 = ["dep:p3-air", "dep:p3-challenger", "dep:p3-commit", "dep:p3-dft", "dep:p3-field", "dep:p3-fri", "dep:p3-goldilocks", "dep:p3-matrix", "dep:p3-merkle-tree", "dep:p3-symmetric", "dep:p3-uni-stark", "dep:rand", "dep:postcard", "dep:serde", "dep:tiny-keccak"]
 
 [lints.rust]
 unsafe_code = "forbid"

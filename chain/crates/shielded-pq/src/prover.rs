@@ -171,6 +171,7 @@ pub fn proof_options() -> ProofOptions {
 }
 
 /// One real spend's witness: the owning key, the note, and its Merkle path.
+#[derive(Clone)]
 pub struct BundleSpend {
     /// The key owning the note (its `owner_tag` must match).
     pub key: SpendingKey,

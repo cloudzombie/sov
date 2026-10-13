@@ -63,6 +63,9 @@ use crate::proof_frame::{validate_proof_frame, ProofFrameError, MAX_PROOF_LEN};
 /// The one proof/wire version this build understands (D6; v0.2.0 = 1).
 pub const PROOF_VERSION_V1: u8 = 1;
 
+/// Explicit opt-in hiding proof candidate, gated separately from activation.
+pub const PROOF_VERSION_V2: u8 = 2;
+
 /// Exact AEAD ciphertext length: the 72-byte note plaintext plus the
 /// 16-byte Poly1305 tag.
 pub const AEAD_CT_LEN: usize = 88;
@@ -97,6 +100,9 @@ pub enum WireError {
     /// The embedded proof failed structural frame validation.
     #[error("malformed proof frame: {0}")]
     ProofFrame(#[from] ProofFrameError),
+    /// The opt-in suite-2 proof frame failed bounded canonical decoding.
+    #[error("malformed suite-2 proof frame: {0}")]
+    Suite2ProofFrame(String),
     /// Bytes remain after a structurally complete bundle.
     #[error("{0} trailing bytes after the bundle")]
     TrailingBytes(usize),
@@ -216,10 +222,44 @@ pub fn encode_bundle(bundle: &SpendBundle) -> Vec<u8> {
 /// only (see the module docs); run [`crate::bundle::verify_bundle`] on
 /// the result for the semantic/cryptographic rules.
 pub fn decode_bundle(data: &[u8]) -> Result<SpendBundle, WireError> {
+    decode_bundle_inner(data, PROOF_VERSION_V1)
+}
+
+/// Decode one explicitly selected suite. This selects a codec, never enables
+/// consensus admission. Suite 1 remains byte-identical and never falls back to
+/// suite 2; unsupported versions are refused before reading payload fields.
+pub fn decode_bundle_for_suite(version: u8, data: &[u8]) -> Result<SpendBundle, WireError> {
+    if version != PROOF_VERSION_V1 && !(cfg!(feature = "zk-suite2") && version == PROOF_VERSION_V2)
+    {
+        return Err(WireError::UnknownProofVersion(version));
+    }
+    decode_bundle_inner(data, version)
+}
+
+/// Encode an explicitly selected suite. A suite-2 proof must already have its
+/// canonical versioned frame; merely relabeling historical proof bytes fails.
+pub fn encode_bundle_for_suite(version: u8, bundle: &SpendBundle) -> Result<Vec<u8>, WireError> {
+    if version == PROOF_VERSION_V1 {
+        return Ok(encode_bundle(bundle));
+    }
+    #[cfg(feature = "zk-suite2")]
+    if version == PROOF_VERSION_V2 {
+        crate::zk_suite2::validate_proof_frame(&bundle.proof_bytes)
+            .map_err(|e| WireError::Suite2ProofFrame(e.to_string()))?;
+        let mut bytes = encode_bundle(bundle);
+        bytes[0] = version;
+        // Verify canonical ciphertext and public-field encoding too.
+        decode_bundle_for_suite(version, &bytes)?;
+        return Ok(bytes);
+    }
+    Err(WireError::UnknownProofVersion(version))
+}
+
+fn decode_bundle_inner(data: &[u8], expected_version: u8) -> Result<SpendBundle, WireError> {
     let mut r = Reader::new(data);
     // D6 version gate: the FIRST byte selects the decoder.
     let version = r.u8("proof_version")?;
-    if version != PROOF_VERSION_V1 {
+    if version != expected_version {
         return Err(WireError::UnknownProofVersion(version));
     }
 
@@ -261,11 +301,25 @@ pub fn decode_bundle(data: &[u8]) -> Result<SpendBundle, WireError> {
     // this bundle's own public inputs so the blob can never panic
     // winterfell downstream (D15).
     let proof_len = r.u32_le("proof_len")?;
-    if proof_len == 0 || proof_len as usize > MAX_PROOF_LEN {
+    let max_proof_len = MAX_PROOF_LEN;
+    #[cfg(feature = "zk-suite2")]
+    let max_proof_len = if version == PROOF_VERSION_V2 {
+        crate::zk_suite2::MAX_CANDIDATE_PROOF_BYTES
+    } else {
+        max_proof_len
+    };
+    if proof_len == 0 || proof_len as usize > max_proof_len {
         return Err(WireError::ProofLength(proof_len));
     }
     let proof_bytes = r.bytes(proof_len as usize, "proof")?.to_vec();
-    validate_proof_frame(&proof_bytes, &public_inputs)?;
+    if version == PROOF_VERSION_V1 {
+        validate_proof_frame(&proof_bytes, &public_inputs)?;
+    }
+    #[cfg(feature = "zk-suite2")]
+    if version == PROOF_VERSION_V2 {
+        crate::zk_suite2::validate_proof_frame(&proof_bytes)
+            .map_err(|e| WireError::Suite2ProofFrame(e.to_string()))?;
+    }
 
     let mut output_ciphertexts: [Option<NoteCiphertext>; NUM_SLOTS] = [None, None, None, None];
     for slot in &mut output_ciphertexts {

@@ -4,13 +4,15 @@
 //! per-real-output ciphertexts + one ML-DSA-65 carrier signature.
 //! **Scope, stated precisely:**
 //!
-//! - PROVEN by the STARK, in zero knowledge ([`crate::air`]): per real
+//! - CONSTRAINED by the historical STARK ([`crate::air`]): per real
 //!   input — commitment opening, depth-20 membership under its public
 //!   anchor, nullifier derivation bound to the owner's `nsk`; per real
 //!   output — commitment integrity; per dummy slot — zero value +
 //!   domain-separated dummy nullifier; 61-bit range checks on every value;
 //!   and value conservation with ONLY `t_in`/`t_out`/`fee` public.
-//!   **All note values are private witnesses.**
+//!   These are witness registers, but the old unmasked proof does not hide
+//!   them. Its carrier signature does not bind the proof transcript to an
+//!   owner/payout. Keep this verifier for historical replay only.
 //! - CHECKED NATIVELY here: the public bounds the no-wrap argument needs
 //!   (`t_in`/`t_out`/`fee` ≤ [`MAX_NOTE_VALUE`], re-checked in
 //!   [`verify_spend`]), dummy-slot conventions (zero anchors/nullifiers/

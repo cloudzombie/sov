@@ -171,8 +171,49 @@ pub fn verify_bundle_for_carrier(
     nonce: u64,
     signer_balance: Balance,
 ) -> Result<V2Effects, ShieldedV2Error> {
+    verify_bundle_for_carrier_with_suite2(
+        bundle_bytes,
+        ledger,
+        mining,
+        height,
+        domain,
+        signer,
+        nonce,
+        signer_balance,
+        false,
+    )
+}
+
+/// Verify the explicitly activated hiding suite, preserving the historical
+/// decoder and verifier for suite 1. Activation comes from this block's branch.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_bundle_for_carrier_with_suite2(
+    bundle_bytes: &[u8],
+    ledger: &Ledger,
+    mining: &MiningPolicy,
+    height: u64,
+    domain: &SigningDomain,
+    signer: &AccountId,
+    nonce: u64,
+    signer_balance: Balance,
+    suite2_active: bool,
+) -> Result<V2Effects, ShieldedV2Error> {
     // ── 1. Decode + proof_version gate (D6) ─────────────────────────────
-    let bundle = decode_bundle(bundle_bytes).map_err(|e| match e {
+    let suite2 = bundle_bytes.first() == Some(&sov_shielded_pq::wire::PROOF_VERSION_V2);
+    if suite2_active && !suite2 {
+        return Err(ShieldedV2Error::UnknownProofVersion(
+            bundle_bytes.first().copied().unwrap_or(0),
+        ));
+    }
+    if suite2 && !(suite2_active && cfg!(feature = "zk-suite2")) {
+        return Err(ShieldedV2Error::UnknownProofVersion(2));
+    }
+    let decoded = if suite2 {
+        sov_shielded_pq::wire::decode_bundle_for_suite(2, bundle_bytes)
+    } else {
+        decode_bundle(bundle_bytes)
+    };
+    let bundle = decoded.map_err(|e| match e {
         sov_shielded_pq::WireError::UnknownProofVersion(v) => {
             ShieldedV2Error::UnknownProofVersion(v)
         }
@@ -211,8 +252,26 @@ pub fn verify_bundle_for_carrier(
     }
 
     // ── 4. The STARK proof over the full public-input set ───────────────
-    verify_spend(&bundle.proof_bytes, pi)
+    if suite2 {
+        #[cfg(feature = "zk-suite2")]
+        sov_shielded_pq::zk_suite2::verify_spend(
+            &bundle.proof_bytes,
+            pi,
+            &sov_shielded_pq::zk_suite2::Suite2Context {
+                chain_id: carrier.chain_id,
+                genesis: carrier.genesis,
+                signer: carrier.signer,
+                nonce,
+                auth_pk: &bundle.auth_pk,
+            },
+        )
         .map_err(|e| ShieldedV2Error::InvalidProof(e.to_string()))?;
+        #[cfg(not(feature = "zk-suite2"))]
+        return Err(ShieldedV2Error::UnknownProofVersion(2));
+    } else {
+        verify_spend(&bundle.proof_bytes, pi)
+            .map_err(|e| ShieldedV2Error::InvalidProof(e.to_string()))?;
+    }
 
     // ── 5. Anchors: each real input against the 128-entry ring (D5) ─────
     let pool: &ShieldedV2State = ledger.shielded_v2();
@@ -542,6 +601,60 @@ mod tests {
         let mut spend = built.bundle;
         authorize_for_carrier(&mut spend, k, CHAIN_ID, &GENESIS, SIGNER, 0).expect("carrier-bind");
         (ledger, encode_bundle(&spend))
+    }
+
+    /// Historical version 1 must remain verifiable, but its proof does not
+    /// bind the carrier key or payout account. A copied pending withdrawal
+    /// can be reauthorized without the owner's key or a new proof, even before
+    /// considering the unmasked witness disclosure. A withdrawal-only shape
+    /// therefore does not make legacy recovery ownership-safe.
+    #[test]
+    fn legacy_withdrawal_authorization_key_is_not_bound_to_note_owner() {
+        use sov_shielded_pq::carrier::sign_in_carrier;
+
+        let owner = key(31);
+        // Withdraw the entire note: no private outputs and no deposit leg.
+        let (ledger, bytes) = deshield_fixture(&owner, 5, 5);
+        let mut withdrawal = decode_bundle(&bytes).expect("historical bundle");
+        assert_eq!(withdrawal.public_inputs.transparent_in, 0);
+        assert!(withdrawal
+            .public_inputs
+            .output_dummy
+            .iter()
+            .all(|&dummy| dummy));
+
+        let unrelated = key(32);
+        let unrelated_signer = AccountId::new("unrelated.sov").expect("account");
+        assert_ne!(owner.owner_tag(), unrelated.owner_tag());
+        let (auth_pk, auth_sig) = sign_in_carrier(
+            unrelated.auth_key(),
+            &withdrawal.public_inputs,
+            &withdrawal.output_ciphertexts,
+            &CarrierContext {
+                chain_id: CHAIN_ID.as_bytes(),
+                genesis: &GENESIS,
+                signer: unrelated_signer.as_str().as_bytes(),
+                nonce: 77,
+            },
+        )
+        .expect("an unrelated key can sign the carrier");
+        withdrawal.auth_pk = auth_pk;
+        withdrawal.auth_sig = auth_sig;
+        let effects = verify_bundle_for_carrier(
+            &encode_bundle(&withdrawal),
+            &ledger,
+            &policy(),
+            1,
+            &domain(),
+            &unrelated_signer,
+            77,
+            Balance::from_grains(10 * XUS),
+        )
+        .expect("legacy replay relies on the note witness, not the carrier key");
+        assert_eq!(effects.deshield_out.grains(), 5 * XUS);
+        assert!(effects.commitments.is_empty());
+        assert_eq!(ledger.shielded_v2_value().grains(), 5 * XUS);
+        assert_eq!(ledger.shielded_v2().nullifier_count(), 0);
     }
 
     /// The pool-v2 de-shield DRAIN LIMITER must actually bind. It is the

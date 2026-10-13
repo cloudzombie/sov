@@ -1,14 +1,11 @@
 //! # sov-shielded-pq — post-quantum shielded pool core (pool v2, pre-audit)
 //!
-//! **Everything here is DORMANT: the `shielded-v2` deployment (signal
-//! bit 2) is defined but NOT armed, so no chain executes any of this code
-//! in consensus today, and nothing here enters the trust path until it has
-//! an external audit and parameter review** (see `notes/v0.2.0-program.md`).
-//! As of v0.2.0 slices S2a/S2b the pool's *consensus state shape* exists
-//! ([`state`], folded into the ledger root only once non-empty) and the
-//! `Action::ShieldedV2` carrier variant exists (appended, size-capped,
-//! hard-rejected `FeatureInactive` at execution) — both inert until an
-//! explicit, separately-audited arming release schedules bit 2.
+//! Pool v2 has been armed on mainnet since v0.2.5 and can hold existing notes
+//! and supply. Its historical proof suite remains available for deterministic
+//! replay. New production writes are quarantined because that suite does not
+//! hide its witness and its proof is not bound to the carrier's payout context.
+//! The opt-in `zk-suite2` feature implements a versioned hiding replacement;
+//! its separate bit-5 schedule is currently limited to isolated rehearsals.
 //!
 //! ## What it is
 //!
@@ -17,16 +14,16 @@
 //! - **Hash-based note commitments** over domain-separated Rescue-Prime
 //!   (`Rp64_256`), the STARK-friendly hash the proof system proves natively
 //!   ([`hash`], [`note`], [`domains`]).
-//! - A **fixed-depth-20 append-only commitment tree** with membership
+//! - A **fixed-depth-32 append-only commitment tree** with membership
 //!   witnesses ([`tree`]).
-//! - **PRF-style nullifiers** `nf = H_NF(nsk, rho)` with ownership bound in
+//! - **Position-bound nullifiers** with ownership bound in
 //!   circuit via `owner_tag = H_TAG(nsk, 0)` ([`note`]).
 //! - A **consensus-grade 4-in/4-out bundle STARK** (winterfell): per real
 //!   input — commitment opening + Merkle membership + nullifier derivation;
 //!   per real output — commitment integrity; dummy slots proven zero-valued
 //!   with domain-separated dummy nullifiers; 61-bit range checks on every
 //!   value; and **in-circuit value conservation with all note values
-//!   PRIVATE** — only the transparent legs (`t_in`, `t_out`, `fee`) are
+//!   witness registers** — only the transparent legs (`t_in`, `t_out`, `fee`) are
 //!   public ([`air`], [`prover`]). No fake proofs: everything the verifier
 //!   accepts is either proven in-circuit or checked natively and documented
 //!   as transparent.
@@ -39,8 +36,9 @@
 //!
 //! - Spend authorization is a carrier ML-DSA-65 signature, not in-circuit
 //!   (pinned trade-off D4; a future proof_version revisits it).
-//! - Dummy-slot flags are public: the bundle's real arity (≤ 4 each side)
-//!   is visible. Values, owners, and note linkages are not.
+//! - Dummy-slot flags reveal real arity (≤ 4 each side). The historical
+//!   unmasked suite does not establish privacy for values, owners or linkages.
+//!   New masking cannot revoke spending keys already exposed by old proofs.
 //! - The written 128-bit parameter review (S1d) is a separate, still
 //!   pending slice. The 128 figure is a *classical* FRI soundness bound
 //!   (proven Johnson/list-decoding radius); post-quantum (QROM) soundness of
@@ -74,6 +72,13 @@ pub mod state;
 pub mod tree;
 pub mod wallet;
 pub mod wire;
+#[cfg(feature = "zk-suite2")]
+mod zk_seed;
+/// Opt-in replacement proof candidate; independent of the historical verifier.
+#[cfg(feature = "zk-suite2")]
+pub mod zk_suite2;
+#[cfg(feature = "zk-suite2")]
+mod zk_suite2_decode;
 
 pub use air::BundlePublicInputs;
 pub use auth::AuthKeypair;

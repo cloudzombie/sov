@@ -130,6 +130,9 @@ pub struct Blockchain {
     /// Arming is a later, separately-audited release that installs a
     /// deployment here, exactly as v0.1.99 did for bits 0/1.
     shielded_v2_deployment: Option<sov_governance::Deployment>,
+    /// Independently signaled replacement proof suite; absent on canonical
+    /// networks until a reviewed activation schedule is published.
+    shielded_v2_suite2_deployment: Option<sov_governance::Deployment>,
     /// The miner-signaled `tx-timestamp` deployment (signal bit 3 — the
     /// `Action::Timestamped` bounded creation-time envelope), if this chain
     /// schedules one. `None` keeps the envelope a hard `FeatureInactive` reject
@@ -594,6 +597,7 @@ impl Blockchain {
             tx_domain_grace_blocks: TX_DOMAIN_GRACE_BLOCKS,
             fee_auction_deployment: None,
             shielded_v2_deployment: None,
+            shielded_v2_suite2_deployment: None,
             tx_timestamp_deployment: None,
             active_receipts: HashMap::new(),
             tx_height: HashMap::new(),
@@ -1097,6 +1101,12 @@ impl Blockchain {
         self.shielded_v2_deployment = Some(deployment);
     }
 
+    /// Install the independent suite-2 activation schedule. This setter does
+    /// not change genesis, historical proof verification, or the bit-2 schedule.
+    pub fn set_shielded_v2_suite2_deployment(&mut self, deployment: sov_governance::Deployment) {
+        self.shielded_v2_suite2_deployment = Some(deployment);
+    }
+
     /// Schedule the miner-signaled `tx-timestamp` deployment (signal bit 3):
     /// once `deployment` activates under the BIP-9/8 state machine, an
     /// `Action::Timestamped` envelope executes — its declared `created_at_ms`
@@ -1145,6 +1155,7 @@ impl Blockchain {
             .fee_auction_deployment
             .iter()
             .chain(self.shielded_v2_deployment.iter())
+            .chain(self.shielded_v2_suite2_deployment.iter())
             .chain(self.tx_timestamp_deployment.iter())
         {
             out.push(DeploymentStatus {
@@ -1378,11 +1389,15 @@ impl Blockchain {
     /// active entries above the fork) plus per-block re-recording — so the gate
     /// that uses it resolves precisely the mode execution will.
     fn branch_signals_of(&self, block: &Block) -> sov_governance::SignalLog {
+        self.branch_signals_from(block.header.prev_hash)
+    }
+
+    fn branch_signals_from(&self, parent: Hash) -> sov_governance::SignalLog {
         // Walk parent links, collecting the branch's own (height, bits) above the
         // fork point, until we meet a block that is the active block at its own
         // height — the common ancestor. Mirrors `locate_fork`, headers only.
         let mut branch_bits: Vec<(BlockHeight, u32)> = Vec::new();
-        let mut hash = block.header.prev_hash;
+        let mut hash = parent;
         let mut fork_height = 0u64;
         while let Some(entry) = self.index.get(&hash) {
             let h = entry.height;
@@ -1436,6 +1451,21 @@ impl Blockchain {
     /// evaluates activation over *that branch's* signals.
     fn shielded_v2_active_with(&self, height: u64, signals: &sov_governance::SignalLog) -> bool {
         Self::deployment_active_at(self.shielded_v2_deployment.as_ref(), height, signals)
+    }
+
+    /// Whether bit 5 activates the replacement proof at this height, evaluated
+    /// over committed miner signals. Both bit 2 and bit 5 must be active.
+    pub fn shielded_v2_suite2_active(&self, height: u64) -> bool {
+        self.shielded_v2_suite2_active_with(height, &self.signals)
+    }
+
+    fn shielded_v2_suite2_active_with(
+        &self,
+        height: u64,
+        signals: &sov_governance::SignalLog,
+    ) -> bool {
+        Self::deployment_active_at(self.shielded_v2_suite2_deployment.as_ref(), height, signals)
+            && self.shielded_v2_active_with(height, signals)
     }
 
     /// Whether the miner-signaled `tx-timestamp` deployment (bit 3) is `Active`
@@ -1520,7 +1550,26 @@ impl Blockchain {
                 None => break, // reached genesis (its parent link is not indexed)
             }
         }
-        elastic_block_cap(sizes)
+        let normal = elastic_block_cap(sizes);
+        if self.shielded_v2_suite2_deployment.is_none() {
+            return normal;
+        }
+        let height = parent.height.saturating_add(1);
+        let active = if parent.block.hash() == self.head {
+            self.shielded_v2_suite2_active(height)
+        } else {
+            self.shielded_v2_suite2_active_with(
+                height,
+                &self.branch_signals_from(parent.block.hash()),
+            )
+        };
+        // Seed-preimage ownership needs a wider proof. Only the independently
+        // activated branch gets a larger floor; the 4 MiB ceiling is unchanged.
+        if active {
+            normal.max(2560 * 1024)
+        } else {
+            normal
+        }
     }
 
     /// `timestamp_ms` is the CANDIDATE block's own committed timestamp: past
@@ -1840,6 +1889,7 @@ impl Blockchain {
             tx_domain: self.resolved_tx_domain_mode(next_height),
             fee_auction_active: self.fee_auction_active(next_height),
             shielded_v2_active: self.shielded_v2_active(next_height),
+            shielded_v2_suite2_active: self.shielded_v2_suite2_active(next_height),
             tx_timestamp_active: self.tx_timestamp_active(next_height),
             block_time_ms: timestamp_ms,
             chain_domain: self.chain_domain(),
@@ -1867,7 +1917,16 @@ impl Blockchain {
         let weight_limit = sov_types::MAX_BLOCK_WEIGHT;
         // Seed with the empty block's own serialized overhead, so the budget
         // measures the same thing `block_weight` will at import.
-        let mut weight_acc: u64 = 0;
+        let mut weight_acc = Block::assemble(
+            BlockHeight::new(next_height),
+            prev_hash,
+            Hash::ZERO,
+            Hash::ZERO,
+            timestamp_ms,
+            proposer.clone(),
+            vec![],
+        )
+        .serialized_size() as u64;
         for stx in transactions {
             // Skip (but keep in the mempool) any transaction that would push the block
             // past the elastic size cap; a smaller later transaction may still fit.
@@ -1905,6 +1964,7 @@ impl Blockchain {
             tx_domain: self.resolved_tx_domain_mode(next_height),
             fee_auction_active: self.fee_auction_active(next_height),
             shielded_v2_active: self.shielded_v2_active(next_height),
+            shielded_v2_suite2_active: self.shielded_v2_suite2_active(next_height),
             tx_timestamp_active: self.tx_timestamp_active(next_height),
             block_time_ms: timestamp_ms,
             chain_domain: self.chain_domain(),
@@ -2629,6 +2689,7 @@ impl Blockchain {
             tx_domain: self.resolved_tx_domain_mode_with(height, signals),
             fee_auction_active: self.fee_auction_active_with(height, signals),
             shielded_v2_active: self.shielded_v2_active_with(height, signals),
+            shielded_v2_suite2_active: self.shielded_v2_suite2_active_with(height, signals),
             tx_timestamp_active: self.tx_timestamp_active_with(height, signals),
             block_time_ms: block.header.timestamp_ms,
             chain_domain: self.chain_domain(),
@@ -6541,6 +6602,103 @@ mod assumevalid_ancestry_tests {
 #[cfg(test)]
 mod block_weight_tests {
     use super::tests::fresh_chain;
+    use super::*;
+
+    #[test]
+    fn producer_includes_header_and_vector_prefix_at_the_weight_boundary() {
+        use sov_types::{Action, Transaction};
+
+        for excess in [0u64, 1] {
+            let mut chain = fresh_chain();
+            let miner = AccountId::new("val01.node.sov").unwrap();
+            chain.set_coinbase(miner.clone());
+            chain.set_shielded_v2_deployment(
+                sov_governance::Deployment::new(
+                    "shielded-v2",
+                    2,
+                    BlockHeight::new(4),
+                    BlockHeight::new(400),
+                    4,
+                    sov_governance::Threshold::new(3, 4).unwrap(),
+                    BlockHeight::new(12),
+                    false,
+                )
+                .unwrap(),
+            );
+            chain.set_signal_mask(1 << 2);
+            for height in 1..=12 {
+                let block = chain.produce_block(vec![], (height + 1) * 1_000).unwrap();
+                chain.import_block(block).unwrap();
+            }
+            assert!(chain.shielded_v2_active(13));
+            // Isolate the weight budget from the separately tested elastic
+            // byte-cap calculation by supplying a full-cap ancestor window.
+            for entry in chain.index.values_mut() {
+                entry.size = BLOCK_SIZE_CEILING / 2;
+            }
+            assert_eq!(chain.next_block_size_limit(), BLOCK_SIZE_CEILING);
+            let empty = chain.produce_block(vec![], 14_000).unwrap();
+            let overhead = empty.serialized_size() as u64;
+            assert!(
+                overhead > 4,
+                "the budget includes both the header and vector prefix"
+            );
+
+            let key = sov_crypto::Keypair::from_seed([2; 32]);
+            let signed = |nonce, padding| {
+                SignedTransaction::sign(
+                    Transaction {
+                        signer: AccountId::new("usa.reserve.sov").unwrap(),
+                        public_key: key.public_key(),
+                        nonce,
+                        // A non-proposable child earns a normal failed receipt,
+                        // consumes its nonce and still carries verification
+                        // weight. No synthetic valid private proof is assumed.
+                        action: Action::ProposeMultisig {
+                            account: AccountId::new("vault.sov").unwrap(),
+                            action: Box::new(Action::ShieldedV2 {
+                                bundle: vec![1; padding],
+                            }),
+                        },
+                    },
+                    &key,
+                )
+                .unwrap()
+            };
+            let count = 32u64;
+            let base = sov_types::weight::tx_weight(&signed(0, 0));
+            let target = sov_types::MAX_BLOCK_WEIGHT - overhead + excess;
+            let mut transactions = Vec::new();
+            for nonce in 0..count {
+                let weight = target / count + u64::from(nonce < target % count);
+                let padding = usize::try_from(weight - base).unwrap();
+                assert!(padding <= sov_types::transaction::MAX_SHIELDED_V2_BUNDLE_BYTES);
+                transactions.push(signed(nonce, padding));
+            }
+            assert_eq!(
+                transactions
+                    .iter()
+                    .map(sov_types::weight::tx_weight)
+                    .sum::<u64>(),
+                target
+            );
+            // With one extra unit, transaction bytes/verification alone are
+            // still below the cap. Only correct block-overhead accounting
+            // causes the last otherwise executable transaction to be skipped.
+            let block = chain.produce_block(transactions, 14_000).unwrap();
+            assert_eq!(block.transactions.len(), 32 - excess as usize);
+            let actual = sov_types::block_weight(&block);
+            if excess == 0 {
+                assert_eq!(actual, sov_types::MAX_BLOCK_WEIGHT);
+            } else {
+                assert!(actual < sov_types::MAX_BLOCK_WEIGHT);
+            }
+            let receipts = chain.import_block(block).unwrap();
+            assert_eq!(receipts.len(), 32 - excess as usize);
+            assert!(receipts.iter().all(|receipt| !receipt.succeeded()));
+            assert_eq!(chain.height(), 13);
+        }
+    }
 
     /// `MAX_BLOCK_WEIGHT` must be a real limit, not a declared constant.
     ///
@@ -6600,5 +6758,91 @@ mod block_weight_tests {
             "with no shielded-v2 deployment the weight rule must not apply — \
              enforcing it retroactively would split the network"
         );
+    }
+}
+
+#[cfg(test)]
+mod suite2_branch_limit_tests {
+    use super::tests::fresh_chain;
+    use super::*;
+
+    fn signaling_chain(signal: bool) -> Blockchain {
+        let mut chain = fresh_chain();
+        chain.set_shielded_v2_deployment(
+            sov_governance::Deployment::new(
+                "shielded-v2",
+                2,
+                BlockHeight::new(4),
+                BlockHeight::new(400),
+                4,
+                sov_governance::Threshold::new(3, 4).unwrap(),
+                BlockHeight::new(12),
+                false,
+            )
+            .unwrap(),
+        );
+        chain.set_shielded_v2_suite2_deployment(
+            sov_governance::Deployment::new(
+                "shielded-v2-suite2",
+                5,
+                BlockHeight::new(4),
+                BlockHeight::new(400),
+                4,
+                sov_governance::Threshold::new(3, 4).unwrap(),
+                BlockHeight::new(12),
+                false,
+            )
+            .unwrap(),
+        );
+        chain.set_signal_mask((1 << 2) | if signal { 1 << 5 } else { 0 });
+        chain
+    }
+
+    #[test]
+    fn suite2_block_floor_follows_parent_branch_at_exact_activation() {
+        let mut active = signaling_chain(true);
+        let mut inactive = signaling_chain(false);
+        assert_eq!(active.genesis_hash, inactive.genesis_hash);
+        let mut yes = Vec::new();
+        let mut no = Vec::new();
+        for height in 1..=12 {
+            let block = active.produce_block(vec![], (height + 1) * 1000).unwrap();
+            active.import_block(block.clone()).unwrap();
+            yes.push(block);
+            let block = inactive.produce_block(vec![], (height + 1) * 1000).unwrap();
+            inactive.import_block(block.clone()).unwrap();
+            no.push(block);
+        }
+        for block in &no {
+            active.import_block(block.clone()).unwrap();
+        }
+        for block in &yes {
+            inactive.import_block(block.clone()).unwrap();
+        }
+        // Both views hold both branches. The active head's signal state must
+        // not leak into a candidate extending the other branch, in either
+        // direction. Height 11 is the parent of the first active block (12).
+        for view in [&active, &inactive] {
+            assert_eq!(
+                view.block_size_limit(view.index.get(&yes[9].hash()).unwrap()),
+                BLOCK_SIZE_FLOOR
+            );
+            assert_eq!(
+                view.block_size_limit(view.index.get(&yes[10].hash()).unwrap()),
+                2560 * 1024
+            );
+            assert_eq!(
+                view.block_size_limit(view.index.get(&yes[11].hash()).unwrap()),
+                2560 * 1024
+            );
+            assert_eq!(
+                view.block_size_limit(view.index.get(&no[10].hash()).unwrap()),
+                BLOCK_SIZE_FLOOR
+            );
+            assert_eq!(
+                view.block_size_limit(view.index.get(&no[11].hash()).unwrap()),
+                BLOCK_SIZE_FLOOR
+            );
+        }
     }
 }

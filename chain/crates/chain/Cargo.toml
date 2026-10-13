@@ -30,3 +30,6 @@ sov-shielded-pq = { path = "../shielded-pq" }
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
+
+[features]
+zk-suite2 = ["sov-runtime/zk-suite2", "sov-shielded-pq/zk-suite2"]

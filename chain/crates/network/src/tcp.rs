@@ -88,6 +88,8 @@ struct Peer {
     /// including both exact KEM messages. Used to bind the signed `Hello`
     /// identity to this pipe even if the Noise key exchange is broken.
     handshake_hash: Vec<u8>,
+    /// Set only after the application's signed chain/identity Hello succeeds.
+    authenticated: AtomicBool,
 }
 
 type PeerWriter = Arc<Peer>;
@@ -866,6 +868,17 @@ impl TcpNode {
             .map(|p| p.handshake_hash.clone())
     }
 
+    /// Enable discovery only after the application authenticated this link.
+    /// Establishing Noise/ML-KEM alone does not authenticate a chain identity.
+    pub fn mark_authenticated(&self, addr: SocketAddr) {
+        let peer = self.shared.peers.lock().unwrap().get(&addr).cloned();
+        if let Some(peer) = peer {
+            if !peer.authenticated.swap(true, Ordering::AcqRel) {
+                let _ = write_frame(&peer, &NetMessage::GetAddr);
+            }
+        }
+    }
+
     /// Listening addresses this node has discovered.
     pub fn known_peers(&self) -> Vec<SocketAddr> {
         self.shared.known.lock().unwrap().iter().copied().collect()
@@ -1155,6 +1168,7 @@ fn setup_connection(
         noise: Mutex::new(transport),
         pq: Mutex::new(pq),
         handshake_hash,
+        authenticated: AtomicBool::new(false),
     });
     shared.peers.lock().unwrap().insert(key, Arc::clone(&peer));
     // Connection is live: stop treating this address as an in-flight dial.
@@ -1170,18 +1184,8 @@ fn setup_connection(
         ),
     );
 
-    // Announce ourselves + everyone we know, so the peer can discover the network.
-    let mut addrs = vec![shared.local_addr.to_string()];
-    addrs.extend(
-        shared
-            .known
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|a| !addr_is_dead(shared, a))
-            .map(|a| a.to_string()),
-    );
-    let _ = write_frame(&peer, &NetMessage::Peers(addrs));
+    // Discovery begins only after application Hello authentication. A wrong-
+    // genesis peer must not poison the persisted peer set before being rejected.
 
     reader_loop(shared, key, reader, peer);
     shared.inbound.lock().unwrap().remove(&key);
@@ -1406,6 +1410,9 @@ fn reader_loop(shared: &Arc<Shared>, key: SocketAddr, mut reader: TcpStream, pee
                 match message {
                     // Discovery messages are handled here, not surfaced to the app.
                     NetMessage::Peers(list) => {
+                        if !peer.authenticated.load(Ordering::Acquire) {
+                            continue;
+                        }
                         // Bound gossip: an honest node advertises a handful of peers; a
                         // flood (up to ~100k entries in an 8 MiB frame) would wedge the
                         // single dial thread (CONNECT_TIMEOUT per bogus address) and bloat
@@ -1458,6 +1465,9 @@ fn reader_loop(shared: &Arc<Shared>, key: SocketAddr, mut reader: TcpStream, pee
                     // same set the connect-time push sends. Only a v0.1.86+ peer sends
                     // GetAddr, so a `Peers` reply (an original variant) is always decodable.
                     NetMessage::GetAddr => {
+                        if !peer.authenticated.load(Ordering::Acquire) {
+                            continue;
+                        }
                         let mut addrs = vec![shared.local_addr.to_string()];
                         addrs.extend(
                             shared
@@ -2015,8 +2025,36 @@ mod tests {
         a.connect(&b.local_addr().to_string()).unwrap();
 
         let c_addr = c.local_addr();
-        let learned = wait_until(15, || a.known_peers().contains(&c_addr));
+        let learned = wait_until(15, || {
+            // These standalone transport fixtures explicitly simulate the
+            // application's verified Hello before enabling discovery.
+            for node in [&a, &b, &c] {
+                for peer in node.connected_peers() {
+                    node.mark_authenticated(peer);
+                }
+            }
+            a.known_peers().contains(&c_addr)
+        });
         assert!(learned, "A discovered C transitively through B");
+    }
+
+    #[test]
+    fn unauthenticated_discovery_cannot_poison_the_address_book() {
+        let a = TcpNode::bind("127.0.0.1:0").unwrap();
+        let b = TcpNode::bind("127.0.0.1:0").unwrap();
+        let c = TcpNode::bind("127.0.0.1:0").unwrap();
+        a.connect(&b.local_addr().to_string()).unwrap();
+        assert!(wait_until(5, || a.peer_count() > 0 && b.peer_count() > 0));
+        b.broadcast(&NetMessage::Peers(vec![c.local_addr().to_string()]));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!a.known_peers().contains(&c.local_addr()));
+        for node in [&a, &b] {
+            for peer in node.connected_peers() {
+                node.mark_authenticated(peer);
+            }
+        }
+        b.broadcast(&NetMessage::Peers(vec![c.local_addr().to_string()]));
+        assert!(wait_until(5, || a.known_peers().contains(&c.local_addr())));
     }
 
     #[test]

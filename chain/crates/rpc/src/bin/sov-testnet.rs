@@ -19,6 +19,7 @@
 //!                    [--base-rpc 8645] [--base-p2p 9645] [--faucet-sov F]
 //!                    [--block-time-ms 60000] [--pow sha256d|randomx]
 //!                    [--pq-rehearsal yes] # isolated mandatory PQ R=48 / S=64
+//!                    [--suite2-rehearsal yes] # opt-in hiding suite, distinct genesis
 //!     # DEFAULT policy is mainnet-like: NO pre-mine (genesis funds nothing, the
 //!     # whole 21M cap is mined at 12.5 XUS/block and taxed 9%/1%). The faucet is
 //!     # the first miner, dispensing coins it mines. `--policy test` instead
@@ -59,7 +60,7 @@ use serde::{Deserialize, Serialize};
 use sov_primitives::{AccountId, Balance};
 use sov_rpc::{
     ChainSpec, Keystore, KeystoreEntry, NodeConfig, PolicyPreset, RpcClient, SpecAccount,
-    PQ_REHEARSAL_CHAIN_PREFIX,
+    PQ_REHEARSAL_CHAIN_PREFIX, SUITE2_REHEARSAL_CHAIN_PREFIX,
 };
 
 use sov_crypto::Keypair;
@@ -245,6 +246,14 @@ fn public_key_string(seed_hex: &str) -> Result<String, Box<dyn Error>> {
 /// Select the pinned retirement namespace explicitly; a canonical identity can
 /// never be repurposed as a rehearsal with different consensus rules.
 fn generated_chain_id(flags: &Flags) -> Result<String, Box<dyn Error>> {
+    let suite2 = match flags.get("suite2-rehearsal") {
+        None | Some("no") | Some("false") => false,
+        Some("yes") | Some("true") => true,
+        Some(_) => return Err("--suite2-rehearsal requires yes|no".into()),
+    };
+    if suite2 && !cfg!(feature = "zk-suite2") {
+        return Err("--suite2-rehearsal requires a build with --features zk-suite2".into());
+    }
     let pq_rehearsal = match flags.get("pq-rehearsal") {
         None | Some("no") | Some("false") => false,
         Some("yes") | Some("true") => true,
@@ -252,10 +261,23 @@ fn generated_chain_id(flags: &Flags) -> Result<String, Box<dyn Error>> {
     };
     let default = if pq_rehearsal {
         "sov-pq-rehearsal-local"
+    } else if suite2 {
+        "sov-suite2-rehearsal-local"
     } else {
         "sov-testnet"
     };
     let chain_id = flags.get("chain-id").unwrap_or(default);
+    if suite2 && pq_rehearsal {
+        return Err("choose only one rehearsal".into());
+    }
+    if suite2
+        && (!chain_id.starts_with(SUITE2_REHEARSAL_CHAIN_PREFIX) || chain_id.contains("mainnet"))
+    {
+        return Err("suite2 rehearsal requires its isolated reserved namespace".into());
+    }
+    if !suite2 && chain_id.starts_with(SUITE2_REHEARSAL_CHAIN_PREFIX) {
+        return Err("the suite2 namespace requires --suite2-rehearsal yes".into());
+    }
     if pq_rehearsal
         && (!chain_id.starts_with(PQ_REHEARSAL_CHAIN_PREFIX) || chain_id.contains("mainnet"))
     {
@@ -476,6 +498,7 @@ fn cmd_gen(flags: &Flags) -> Result<(), Box<dyn Error>> {
                 scheme: Some("hybrid65".into()),
                 mnemonic: None,
                 public_key: None,
+                operate_as: None,
             }],
         };
         write_json(&node_dir.join("keystore.json"), &keystore)?;
@@ -596,6 +619,7 @@ fn cmd_join(flags: &Flags) -> Result<(), Box<dyn Error>> {
             scheme: Some("hybrid65".into()),
             mnemonic: None,
             public_key: None,
+            operate_as: None,
         }],
     };
     write_json(&node_dir.join("keystore.json"), &keystore)?;

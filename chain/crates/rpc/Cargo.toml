@@ -31,6 +31,7 @@ sov-shielded = { path = "../shielded" }
 sov-shielded-pq = { path = "../shielded-pq" }
 sov-wallet = { path = "../wallet" }
 borsh.workspace = true
+base64 = "0.22"
 hex.workspace = true
 sha2 = "0.10"
 wat = "1"
@@ -45,3 +46,7 @@ thiserror.workspace = true
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
+
+[features]
+default = ["zk-suite2"]
+zk-suite2 = ["sov-node/zk-suite2", "sov-chain/zk-suite2", "sov-runtime/zk-suite2", "sov-shielded-pq/zk-suite2"]

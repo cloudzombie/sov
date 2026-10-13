@@ -20,6 +20,11 @@ ignore = [
     # patch (upstream is dead). The original `proc-macro-error` (RUSTSEC-2024-0370)
     # is no longer in the tree, so its waiver was removed.
     "RUSTSEC-2026-0173", # proc-macro-error2 — unmaintained
+    # Reviewed 2026-10-11: pinned p3-field 0.8.0 uses paste 1.0.15 only as a
+    # compile-time identifier macro. RUSTSEC-2024-0436 is an unmaintained
+    # notice, not a runtime vulnerability; no paste crate code is linked into
+    # Station. Revisit upstream replacement before production suite-2 activation.
+    "RUSTSEC-2024-0436", # paste — build-only, optional hiding-proof dependency
 ]
 
 [bans]

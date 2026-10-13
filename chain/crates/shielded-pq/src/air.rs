@@ -323,7 +323,7 @@ impl ToElements<Felt> for BundlePublicInputs {
 //   120..128 range-check landing: accumulator == value register (×8)
 //   128      value conservation (public t_in/t_out/fee folded in)
 //   129      leaf-position accumulator recurrence (PQV2-01)
-const NUM_CONSTRAINTS: usize = 130;
+pub(crate) const NUM_CONSTRAINTS: usize = 130;
 
 // Periodic column index map (must match `get_periodic_column_values`):
 //   0        hash-round mask (period 8)
@@ -334,26 +334,26 @@ const NUM_CONSTRAINTS: usize = 130;
 //   45 m_acc         46 m_isbit        47..55 m_rcend_m
 //   55 m_bal         56 m_const_keys   57 m_const_vals
 //   58 m_pos_step    59 m_pos_weight
-const P_ROW0: usize = 25;
-const P_SEED_IN: usize = 26;
-const P_TAG: usize = 27;
-const P_TAG_I: usize = 28;
-const P_CM: usize = 32;
-const P_MERKLE: usize = 33;
-const P_NF_ANY: usize = 34;
-const P_NF_I: usize = 35;
-const P_OUTSEED: usize = 39;
-const P_OUTSEED_J: usize = 40;
-const P_OUTCM: usize = 44;
-const P_ACC: usize = 45;
-const P_ISBIT: usize = 46;
-const P_RCEND_M: usize = 47;
-const P_BAL: usize = 55;
-const P_CONST_KEYS: usize = 56;
-const P_CONST_VALS: usize = 57;
-const P_POS_STEP: usize = 58;
-const P_POS_W: usize = 59;
-const NUM_PERIODIC: usize = 60;
+pub(crate) const P_ROW0: usize = 25;
+pub(crate) const P_SEED_IN: usize = 26;
+pub(crate) const P_TAG: usize = 27;
+pub(crate) const P_TAG_I: usize = 28;
+pub(crate) const P_CM: usize = 32;
+pub(crate) const P_MERKLE: usize = 33;
+pub(crate) const P_NF_ANY: usize = 34;
+pub(crate) const P_NF_I: usize = 35;
+pub(crate) const P_OUTSEED: usize = 39;
+pub(crate) const P_OUTSEED_J: usize = 40;
+pub(crate) const P_OUTCM: usize = 44;
+pub(crate) const P_ACC: usize = 45;
+pub(crate) const P_ISBIT: usize = 46;
+pub(crate) const P_RCEND_M: usize = 47;
+pub(crate) const P_BAL: usize = 55;
+pub(crate) const P_CONST_KEYS: usize = 56;
+pub(crate) const P_CONST_VALS: usize = 57;
+pub(crate) const P_POS_STEP: usize = 58;
+pub(crate) const P_POS_W: usize = 59;
+pub(crate) const NUM_PERIODIC: usize = 60;
 
 /// The bundle AIR. See the module docs for the statement and trace layout.
 pub struct BundleAir {

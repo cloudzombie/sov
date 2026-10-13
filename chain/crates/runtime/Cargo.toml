@@ -27,6 +27,9 @@ thiserror.workspace = true
 sov-verify = { path = "../verify" }
 wat = "1"
 
+[features]
+zk-suite2 = ["sov-shielded-pq/zk-suite2"]
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
