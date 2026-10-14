@@ -1533,8 +1533,8 @@ fn call(
                 "creationAllowed": suite2_allowed,
                 // Admission and historical state are separate capabilities.
                 // Existing notes remain readable and part of total supply,
-                // even though this proof suite cannot safely authorize a new
-                // private send or an independent-owner recovery withdrawal.
+                // while new suite-2 sends and recovery withdrawals follow the
+                // next-block policy derived from committed miner readiness.
                 "spendsAllowed": suite2_allowed,
                 "recoveryAllowed": suite2_allowed,
                 "scanSupported": true,

@@ -121,17 +121,11 @@ pub struct Blockchain {
     /// byte-identical to pre-fork, so the genesis hash and every KAT vector are
     /// reproduced exactly and a chain that never schedules it is unaffected.
     fee_auction_deployment: Option<sov_governance::Deployment>,
-    /// The miner-signaled `shielded-v2` deployment (signal bit 2 — the
-    /// post-quantum shielded pool), if this chain schedules one. **No chain
-    /// does today**: v0.2.0 defines bit 2 but bakes NO schedule (D13), so this
-    /// is `None` on mainnet and every node, which keeps `Action::ShieldedV2` a
-    /// hard `FeatureInactive` reject at every height — execution, the genesis
-    /// hash, and every KAT vector byte-identical to a build without pool v2.
-    /// Arming is a later, separately-audited release that installs a
-    /// deployment here, exactly as v0.1.99 did for bits 0/1.
+    /// The miner-signaled `shielded-v2` deployment (signal bit 2), if this chain
+    /// schedules one. The daemon installs its release-pinned mainnet schedule
+    /// before replay; a chain with no schedule keeps the action inactive.
     shielded_v2_deployment: Option<sov_governance::Deployment>,
-    /// Independently signaled replacement proof suite; absent on canonical
-    /// networks until a reviewed activation schedule is published.
+    /// The original independently signaled replacement proof deployment.
     shielded_v2_suite2_deployment: Option<sov_governance::Deployment>,
     /// A separate prospective suite-2 readiness window. The original bit-5
     /// deployment and its committed historical votes remain unchanged.
@@ -1118,10 +1112,6 @@ impl Blockchain {
     /// turnstile, value balance, drain limiter). Dormant until activation —
     /// pre-activation execution (and thus the genesis hash and every KAT
     /// vector) is byte-identical: the variant stays a hard reject.
-    ///
-    /// **Nothing calls this on a real chain in v0.2.0.** Bit 2 is defined but
-    /// unarmed (D13); this exists so arming is a schedule change rather than
-    /// new consensus code, and so tests can drive a real activation.
     pub fn set_shielded_v2_deployment(&mut self, deployment: sov_governance::Deployment) {
         self.shielded_v2_deployment = Some(deployment);
     }
@@ -1519,8 +1509,7 @@ impl Blockchain {
 
     /// Whether the miner-signaled `shielded-v2` deployment (bit 2) is `Active`
     /// for a block at `height`, over the active chain's committed signals.
-    /// `false` on every chain today — no schedule is baked (D13) — which keeps
-    /// `Action::ShieldedV2` a hard reject and the pool-v2 state absent.
+    /// False until committed readiness activates this chain's configured schedule.
     pub fn shielded_v2_active(&self, height: u64) -> bool {
         self.shielded_v2_active_with(height, &self.signals)
     }
