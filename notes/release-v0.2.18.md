@@ -47,3 +47,11 @@ activation policy. A matched client/miner/relay upgrade is required; older peers
 cannot authenticate with protocol 3. Do not reset chain data or replace wallet
 seeds. Mainnet legacy-key retirement remains unarmed, and independent proof and
 quantum-soundness review remain outstanding.
+
+Peer discovery now announces a bounded address set when Hello authentication
+completes, in addition to requesting addresses. This repairs the ordering race
+where the other endpoint correctly discarded an early unauthenticated request
+and discovery never resumed. A deterministic regression forces that ordering;
+unauthenticated address-book poisoning remains rejected. Stratum protocol tests
+also use the actual bridge-owned ephemeral listener, removing a released-port
+race under parallel test execution.

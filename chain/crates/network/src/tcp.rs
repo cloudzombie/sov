@@ -874,7 +874,16 @@ impl TcpNode {
         let peer = self.shared.peers.lock().unwrap().get(&addr).cloned();
         if let Some(peer) = peer {
             if !peer.authenticated.swap(true, Ordering::AcqRel) {
-                let _ = write_frame(&peer, &NetMessage::GetAddr);
+                // The remote side may have discarded our initial request while
+                // its application was still authenticating our Hello. Announce
+                // our bounded address set as well as asking for theirs: whichever
+                // endpoint finishes last restarts discovery in both directions.
+                let result = write_frame(&peer, &NetMessage::GetAddr).and_then(|_| {
+                    write_frame(&peer, &NetMessage::Peers(discovery_addresses(&self.shared)))
+                });
+                if result.is_err() {
+                    self.drop_broken_peer(&addr);
+                }
             }
         }
     }
@@ -1096,6 +1105,23 @@ fn attempt_dial(shared: &Arc<Shared>, addr: SocketAddr) -> std::io::Result<()> {
             Err(e)
         }
     }
+}
+
+/// The same bounded, live address set for post-authentication announcements
+/// and explicit GetAddr replies. All locks are released before network writes.
+fn discovery_addresses(shared: &Shared) -> Vec<String> {
+    let mut addrs = vec![shared.local_addr.to_string()];
+    addrs.extend(
+        shared
+            .known
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| !addr_is_dead(shared, a))
+            .take(MAX_PEERS_PER_MSG.saturating_sub(1))
+            .map(|a| a.to_string()),
+    );
+    addrs
 }
 
 /// Register a freshly-established connection. The Noise handshake (which blocks)
@@ -1468,18 +1494,7 @@ fn reader_loop(shared: &Arc<Shared>, key: SocketAddr, mut reader: TcpStream, pee
                         if !peer.authenticated.load(Ordering::Acquire) {
                             continue;
                         }
-                        let mut addrs = vec![shared.local_addr.to_string()];
-                        addrs.extend(
-                            shared
-                                .known
-                                .lock()
-                                .unwrap()
-                                .iter()
-                                .filter(|a| !addr_is_dead(shared, a))
-                                .take(MAX_PEERS_PER_MSG.saturating_sub(1))
-                                .map(|a| a.to_string()),
-                        );
-                        let _ = write_frame(&peer, &NetMessage::Peers(addrs));
+                        let _ = write_frame(&peer, &NetMessage::Peers(discovery_addresses(shared)));
                     }
                     message => {
                         // Bounded by BOTH count and bytes; a count-only bound is not a
@@ -2036,6 +2051,45 @@ mod tests {
             a.known_peers().contains(&c_addr)
         });
         assert!(learned, "A discovered C transitively through B");
+    }
+
+    #[test]
+    fn discovery_recovers_when_remote_authenticates_after_initial_request() {
+        let a = TcpNode::bind("127.0.0.1:0").unwrap();
+        let b = TcpNode::bind("127.0.0.1:0").unwrap();
+        let c = TcpNode::bind("127.0.0.1:0").unwrap();
+        // B has an address to advertise which A cannot learn elsewhere.
+        b.shared.known.lock().unwrap().insert(c.local_addr());
+        a.connect(&b.local_addr().to_string()).unwrap();
+        assert!(wait_until(5, || a.peer_count() == 1 && b.peer_count() == 1));
+        let a_inbound = b.connected_peers()[0];
+
+        a.mark_authenticated(b.local_addr());
+        // An ordered application frame is a barrier: seeing it in B's inbox
+        // proves B already consumed (and refused) A's unauthenticated discovery
+        // request. No sleep or scheduler-dependent assumption establishes this.
+        let barrier = status(12345);
+        assert!(a.send(b.local_addr(), &barrier));
+        assert!(wait_until(5, || b
+            .drain()
+            .iter()
+            .any(|(_, msg)| msg == &barrier)));
+        assert!(!a.known_peers().contains(&c.local_addr()));
+
+        // Only now does B finish verifying A's Hello. Both directions must
+        // discover without a reconnect or a second mark_authenticated call.
+        b.mark_authenticated(a_inbound);
+        assert!(
+            wait_until(5, || a.known_peers().contains(&c.local_addr())),
+            "late authentication must restart both directions of discovery"
+        );
+        assert!(
+            wait_until(5, || a.connected_peers().contains(&c.local_addr())),
+            "the learned address must actually be dialed"
+        );
+        for node in [&a, &b, &c] {
+            node.shutdown();
+        }
     }
 
     #[test]
