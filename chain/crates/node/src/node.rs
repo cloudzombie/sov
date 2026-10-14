@@ -14,6 +14,8 @@
 //! networked multi-node operation layer on top — which keeps the core
 //! production logic fully testable.
 
+use borsh::{BorshDeserialize, BorshSerialize};
+use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sov_chain::{Blockchain, ChainError, MiningCandidate};
@@ -22,6 +24,19 @@ use sov_primitives::{AccountId, Hash};
 use sov_types::{Action, Block, Receipt, SignedTransaction};
 
 use crate::timing::{TxTiming, TxTimingIndex};
+
+/// A bounded node-local rejection observation, never an on-chain receipt.
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct TxRejection {
+    /// Public transaction identifier.
+    pub tx_id: Hash,
+    /// Canonical height when this node rejected the transaction.
+    pub height: u64,
+    /// Canonical head at that observation (may subsequently be reorganized).
+    pub head: Hash,
+    /// Human-readable reason, capped at 512 characters.
+    pub reason: String,
+}
 
 /// A running SOV node.
 pub struct Node {
@@ -36,6 +51,7 @@ pub struct Node {
     /// execution, selection, or fork choice, so it cannot influence any
     /// committed root. Bounded by construction; persisted outside the block log.
     timing: TxTimingIndex,
+    rejections: VecDeque<TxRejection>,
 }
 
 /// The outcome of mining one block.
@@ -55,6 +71,7 @@ impl Node {
             mempool: Mempool::new(mempool_capacity),
             max_block_txs,
             timing: TxTimingIndex::new(),
+            rejections: VecDeque::new(),
         };
         node.refresh_mempool_domain();
         node
@@ -174,7 +191,13 @@ impl Node {
     ///
     /// [`Mempool::entries`]: sov_mempool::Mempool::entries
     pub fn mempool_entries(&self, limit: usize) -> Vec<sov_mempool::MempoolEntry> {
-        self.mempool.entries(limit)
+        let mut entries = self.mempool.entries(limit);
+        for entry in &mut entries {
+            entry.ready = self
+                .pending_status(&entry.id)
+                .is_some_and(|(_, ready)| ready);
+        }
+        entries
     }
 
     /// This node's recorded timing for transaction `id`, or `None` when it holds
@@ -368,6 +391,12 @@ impl Node {
                 account: stx.transaction.signer.to_string(),
             });
         }
+        if let Err(error) = sov_runtime::shielded_v2::reject_spent_inputs(
+            &stx.transaction.action,
+            self.chain.ledger(),
+        ) {
+            return Err(NodeError::SpentV2(error));
+        }
         // A fee-empty wallet may submit a direct hiding-suite withdrawal.
         // Mirror execution's proof-backed funding exception without crediting
         // any hypothetical payout to its mempool balance or later transfers.
@@ -455,6 +484,73 @@ impl Node {
             .map_err(NodeError::Mempool)
     }
 
+    /// Record an eviction without changing the chain or consuming a nonce.
+    pub fn reject_tx(&mut self, id: Hash, reason: String) {
+        self.mempool.remove_pending(&id);
+        self.rejections.retain(|r| r.tx_id != id);
+        self.rejections.push_back(TxRejection {
+            tx_id: id,
+            height: self.chain.height(),
+            head: self.chain.head().hash(),
+            reason: reason.chars().take(512).collect(),
+        });
+        while self.rejections.len() > 4096 {
+            self.rejections.pop_front();
+        }
+    }
+
+    /// Last rejection by this node. Receipt and current pool membership take precedence.
+    pub fn tx_rejection(&self, id: &Hash) -> Option<&TxRejection> {
+        self.rejections.iter().rev().find(|r| r.tx_id == *id)
+    }
+
+    /// Persistable public observations; contains no signing material or proofs.
+    pub fn rejection_snapshot(&self) -> Vec<TxRejection> {
+        self.rejections.iter().cloned().collect()
+    }
+
+    /// Restore bounded node-local observations without affecting consensus.
+    pub fn restore_rejections(&mut self, rows: Vec<TxRejection>) {
+        self.rejections = rows
+            .into_iter()
+            .rev()
+            .take(4096)
+            .map(|mut r| {
+                r.reason = r.reason.chars().take(512).collect();
+                r
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+    }
+
+    /// Current pool membership and nonce reachability, without proof verification.
+    pub fn pending_status(&self, id: &Hash) -> Option<(&SignedTransaction, bool)> {
+        self.mempool
+            .transaction_status(id, |a| self.chain.ledger().account(a).nonce)
+    }
+
+    /// Evict spent inputs on relay nodes too. Work is bounded by pool capacity
+    /// and reads only each bundle's fixed-size public prefix, never its proof.
+    pub fn prune_spent_v2(&mut self) {
+        let invalid: Vec<_> = self
+            .mempool
+            .transactions()
+            .filter_map(|tx| {
+                sov_runtime::shielded_v2::reject_spent_inputs(
+                    &tx.transaction.action,
+                    self.chain.ledger(),
+                )
+                .err()
+                .map(|e| (tx.id(), format!("shielded-v2: {e}")))
+            })
+            .collect();
+        for (id, reason) in invalid {
+            self.reject_tx(id, reason);
+        }
+    }
+
     /// A snapshot of the pending pool — persisted to disk so it survives a restart.
     pub fn mempool_snapshot(&self) -> Vec<SignedTransaction> {
         self.mempool.snapshot()
@@ -463,12 +559,12 @@ impl Node {
     /// Re-admit a persisted pool against current state on startup, dropping any tx that no
     /// longer validates (stale nonce, now unaffordable).
     pub fn restore_mempool(&mut self, txs: Vec<SignedTransaction>) {
-        let ledger = self.chain.ledger();
-        self.mempool.restore(
-            txs,
-            |a| ledger.account(a).nonce,
-            |a| ledger.account(a).balance,
-        );
+        for tx in txs {
+            let id = tx.id();
+            if let Err(error) = self.submit(tx) {
+                self.reject_tx(id, error.to_string());
+            }
+        }
     }
 
     /// Produce (mine), import, and (self-)finalize the next block at
@@ -593,6 +689,7 @@ impl Node {
             self.mempool
                 .evict_stranded(|a| ledger.account(a).nonce, sov_mempool::STRANDED_TTL_MS);
         }
+        self.prune_spent_v2();
         Ok(Produced { block, receipts })
     }
 
@@ -667,6 +764,7 @@ impl Node {
         // stranded-entry backstop must live here too, not only on the produce path.
         self.mempool
             .evict_stranded(|a| ledger.account(a).nonce, sov_mempool::STRANDED_TTL_MS);
+        self.prune_spent_v2();
         Ok(imported.receipts)
     }
 }
@@ -677,6 +775,9 @@ pub enum NodeError {
     /// A transaction was rejected by the mempool.
     #[error("mempool rejected transaction: {0}")]
     Mempool(MempoolError),
+    /// A pool input has already been consumed on this chain.
+    #[error("shielded-v2: {0}")]
+    SpentV2(sov_runtime::ShieldedV2Error),
     /// A direct activated hiding-suite withdrawal cannot safely fund its fee.
     #[error("suite-2 withdrawal fee funding rejected: {0}")]
     Suite2FeeFunding(sov_runtime::ExecutionError),
@@ -748,6 +849,46 @@ mod tests {
             },
         };
         SignedTransaction::sign(tx, &kp).unwrap()
+    }
+
+    #[test]
+    fn rejecting_a_front_transaction_exposes_the_nonce_gap_and_retains_the_reason() {
+        let mut node = devnet_node();
+        let first = usa_transfer("ecb.reserve.sov", 1, 0);
+        let second = usa_transfer("ecb.reserve.sov", 1, 1);
+        node.submit(first.clone()).unwrap();
+        node.submit(second.clone()).unwrap();
+        assert!(node.pending_status(&second.id()).unwrap().1);
+        node.reject_tx(first.id(), "input 0: nullifier already spent".into());
+        assert!(node.pending_status(&first.id()).is_none());
+        assert!(!node.pending_status(&second.id()).unwrap().1);
+        assert!(node
+            .tx_rejection(&first.id())
+            .unwrap()
+            .reason
+            .contains("already spent"));
+        let bytes = borsh::to_vec(&node.rejection_snapshot()).unwrap();
+        let mut restarted = devnet_node();
+        restarted.restore_rejections(borsh::from_slice(&bytes).unwrap());
+        restarted.restore_mempool(node.mempool_snapshot());
+        assert!(restarted.tx_rejection(&first.id()).is_some());
+        assert!(!restarted.pending_status(&second.id()).unwrap().1);
+        // Filling the missing slot recovers the queue; no nonce is consumed by rejection.
+        restarted.submit(first).unwrap();
+        assert!(restarted.pending_status(&second.id()).unwrap().1);
+        assert_eq!(restarted.account_nonce(&id("usa.reserve.sov")), 0);
+    }
+
+    #[test]
+    fn restored_pool_rechecks_account_authorization() {
+        let mut node = devnet_node();
+        let wrong_key = Keypair::from_seed([9; 32]);
+        let mut tx = usa_transfer("ecb.reserve.sov", 1, 0).transaction;
+        tx.public_key = wrong_key.public_key();
+        let tx = SignedTransaction::sign(tx, &wrong_key).unwrap();
+        node.restore_mempool(vec![tx.clone()]);
+        assert_eq!(node.mempool_len(), 0);
+        assert!(node.tx_rejection(&tx.id()).is_some());
     }
 
     #[test]

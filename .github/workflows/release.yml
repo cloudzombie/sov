@@ -396,7 +396,7 @@ jobs:
             recovery window with recipient-bound authorization. New Station
             shielded-v1 deposits/private sends are disabled. All new pool-v2
             version-1 transaction admission and proof creation remain disabled.
-            Version 0.2.16 includes the context-bound hiding replacement, with
+            The context-bound hiding replacement includes
             original-seed ownership proofs for existing notes. Mainnet bit-5
             readiness starts at **27,648** (90% of a 288-block window); earliest
             activation is **28,224**, with no forced lock-in. After activation,
@@ -405,6 +405,15 @@ jobs:
             Existing wallet seeds and notes are preserved; scans authenticate
             receipts and roots, follow executed wrappers, and recover incomplete
             caches without overwriting the originals.
+
+            **V2 wallet repair:** both receiving keys share one authenticated,
+            incremental scan with bounded block/receipt pages and visible progress.
+            Withdrawal Max stays a gross amount and refreshes after completed
+            scans; fees and network limits are shown separately. Relays remove
+            already-spent V2 inputs from pending work, preserve rejection reasons,
+            and distinguish rejected transactions from missing earlier nonces.
+            Station keeps rejection history across restart. No transaction is
+            automatically resent and no chain or wallet reset is required.
 
             The Apple Silicon build uses an explicit ARM64/M1 baseline and
             macOS 11 deployment target for Rust and RandomX C/C++ code. The

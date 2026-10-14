@@ -1487,6 +1487,49 @@ impl Mempool {
         evicted + (before - self.queued.len())
     }
 
+    /// Borrow all pending transactions without cloning their proof bytes.
+    pub fn transactions(&self) -> impl Iterator<Item = &SignedTransaction> {
+        self.by_id
+            .values()
+            .chain(self.queued.values().map(|q| &q.stx))
+    }
+
+    /// Lookup with actual nonce reachability, including a gap created by eviction.
+    pub fn transaction_status(
+        &self,
+        id: &Hash,
+        current_nonce: impl Fn(&AccountId) -> u64,
+    ) -> Option<(&SignedTransaction, bool)> {
+        let stx = self.by_id.get(id).or_else(|| {
+            self.queued
+                .values()
+                .find(|q| q.stx.id() == *id)
+                .map(|q| &q.stx)
+        })?;
+        let signer = &stx.transaction.signer;
+        let mut next = current_nonce(signer);
+        while next < stx.transaction.nonce && self.by_sender.contains_key(&(signer.clone(), next)) {
+            next = next.saturating_add(1);
+        }
+        Some((
+            stx,
+            self.by_id.contains_key(id) && next == stx.transaction.nonce,
+        ))
+    }
+
+    /// Remove from either region, for state-invalid transaction eviction.
+    pub fn remove_pending(&mut self, id: &Hash) -> Option<SignedTransaction> {
+        if let Some(stx) = self.remove(id) {
+            return Some(stx);
+        }
+        let slot = self
+            .queued
+            .iter()
+            .find(|(_, q)| q.stx.id() == *id)
+            .map(|(slot, _)| slot.clone())?;
+        self.remove_queued(&slot).map(|q| q.stx)
+    }
+
     /// All pooled transactions — the READY region in `(signer, nonce)` order,
     /// then the QUEUED region in `(signer, nonce)` order — the snapshot persisted
     /// to disk so the pool survives a restart. Restoring re-inserts in this

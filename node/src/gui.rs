@@ -2758,6 +2758,71 @@ impl V2Guard {
     }
 }
 
+/// A withdrawal amount belongs to one wallet and network. A deliberate Max
+/// selection follows completed scans until review; typed amounts stay exact.
+#[derive(Default)]
+struct V2WithdrawalAmount {
+    text: String,
+    context: Option<(String, Network)>,
+    follows_max: bool,
+}
+
+impl V2WithdrawalAmount {
+    fn synchronize(
+        &mut self,
+        wallet: &str,
+        network: Network,
+        maximum: Option<u128>,
+        reviewed: bool,
+    ) {
+        let context = (wallet.to_owned(), network);
+        if self.context.as_ref() != Some(&context) {
+            self.clear();
+            self.context = Some(context);
+        }
+        if self.follows_max && !reviewed {
+            if let Some(maximum) = maximum {
+                self.text = grains_to_xus_plain(maximum);
+            }
+        }
+    }
+
+    fn choose_max(&mut self, maximum: u128) {
+        self.follows_max = true;
+        self.text = grains_to_xus_plain(maximum);
+    }
+
+    fn edited(&mut self) {
+        self.follows_max = false;
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.follows_max = false;
+    }
+}
+
+fn v2_withdrawal_balance_text(view: &ShieldedV2View, guard: &V2Guard) -> String {
+    if !guard.scanned {
+        return "pool balance unknown — scan pool v2 first".into();
+    }
+    let mut text = format!("pool balance {} XUS", xus(&view.balance.to_string()));
+    if guard.balance_grains < u128::from(view.balance) {
+        text.push_str(&format!(
+            " · up to {} XUS in one transaction (four input notes)",
+            xus(&guard.balance_grains.to_string())
+        ));
+    }
+    if guard.deshield_cap() < guard.balance_grains {
+        text.push_str(&format!(
+            " · current network withdrawal limit {} XUS",
+            xus(&guard.deshield_cap().to_string())
+        ));
+    }
+    text.push_str(" · gross amount before the network fee");
+    text
+}
+
 /// A pool-v2 action awaiting permission.
 #[derive(Clone, Copy, Debug)]
 enum V2Intent<'a> {
@@ -3054,18 +3119,364 @@ impl V2WalletStores {
 }
 
 fn scan_store_v2(rpc: &str, seed: [u8; 32]) -> Result<V2WalletStores, String> {
+    scan_store_v2_with_progress(rpc, seed, |_, _, _, _| {})
+}
+
+/// One history walk feeds both receiving keys. The callback exposes only public
+/// progress and already reconciled cached balances, never note/key material.
+fn scan_store_v2_with_progress(
+    rpc: &str,
+    seed: [u8; 32],
+    mut progress: impl FnMut(&V2WalletStores, u64, usize, bool),
+) -> Result<V2WalletStores, String> {
     let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(15));
     let domain = client.chain_domain().map_err(|error| error.to_string())?;
-    let mut legacy = scan_store_v2_for_key(rpc, seed, false)?;
-    let suite2 = scan_store_v2_for_key(rpc, seed, true)?;
-    // The node may add a block between the two cached traversals. Catch the
-    // older store up before publishing a combined balance and spend witnesses.
-    if legacy.scanned_height() < suite2.scanned_height() {
-        legacy = scan_store_v2_for_key(rpc, seed, false)?;
+    let store_id = Keypair::hybrid_from_seed(seed)
+        .public_key()
+        .implicit_account_id()
+        .to_string();
+    let path = note_store_v2_path(&store_id, &domain)?;
+    let suite2_path = path.with_extension("suite2.store");
+    // Includes the chain identity and wallet id. Concurrent automatic/manual or
+    // post-submit scans share this lock and reload the winner's incremental cache.
+    let scan_lock = v2_scan_lock(&path)?;
+    let _scan_guard = scan_lock.lock().map_err(|_| "pool-v2 scan lock failed")?;
+    let dkey = notes_cache_key(&seed);
+    let keys = [
+        PqShieldedKey::from_leaf_seed(&seed),
+        PqShieldedKey::from_leaf_seed_suite2(&seed),
+    ];
+    let load = |path: &Path| {
+        std::fs::read(path)
+            .ok()
+            .and_then(|enc| decrypt_blob(&dkey, &enc))
+            .and_then(|bytes| PqNoteStore::from_bytes(&bytes))
+            .unwrap_or_else(|| PqNoteStore::new(0))
+    };
+    let mut stores = V2WalletStores {
+        legacy: load(&path),
+        suite2: load(&suite2_path),
+    };
+    let persist = |stores: &V2WalletStores| -> Result<(), String> {
+        write_private_atomic(&path, &encrypt_blob(&dkey, &stores.legacy.to_bytes())?)?;
+        write_private_atomic(
+            &suite2_path,
+            &encrypt_blob(&dkey, &stores.suite2.to_bytes())?,
+        )
+    };
+    let mut info = client
+        .call("sov_getShieldedV2Info", json!({}))
+        .map_err(|error| error.to_string())?;
+    let initial_tip = v2_scan_snapshot_height(&info)?;
+    let mut known_hashes = HashMap::new();
+    reconcile_v2_scan_cache(&client, &mut stores.legacy, initial_tip, &mut known_hashes)?;
+    reconcile_v2_scan_cache(&client, &mut stores.suite2, initial_tip, &mut known_hashes)?;
+    progress(
+        &stores,
+        initial_tip,
+        0,
+        validate_v2_store_pair(&stores.legacy, &stores.suite2).is_ok(),
+    );
+    let mut batched = true;
+    let mut history_requests = 0;
+    let mut last_persist = Instant::now();
+    let mut persisted_height = stores
+        .legacy
+        .scanned_height()
+        .min(stores.suite2.scanned_height());
+    // A snapshot remains pinned while pages are fetched. A newly mined block is
+    // caught up without discarding the completed work or traversing it twice.
+    for _ in 0..3 {
+        let tip = v2_scan_snapshot_height(&info)?;
+        if tip
+            < stores
+                .legacy
+                .scanned_height()
+                .max(stores.suite2.scanned_height())
+        {
+            return Err("the chain reorganized during the pool-v2 scan; scan will retry".into());
+        }
+        let snapshot_hash = if tip == 0 {
+            domain.genesis()
+        } else {
+            Hash::from_bytes(
+                canonical_hash(&client, tip)?.ok_or("pool-v2 snapshot block unavailable")?,
+            )
+        };
+        let mut next = stores
+            .legacy
+            .scanned_height()
+            .min(stores.suite2.scanned_height())
+            .saturating_add(1);
+        while next <= tip {
+            let blocks = fetch_v2_scan_page(
+                &client,
+                &domain,
+                next,
+                tip,
+                snapshot_hash,
+                &mut batched,
+                &mut history_requests,
+            )?;
+            ingest_v2_scan_page(&mut stores, &keys, &blocks, &domain, tip, snapshot_hash)?;
+            next = blocks
+                .last()
+                .ok_or("empty pool-v2 scan page")?
+                .block
+                .header
+                .height
+                .get()
+                + 1;
+            if next.saturating_sub(1).saturating_sub(persisted_height) >= V2_SCAN_PAGE_BLOCKS
+                || last_persist.elapsed() >= Duration::from_secs(1)
+                || next > tip
+            {
+                persist(&stores)?;
+                persisted_height = next - 1;
+                last_persist = Instant::now();
+            }
+            progress(&stores, tip, history_requests, false);
+        }
+        validate_v2_store_pair(&stores.legacy, &stores.suite2)?;
+        if !validate_v2_scan_snapshot(&stores.legacy, &info)? {
+            return Err("pool-v2 snapshot height changed; scan will retry".into());
+        }
+        validate_scan_origin(&client, &domain, stores.legacy.tip_checkpoint())?;
+        let latest = client
+            .call("sov_getShieldedV2Info", json!({}))
+            .map_err(|error| error.to_string())?;
+        if validate_v2_scan_snapshot(&stores.legacy, &latest)? {
+            persist(&stores)?;
+            progress(&stores, tip, history_requests, true);
+            return Ok(stores);
+        }
+        info = latest;
     }
-    validate_v2_store_pair(&legacy, &suite2)?;
-    validate_scan_origin(&client, &domain, legacy.tip_checkpoint())?;
-    Ok(V2WalletStores { legacy, suite2 })
+    Err("the chain advanced during the pool-v2 scan; scan again to finish catching up".into())
+}
+
+fn v2_scan_lock(path: &Path) -> Result<Arc<Mutex<()>>, String> {
+    type ScanLocks = Mutex<HashMap<PathBuf, std::sync::Weak<Mutex<()>>>>;
+    static LOCKS: std::sync::OnceLock<ScanLocks> = std::sync::OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| "pool-v2 scan lock registry failed")?;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(path).and_then(std::sync::Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+fn v2_scan_snapshot_height(info: &Value) -> Result<u64, String> {
+    info.get("height")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "node did not report its pool-v2 snapshot height".into())
+}
+
+fn reconcile_v2_scan_cache(
+    client: &RpcClient,
+    store: &mut PqNoteStore,
+    tip: u64,
+    known_hashes: &mut HashMap<u64, Option<[u8; 32]>>,
+) -> Result<(), String> {
+    let Some((height, cached_hash)) = store.tip_checkpoint() else {
+        return Ok(());
+    };
+    let mut canonical = |height| -> Result<Option<[u8; 32]>, String> {
+        if height > tip {
+            return Ok(None);
+        }
+        if let Some(hash) = known_hashes.get(&height) {
+            return Ok(*hash);
+        }
+        let hash = canonical_hash(client, height)?;
+        known_hashes.insert(height, hash);
+        Ok(hash)
+    };
+    if canonical(height)? == Some(cached_hash) {
+        return Ok(());
+    }
+    for (height, hash) in store.checkpoints().into_iter().rev() {
+        if canonical(height)? == Some(hash) && store.rollback_to(height) {
+            return Ok(());
+        }
+    }
+    *store = PqNoteStore::new(store.birthday());
+    Ok(())
+}
+
+const V2_SCAN_PAGE_BLOCKS: u64 = 256;
+const V2_SCAN_FALLBACK_WORKERS: u64 = 8;
+
+struct V2ScanBlock {
+    block: Block,
+    receipts: Vec<Receipt>,
+}
+
+fn parse_v2_scan_page(
+    value: Value,
+    domain: &sov_primitives::SigningDomain,
+    from: u64,
+    tip: u64,
+    snapshot_hash: Hash,
+) -> Result<Vec<V2ScanBlock>, String> {
+    let entries = value
+        .get("blocks")
+        .and_then(Value::as_array)
+        .ok_or("node returned malformed pool-v2 scan blocks")?;
+    let next = from
+        .checked_add(entries.len() as u64)
+        .ok_or("scan height overflow")?;
+    if value.get("chainId").and_then(Value::as_str) != Some(domain.chain_id())
+        || value.get("genesisHash").and_then(Value::as_str)
+            != Some(domain.genesis().to_hex().as_str())
+        || value.get("snapshotHeight").and_then(Value::as_u64) != Some(tip)
+        || value.get("snapshotHash").and_then(Value::as_str)
+            != Some(snapshot_hash.to_hex().as_str())
+        || value.get("fromHeight").and_then(Value::as_u64) != Some(from)
+        || value.get("nextHeight").and_then(Value::as_u64) != Some(next)
+        || value.get("complete").and_then(Value::as_bool) != Some(next > tip)
+        || entries.is_empty()
+        || entries.len() > V2_SCAN_PAGE_BLOCKS as usize
+        || next.saturating_sub(1) > tip
+    {
+        return Err(
+            "pool-v2 scan page changed its chain, snapshot, or contiguous range; scan will retry"
+                .into(),
+        );
+    }
+    entries
+        .iter()
+        .enumerate()
+        .map(|(offset, entry)| {
+            let block: Block =
+                serde_json::from_value(entry.get("block").cloned().unwrap_or(Value::Null))
+                    .map_err(|error| format!("malformed pool-v2 scan block: {error}"))?;
+            if block.header.height.get() != from + offset as u64 {
+                return Err(
+                    "pool-v2 scan page omitted or reordered a block; scan will retry".into(),
+                );
+            }
+            let receipts = validated_scan_receipts(
+                &block,
+                entry.get("receipts").cloned().unwrap_or(Value::Null),
+            )?;
+            Ok(V2ScanBlock { block, receipts })
+        })
+        .collect()
+}
+
+fn fetch_v2_scan_page(
+    client: &RpcClient,
+    domain: &sov_primitives::SigningDomain,
+    from: u64,
+    tip: u64,
+    snapshot_hash: Hash,
+    batched: &mut bool,
+    history_requests: &mut usize,
+) -> Result<Vec<V2ScanBlock>, String> {
+    let mut fallback_count = V2_SCAN_FALLBACK_WORKERS.min(tip - from + 1);
+    if *batched {
+        *history_requests += 1;
+        match client.call(
+            "sov_getWalletScanBlocks",
+            json!({
+                "fromHeight": from, "limit": V2_SCAN_PAGE_BLOCKS,
+                "snapshotHeight": tip, "snapshotHash": snapshot_hash.to_hex(),
+            }),
+        ) {
+            Ok(value) => return parse_v2_scan_page(value, domain, from, tip, snapshot_hash),
+            Err(sov_rpc::RpcClientError::Rpc { code: -32601, .. }) => *batched = false,
+            // A large historical block gets its existing bounded full-block RPC;
+            // later pages continue to use batches. Other failures never degrade.
+            Err(sov_rpc::RpcClientError::Rpc { code: -32012, .. }) => fallback_count = 1,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    *history_requests += 2 * fallback_count as usize;
+    std::thread::scope(|scope| {
+        let jobs: Vec<_> = (from..from + fallback_count)
+            .map(|height| {
+                scope.spawn(move || {
+                    let block = client
+                        .block_by_height(height)
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| format!("block {height} unavailable; will resume"))?;
+                    let value = client
+                        .call("sov_getBlockReceipts", json!({"height": height}))
+                        .map_err(|error| error.to_string())?;
+                    let receipts = validated_scan_receipts(&block, value)?;
+                    Ok(V2ScanBlock { block, receipts })
+                })
+            })
+            .collect();
+        jobs.into_iter()
+            .map(|job| {
+                job.join()
+                    .map_err(|_| "pool-v2 scan worker failed".to_string())?
+            })
+            .collect()
+    })
+}
+
+fn ingest_v2_scan_page(
+    stores: &mut V2WalletStores,
+    keys: &[PqShieldedKey; 2],
+    blocks: &[V2ScanBlock],
+    domain: &sov_primitives::SigningDomain,
+    tip: u64,
+    snapshot_hash: Hash,
+) -> Result<(), String> {
+    // Authenticate the complete page before advancing either index, including
+    // the connection to a farther-ahead cache when the two files differ in age.
+    let start = if stores.legacy.scanned_height() <= stores.suite2.scanned_height() {
+        &stores.legacy
+    } else {
+        &stores.suite2
+    };
+    let mut parent = start
+        .tip_checkpoint()
+        .map(|(_, hash)| Hash::from_bytes(hash))
+        .unwrap_or_else(|| domain.genesis());
+    for (height, entry) in (start.scanned_height() + 1..).zip(blocks.iter()) {
+        validate_scan_parent(&entry.block, height, parent)?;
+        parent = entry.block.hash();
+        for store in [&stores.legacy, &stores.suite2] {
+            if let Some((cached_height, cached_hash)) = store.tip_checkpoint() {
+                if height == cached_height && *parent.as_bytes() != cached_hash {
+                    return Err(
+                        "the chain changed between pool-v2 cache checkpoints; scan will retry"
+                            .into(),
+                    );
+                }
+            }
+        }
+        if height == tip && parent != snapshot_hash {
+            return Err(
+                "pool-v2 scan did not reach its pinned snapshot hash; scan will retry".into(),
+            );
+        }
+    }
+    for entry in blocks {
+        let height = entry.block.header.height.get();
+        let bundles = v2_scan_bundles(&entry.block, &entry.receipts)?;
+        let refs: Vec<_> = bundles.iter().collect();
+        if height > stores.legacy.scanned_height() {
+            stores
+                .legacy
+                .ingest_block(&keys[0], height, *entry.block.hash().as_bytes(), &refs);
+        }
+        if height > stores.suite2.scanned_height() {
+            stores
+                .suite2
+                .ingest_block(&keys[1], height, *entry.block.hash().as_bytes(), &refs);
+        }
+    }
+    Ok(())
 }
 
 fn validate_v2_store_pair(legacy: &PqNoteStore, suite2: &PqNoteStore) -> Result<(), String> {
@@ -4240,7 +4651,7 @@ pub struct Station {
     shielded_v2: Arc<Mutex<ScannedPools<ShieldedV2View>>>,
     shield_v2_amount_in: String,
     shield_v2_to: String,
-    deshield_v2_amount_in: String,
+    deshield_v2_amount_in: V2WithdrawalAmount,
     private_v2_to: String,
     private_v2_amount: String,
     earnings: Arc<Mutex<EarningsView>>,
@@ -4633,7 +5044,7 @@ impl Station {
             shielded_v2: Arc::new(Mutex::new(ScannedPools::default())),
             shield_v2_amount_in: String::new(),
             shield_v2_to: String::new(),
-            deshield_v2_amount_in: String::new(),
+            deshield_v2_amount_in: V2WithdrawalAmount::default(),
             private_v2_to: String::new(),
             private_v2_amount: String::new(),
             earnings: Arc::new(Mutex::new(EarningsView::default())),
@@ -5527,7 +5938,7 @@ impl Station {
                     let (glyph, col) = match t.state {
                         SendState::Pending => ("⏳", palette::warning()),
                         SendState::Confirmed => ("✓", palette::success()),
-                        SendState::Failed => ("✗", palette::error()),
+                        SendState::Failed | SendState::Rejected => ("✗", palette::error()),
                         SendState::Replaced => ("⇄", palette::unknown()),
                         SendState::Superseded => ("·", palette::unknown()),
                     };
@@ -5927,12 +6338,38 @@ impl Station {
         let ctx = ctx.clone();
         if let Ok(mut m) = view.lock() {
             let v = m.entry_mut(&account);
+            if v.scanning {
+                return;
+            }
             v.scanning = true;
             v.account = account.clone();
-            v.message = "scanning pool v2 (trial decapsulation)…".to_string();
+            v.message = "loading cached pool-v2 notes…".to_string();
         }
         std::thread::spawn(move || {
-            let result = scan_store_v2(&rpc, seed);
+            let started = Instant::now();
+            let result = scan_store_v2_with_progress(
+                &rpc,
+                seed,
+                |stores, tip, requests, reconciled| {
+                    if let Ok(mut m) = view.lock() {
+                        let v = m.entry_mut(&account);
+                        if reconciled && stores.scanned_height() > 0 {
+                            v.balance = stores.balance();
+                            v.spendable_grains = Some(stores.spendable_balance());
+                            v.legacy_balance = stores.legacy.balance();
+                            v.suite2_balance = stores.suite2.balance();
+                            v.notes = stores.unspent_count();
+                            v.scanned_height = stores.scanned_height();
+                        }
+                        let done = stores
+                            .legacy
+                            .scanned_height()
+                            .min(stores.suite2.scanned_height());
+                        v.message = format!("scanning pool v2: {done}/{tip} blocks · {requests} history requests · {:.1}s", started.elapsed().as_secs_f64());
+                    }
+                    ctx.request_repaint();
+                },
+            );
             if let Ok(mut m) = view.lock() {
                 let v = m.entry_mut(&account);
                 v.scanning = false;
@@ -5945,7 +6382,11 @@ impl Station {
                         v.suite2_balance = store.suite2.balance();
                         v.notes = store.unspent_count();
                         v.scanned_height = store.scanned_height();
-                        v.message = format!("scanned to height {}", store.scanned_height());
+                        v.message = format!(
+                            "scanned to height {} in {:.2}s",
+                            store.scanned_height(),
+                            started.elapsed().as_secs_f64()
+                        );
                     }
                     Err(e) => v.message = format!("pool-v2 scan failed: {e}"),
                 }
@@ -6095,7 +6536,7 @@ impl Station {
         };
         let amount = match what {
             V2Action::Shield => &self.shield_v2_amount_in,
-            V2Action::Deshield => &self.deshield_v2_amount_in,
+            V2Action::Deshield => &self.deshield_v2_amount_in.text,
             V2Action::Send => &self.private_v2_amount,
         };
         let Some(gross_amount) = parse_xus(amount).filter(|amount| *amount > 0) else {
@@ -6183,7 +6624,7 @@ impl Station {
                             && self.shield_v2_to.trim() == review.recipient
                     }
                     V2Action::Deshield => {
-                        parse_xus(&self.deshield_v2_amount_in) == Some(review.gross_amount)
+                        parse_xus(&self.deshield_v2_amount_in.text) == Some(review.gross_amount)
                     }
                     V2Action::Send => false,
                 };
@@ -6299,7 +6740,7 @@ impl Station {
         }
         let field = match what {
             V2Action::Shield => &self.shield_v2_amount_in,
-            V2Action::Deshield => &self.deshield_v2_amount_in,
+            V2Action::Deshield => &self.deshield_v2_amount_in.text,
             V2Action::Send => &self.private_v2_amount,
         };
         let Some(grains) = parse_xus(field).filter(|g| *g > 0) else {
@@ -13494,6 +13935,15 @@ impl Station {
                         .find(|a| a.account == account)
                         .and_then(|a| a.balance.parse::<u128>().ok()),
                 );
+            let withdrawal_reviewed = self.pending_v2_action.as_ref().is_some_and(|review| {
+                review.what == V2Action::Deshield
+            });
+            self.deshield_v2_amount_in.synchronize(
+                &account,
+                self.network,
+                (v2_guard.scanned && !v2v.scanning).then(|| v2_guard.deshield_cap()),
+                withdrawal_reviewed,
+            );
             // The operator's choice FOR THIS WALLET. `chosen_for` drops a choice
             // made for a different wallet before a single control is drawn, so a
             // wallet switch can never leave someone else's pool armed.
@@ -13886,7 +14336,7 @@ impl Station {
                 let deshield_v = v2_allows(
                     &guard,
                     V2Intent::Deshield {
-                        amount: parse_xus(&self.deshield_v2_amount_in),
+                        amount: parse_xus(&self.deshield_v2_amount_in.text),
                     },
                     snap.shielded_v2.as_ref(),
                 );
@@ -13947,20 +14397,23 @@ impl Station {
 
                         ui.label(egui::RichText::new("Gross withdrawal").weak());
                         ui.horizontal_wrapped(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.deshield_v2_amount_in)
+                            if ui.add_enabled(
+                                !withdrawal_reviewed,
+                                egui::TextEdit::singleline(&mut self.deshield_v2_amount_in.text)
                                     .hint_text("amount")
                                     .desired_width(ui.available_width().min(140.0)),
-                            );
-                            ui.add_enabled_ui(v2_cap > 0, |ui| {
+                            ).changed() {
+                                self.deshield_v2_amount_in.edited();
+                            }
+                            ui.add_enabled_ui(v2_cap > 0 && guard.scanned && !v2v.scanning && !withdrawal_reviewed, |ui| {
                                 if ui
                                     .button("Max")
                                     .on_hover_text(
-                                        "the most allowed right now (balance, capped by the window budget)",
+                                        "Use the largest gross withdrawal available from your notes and the network window. Updates after scans until review. The fee is deducted only from the received amount.",
                                     )
                                     .clicked()
                                 {
-                                    self.deshield_v2_amount_in = grains_to_xus_plain(v2_cap);
+                                    self.deshield_v2_amount_in.choose_max(v2_cap);
                                 }
                             });
                             ui.add_enabled_ui(deshield_v.is_ok(), |ui| {
@@ -13972,22 +14425,7 @@ impl Station {
                             // when this wallet's v2 notes have not been scanned. A
                             // bare zero beside the field is exactly how an operator
                             // concludes their funds are gone.
-                            let ctx_text = if guard.scanned {
-                                if v2_cap < guard.balance_grains {
-                                    format!(
-                                        "up to {} XUS now (window cap) of {} XUS in pool",
-                                        grains_to_xus_plain(v2_cap),
-                                        xus(&guard.balance_grains.to_string())
-                                    )
-                                } else {
-                                    format!(
-                                        "pool balance {} XUS",
-                                        xus(&guard.balance_grains.to_string())
-                                    )
-                                }
-                            } else {
-                                "pool balance unknown — scan pool v2 first".to_string()
-                            };
+                            let ctx_text = v2_withdrawal_balance_text(&v2v, &guard);
                             ui.label(
                                 egui::RichText::new(ctx_text)
                                     .size(ty::SMALL)
@@ -14547,6 +14985,7 @@ impl Station {
                 self.selected = i;
                 self.receive_kind = ReceiveKind::Account;
                 self.clear_transaction_reviews();
+                self.deshield_v2_amount_in.clear();
                 self.rename_field.clear();
                 self.forget_armed = false;
                 self.forget_confirm.clear();
@@ -15752,110 +16191,6 @@ fn scan_store(rpc: &str, seed: [u8; 32]) -> Result<NoteStore, String> {
 
     // Persist the updated cache (encrypted, owner-only).
     validate_scan_origin(&client, &domain, store.tip_checkpoint())?;
-    let enc = encrypt_blob(&dkey, &store.to_bytes())?;
-    write_private_atomic(&path, &enc)?;
-    Ok(store)
-}
-
-/// Scan the chain for this wallet's POOL-V2 (post-quantum) notes, mirroring
-/// [`scan_store`] one-for-one — same cache discipline, same reorg reconciliation,
-/// same fail-closed receipt filter — over `Action::ShieldedV2` bundles.
-///
-/// Pool v2 detection cannot use pool v1's ECDH trick: ML-KEM has no shared
-/// secret until a decapsulation happens, so every v2 ciphertext must be
-/// trial-decapsulated. That cost is why the cache matters here even more than
-/// it does for v1.
-fn scan_store_v2_for_key(rpc: &str, seed: [u8; 32], suite2: bool) -> Result<PqNoteStore, String> {
-    let client = RpcClient::new(rpc.to_string()).with_timeout(Duration::from_secs(15));
-    let key = if suite2 {
-        PqShieldedKey::from_leaf_seed_suite2(&seed)
-    } else {
-        PqShieldedKey::from_leaf_seed(&seed)
-    };
-    let store_id = Keypair::hybrid_from_seed(seed)
-        .public_key()
-        .implicit_account_id()
-        .to_string();
-    let domain = client.chain_domain().map_err(|e| e.to_string())?;
-    let mut path = note_store_v2_path(&store_id, &domain)?;
-    if suite2 {
-        path = path.with_extension("suite2.store");
-    }
-    let dkey = notes_cache_key(&seed);
-
-    let mut store = std::fs::read(&path)
-        .ok()
-        .and_then(|enc| decrypt_blob(&dkey, &enc))
-        .and_then(|bytes| PqNoteStore::from_bytes(&bytes))
-        .unwrap_or_else(|| PqNoteStore::new(0));
-
-    let tip = client.height().map_err(|e| e.to_string())?;
-
-    // Same reorg reconciliation as v1: never extend an orphaned branch.
-    if let Some((tip_h, cached_hash)) = store.tip_checkpoint() {
-        if canonical_hash(&client, tip_h)? != Some(cached_hash) {
-            let mut fork = None;
-            for (h, our_hash) in store.checkpoints().into_iter().rev() {
-                if canonical_hash(&client, h)? == Some(our_hash) {
-                    fork = Some(h);
-                    break;
-                }
-            }
-            match fork {
-                Some(f) if store.rollback_to(f) => {}
-                _ => store = PqNoteStore::new(store.birthday()),
-            }
-        }
-    }
-
-    let mut scan_tip = tip;
-    let mut complete = false;
-    // Catch up a bounded number of times when a new block arrives while the
-    // initial history scan is running. Never compare roots from different heights.
-    for _ in 0..3 {
-        for h in (store.scanned_height() + 1)..=scan_tip {
-            let block = client
-                .block_by_height(h)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("block {h} unavailable; will resume"))?;
-            let parent = store
-                .tip_checkpoint()
-                .map(|(_, hash)| Hash::from_bytes(hash))
-                .unwrap_or_else(|| domain.genesis());
-            validate_scan_parent(&block, h, parent)?;
-            let value = client
-                .call("sov_getBlockReceipts", json!({ "height": h }))
-                .map_err(|e| e.to_string())?;
-            let receipts = validated_scan_receipts(&block, value)?;
-            let bundles = v2_scan_bundles(&block, &receipts)?;
-            let refs: Vec<&SpendBundle> = bundles.iter().collect();
-            store.ingest_block(&key, h, *block.hash().as_bytes(), &refs);
-            if h % 100 == 0 {
-                write_private_atomic(&path, &encrypt_blob(&dkey, &store.to_bytes())?)?;
-            }
-        }
-        validate_scan_origin(&client, &domain, store.tip_checkpoint())?;
-        let info = client
-            .call("sov_getShieldedV2Info", json!({}))
-            .map_err(|e| e.to_string())?;
-        if validate_v2_scan_snapshot(&store, &info)? {
-            complete = true;
-            break;
-        }
-        scan_tip = info
-            .get("height")
-            .and_then(Value::as_u64)
-            .ok_or("node did not report its pool-v2 snapshot height")?;
-        if scan_tip < store.scanned_height() {
-            return Err("the chain reorganized during the pool-v2 scan; scan will retry".into());
-        }
-    }
-    if !complete {
-        return Err(
-            "the chain advanced during the pool-v2 scan; scan again to finish catching up".into(),
-        );
-    }
-
     let enc = encrypt_blob(&dkey, &store.to_bytes())?;
     write_private_atomic(&path, &enc)?;
     Ok(store)
@@ -17965,9 +18300,17 @@ pub fn run(rpc: String) -> Result<(), String> {
 
     // Restore public submission identifiers before polling or offering a resend.
     let pending_path = station_dir()?.join("pending-submissions.json");
+    let observations = submission_observations(&pending_path);
     let restored = load_pending_submissions(&pending_path)?
         .iter()
-        .map(PendingSubmission::restored_send)
+        .map(|pending| {
+            let mut send = pending.restored_send();
+            if let Some(note) = observations.get(&pending.txid) {
+                send.state = SendState::Rejected;
+                send.note = note.clone();
+            }
+            send
+        })
         .collect();
     let outbox: Arc<Mutex<Vec<SentTx>>> = Arc::new(Mutex::new(restored));
 
@@ -18072,13 +18415,62 @@ fn load_pending_submissions(path: &Path) -> Result<Vec<PendingSubmission>, Strin
     Ok(entries)
 }
 
+fn submission_observations(path: &Path) -> HashMap<String, String> {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path.with_file_name("submission-observations.json")) else {
+        return HashMap::new();
+    };
+    let mut bytes = Vec::new();
+    if file.take(1024 * 1024 + 1).read_to_end(&mut bytes).is_err() || bytes.len() > 1024 * 1024 {
+        return HashMap::new();
+    }
+    let rows: HashMap<String, String> = serde_json::from_slice(&bytes).unwrap_or_default();
+    if rows.len() > 1024
+        || rows
+            .iter()
+            .any(|(id, note)| Hash::from_hex(id).is_err() || note.len() > 4096)
+    {
+        return HashMap::new();
+    }
+    rows
+}
+
+fn persist_submission_observations(
+    path: &Path,
+    updates: &[(String, SendState, String)],
+) -> Result<(), String> {
+    let _guard = PENDING_JOURNAL_LOCK
+        .lock()
+        .map_err(|_| "submission journal unavailable")?;
+    let pending = load_pending_submissions(path)?;
+    let mut rows = submission_observations(path);
+    let before = rows.clone();
+    rows.retain(|id, _| pending.iter().any(|p| p.txid == *id));
+    for (id, state, note) in updates {
+        if *state == SendState::Rejected && pending.iter().any(|p| p.txid == *id) {
+            rows.insert(id.clone(), note.chars().take(1000).collect());
+        } else {
+            rows.remove(id);
+        }
+    }
+    if rows != before {
+        write_private_atomic(
+            &path.with_file_name("submission-observations.json"),
+            &serde_json::to_vec(&rows).map_err(|e| e.to_string())?,
+        )?;
+    }
+    Ok(())
+}
+
 fn journal_pending_submission(path: &Path, pending: &PendingSubmission) -> Result<(), String> {
     let _guard = PENDING_JOURNAL_LOCK
         .lock()
         .map_err(|_| "submission journal unavailable")?;
     let mut entries = load_pending_submissions(path)?;
+    let observations = submission_observations(path);
     if entries.iter().any(|entry| {
-        entry.chain_id == pending.chain_id
+        !observations.contains_key(&entry.txid)
+            && entry.chain_id == pending.chain_id
             && entry.genesis == pending.genesis
             && entry.from_account == pending.from_account
             && entry.nonce == pending.nonce
@@ -18145,7 +18537,25 @@ mod pending_journal_tests {
         for secret_field in ["amount", "seed", "recipient", "witness", "mnemonic"] {
             assert!(!bytes.contains(secret_field));
         }
-        remove_pending_submissions(&path, &[pending.txid]).unwrap();
+        persist_submission_observations(
+            &path,
+            &[(
+                pending.txid.clone(),
+                SendState::Rejected,
+                "Connected node rejected: input already spent".into(),
+            )],
+        )
+        .unwrap();
+        assert!(submission_observations(&path).contains_key(&pending.txid));
+        let mut replacement = pending.clone();
+        replacement.txid = Hash::digest(b"new reviewed transaction").to_hex();
+        journal_pending_submission(&path, &replacement).unwrap();
+        assert_eq!(
+            load_pending_submissions(&path).unwrap().len(),
+            2,
+            "rejection history is retained"
+        );
+        remove_pending_submissions(&path, &[pending.txid, replacement.txid]).unwrap();
         assert!(load_pending_submissions(&path).unwrap().is_empty());
         std::fs::write(&path, b"unreadable old record").unwrap();
         assert!(journal_pending_submission(&path, &entries[0]).is_err());
@@ -18158,7 +18568,7 @@ fn refresh_outbox(client: &RpcClient, outbox: &Arc<Mutex<Vec<SentTx>>>, chain_id
     let pending: Vec<(String, String, u64)> = match outbox.lock() {
         Ok(o) => o
             .iter()
-            .filter(|t| t.state.is_pending() && t.on_chain(chain_id))
+            .filter(|t| t.state.needs_tracking() && t.on_chain(chain_id))
             .map(|t| (t.txid.clone(), t.from_account.clone(), t.nonce))
             .collect(),
         Err(_) => return,
@@ -18168,6 +18578,16 @@ fn refresh_outbox(client: &RpcClient, outbox: &Arc<Mutex<Vec<SentTx>>>, chain_id
     }
     let mut settled: Vec<(String, SendState, String)> = Vec::new();
     for (txid, account, nonce) in pending {
+        if let Ok(status) = client.call("sov_getTransactionStatus", json!({"txId": &txid})) {
+            if status.get("chainId").and_then(Value::as_str) == Some(chain_id)
+                && status.get("txId").and_then(Value::as_str) == Some(txid.as_str())
+            {
+                if let Some((state, note)) = auction::resolve_node_status(&status) {
+                    settled.push((txid, state, note));
+                    continue;
+                }
+            }
+        }
         let receipt = client.call("sov_getReceipt", json!({ "txId": &txid })).ok();
         let onchain_nonce = AccountId::new(&account)
             .ok()
@@ -18191,7 +18611,7 @@ fn refresh_outbox(client: &RpcClient, outbox: &Arc<Mutex<Vec<SentTx>>>, chain_id
                 // Only ever settle something still pending: a bump may have moved
                 // this entry to REPLACED while the RPCs above were in flight, and
                 // that user-known truth must not be overwritten by a stale read.
-                if entry.state.is_pending() && entry.on_chain(chain_id) {
+                if entry.state.needs_tracking() && entry.on_chain(chain_id) {
                     entry.state = *state;
                     entry.note = note.clone();
                 }
@@ -18199,7 +18619,13 @@ fn refresh_outbox(client: &RpcClient, outbox: &Arc<Mutex<Vec<SentTx>>>, chain_id
         }
     }
     if let Ok(dir) = station_dir() {
-        let ids: Vec<_> = settled.into_iter().map(|(id, _, _)| id).collect();
+        let path = dir.join("pending-submissions.json");
+        let _ = persist_submission_observations(&path, &settled);
+        let ids: Vec<_> = settled
+            .into_iter()
+            .filter(|(_, state, _)| !state.needs_tracking())
+            .map(|(id, _, _)| id)
+            .collect();
         let _ = remove_pending_submissions(&dir.join("pending-submissions.json"), &ids);
     }
 }
@@ -21460,7 +21886,7 @@ mod transaction_review_tests {
         let rpc = listener.local_addr().unwrap().to_string();
         let node = std::thread::spawn(move || {
             let mut methods = Vec::new();
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let deadline = std::time::Instant::now() + Duration::from_secs(3);
                 let (mut stream, _) = loop {
                     match listener.accept() {
@@ -21498,7 +21924,9 @@ mod transaction_review_tests {
                 let payload: Value =
                     serde_json::from_slice(&request[split + 4..split + 4 + length]).unwrap();
                 let method = payload["method"].as_str().unwrap().to_string();
-                let result = if method == "sov_getReceipt" {
+                let result = if method == "sov_getTransactionStatus" {
+                    Value::Null // old node does not know the new status method
+                } else if method == "sov_getReceipt" {
                     json!({ "status": { "status": "success" } })
                 } else {
                     assert_eq!(method, "sov_getNonce");
@@ -21536,7 +21964,10 @@ mod transaction_review_tests {
         let outbox = Arc::new(Mutex::new(vec![mainnet, testnet]));
         let client = RpcClient::new(rpc.clone()).with_timeout(Duration::from_secs(2));
         refresh_outbox(&client, &outbox, Network::Testnet.chain_id());
-        assert_eq!(node.join().unwrap(), ["sov_getReceipt", "sov_getNonce"]);
+        assert_eq!(
+            node.join().unwrap(),
+            ["sov_getTransactionStatus", "sov_getReceipt", "sov_getNonce"]
+        );
         let entries = outbox.lock().unwrap();
         assert_eq!(entries.len(), 2, "old-network history must be retained");
         assert_eq!(
@@ -21572,7 +22003,10 @@ mod transaction_review_tests {
         let outbox = Arc::new(Mutex::new(vec![original]));
         let client = RpcClient::new(rpc.clone()).with_timeout(Duration::from_secs(2));
         refresh_outbox(&client, &outbox, Network::Mainnet.chain_id());
-        assert_eq!(node.join().unwrap(), ["sov_getReceipt", "sov_getNonce"]);
+        assert_eq!(
+            node.join().unwrap(),
+            ["sov_getTransactionStatus", "sov_getReceipt", "sov_getNonce"]
+        );
         let entries = outbox.lock().unwrap();
         assert_eq!(entries[0].state, SendState::Confirmed);
         assert!(entries[0].on_origin(Network::Mainnet.chain_id(), &p.rpc));
@@ -23987,7 +24421,17 @@ mod wallet_note_recovery_tests {
             }
         }
         require_v2_live(&client).unwrap();
-        let recovered = scan_store_v2(&rpc, legacy_wallet.seed).unwrap();
+        let mut cold_requests = 0;
+        let recovered =
+            scan_store_v2_with_progress(&rpc, legacy_wallet.seed, |_, _, n, _| cold_requests = n)
+                .unwrap();
+        assert_eq!(cold_requests, 1, "one history page feeds both note keys");
+        let mut warm_requests = usize::MAX;
+        let warm =
+            scan_store_v2_with_progress(&rpc, legacy_wallet.seed, |_, _, n, _| warm_requests = n)
+                .unwrap();
+        assert_eq!(warm_requests, 0, "warm scan reuses both validated caches");
+        assert_eq!(warm.balance(), recovered.balance());
         assert_eq!(recovered.legacy.balance(), 100_000_000);
         assert_eq!(recovered.suite2.balance(), 0);
         let stopped = Arc::new(AtomicBool::new(false));
@@ -24125,6 +24569,173 @@ mod wallet_note_recovery_tests {
     }
 
     #[test]
+    #[ignore = "requires an isolated copy of public mainnet history"]
+    fn benchmark_v2_scan_public_history() {
+        let _env = tests::env_guard();
+        let spec_path = std::env::var("SOV_SCAN_BENCH_SPEC").unwrap();
+        let data_path = std::env::var("SOV_SCAN_BENCH_DATA").unwrap();
+        let dir = std::env::temp_dir().join(format!("sov-scan-bench-{}", std::process::id()));
+        let previous = std::env::var_os("SOV_STATION_DIR");
+        std::env::set_var("SOV_STATION_DIR", &dir);
+        let spec = ChainSpec::from_json(&std::fs::read_to_string(spec_path).unwrap()).unwrap();
+        let daemon = Daemon::new(
+            &spec.to_genesis_config_verified().unwrap(),
+            data_path,
+            128,
+            128,
+            vec![],
+        )
+        .unwrap();
+        let server = sov_rpc::RpcServer::new(daemon.node())
+            .start("127.0.0.1:0", 4)
+            .unwrap();
+        let rpc = server.local_addr().to_string();
+        let mut request_counts = vec![];
+        for pass in ["cold", "warm"] {
+            let started = Instant::now();
+            let mut requests = 0;
+            let stores =
+                scan_store_v2_with_progress(&rpc, [213; 32], |_, _, n, _| requests = n).unwrap();
+            eprintln!(
+                "V2_SCAN_BENCH {pass} height={} history_requests={requests} seconds={:.3}",
+                stores.scanned_height(),
+                started.elapsed().as_secs_f64()
+            );
+            assert_eq!(stores.balance(), 0);
+            request_counts.push(requests);
+        }
+        assert!(request_counts[0] > 0);
+        assert_eq!(
+            request_counts[1], 0,
+            "cached scan must request no historical pages"
+        );
+        server.shutdown();
+        match previous {
+            Some(path) => std::env::set_var("SOV_STATION_DIR", path),
+            None => std::env::remove_var("SOV_STATION_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn v2_withdrawal_two_notes_offer_the_full_gross_balance_before_fees() {
+        const XUS: u64 = 100_000_000;
+        for split_keys in [false, true] {
+            let seed = [142; 32];
+            let old = PqShieldedKey::from_leaf_seed(&seed);
+            let fresh = PqShieldedKey::from_leaf_seed_suite2(&seed);
+            let mut legacy = PqNoteStore::new(0);
+            let mut suite2 = PqNoteStore::new(0);
+            for (index, value) in [100_000 * XUS, 25_000 * XUS].into_iter().enumerate() {
+                let key = if split_keys && index == 1 {
+                    &fresh
+                } else {
+                    &old
+                };
+                let bundle = scan_bundle(key, value);
+                let height = index as u64 + 1;
+                legacy.ingest_block(&old, height, [height as u8; 32], &[&bundle]);
+                suite2.ingest_block(&fresh, height, [height as u8; 32], &[&bundle]);
+            }
+            validate_v2_store_pair(&legacy, &suite2).unwrap();
+            let stores = V2WalletStores { legacy, suite2 };
+            let gross = u128::from(125_000 * XUS);
+            assert_eq!(u128::from(stores.balance()), gross);
+            assert_eq!(u128::from(stores.spendable_balance()), gross);
+            assert_eq!(stores.unspent_count(), 2);
+            let view = ShieldedV2View {
+                account: "owner".into(),
+                balance: stores.balance(),
+                spendable_grains: Some(stores.spendable_balance()),
+                notes: stores.unspent_count(),
+                scanned_height: stores.scanned_height(),
+                ..Default::default()
+            };
+            let guard = view.guard("owner", true, false, Some(250_000 * u128::from(XUS)));
+            let mut amount = V2WithdrawalAmount::default();
+            amount.synchronize("owner", Network::Mainnet, Some(guard.deshield_cap()), false);
+            amount.choose_max(guard.deshield_cap());
+            assert_eq!(amount.text, "125000");
+            let fee = 1_300 * u128::from(XUS);
+            assert_eq!(gross - fee, 123_700 * u128::from(XUS));
+            assert_eq!(
+                parse_xus(&amount.text),
+                Some(gross),
+                "a net receipt never replaces gross"
+            );
+            assert!(v2_withdrawal_balance_text(&view, &guard).contains("pool balance 125,000 XUS"));
+
+            let capped = view.guard("owner", true, false, Some(gross - fee));
+            assert_eq!(capped.deshield_cap(), gross - fee);
+            let text = v2_withdrawal_balance_text(&view, &capped);
+            assert!(text.contains("pool balance 125,000 XUS"));
+            assert!(text.contains("network withdrawal limit 123,700 XUS"));
+        }
+    }
+
+    #[test]
+    fn v2_withdrawal_max_refreshes_after_scans_without_changing_reviewed_or_typed_amounts() {
+        const XUS: u128 = 100_000_000;
+        let mut amount = V2WithdrawalAmount::default();
+        amount.synchronize("owner", Network::Mainnet, Some(123_700 * XUS), false);
+        amount.choose_max(123_700 * XUS);
+        amount.synchronize("owner", Network::Mainnet, None, false);
+        assert_eq!(
+            amount.text, "123700",
+            "an in-flight scan cannot invent a balance"
+        );
+        amount.synchronize("owner", Network::Mainnet, Some(125_000 * XUS), false);
+        assert_eq!(
+            amount.text, "125000",
+            "completed scans refresh a deliberate Max selection"
+        );
+        amount.synchronize("owner", Network::Mainnet, Some(126_000 * XUS), true);
+        assert_eq!(amount.text, "125000", "reviewed terms remain exact");
+        amount.synchronize("owner", Network::Mainnet, Some(126_000 * XUS), false);
+        assert_eq!(
+            amount.text, "126000",
+            "cancelling review resumes Max updates"
+        );
+        amount.text = "25000".into();
+        amount.edited();
+        amount.synchronize("owner", Network::Mainnet, Some(130_000 * XUS), false);
+        assert_eq!(
+            amount.text, "25000",
+            "a manual amount must never increase automatically"
+        );
+        amount.choose_max(130_000 * XUS);
+        amount.clear();
+        amount.synchronize("owner", Network::Mainnet, Some(130_000 * XUS), false);
+        assert!(
+            amount.text.is_empty(),
+            "submission clears Max so a second send is not prefilled"
+        );
+    }
+
+    #[test]
+    fn v2_withdrawal_amount_cannot_follow_a_different_wallet_or_network() {
+        let mut amount = V2WithdrawalAmount::default();
+        amount.synchronize("wallet-a", Network::Mainnet, Some(123_700), false);
+        amount.choose_max(123_700);
+        amount.synchronize("wallet-b", Network::Mainnet, Some(125_000), false);
+        assert!(amount.text.is_empty());
+        assert!(!amount.follows_max);
+        amount.text = "12".into();
+        amount.edited();
+        amount.synchronize("wallet-a", Network::Mainnet, Some(123_700), false);
+        assert!(
+            amount.text.is_empty(),
+            "a typed amount also belongs to its wallet"
+        );
+        amount.choose_max(123_700);
+        amount.synchronize("wallet-a", Network::Testnet, Some(125_000), false);
+        assert!(
+            amount.text.is_empty(),
+            "network switches cannot reuse a mainnet withdrawal"
+        );
+    }
+
+    #[test]
     fn combined_balance_and_maximum_proof_spend_are_distinct_across_both_key_sets() {
         let seed = [140; 32];
         let old = PqShieldedKey::from_leaf_seed(&seed);
@@ -24165,6 +24776,10 @@ mod wallet_note_recovery_tests {
         );
         let guard = view.guard("owner", true, false, Some(170));
         assert_eq!(guard.balance_grains, 180);
+        let withdrawal_text = v2_withdrawal_balance_text(&view, &guard);
+        assert!(withdrawal_text.contains("pool balance 0.0000021 XUS"));
+        assert!(withdrawal_text.contains("one transaction (four input notes)"));
+        assert!(withdrawal_text.contains("network withdrawal limit"));
         assert_eq!(
             guard.deshield_cap(),
             170,

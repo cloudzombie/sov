@@ -108,6 +108,28 @@ pub enum WireError {
     TrailingBytes(usize),
 }
 
+/// Read only the fixed-size input prefix for negative mempool checks.
+/// This does not authenticate a bundle or permit execution. A caller may reject
+/// an already-spent input, but must still use the full verifier to accept it.
+pub fn input_nullifiers(bytes: &[u8]) -> Result<[(PqDigest, bool); NUM_SLOTS], WireError> {
+    let mut r = Reader::new(bytes);
+    let version = r.u8("proof_version")?;
+    if !matches!(version, PROOF_VERSION_V1 | PROOF_VERSION_V2) {
+        return Err(WireError::UnknownProofVersion(version));
+    }
+    for _ in 0..NUM_SLOTS {
+        r.digest("anchor")?;
+    }
+    let mut inputs = [(PqDigest::ZERO, false); NUM_SLOTS];
+    for (nf, _) in &mut inputs {
+        *nf = r.digest("nullifier")?;
+    }
+    for (_, dummy) in &mut inputs {
+        *dummy = r.flag("input_dummy")?;
+    }
+    Ok(inputs)
+}
+
 /// A total, bounds-checked forward reader (no indexing, no panics).
 struct Reader<'a> {
     data: &'a [u8],

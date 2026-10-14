@@ -27,7 +27,7 @@
 //! ## Methods
 //! Reads: `sov_health`, `sov_version`, `sov_chainId`, `sov_getHeight`, `sov_getSupply`,
 //! `sov_getAccount`, `sov_getBalance`, `sov_getNonce`, `sov_getBlockByHeight`,
-//! `sov_getBlockByHash`, `sov_getBlockDigest`, `sov_getHead`,
+//! `sov_getBlockByHash`, `sov_getWalletScanBlocks`, `sov_getBlockDigest`, `sov_getHead`,
 //! `sov_getStateRoot`, `sov_getDifficulty`, `sov_estimateFee`,
 //! `sov_getMempoolSize`, `sov_getMempoolHistogram` (effective-tip buckets for
 //! multi-block projection), `sov_getMempoolInfo` (ready/queued occupancy, bounds,
@@ -128,6 +128,11 @@ const MAX_REQUEST_HEADERS: usize = 64;
 
 /// Maximum JSON-RPC batch length, so one request cannot fan out without bound.
 const MAX_RPC_BATCH: usize = 100;
+
+/// A wallet scan page replaces hundreds of separate block/receipt round trips.
+/// Both bounds apply: a busy block can end the page before the block count does.
+const MAX_WALLET_SCAN_BLOCKS: u64 = 256;
+const MAX_WALLET_SCAN_BYTES: usize = 8 * 1024 * 1024;
 
 /// Per-IP RPC rate limit (token bucket). The RPC is bound on `0.0.0.0` so any state query
 /// or `sov_submitTransaction` (which forces a hybrid PQ signature verify before it can be
@@ -589,6 +594,19 @@ fn dispatch(node: &Arc<Mutex<Node>>, ctx: &RpcCtx, body: &[u8]) -> Vec<u8> {
         Value::Array(reqs) if reqs.len() > MAX_RPC_BATCH => {
             error_envelope(Value::Null, -32600, "Invalid Request (batch too large)")
         }
+        Value::Array(reqs)
+            if reqs.iter().any(|r| {
+                r.get("method").and_then(Value::as_str) == Some("sov_getWalletScanBlocks")
+            }) =>
+        {
+            // This method already batches up to 256 blocks. Nesting those pages
+            // in a JSON-RPC batch would multiply the bounded response by 100.
+            error_envelope(
+                Value::Null,
+                -32600,
+                "sov_getWalletScanBlocks must be sent as a single request",
+            )
+        }
         Value::Array(reqs) if !reqs.is_empty() => {
             Value::Array(reqs.iter().map(|r| handle_one(node, ctx, r)).collect())
         }
@@ -783,6 +801,126 @@ fn block_with_hash(b: &Block) -> Value {
         header.insert("hash".into(), Value::String(hash.to_hex()));
     }
     v
+}
+
+/// Count JSON bytes without allocating another copy of a potentially large
+/// block. Stop as soon as the page budget would be exceeded.
+fn bounded_json_size(value: &Value, limit: usize) -> Option<usize> {
+    struct Counter {
+        remaining: usize,
+    }
+    impl Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.remaining = self.remaining.checked_sub(bytes.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::FileTooLarge, "wallet scan page byte limit")
+            })?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter { remaining: limit };
+    serde_json::to_writer(&mut counter, value).ok()?;
+    Some(limit - counter.remaining)
+}
+
+/// Canonical, contiguous full blocks and their ordered receipts from one locked
+/// chain view. The snapshot must still be canonical on EVERY page. A new tip can
+/// grow beyond it; a reorg replacing it fails explicitly instead of mixing
+/// histories or silently skipping a height. Clients still authenticate headers,
+/// transaction/receipt roots, chain identity, and their final pool tree locally.
+fn wallet_scan_blocks(
+    chain: &sov_chain::Blockchain,
+    params: &Value,
+    byte_limit: usize,
+) -> Result<Value, RpcError> {
+    let integer = |name| {
+        params
+            .get(name)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| RpcError::invalid_params(format!("missing integer param `{name}`")))
+    };
+    let from = integer("fromHeight")?;
+    let snapshot_height = integer("snapshotHeight")?;
+    let snapshot_hash = params
+        .get("snapshotHash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::invalid_params("missing string param `snapshotHash`"))?;
+    let snapshot_hash = Hash::from_hex(snapshot_hash)
+        .map_err(|_| RpcError::invalid_params("invalid `snapshotHash`"))?;
+    let after_snapshot = snapshot_height
+        .checked_add(1)
+        .ok_or_else(|| RpcError::invalid_params("snapshot height overflow"))?;
+    if from > after_snapshot {
+        return Err(RpcError::invalid_params(
+            "`fromHeight` is beyond the scan snapshot",
+        ));
+    }
+    let limit = match params.get("limit") {
+        None => MAX_WALLET_SCAN_BLOCKS,
+        Some(value) => value
+            .as_u64()
+            .filter(|limit| *limit > 0)
+            .ok_or_else(|| RpcError::invalid_params("`limit` must be a positive integer"))?
+            .min(MAX_WALLET_SCAN_BLOCKS),
+    };
+    if chain.block_by_height(snapshot_height).map(Block::hash) != Some(snapshot_hash) {
+        return Err(RpcError::server(
+            "wallet scan snapshot is no longer canonical; refresh the snapshot before continuing",
+        ));
+    }
+    let genesis_hash = chain
+        .block_by_height(0)
+        .ok_or_else(|| RpcError::server("canonical genesis unavailable"))?
+        .hash();
+    // Reserve the largest possible nextHeight spelling and `false` (one byte
+    // longer than `true`) so final metadata never pushes a page over its cap.
+    let mut result = json!({
+        "chainId": chain.chain_id(),
+        "genesisHash": genesis_hash.to_hex(),
+        "snapshotHeight": snapshot_height,
+        "snapshotHash": snapshot_hash.to_hex(),
+        "fromHeight": from,
+        "nextHeight": u64::MAX,
+        "complete": false,
+        "blocks": [],
+    });
+    let mut used = bounded_json_size(&result, byte_limit)
+        .ok_or_else(|| RpcError::server("wallet scan metadata exceeds page byte limit"))?;
+    let mut blocks = Vec::new();
+    let mut next = from;
+    while next < after_snapshot && blocks.len() < limit as usize {
+        let block = chain
+            .block_by_height(next)
+            .ok_or_else(|| RpcError::server("canonical block unavailable during wallet scan"))?;
+        let receipts = chain
+            .receipts_at_height(next)
+            .ok_or_else(|| RpcError::server("canonical receipts unavailable during wallet scan"))?;
+        let entry = json!({ "block": block_with_hash(block), "receipts": receipts });
+        let separator = usize::from(!blocks.is_empty());
+        let size = byte_limit
+            .checked_sub(used + separator)
+            .and_then(|remaining| bounded_json_size(&entry, remaining));
+        let Some(size) = size else {
+            if blocks.is_empty() {
+                // No height is advanced. A client may retrieve this unusually
+                // large block with the existing individual block/receipt RPCs.
+                return Err(RpcError::new(
+                    -32012,
+                    format!("wallet scan block {next} exceeds page byte limit; fetch this height individually"),
+                ));
+            }
+            break;
+        };
+        used += separator + size;
+        blocks.push(entry);
+        next += 1;
+    }
+    result["blocks"] = Value::Array(blocks);
+    result["nextHeight"] = json!(next);
+    result["complete"] = json!(next == after_snapshot);
+    Ok(result)
 }
 
 // ---- method dispatch ------------------------------------------------------
@@ -1132,12 +1270,41 @@ fn call(
                 .block_by_height(h)
                 .map_or(Value::Null, block_with_hash))
         }
+        "sov_getWalletScanBlocks" => {
+            wallet_scan_blocks(node.chain(), params, MAX_WALLET_SCAN_BYTES)
+        }
         "sov_getBlockByHash" => {
             let hash = param_hash(params)?;
             Ok(node
                 .chain()
                 .block_by_hash(&hash)
                 .map_or(Value::Null, block_with_hash))
+        }
+        "sov_getTransactionStatus" => {
+            let id = param_tx_id(params)?;
+            let chain = node.chain();
+            let mut result = json!({"txId": id.to_hex(), "chainId": chain.chain_id(),
+                "headHeight": chain.height(), "headHash": chain.head().hash().to_hex(),
+                "state": "unknown", "nodeLocal": true});
+            if let Some((height, receipt)) = chain.receipt(&id) {
+                result["state"] = json!("included");
+                result["height"] = json!(height);
+                result["receipt"] = to_value(receipt);
+                result["nodeLocal"] = json!(false);
+            } else if let Some((tx, ready)) = node.pending_status(&id) {
+                result["state"] = json!(if ready { "pending" } else { "queued" });
+                result["nonce"] = json!(tx.transaction.nonce);
+                result["accountNonce"] = json!(node.account_nonce(&tx.transaction.signer));
+                if !ready {
+                    result["reason"] = json!("waiting for an earlier account nonce");
+                }
+            } else if let Some(row) = node.tx_rejection(&id) {
+                result["state"] = json!("rejected");
+                result["reason"] = json!(row.reason);
+                result["observedHeight"] = json!(row.height);
+                result["observedHeadHash"] = json!(row.head.to_hex());
+            }
+            Ok(result)
         }
         "sov_getReceipt" => {
             // The recorded outcome of a transaction by its id: success, or the
@@ -2169,11 +2336,17 @@ fn call(
             let ts = crate::daemon::clamp_block_timestamp(crate::daemon::now_ms(), parent_ts, mtp);
             // The consensus floor: strictly after the parent AND after MTP (BIP-113).
             let min_ts = parent_ts.saturating_add(1).max(mtp.saturating_add(1));
-            let (candidate, _excluded) = match coinbase {
+            let (candidate, excluded) = match coinbase {
                 Some(cb) => node.build_candidate_for(ts, cb),
                 None => node.build_candidate(ts),
             }
             .map_err(|e| RpcError::server(format!("build template failed: {e}")))?;
+
+            for (tx, reason) in excluded {
+                if node.account_nonce(&tx.transaction.signer) == tx.transaction.nonce {
+                    node.reject_tx(tx.id(), reason);
+                }
+            }
 
             let header = candidate.block().header.clone();
             let template_id = header.hash();
@@ -2320,6 +2493,72 @@ fn call(
             }
         }
         other => Err(RpcError::method_not_found(other)),
+    }
+}
+
+#[cfg(test)]
+mod wallet_scan_tests {
+    use super::*;
+
+    fn node() -> Node {
+        let config = sov_chain::GenesisConfig {
+            chain_id: "sov-wallet-scan-page-test".into(),
+            timestamp_ms: 1_000,
+            accounts: vec![],
+            mining: sov_mining::MiningPolicy::test(),
+            vesting: vec![],
+        };
+        let mut node = Node::new(sov_chain::Blockchain::new(&config).unwrap(), 10, 10);
+        node.set_coinbase(AccountId::new("miner.sov").unwrap());
+        node.produce(2_000).unwrap();
+        node.produce(3_000).unwrap();
+        node
+    }
+
+    #[test]
+    fn wallet_scan_json_budget_counts_escaping_and_stops_at_bound() {
+        let value = json!({"escaped": "\n\r\t\"\\😃", "number": u64::MAX});
+        let size = serde_json::to_vec(&value).unwrap().len();
+        assert_eq!(bounded_json_size(&value, size), Some(size));
+        assert_eq!(bounded_json_size(&value, size - 1), None);
+    }
+
+    #[test]
+    fn wallet_scan_byte_limited_pages_are_contiguous_and_never_skip_large_blocks() {
+        let node = node();
+        let chain = node.chain();
+        let mut params = json!({
+            "fromHeight": 0, "limit": 1,
+            "snapshotHeight": 2, "snapshotHash": chain.head().hash().to_hex(),
+        });
+        // A real one-block page budget (with room for worst-case metadata),
+        // well below the size of two blocks, exercises an early byte cutoff.
+        let mut page_limit = 0;
+        for height in 0..=2 {
+            params["fromHeight"] = json!(height);
+            let one = wallet_scan_blocks(chain, &params, MAX_WALLET_SCAN_BYTES).unwrap();
+            page_limit = page_limit.max(serde_json::to_vec(&one).unwrap().len() + 20);
+        }
+        params["limit"] = json!(256);
+        let mut seen = Vec::new();
+        for height in 0..=2 {
+            params["fromHeight"] = json!(height);
+            let page = wallet_scan_blocks(chain, &params, page_limit).unwrap();
+            assert!(serde_json::to_vec(&page).unwrap().len() <= page_limit);
+            let blocks = page["blocks"].as_array().unwrap();
+            assert_eq!(blocks.len(), 1);
+            seen.push(blocks[0]["block"]["header"]["height"].as_u64().unwrap());
+            assert_eq!(page["nextHeight"], height + 1);
+            assert_eq!(page["complete"], height == 2);
+        }
+        assert_eq!(seen, vec![0, 1, 2]);
+        params["fromHeight"] = json!(0);
+        let error = wallet_scan_blocks(chain, &params, 400).unwrap_err();
+        assert_eq!(
+            error.code, -32012,
+            "oversized block gets its own fallback code"
+        );
+        assert!(error.message.contains("block 0"));
     }
 }
 

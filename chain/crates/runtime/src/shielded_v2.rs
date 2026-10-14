@@ -115,6 +115,36 @@ pub enum ShieldedV2Error {
     DrainLimit,
 }
 
+/// Cheap, rejection-only mempool check against the current canonical spent set.
+/// No proof verification or ledger mutation is performed. Full consensus
+/// verification remains mandatory even when this check succeeds.
+pub fn reject_spent_inputs(
+    action: &sov_types::Action,
+    ledger: &Ledger,
+) -> Result<(), ShieldedV2Error> {
+    use sov_types::Action;
+    let mut action = action;
+    loop {
+        action = match action {
+            Action::Tipped { inner, .. }
+            | Action::Timestamped { inner, .. }
+            | Action::MultisigExec { action: inner, .. }
+            | Action::ProposeMultisig { action: inner, .. } => inner,
+            Action::ShieldedV2 { bundle } => {
+                let inputs = sov_shielded_pq::wire::input_nullifiers(bundle)
+                    .map_err(|e| ShieldedV2Error::MalformedBundle(e.to_string()))?;
+                for (slot, (nf, dummy)) in inputs.iter().enumerate() {
+                    if !dummy && ledger.shielded_v2().nullifier_seen(nf) {
+                        return Err(ShieldedV2Error::NullifierAlreadySpent(slot));
+                    }
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+    }
+}
+
 /// The exact, fully validated state effect of one accepted bundle. Applied
 /// by the executor; nothing here is optional or recomputed at apply time.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -839,11 +869,27 @@ mod tests {
             "a spend must publish a nullifier"
         );
 
+        let pending_action = sov_types::Action::ShieldedV2 {
+            bundle: bytes.clone(),
+        };
+        assert!(reject_spent_inputs(&pending_action, &ledger).is_ok());
         // Publish its nullifiers, exactly as block execution would.
         ledger
             .apply_shielded_v2(&effects.nullifiers, &effects.commitments)
             .expect("apply the spend");
 
+        assert!(matches!(
+            reject_spent_inputs(&pending_action, &ledger),
+            Err(ShieldedV2Error::NullifierAlreadySpent(_))
+        ));
+        let wrapped = sov_types::Action::Timestamped {
+            created_at_ms: 1,
+            inner: Box::new(pending_action),
+        };
+        assert!(matches!(
+            reject_spent_inputs(&wrapped, &ledger),
+            Err(ShieldedV2Error::NullifierAlreadySpent(_))
+        ));
         // The SAME bundle must now be refused as a double spend.
         let again = verify_bundle_for_carrier(
             &bytes,

@@ -329,6 +329,8 @@ pub fn bump_tip_grains(old_tip_grains: u128, auction: &Auction) -> u128 {
 pub enum SendState {
     /// Submitted, not yet mined.
     Pending,
+    /// Rejected by the connected node; not an on-chain receipt.
+    Rejected,
     /// Mined and applied.
     Confirmed,
     /// Mined but rejected on-chain (the receipt carries the reason).
@@ -348,10 +350,16 @@ impl SendState {
         matches!(self, SendState::Pending)
     }
 
+    /// Keep checking node rejections because a reorg or another node may differ.
+    pub fn needs_tracking(self) -> bool {
+        matches!(self, Self::Pending | Self::Rejected)
+    }
+
     /// Short label for the status chip.
     pub fn label(self) -> &'static str {
         match self {
             SendState::Pending => "PENDING",
+            SendState::Rejected => "NODE REJECTED",
             SendState::Confirmed => "CONFIRMED",
             SendState::Failed => "FAILED",
             SendState::Replaced => "REPLACED",
@@ -448,6 +456,25 @@ pub fn resolve_state(receipt: Option<&Value>, onchain_nonce: Option<u64>, nonce:
     SendState::Pending
 }
 
+/// Resolve one atomic node observation. Absence is never proof of failure.
+/// A rejection remains tracked and must never authorize an automatic resend.
+pub fn resolve_node_status(status: &Value) -> Option<(SendState, String)> {
+    match status.get("state")?.as_str()? {
+        "included" => {
+            let receipt = status.get("receipt")?;
+            let state = resolve_state(Some(receipt), None, 0);
+            if state.is_pending() { return None; }
+            Some((state, receipt_failure_reason(receipt).unwrap_or_default()))
+        }
+        "pending" => Some((SendState::Pending, String::new())),
+        "queued" => Some((SendState::Pending, "Waiting for an earlier account nonce; increasing the fee will not fill that gap.".into())),
+        "rejected" => Some((SendState::Rejected, format!(
+            "Connected node rejected this transaction: {}. This is not an on-chain confirmation. Refresh pool notes and review the status before creating another withdrawal.",
+            status.get("reason").and_then(Value::as_str).unwrap_or("unspecified rejection")))),
+        _ => None,
+    }
+}
+
 /// The on-chain failure reason from a receipt, if it carries one.
 pub fn receipt_failure_reason(receipt: &Value) -> Option<String> {
     let status = receipt.get("status")?;
@@ -526,6 +553,36 @@ mod tests {
         assert!(a.available && a.fee_auction_active, "the fixture is LIVE");
         assert_eq!(a.next_block_floor_grains, floor);
         a
+    }
+
+    #[test]
+    fn node_rejection_is_distinct_from_receipt_failure_and_remains_tracked() {
+        let rejection =
+            serde_json::json!({"state":"rejected", "reason":"input 0: nullifier already spent"});
+        let (state, note) = resolve_node_status(&rejection).unwrap();
+        assert_eq!(state, SendState::Rejected);
+        assert!(state.needs_tracking());
+        assert!(!state.is_pending());
+        assert!(note.contains("already spent"));
+        assert!(resolve_node_status(&serde_json::json!({"state":"unknown"})).is_none());
+        assert_eq!(
+            resolve_node_status(&serde_json::json!({"state":"pending"}))
+                .unwrap()
+                .0,
+            SendState::Pending
+        );
+        assert_eq!(
+            resolve_node_status(
+                &serde_json::json!({"state":"included", "receipt":{"status":{"status":"success"}}})
+            )
+            .unwrap()
+            .0,
+            SendState::Confirmed
+        );
+        assert!(resolve_node_status(&serde_json::json!({"state":"queued"}))
+            .unwrap()
+            .1
+            .contains("nonce"));
     }
 
     /// Both mempool RPCs parse, and `sov_getMempoolInfo` wins the fields both

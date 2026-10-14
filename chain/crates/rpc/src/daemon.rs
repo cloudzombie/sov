@@ -1622,10 +1622,17 @@ fn genesis_chain_with_baked_preset(genesis: &GenesisConfig) -> Result<Blockchain
 /// node lock. Cheap (the pool is bounded), so it is written on the periodic snapshot tick
 /// and once more on clean shutdown.
 fn write_mempool(path: &Path, node: &Mutex<Node>) {
-    let txs = match node.lock() {
-        Ok(n) => n.mempool_snapshot(),
+    let (txs, rejected) = match node.lock() {
+        Ok(n) => (n.mempool_snapshot(), n.rejection_snapshot()),
         Err(_) => return,
     };
+    // Write the explanation before removing a transaction from the disk pool.
+    let Ok(bytes) = borsh::to_vec(&rejected) else {
+        return;
+    };
+    if write_snapshot_bytes(&path.with_file_name("tx-rejections.dat"), &bytes).is_err() {
+        return; // Retain the old disk pool until its rejection evidence is durable.
+    }
     if let Ok(bytes) = borsh::to_vec(&txs) {
         let _ = write_snapshot_bytes(path, &bytes);
     }
@@ -2197,9 +2204,27 @@ impl Daemon {
         // against the state we just replayed (stale/unaffordable ones are dropped). The
         // chain is the source of truth, so a missing/corrupt file is harmless.
         let mp_path = mempool_path(&data_dir);
+        let rejection_path = mp_path.with_file_name("tx-rejections.dat");
+        if fs::metadata(&rejection_path).is_ok_and(|m| m.len() <= 4 * 1024 * 1024) {
+            if let Ok(bytes) = fs::read(&rejection_path) {
+                if let Ok(rows) = borsh::from_slice(&bytes) {
+                    node.restore_rejections(rows);
+                }
+            }
+        }
         let restored = load_mempool(&mp_path);
         if !restored.is_empty() {
             node.restore_mempool(restored);
+            // Disk restore obeys the same new-proof quarantine as RPC and P2P.
+            // Spent-input rejection above takes precedence for useful diagnostics.
+            for tx in node.mempool_snapshot() {
+                if !crate::safe_new_transaction_for_suite2(
+                    &tx.transaction.action,
+                    crate::suite2_admission_allowed(node.chain()),
+                ) {
+                    node.reject_tx(tx.id(), "pool-v2 proof version is not admitted for new transactions; refresh notes after replacement proof activation".into());
+                }
+            }
         }
 
         // Restore this node's NODE-LOCAL transaction-timing observations, under
@@ -2721,7 +2746,7 @@ impl Daemon {
                                 if n.account_nonce(&stx.transaction.signer) == stx.transaction.nonce
                                 {
                                     let id = stx.id();
-                                    n.drop_tx(&id);
+                                    n.reject_tx(id, reason.clone());
                                     let hex = id.to_hex();
                                     daemon_log(
                                         &log,
@@ -4039,6 +4064,28 @@ mod tests {
                 .mempool_snapshot()
                 .iter()
                 .any(|t| t.id() == tx_id));
+        }
+        // Rejection explanations survive a later restart after the tx is removed.
+        {
+            let daemon = Daemon::new(&genesis, &dir, 1024, 256, keys()).unwrap();
+            let node = daemon.node();
+            node.lock()
+                .unwrap()
+                .reject_tx(tx_id, "input 0: nullifier already spent".into());
+            write_mempool(&mempool_path(&dir), &node);
+        }
+        {
+            let daemon = Daemon::new(&genesis, &dir, 1024, 256, keys()).unwrap();
+            let node = daemon.node();
+            let node = node.lock().unwrap();
+            assert_eq!(node.mempool_len(), 0);
+            assert!(node
+                .tx_rejection(&tx_id)
+                .unwrap()
+                .reason
+                .contains("already spent"));
+            assert!(node.chain().receipt(&tx_id).is_none());
+            assert_eq!(node.account_nonce(&signer), 0);
         }
         let _ = fs::remove_dir_all(&dir);
     }
