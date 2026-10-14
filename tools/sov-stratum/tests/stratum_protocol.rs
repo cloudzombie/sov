@@ -155,30 +155,51 @@ impl Drop for Bridge {
 }
 
 fn spawn_bridge(node_addr: &str, extra: &[&str]) -> Bridge {
-    // Reserve a port by binding :0 and releasing it — the bridge takes it next.
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let addr = format!("127.0.0.1:{port}");
+    // Let the bridge own its ephemeral port from bind through shutdown. Releasing
+    // a reserved port before spawn lets another parallel test or outgoing RPC
+    // connection take it, so a miner can connect to the wrong socket.
     let child = Command::new(env!("CARGO_BIN_EXE_sov-stratum"))
         .args([
             "--node",
             node_addr,
             "--bind",
-            &addr,
+            "127.0.0.1:0",
             "--poll-ms",
             "250",
             "--refresh-secs",
             "3600", // one template for the whole test: fully deterministic
         ])
         .args(extra)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn sov-stratum binary");
-    Bridge { child, addr }
+    let mut bridge = Bridge {
+        child,
+        addr: String::new(),
+    };
+    let output = bridge.child.stdout.take().expect("bridge stdout");
+    let (ready, receiver) = std::sync::mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut reader = BufReader::new(output);
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            if let Some((_, address)) = line.split_once("listening for miners on ") {
+                let _ = ready.send(address.trim().to_string());
+                break;
+            }
+            line.clear();
+        }
+        // Keep draining: the oversized-login test emits more than a pipe buffer.
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+    });
+    bridge.addr = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("bridge must announce its owned listening socket after startup");
+    let address: std::net::SocketAddr = bridge.addr.parse().expect("bound socket address");
+    assert!(address.ip().is_loopback());
+    assert_ne!(address.port(), 0);
+    bridge
 }
 
 /// A scripted Stratum miner connection.

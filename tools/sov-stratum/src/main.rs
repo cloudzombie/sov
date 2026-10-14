@@ -816,7 +816,12 @@ fn main() {
             .expect("spawn worker thread");
     }
 
-    log(&format!("listening for miners on {}", cfg.bind));
+    // Report the socket actually owned by this process (including an OS-assigned
+    // port when --bind uses :0), only after worker initialization is complete.
+    log(&format!(
+        "listening for miners on {}",
+        listener.local_addr().expect("bound listener address")
+    ));
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
