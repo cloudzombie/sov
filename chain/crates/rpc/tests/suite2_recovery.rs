@@ -31,7 +31,7 @@ fn config() -> GenesisConfig {
         vesting: vec![],
     }
 }
-fn chain() -> Blockchain {
+fn chain(recovery: bool) -> Blockchain {
     let mut chain = Blockchain::new(&config()).unwrap();
     let deployment = |name: &str, bit, start, active| {
         Deployment::new(
@@ -49,13 +49,35 @@ fn chain() -> Blockchain {
     chain.set_tx_domain_deployment(deployment("tx-domain", 0, 4, 12));
     chain.set_tx_domain_grace_blocks(0);
     chain.set_shielded_v2_deployment(deployment("shielded-v2", 2, 4, 12));
-    chain.set_shielded_v2_suite2_deployment(deployment("shielded-v2-suite2", 5, 16, 24));
+    if recovery {
+        chain.set_shielded_v2_suite2_deployment(
+            Deployment::new(
+                "shielded-v2-suite2",
+                5,
+                BlockHeight::new(4),
+                BlockHeight::new(16),
+                4,
+                Threshold::new(3, 4).unwrap(),
+                BlockHeight::new(12),
+                false,
+            )
+            .unwrap(),
+        );
+        chain.set_shielded_v2_suite2_recovery_deployment(deployment(
+            "shielded-v2-suite2-recovery",
+            6,
+            16,
+            20,
+        ));
+    } else {
+        chain.set_shielded_v2_suite2_deployment(deployment("shielded-v2-suite2", 5, 16, 24));
+    }
     chain.set_pq_deployment(sov_chain::blockchain::PqDeploymentConfig {
         deployment: deployment("pq-sunset", 4, 24, 32),
         sunset_delay_blocks: 8,
         threshold_grains: 0,
     });
-    chain.set_signal_mask((1 << 0) | (1 << 2) | (1 << 4) | (1 << 5));
+    chain.set_signal_mask((1 << 0) | (1 << 2) | (1 << 4) | (1 << if recovery { 6 } else { 5 }));
     chain
 }
 fn mine(node: &mut Node, txs: Vec<SignedTransaction>) -> Block {
@@ -107,7 +129,16 @@ fn scan(key: &PqShieldedKey, blocks: &[Block]) -> PqNoteStore {
 
 #[test]
 fn legacy_deposit_recovers_through_hiding_rpc_spends_after_activation_and_sunset() {
-    let node = Arc::new(Mutex::new(Node::new(chain(), 128, 32)));
+    exercise_legacy_recovery(false);
+}
+
+#[test]
+fn failed_original_window_recovers_legacy_notes_through_distinct_bit6_and_cold_replay() {
+    exercise_legacy_recovery(true);
+}
+
+fn exercise_legacy_recovery(recovery: bool) {
+    let node = Arc::new(Mutex::new(Node::new(chain(recovery), 128, 32)));
     let handle = RpcServer::new(Arc::clone(&node))
         .start("127.0.0.1:0", 2)
         .unwrap();
@@ -165,12 +196,65 @@ fn legacy_deposit_recovers_through_hiding_rpc_spends_after_activation_and_sunset
     );
     assert!(
         client.submit_transaction(&tx).is_err(),
-        "bit5 is not active yet"
+        "replacement proof is not active yet"
     );
-    for _ in 13..23 {
+    for _ in 13..19 {
+        blocks.push(mine(&mut node.lock().unwrap(), vec![]));
+    }
+    let locked = client
+        .call("sov_getShieldedV2Info", serde_json::json!({}))
+        .unwrap();
+    let chosen_bit = if recovery { 6 } else { 5 };
+    let locked_deployment = locked["suite2Deployments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["bit"] == chosen_bit)
+        .unwrap();
+    assert_eq!(locked["height"], 19);
+    assert_eq!(locked["evaluatedHeight"], 20);
+    assert_eq!(locked["suite2NextBlockActive"], false);
+    assert_eq!(locked_deployment["state"], "Started");
+    assert_eq!(locked_deployment["nextState"], "LockedIn");
+    assert_eq!(locked_deployment["activationHeight"], 24);
+    for _ in 19..23 {
         blocks.push(mine(&mut node.lock().unwrap(), vec![]));
     }
     assert!(node.lock().unwrap().chain().shielded_v2_suite2_active(24));
+    let info = client
+        .call("sov_getShieldedV2Info", serde_json::json!({}))
+        .unwrap();
+    assert_eq!(info["height"], 23);
+    assert_eq!(info["evaluatedHeight"], 24);
+    assert_eq!(info["suite2CurrentActive"], false);
+    assert_eq!(info["suite2NextBlockActive"], true);
+    assert_eq!(info["suite2Active"], true);
+    assert_eq!(info["spendsAllowed"], true);
+    assert_eq!(info["acceptedNewProofVersions"], serde_json::json!([2]));
+    let deployments = client
+        .call("sov_getDeployments", serde_json::json!({}))
+        .unwrap();
+    let suite_deployments = info["suite2Deployments"].as_array().unwrap();
+    let chosen = suite_deployments
+        .iter()
+        .find(|d| d["bit"] == chosen_bit)
+        .unwrap();
+    assert_eq!(chosen["state"], "LockedIn");
+    assert_eq!(chosen["nextState"], "Active");
+    assert_eq!(chosen["activationHeight"], 24);
+    assert_eq!(chosen["earliestActivationHeight"], 24);
+    assert_eq!(chosen["requiredSignalingBlocks"], 3);
+    assert_eq!(chosen["windowSignalingBlocks"], 4);
+    assert!(deployments["deployments"]
+        .as_array()
+        .unwrap()
+        .contains(chosen));
+    if recovery {
+        let old = suite_deployments.iter().find(|d| d["bit"] == 5).unwrap();
+        assert_eq!(old["state"], "Failed");
+        assert_eq!(old["nextState"], "Failed");
+        assert_eq!(old["activationHeight"], serde_json::Value::Null);
+    }
     client.submit_transaction(&tx).unwrap();
     blocks.push(mine(&mut node.lock().unwrap(), vec![tx]));
     assert_eq!(blocks.last().unwrap().transactions.len(), 1);
@@ -239,7 +323,7 @@ fn legacy_deposit_recovers_through_hiding_rpc_spends_after_activation_and_sunset
     let expected = node.lock().unwrap().chain().head().clone();
     let expected_supply = node.lock().unwrap().chain().ledger().total_supply();
     for _ in 0..2 {
-        let mut replay = chain();
+        let mut replay = chain(recovery);
         for block in &blocks {
             replay.import_block(block.clone()).unwrap();
         }

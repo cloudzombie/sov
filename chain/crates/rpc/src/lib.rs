@@ -925,6 +925,40 @@ fn wallet_scan_blocks(
 
 // ---- method dispatch ------------------------------------------------------
 
+fn deployment_status_json(d: &sov_chain::blockchain::DeploymentStatus) -> Value {
+    json!({
+        "name": d.name,
+        "bit": d.bit,
+        "state": format!("{:?}", d.state),
+        "nextState": format!("{:?}", d.next_state),
+        "startHeight": d.start_height,
+        "timeoutHeight": d.timeout_height,
+        "period": d.period,
+        "minActivationHeight": d.min_activation_height,
+        "earliestActivationHeight": d.earliest_activation_height,
+        "activationHeight": d.activation_height,
+        "threshold": { "num": d.threshold.num, "den": d.threshold.den },
+        "lockinontimeout": d.lockinontimeout,
+        "windowStartHeight": d.window_start_height,
+        "windowEndHeight": d.window_end_height,
+        "windowBlocksMined": d.window_blocks_mined,
+        "windowSignalingBlocks": d.window_signaling_blocks,
+        "requiredSignalingBlocks": d.required_signaling_blocks,
+    })
+}
+
+fn suite2_deployments_json(chain: &sov_chain::Blockchain) -> Vec<Value> {
+    chain
+        .deployment_states()
+        .iter()
+        .filter(|d| {
+            d.bit == sov_governance::BIT_SHIELDED_V2_SUITE2
+                || d.bit == sov_governance::BIT_SHIELDED_V2_SUITE2_RECOVERY
+        })
+        .map(deployment_status_json)
+        .collect()
+}
+
 /// Quantum policy for the next includable block, derived from the same release
 /// configuration and committed signals as consensus. `false` proof-security
 /// disclosure is deliberate: hash-based proofs are not a completed QROM audit.
@@ -1009,6 +1043,9 @@ fn quantum_status(chain: &sov_chain::Blockchain) -> Value {
         "poolV2HistoricalProofVersions": if cfg!(feature = "zk-suite2") { vec![1u8,2] } else { vec![1u8] },
         "poolV2AcceptedNewProofVersions": if suite2_allowed { vec![2u8] } else { vec![] },
         "poolV2Suite2ParameterId": suite2_parameter_id(),
+        "poolV2Suite2CurrentActive": chain.shielded_v2_suite2_active(height),
+        "poolV2Suite2NextBlockActive": chain.shielded_v2_suite2_active(evaluated_height),
+        "poolV2Suite2Deployments": suite2_deployments_json(chain),
         "poolV2WriteBlockReason": if suite2_allowed { Value::Null } else { json!("replacement_proof_not_activated") },
         "fullyPostQuantum": false,
         "signatureScheme": "Ed25519 + ML-DSA-65 (hybrid)",
@@ -1506,6 +1543,10 @@ fn call(
                 "acceptedNewProofVersions": if suite2_allowed { vec![2u8] } else { vec![] },
                 "suite2Compiled": cfg!(feature = "zk-suite2"),
                 "suite2Active": c.shielded_v2_suite2_active(height.saturating_add(1)),
+                "suite2CurrentActive": c.shielded_v2_suite2_active(height),
+                "suite2NextBlockActive": c.shielded_v2_suite2_active(height.saturating_add(1)),
+                "evaluatedHeight": height.saturating_add(1),
+                "suite2Deployments": suite2_deployments_json(c),
                 "suite2ParameterId": suite2_parameter_id(),
                 "experimentalSuite2": c.chain_id().starts_with(SUITE2_REHEARSAL_CHAIN_PREFIX),
                 "legacyKeyExposureRecoveryEstablished": false,
@@ -2004,17 +2045,7 @@ fn call(
                 .chain()
                 .deployment_states()
                 .iter()
-                .map(|d| {
-                    json!({
-                        "name": d.name,
-                        "bit": d.bit,
-                        "state": format!("{:?}", d.state),
-                        "startHeight": d.start_height,
-                        "timeoutHeight": d.timeout_height,
-                        "period": d.period,
-                        "lockinontimeout": d.lockinontimeout,
-                    })
-                })
+                .map(deployment_status_json)
                 .collect();
             Ok(json!({
                 "height": node.chain().height(),

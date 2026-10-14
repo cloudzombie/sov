@@ -69,7 +69,7 @@ pub const MAX_SIGNAL_BIT: u8 = 28;
 // ── The signal-bit registry (forward-compat law F1) ──────────────────────────
 // ONE table owns every signaling bit SOV has ever assigned. Adding a deployment
 // means claiming the next bit HERE first; nothing else may reuse or renumber a
-// bit. Bits 6..=28 are reserved and unassigned.
+// bit. Bits 7..=28 are reserved and unassigned.
 
 /// Signal bit 0 — the `tx-domain` hard fork (chain-bound tx/intent signatures).
 /// Armed and ACTIVATED on mainnet (v0.1.99, active at height 11520).
@@ -109,6 +109,12 @@ pub const PQ_SUNSET_DEPLOYMENT: &str = "pq-sunset";
 pub const BIT_SHIELDED_V2_SUITE2: u8 = 5;
 /// Canonical deployment name for the replacement proof suite.
 pub const SHIELDED_V2_SUITE2_DEPLOYMENT: &str = "shielded-v2-suite2";
+
+/// Signal bit 6 opens a distinct prospective readiness window for suite 2
+/// when the original bit-5 deployment failed. It never rewrites bit-5 history.
+pub const BIT_SHIELDED_V2_SUITE2_RECOVERY: u8 = 6;
+/// Canonical deployment name for the prospective suite-2 recovery window.
+pub const SHIELDED_V2_SUITE2_RECOVERY_DEPLOYMENT: &str = "shielded-v2-suite2-recovery";
 
 /// Errors constructing or operating the governance machine.
 ///

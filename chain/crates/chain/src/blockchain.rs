@@ -133,6 +133,9 @@ pub struct Blockchain {
     /// Independently signaled replacement proof suite; absent on canonical
     /// networks until a reviewed activation schedule is published.
     shielded_v2_suite2_deployment: Option<sov_governance::Deployment>,
+    /// A separate prospective suite-2 readiness window. The original bit-5
+    /// deployment and its committed historical votes remain unchanged.
+    shielded_v2_suite2_recovery_deployment: Option<sov_governance::Deployment>,
     /// The miner-signaled `tx-timestamp` deployment (signal bit 3 — the
     /// `Action::Timestamped` bounded creation-time envelope), if this chain
     /// schedules one. `None` keeps the envelope a hard `FeatureInactive` reject
@@ -397,12 +400,33 @@ pub struct DeploymentStatus {
     pub bit: u8,
     /// The current BIP-9/BIP-8 threshold state (`Defined`/`Started`/`LockedIn`/`Active`/`Failed`).
     pub state: sov_governance::ThresholdState,
+    /// Threshold state governing the next includable block.
+    pub next_state: sov_governance::ThresholdState,
     /// First height at which signaling is counted.
     pub start_height: u64,
     /// Height at which an un-locked-in deployment fails (or, with LOT, force-locks-in).
     pub timeout_height: u64,
     /// The signaling-window length in blocks.
     pub period: u64,
+    /// Minimum height at which a locked-in deployment may become active.
+    pub min_activation_height: u64,
+    /// Earliest permitted active window, assuming immediate threshold readiness.
+    pub earliest_activation_height: u64,
+    /// First active window resolved from committed signals, including a future
+    /// activation already guaranteed by lock-in; absent until determinable.
+    pub activation_height: Option<u64>,
+    /// Required fraction of committed signaling blocks within a window.
+    pub threshold: sov_governance::Threshold,
+    /// Inclusive start of the current signaling window.
+    pub window_start_height: u64,
+    /// Exclusive end of the current signaling window.
+    pub window_end_height: u64,
+    /// Committed blocks observed in this window through the current head.
+    pub window_blocks_mined: u64,
+    /// Observed blocks committing this deployment's signaling bit.
+    pub window_signaling_blocks: u64,
+    /// Minimum signaling blocks required to meet the threshold.
+    pub required_signaling_blocks: u64,
     /// BIP-8 lock-in-on-timeout (a guaranteed mandatory activation).
     pub lockinontimeout: bool,
 }
@@ -598,6 +622,7 @@ impl Blockchain {
             fee_auction_deployment: None,
             shielded_v2_deployment: None,
             shielded_v2_suite2_deployment: None,
+            shielded_v2_suite2_recovery_deployment: None,
             tx_timestamp_deployment: None,
             active_receipts: HashMap::new(),
             tx_height: HashMap::new(),
@@ -1107,6 +1132,16 @@ impl Blockchain {
         self.shielded_v2_suite2_deployment = Some(deployment);
     }
 
+    /// Install a distinct prospective readiness window for the same suite-2
+    /// verifier. This neither reuses the original deployment's bit nor changes
+    /// its historical activation decisions.
+    pub fn set_shielded_v2_suite2_recovery_deployment(
+        &mut self,
+        deployment: sov_governance::Deployment,
+    ) {
+        self.shielded_v2_suite2_recovery_deployment = Some(deployment);
+    }
+
     /// Schedule the miner-signaled `tx-timestamp` deployment (signal bit 3):
     /// once `deployment` activates under the BIP-9/8 state machine, an
     /// `Action::Timestamped` envelope executes — its declared `created_at_ms`
@@ -1128,45 +1163,89 @@ impl Blockchain {
     pub fn deployment_states(&self) -> Vec<DeploymentStatus> {
         let mut out = Vec::new();
         let h = self.height();
-        if let Some(cfg) = &self.pq_deployment {
-            let d = &cfg.deployment;
-            out.push(DeploymentStatus {
+        let status = |d: &sov_governance::Deployment| {
+            let window_start_height = (h / d.period) * d.period;
+            let window_end_height = window_start_height.saturating_add(d.period);
+            let state = sov_governance::state_at(d, BlockHeight::new(h), &self.signals);
+            let next_state =
+                sov_governance::state_at(d, BlockHeight::new(h.saturating_add(1)), &self.signals);
+            let ceil_window = |height: u64| height.div_ceil(d.period).saturating_mul(d.period);
+            let earliest_activation_height = ceil_window(d.start_height.get())
+                .max(d.period)
+                .saturating_add(d.period.saturating_mul(2))
+                .max(ceil_window(d.min_activation_height.get()));
+            let activation_height = if next_state == sov_governance::ThresholdState::Active {
+                // Active is terminal, so a boundary search finds its first
+                // occurrence without depending on wall time or node settings.
+                let mut lo = 0;
+                let mut hi = h.saturating_add(1) / d.period;
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if sov_governance::state_at(d, BlockHeight::new(mid * d.period), &self.signals)
+                        == sov_governance::ThresholdState::Active
+                    {
+                        hi = mid;
+                    } else {
+                        lo = mid + 1;
+                    }
+                }
+                Some(lo * d.period)
+            } else if next_state == sov_governance::ThresholdState::LockedIn {
+                let next_window = (h.saturating_add(1) / d.period)
+                    .saturating_add(1)
+                    .saturating_mul(d.period);
+                let candidate = next_window.max(ceil_window(d.min_activation_height.get()));
+                (sov_governance::state_at(d, BlockHeight::new(candidate), &self.signals)
+                    == sov_governance::ThresholdState::Active)
+                    .then_some(candidate)
+            } else {
+                None
+            };
+            let window_blocks_mined = h
+                .saturating_add(1)
+                .min(window_end_height)
+                .saturating_sub(window_start_height);
+            DeploymentStatus {
                 name: d.name.clone(),
                 bit: d.bit,
-                state: sov_governance::state_at(d, BlockHeight::new(h), &self.signals),
+                state,
+                next_state,
                 start_height: d.start_height.get(),
                 timeout_height: d.timeout_height.get(),
                 period: d.period,
+                min_activation_height: d.min_activation_height.get(),
+                earliest_activation_height,
+                activation_height,
+                threshold: d.threshold,
+                window_start_height,
+                window_end_height,
+                window_blocks_mined,
+                window_signaling_blocks: sov_governance::signaling_count_in_window(
+                    d,
+                    window_start_height,
+                    &self.signals,
+                ),
+                required_signaling_blocks: (u128::from(d.period) * u128::from(d.threshold.num))
+                    .div_ceil(u128::from(d.threshold.den))
+                    as u64,
                 lockinontimeout: d.lockinontimeout,
-            });
+            }
+        };
+        if let Some(cfg) = &self.pq_deployment {
+            out.push(status(&cfg.deployment));
         }
         if let Some(d) = &self.tx_domain_deployment {
-            out.push(DeploymentStatus {
-                name: d.name.clone(),
-                bit: d.bit,
-                state: sov_governance::state_at(d, BlockHeight::new(h), &self.signals),
-                start_height: d.start_height.get(),
-                timeout_height: d.timeout_height.get(),
-                period: d.period,
-                lockinontimeout: d.lockinontimeout,
-            });
+            out.push(status(d));
         }
         for d in self
             .fee_auction_deployment
             .iter()
             .chain(self.shielded_v2_deployment.iter())
             .chain(self.shielded_v2_suite2_deployment.iter())
+            .chain(self.shielded_v2_suite2_recovery_deployment.iter())
             .chain(self.tx_timestamp_deployment.iter())
         {
-            out.push(DeploymentStatus {
-                name: d.name.clone(),
-                bit: d.bit,
-                state: sov_governance::state_at(d, BlockHeight::new(h), &self.signals),
-                start_height: d.start_height.get(),
-                timeout_height: d.timeout_height.get(),
-                period: d.period,
-                lockinontimeout: d.lockinontimeout,
-            });
+            out.push(status(d));
         }
         out
     }
@@ -1453,8 +1532,9 @@ impl Blockchain {
         Self::deployment_active_at(self.shielded_v2_deployment.as_ref(), height, signals)
     }
 
-    /// Whether bit 5 activates the replacement proof at this height, evaluated
-    /// over committed miner signals. Both bit 2 and bit 5 must be active.
+    /// Whether either independent suite-2 readiness deployment activates the
+    /// replacement proof at this height, over committed miner signals. The
+    /// original pool-v2 deployment (bit 2) must also be active.
     pub fn shielded_v2_suite2_active(&self, height: u64) -> bool {
         self.shielded_v2_suite2_active_with(height, &self.signals)
     }
@@ -1464,7 +1544,12 @@ impl Blockchain {
         height: u64,
         signals: &sov_governance::SignalLog,
     ) -> bool {
-        Self::deployment_active_at(self.shielded_v2_suite2_deployment.as_ref(), height, signals)
+        (Self::deployment_active_at(self.shielded_v2_suite2_deployment.as_ref(), height, signals)
+            || Self::deployment_active_at(
+                self.shielded_v2_suite2_recovery_deployment.as_ref(),
+                height,
+                signals,
+            ))
             && self.shielded_v2_active_with(height, signals)
     }
 
@@ -1551,7 +1636,9 @@ impl Blockchain {
             }
         }
         let normal = elastic_block_cap(sizes);
-        if self.shielded_v2_suite2_deployment.is_none() {
+        if self.shielded_v2_suite2_deployment.is_none()
+            && self.shielded_v2_suite2_recovery_deployment.is_none()
+        {
             return normal;
         }
         let height = parent.height.saturating_add(1);
@@ -6766,7 +6853,7 @@ mod suite2_branch_limit_tests {
     use super::tests::fresh_chain;
     use super::*;
 
-    fn signaling_chain(signal: bool) -> Blockchain {
+    fn signaling_chain(signal: bool, recovery: bool) -> Blockchain {
         let mut chain = fresh_chain();
         chain.set_shielded_v2_deployment(
             sov_governance::Deployment::new(
@@ -6781,12 +6868,56 @@ mod suite2_branch_limit_tests {
             )
             .unwrap(),
         );
-        chain.set_shielded_v2_suite2_deployment(
+        let deployment = sov_governance::Deployment::new(
+            if recovery {
+                "shielded-v2-suite2-recovery"
+            } else {
+                "shielded-v2-suite2"
+            },
+            if recovery { 6 } else { 5 },
+            BlockHeight::new(4),
+            BlockHeight::new(400),
+            4,
+            sov_governance::Threshold::new(3, 4).unwrap(),
+            BlockHeight::new(12),
+            false,
+        )
+        .unwrap();
+        if recovery {
+            chain.set_shielded_v2_suite2_recovery_deployment(deployment);
+        } else {
+            chain.set_shielded_v2_suite2_deployment(deployment);
+        }
+        chain.set_signal_mask(
+            (1 << 2)
+                | if signal {
+                    1 << if recovery { 6 } else { 5 }
+                } else {
+                    0
+                },
+        );
+        chain
+    }
+
+    #[test]
+    fn suite2_block_floor_follows_parent_branch_at_exact_activation() {
+        check_block_floor_follows_parent_branch(false);
+    }
+
+    #[test]
+    fn suite2_recovery_block_floor_follows_parent_branch_at_exact_activation() {
+        check_block_floor_follows_parent_branch(true);
+    }
+
+    #[test]
+    fn either_suite2_window_can_activate_but_original_pool_is_always_required() {
+        let mut original = signaling_chain(true, false);
+        original.set_shielded_v2_suite2_recovery_deployment(
             sov_governance::Deployment::new(
-                "shielded-v2-suite2",
-                5,
+                "shielded-v2-suite2-recovery",
+                6,
                 BlockHeight::new(4),
-                BlockHeight::new(400),
+                BlockHeight::new(12),
                 4,
                 sov_governance::Threshold::new(3, 4).unwrap(),
                 BlockHeight::new(12),
@@ -6794,14 +6925,85 @@ mod suite2_branch_limit_tests {
             )
             .unwrap(),
         );
-        chain.set_signal_mask((1 << 2) | if signal { 1 << 5 } else { 0 });
-        chain
+        for height in 1..12 {
+            original
+                .signals
+                .record(BlockHeight::new(height), (1 << 2) | (1 << 5));
+        }
+        assert!(original.shielded_v2_suite2_active(12));
+        assert_eq!(
+            sov_governance::state_at(
+                original
+                    .shielded_v2_suite2_recovery_deployment
+                    .as_ref()
+                    .unwrap(),
+                BlockHeight::new(12),
+                &original.signals,
+            ),
+            sov_governance::ThresholdState::Failed,
+            "a failed recovery window cannot disable an already active original suite"
+        );
+        original.shielded_v2_deployment = None;
+        assert!(!original.shielded_v2_suite2_active(12));
+
+        let mut recovery = signaling_chain(true, true);
+        for height in 1..12 {
+            recovery
+                .signals
+                .record(BlockHeight::new(height), (1 << 2) | (1 << 6));
+        }
+        assert!(recovery.shielded_v2_suite2_active(12));
+        recovery.shielded_v2_deployment = None;
+        assert!(
+            !recovery.shielded_v2_suite2_active(12),
+            "prospective suite-2 readiness cannot activate the original pool by itself"
+        );
     }
 
     #[test]
-    fn suite2_block_floor_follows_parent_branch_at_exact_activation() {
-        let mut active = signaling_chain(true);
-        let mut inactive = signaling_chain(false);
+    fn recovery_readiness_reports_actual_late_lockin_and_minimum_guard() {
+        for (minimum, expected_activation) in [(12, 16), (20, 20)] {
+            let mut chain = signaling_chain(false, true);
+            chain.set_shielded_v2_suite2_recovery_deployment(
+                sov_governance::Deployment::new(
+                    "shielded-v2-suite2-recovery",
+                    6,
+                    BlockHeight::new(4),
+                    BlockHeight::new(24),
+                    4,
+                    sov_governance::Threshold::new(3, 4).unwrap(),
+                    BlockHeight::new(minimum),
+                    false,
+                )
+                .unwrap(),
+            );
+            for height in 1..=11 {
+                chain.set_signal_mask((1 << 2) | if height >= 8 { 1 << 6 } else { 0 });
+                let block = chain.produce_block(vec![], (height + 1) * 1000).unwrap();
+                chain.import_block(block).unwrap();
+            }
+            let states = chain.deployment_states();
+            let recovery = states.iter().find(|d| d.bit == 6).unwrap();
+            assert_eq!(recovery.state, sov_governance::ThresholdState::Started);
+            assert_eq!(
+                recovery.next_state,
+                sov_governance::ThresholdState::LockedIn
+            );
+            assert_eq!(recovery.activation_height, Some(expected_activation));
+            assert_eq!(recovery.earliest_activation_height, minimum);
+            assert_eq!(recovery.window_start_height, 8);
+            assert_eq!(recovery.window_end_height, 12);
+            assert_eq!(recovery.window_blocks_mined, 4);
+            assert_eq!(recovery.window_signaling_blocks, 4);
+            assert_eq!(recovery.required_signaling_blocks, 3);
+            assert!(!chain.shielded_v2_suite2_active(12));
+            assert!(chain.shielded_v2_suite2_active(expected_activation));
+        }
+    }
+
+    fn check_block_floor_follows_parent_branch(recovery: bool) {
+        let mut active = signaling_chain(true, recovery);
+        let mut inactive = signaling_chain(false, recovery);
         assert_eq!(active.genesis_hash, inactive.genesis_hash);
         let mut yes = Vec::new();
         let mut no = Vec::new();

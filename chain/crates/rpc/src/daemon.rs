@@ -1216,6 +1216,8 @@ struct BakedDeployments {
     shielded_v2: Option<sov_governance::Deployment>,
     /// Independently activated hiding proof suite, armed on mainnet in 0.2.16.
     shielded_v2_suite2: Option<sov_governance::Deployment>,
+    /// Prospective recovery readiness window; does not rewrite the bit-5 schedule.
+    shielded_v2_suite2_recovery: Option<sov_governance::Deployment>,
     /// The `tx-timestamp` deployment (bit 3): the `Action::Timestamped` bounded
     /// creation-time envelope. ARMED on MAINNET as of 0.2.6 (`Some`), on a
     /// schedule with real fleet lead time
@@ -1225,8 +1227,8 @@ struct BakedDeployments {
     /// The tx-domain grace window `G` in blocks — consensus-critical once armed,
     /// baked here so no per-node divergence is possible.
     grace_blocks: u64,
-    /// The version-bits mask this node's mined blocks commit (mainnet 0.2.16:
-    /// bits 0, 1, 2, 3 and 5).
+    /// The version-bits mask this node's mined blocks commit (mainnet 0.2.18:
+    /// bits 0, 1, 2, 3, 5 and 6).
     signal_mask: u32,
 }
 
@@ -1346,7 +1348,12 @@ const MAINNET_TX_TIMESTAMP_START_HEIGHT: u64 = 17_280;
 /// required, without lock-in on timeout. Earliest activation is 28,224.
 const MAINNET_SHIELDED_V2_SUITE2_START_HEIGHT: u64 = 27_648;
 
-/// The release-pinned mainnet activation preset (bits 0, 1, 2, 3 and 5).
+/// A distinct prospective window after the immutable bit-5 deployment times
+/// out. This retains all historical activation decisions and requires fresh
+/// 90% miner readiness. Earliest lock-in is 28,800; earliest activation 29,088.
+const MAINNET_SHIELDED_V2_SUITE2_RECOVERY_START_HEIGHT: u64 = 28_512;
+
+/// The release-pinned mainnet activation preset (bits 0, 1, 2, 3, 5 and 6).
 /// These values are consensus-coordinating: two nodes with different heights,
 /// thresholds, or grace `G` would split at activation / at `H_a + G`.
 fn mainnet_deployments() -> BakedDeployments {
@@ -1422,6 +1429,17 @@ fn mainnet_deployments() -> BakedDeployments {
         false,
     )
     .expect("baked mainnet hiding-proof replacement deployment is valid");
+    let suite2_recovery = sov_governance::Deployment::new(
+        sov_governance::SHIELDED_V2_SUITE2_RECOVERY_DEPLOYMENT,
+        sov_governance::BIT_SHIELDED_V2_SUITE2_RECOVERY,
+        BlockHeight::new(MAINNET_SHIELDED_V2_SUITE2_RECOVERY_START_HEIGHT),
+        BlockHeight::new(MAINNET_SHIELDED_V2_SUITE2_RECOVERY_START_HEIGHT + 3 * 288),
+        288,
+        threshold,
+        BlockHeight::new(MAINNET_SHIELDED_V2_SUITE2_RECOVERY_START_HEIGHT + 288),
+        false,
+    )
+    .expect("baked mainnet prospective hiding-proof recovery deployment is valid");
     BakedDeployments {
         pq_sunset: None,
         tx_domain,
@@ -1436,10 +1454,11 @@ fn mainnet_deployments() -> BakedDeployments {
         // Bit 3 is ARMED on mainnet as of 0.2.6, and `signal_mask` below sets
         // bit 3 so mainnet nodes broadcast their readiness vote.
         shielded_v2_suite2: Some(suite2),
+        shielded_v2_suite2_recovery: Some(suite2_recovery),
         tx_timestamp: Some(tx_timestamp),
         grace_blocks: 576,
         signal_mask: if cfg!(feature = "zk-suite2") {
-            0b101111
+            0b1101111
         } else {
             0b1111
         },
@@ -1492,6 +1511,7 @@ fn e2e_rehearsal_deployments() -> BakedDeployments {
         // activation tests live in `sov-chain`), so it schedules none and does
         // not signal it — `Action::Timestamped` stays a hard reject there.
         shielded_v2_suite2: None,
+        shielded_v2_suite2_recovery: None,
         tx_timestamp: None,
         grace_blocks: 0,
         // Signal readiness for bit 0 AND bit 2 (bit 1, fee-auction, is not
@@ -1540,6 +1560,7 @@ fn pq_rehearsal_deployments() -> BakedDeployments {
         fee_auction: None,
         shielded_v2: None,
         shielded_v2_suite2: None,
+        shielded_v2_suite2_recovery: None,
         tx_timestamp: None,
         grace_blocks: 0,
         signal_mask: (1 << sov_governance::BIT_TX_DOMAIN) | (1 << sov_governance::BIT_PQ_SUNSET),
@@ -1608,6 +1629,9 @@ fn genesis_chain_with_baked_preset(genesis: &GenesisConfig) -> Result<Blockchain
         }
         if let Some(suite2) = baked.shielded_v2_suite2 {
             chain.set_shielded_v2_suite2_deployment(suite2);
+        }
+        if let Some(recovery) = baked.shielded_v2_suite2_recovery {
+            chain.set_shielded_v2_suite2_recovery_deployment(recovery);
         }
         if let Some(tx_timestamp) = baked.tx_timestamp {
             chain.set_tx_timestamp_deployment(tx_timestamp);
@@ -3138,11 +3162,11 @@ mod tests {
         assert_eq!(
             baked.signal_mask,
             if cfg!(feature = "zk-suite2") {
-                0b101111
+                0b1101111
             } else {
                 0b1111
             },
-            "signals bits 0, 1, 2, 3 and 5"
+            "signals bits 0, 1, 2, 3, 5 and 6"
         );
         assert!(
             baked.pq_sunset.is_none(),
@@ -3202,6 +3226,89 @@ mod tests {
             baked.pq_sunset.is_none(),
             "separate legacy retirement is not inferred from pool repair"
         );
+    }
+
+    #[test]
+    fn mainnet_suite2_recovery_is_distinct_future_readiness_and_never_forced() {
+        use sov_governance::ThresholdState as S;
+        struct RecoveryVotes(bool);
+        impl sov_governance::MinerSignals for RecoveryVotes {
+            fn signals(&self, height: BlockHeight, bit: u8) -> bool {
+                self.0
+                    && bit == sov_governance::BIT_SHIELDED_V2_SUITE2_RECOVERY
+                    && height.get() >= 28_512
+            }
+        }
+        let baked = mainnet_deployments();
+        let old = baked.shielded_v2_suite2.as_ref().unwrap();
+        let recovery = baked.shielded_v2_suite2_recovery.as_ref().unwrap();
+        assert_eq!(
+            recovery.name,
+            sov_governance::SHIELDED_V2_SUITE2_RECOVERY_DEPLOYMENT
+        );
+        assert_eq!(recovery.bit, 6);
+        assert_ne!(old.bit, recovery.bit);
+        assert_eq!(recovery.start_height.get(), old.timeout_height.get());
+        assert_eq!(recovery.start_height.get(), 28_512);
+        assert_eq!(recovery.min_activation_height.get(), 28_800);
+        assert_eq!(recovery.timeout_height.get(), 29_376);
+        assert_eq!(recovery.period, 288);
+        assert_eq!(
+            recovery.threshold,
+            sov_governance::Threshold::new(9, 10).unwrap()
+        );
+        assert!(!recovery.lockinontimeout);
+        for (height, expected) in [
+            (28_308, S::Defined),
+            (28_511, S::Defined),
+            (28_512, S::Started),
+            (28_799, S::Started),
+            (28_800, S::LockedIn),
+            (29_087, S::LockedIn),
+            (29_088, S::Active),
+            (29_376, S::Active),
+        ] {
+            assert_eq!(
+                sov_governance::state_at(recovery, BlockHeight::new(height), &RecoveryVotes(true)),
+                expected,
+                "prospective recovery state at {height}"
+            );
+        }
+        assert_eq!(
+            sov_governance::state_at(old, BlockHeight::new(29_088), &RecoveryVotes(true)),
+            S::Failed,
+            "new bit-6 votes must never rewrite failed bit-5 history"
+        );
+        assert_eq!(
+            sov_governance::state_at(recovery, BlockHeight::new(29_376), &RecoveryVotes(false)),
+            S::Failed,
+            "no readiness votes means no recovery activation"
+        );
+        struct FirstVotes(u64);
+        impl sov_governance::MinerSignals for FirstVotes {
+            fn signals(&self, height: BlockHeight, bit: u8) -> bool {
+                bit == sov_governance::BIT_SHIELDED_V2_SUITE2_RECOVERY
+                    && (28_512..28_512 + self.0).contains(&height.get())
+            }
+        }
+        for (votes, expected) in [(259, S::Started), (260, S::LockedIn)] {
+            assert_eq!(
+                sov_governance::state_at(recovery, BlockHeight::new(28_800), &FirstVotes(votes)),
+                expected,
+                "readiness threshold is exactly 260 of 288 committed blocks"
+            );
+        }
+        for id in ["sov-e2e-v020-test", "sov-pq-rehearsal-test"] {
+            assert!(baked_deployments(id)
+                .unwrap()
+                .shielded_v2_suite2_recovery
+                .is_none());
+        }
+        #[cfg(feature = "zk-suite2")]
+        assert!(baked_deployments("sov-suite2-rehearsal-test")
+            .unwrap()
+            .shielded_v2_suite2_recovery
+            .is_none());
     }
 
     #[test]
@@ -3367,7 +3474,7 @@ mod tests {
         assert_eq!(
             overlap.signal_mask,
             if cfg!(feature = "zk-suite2") {
-                0b101111
+                0b1101111
             } else {
                 0b1111
             }
@@ -3503,7 +3610,7 @@ mod tests {
         assert_eq!(
             both.signal_mask,
             if cfg!(feature = "zk-suite2") {
-                0b101111
+                0b1101111
             } else {
                 0b1111
             }
@@ -3521,7 +3628,7 @@ mod tests {
         // a preset-less chain cannot replay a post-activation Tipped log is
         // `sov-chain`'s `post_activation_tipped_log_cold_replays_only_with_the_
         // deployment_installed`.) Observable here without mining to height 10944:
-        // the installed signal mask stamps `version_bits = 0b101111` on the first
+        // the installed signal mask stamps `version_bits = 0b1101111` on the first
         // produced block, and a non-mainnet chain stays untouched (bits 0).
         let genesis_for = |chain_id: &str| GenesisConfig {
             chain_id: chain_id.into(),
@@ -3541,7 +3648,7 @@ mod tests {
         assert_eq!(
             block.header.version_bits,
             if cfg!(feature = "zk-suite2") {
-                0b101111
+                0b1101111
             } else {
                 0b1111
             },

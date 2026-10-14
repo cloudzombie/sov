@@ -1,4 +1,4 @@
-# SOV Station v0.2.18 — V2 wallet repair and bounded historical proof verification
+# SOV Station v0.2.18 — V2 spend recovery, wallet and node repair
 
 Publication of v0.2.17 was canceled after Ubuntu CI exposed an allocation abort
 in historical Winterfell proof verification. The outer proof length was bounded,
@@ -42,11 +42,24 @@ Station preserves public rejection history across restart and continues tracking
 it because a local rejection is not a final chain receipt. An absent transaction
 or failed RPC never becomes a claimed confirmation or an automatic resend.
 
-This release inherits v0.2.16's protocol-3 peer authentication and suite-2
-activation policy. A matched client/miner/relay upgrade is required; older peers
-cannot authenticate with protocol 3. Do not reset chain data or replace wallet
-seeds. Mainnet legacy-key retirement remains unarmed, and independent proof and
-quantum-soundness review remain outstanding.
+This release restores the activation path for replacement-proof V2 spends with
+a distinct mainnet readiness deployment, `shielded-v2-suite2-recovery` on bit 6.
+The published bit-5 schedule and historical votes remain unchanged. Its readiness
+window starts at 28,512 and requires 260 of 288 blocks; successful first-window readiness locks
+in at 28,800 and enables spending at 29,088. It times out at 29,376 without forced
+lock-in. Upgraded miner templates signal the new deployment. Pool RPC and Station
+show both activation state and actual vote progress. Existing notes use their
+original seeds, commitments and nullifiers with the replacement proof; neither
+a deposit migration nor a wallet reset is required. Real RPC recovery tests cover
+old notes, mixed notes, private transfers, withdrawals, and cold replay after the
+recovery deployment activates.
+
+A matched client/miner/relay upgrade is required for protocol-3 authentication;
+older peers cannot authenticate with it. Keep existing chain data and wallet
+seeds. New unmasked proof-version-1 carriers remain refused because a copied
+withdrawal can be reauthorized to an unrelated payout signer. Historical blocks
+remain verifiable. Mainnet legacy-key retirement remains unarmed, and independent
+proof and quantum-soundness review remain outstanding.
 
 Peer discovery now announces a bounded address set when Hello authentication
 completes, in addition to requesting addresses. This repairs the ordering race

@@ -292,11 +292,34 @@ struct ShieldedV2Info {
     window_resets_at: u64,
     height: u64,
     suite2_active: bool,
+    suite2_current_active: Option<bool>,
+    evaluated_height: Option<u64>,
+    suite2_deployments: Vec<Suite2ReadinessDeployment>,
     suite2_compiled: bool,
     suite2_profile: u64,
     creation_allowed: bool,
     spends_allowed: bool,
     accepted_new_versions: Vec<u64>,
+}
+
+/// Miner readiness comes from the node's canonical chain. These figures inform
+/// the operator; they never override the node's next-block admission policy.
+#[derive(Clone, PartialEq, Eq)]
+struct Suite2ReadinessDeployment {
+    name: String,
+    bit: u64,
+    state: String,
+    next_state: String,
+    start_height: u64,
+    timeout_height: u64,
+    period: u64,
+    window_start: u64,
+    window_end: u64,
+    blocks_mined: u64,
+    signaling_blocks: u64,
+    required_blocks: u64,
+    earliest_activation_height: Option<u64>,
+    activation_height: Option<u64>,
 }
 
 /// Which shielded pool a surface is describing. The two are NOT interchangeable and
@@ -315,7 +338,7 @@ enum Pool {
 }
 
 const V2_PROOF_SECURITY_NOTE: &str =
-    "Pool v2 uses post-quantum primitives; independent proof audit and quantum soundness review remain pending. Station preserves existing notes and uses the context-bound hiding replacement only when this chain activates compatible suite 2. Legacy proof creation remains disabled. New receiving keys are independent of historical keys.";
+    "Pool v2 uses post-quantum primitives; independent proof audit and quantum soundness review remain pending. Station preserves existing notes and uses the context-bound hiding replacement only when this chain activates compatible suite 2. Original notes are spent with replacement proofs; the exposed legacy proof cannot safely authorize new transactions. New receiving keys are independent of historical keys.";
 
 // No remote RPC flag can establish the soundness of this proof implementation.
 // This release has no reviewed quantum-security proof/parameter allowlist.
@@ -2162,6 +2185,133 @@ fn grains_field(v: &Value, key: &str) -> u128 {
         .unwrap_or(0)
 }
 
+fn suite2_readiness_deployment(v: &Value) -> Option<Suite2ReadinessDeployment> {
+    let state = |key| {
+        let state = v.get(key)?.as_str()?;
+        matches!(
+            state,
+            "Defined" | "Started" | "LockedIn" | "Active" | "Failed"
+        )
+        .then(|| state.to_owned())
+    };
+    let number = |key| v.get(key).and_then(Value::as_u64);
+    Some(Suite2ReadinessDeployment {
+        name: v.get("name")?.as_str()?.to_owned(),
+        bit: number("bit")?,
+        state: state("state")?,
+        next_state: state("nextState")?,
+        start_height: number("startHeight")?,
+        timeout_height: number("timeoutHeight")?,
+        period: number("period")?,
+        window_start: number("windowStartHeight")?,
+        window_end: number("windowEndHeight")?,
+        blocks_mined: number("windowBlocksMined")?,
+        signaling_blocks: number("windowSignalingBlocks")?,
+        required_blocks: number("requiredSignalingBlocks")?,
+        earliest_activation_height: number("earliestActivationHeight"),
+        activation_height: number("activationHeight"),
+    })
+}
+
+/// Recomputed after every node poll, without touching wallet fields or note caches.
+fn v2_readiness_lines(online: bool, info: Option<&ShieldedV2Info>) -> Vec<String> {
+    if !online {
+        return vec!["V2 spend readiness unavailable — connect to your node.".into()];
+    }
+    let Some(info) = info else {
+        return vec![
+            "V2 spend readiness unavailable — update the connected node to report pool-v2 policy."
+                .into(),
+        ];
+    };
+    if quantum_v2_activity_allowed(Some(info)).is_ok() {
+        let block = info
+            .evaluated_height
+            .map(|height| format!(" for block {height}"))
+            .unwrap_or_default();
+        let transition = if info.suite2_current_active == Some(false) {
+            " Miner activation applies to the next block."
+        } else {
+            ""
+        };
+        return vec![format!(
+            "V2 spends ready{block} — original and fresh notes use suite-2 proofs.{transition}"
+        )];
+    }
+    let mut lines = vec![format!(
+        "V2 spend readiness: {}",
+        quantum_v2_activity_allowed(Some(info)).unwrap_err()
+    )];
+    for deployment in &info.suite2_deployments {
+        let mut line = format!(
+            "{} (bit {}): {}",
+            deployment.name, deployment.bit, deployment.state
+        );
+        if deployment.next_state != deployment.state {
+            line.push_str(&format!(" → {} next block", deployment.next_state));
+        }
+        match deployment.state.as_str() {
+            "Defined" => line.push_str(&format!(
+                " · miner signaling starts at block {}",
+                deployment.start_height
+            )),
+            "Started" => line.push_str(&format!(
+                " · votes {} / {} required · window {}–{} · {} / {} blocks mined",
+                deployment.signaling_blocks,
+                deployment.required_blocks,
+                deployment.window_start,
+                deployment.window_end.saturating_sub(1),
+                deployment.blocks_mined,
+                deployment.period
+            )),
+            "Failed" => line.push_str(&format!(
+                " · signaling ended at block {}",
+                deployment.timeout_height
+            )),
+            _ => {}
+        }
+        if let Some(height) = deployment
+            .activation_height
+            .filter(|_| deployment.state != "Failed")
+        {
+            line.push_str(&format!(" · activation block {height}"));
+        } else if let Some(height) = deployment.earliest_activation_height.filter(|height| {
+            matches!(deployment.state.as_str(), "Defined" | "Started")
+                && info
+                    .evaluated_height
+                    .is_none_or(|evaluated| *height >= evaluated)
+        }) {
+            line.push_str(&format!(
+                " · earliest activation block {height}, subject to miner signaling"
+            ));
+        }
+        lines.push(line);
+    }
+    if info.suite2_deployments.is_empty() && !info.suite2_active {
+        lines.push("The node did not report miner readiness. Update the connected node to see activation votes and heights.".into());
+    }
+    lines
+}
+
+fn v2_readiness_view(ui: &mut egui::Ui, online: bool, info: Option<&ShieldedV2Info>) {
+    let ready = online && quantum_v2_activity_allowed(info).is_ok();
+    for (index, line) in v2_readiness_lines(online, info).into_iter().enumerate() {
+        ui.label(
+            egui::RichText::new(line)
+                .size(ty::SMALL)
+                .color(if index == 0 {
+                    if ready {
+                        palette::success()
+                    } else {
+                        palette::text()
+                    }
+                } else {
+                    palette::text_dim()
+                }),
+        );
+    }
+}
+
 /// Parse a `sov_getShieldedV2Info` reply. Pure — the unit under test for the wire→UI
 /// mapping, so a field rename on the node side fails a test rather than silently
 /// rendering zeros in a wallet.
@@ -2194,9 +2344,22 @@ fn shielded_v2_info(v: &Value) -> Option<ShieldedV2Info> {
             .unwrap_or(0),
         height: v.get("height").and_then(Value::as_u64).unwrap_or(0),
         suite2_active: v
-            .get("suite2Active")
+            .get("suite2NextBlockActive")
+            .or_else(|| v.get("suite2Active"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        suite2_current_active: v.get("suite2CurrentActive").and_then(Value::as_bool),
+        evaluated_height: v.get("evaluatedHeight").and_then(Value::as_u64),
+        suite2_deployments: v
+            .get("suite2Deployments")
+            .and_then(Value::as_array)
+            .map(|deployments| {
+                deployments
+                    .iter()
+                    .filter_map(suite2_readiness_deployment)
+                    .collect()
+            })
+            .unwrap_or_default(),
         suite2_compiled: v
             .get("suite2Compiled")
             .and_then(Value::as_bool)
@@ -2849,19 +3012,27 @@ enum V2Intent<'a> {
 /// fundamental blocker rather than a downstream symptom of it.
 fn quantum_v2_activity_allowed(info: Option<&ShieldedV2Info>) -> Result<(), &'static str> {
     if !cfg!(feature = "zk-suite2") {
-        return Err("this Station build does not include the pool-v2 replacement prover; legacy unmasked proofs remain disabled");
+        return Err("update Station to a build with the pool-v2 suite-2 prover");
     }
-    let info =
-        info.ok_or("pool-v2 write policy is unavailable; legacy unmasked proofs remain disabled")?;
-    if !info.active
-        || !info.suite2_active
-        || !info.suite2_compiled
-        || info.suite2_profile != 2
-        || !info.creation_allowed
-        || !info.spends_allowed
-        || info.accepted_new_versions != [2]
-    {
-        return Err("pool-v2 writes require this chain's activated, compatible suite-2 replacement; legacy unmasked proofs remain disabled");
+    let info = info.ok_or("connect to an updated node to read its pool-v2 spend policy")?;
+    if !info.active {
+        return Err("pool v2 has not activated on this chain; await miner activation");
+    }
+    if !info.suite2_compiled {
+        return Err("update the connected node to a build with pool-v2 suite-2 support");
+    }
+    if !info.suite2_active {
+        return Err(
+            "await miner activation of suite 2; readiness votes and heights are shown above",
+        );
+    }
+    if info.suite2_profile != 2 || info.accepted_new_versions != [2] {
+        return Err(
+            "update Station and the connected node to the compatible pool-v2 suite-2 release",
+        );
+    }
+    if !info.creation_allowed || !info.spends_allowed {
+        return Err("the connected node has not enabled suite-2 transactions; update it and check miner readiness");
     }
     Ok(())
 }
@@ -13668,6 +13839,8 @@ impl Station {
                 }
             }
             ui.add_space(sp::M);
+            v2_readiness_view(ui, snap.online, snap.shielded_v2.as_ref());
+            ui.add_space(sp::S);
             ui.collapsing("Pool details · drain budgets, cryptography & network totals", |ui| {
                 shielded_pools_view(ui, &snap, v1_own, v2_own);
             });
@@ -20205,7 +20378,7 @@ mod tests {
     /// it", "v1 is never called post-quantum", "unavailable prints a dash, not a digit"
     /// — are claims about pixels, so they are asserted against the text that reached the
     /// painter rather than against the helpers that were supposed to produce it.
-    fn painted_text(add: impl Fn(&mut egui::Ui)) -> String {
+    pub(super) fn painted_text(add: impl Fn(&mut egui::Ui)) -> String {
         let ctx = egui::Context::default();
         // Wide enough to take the two-column branch of the layout.
         let input = || egui::RawInput {
@@ -23894,9 +24067,7 @@ mod quantum_release_policy_tests {
 
     #[test]
     fn active_pool_cannot_override_local_confidentiality_gate() {
-        assert!(quantum_v2_activity_allowed(None)
-            .unwrap_err()
-            .contains("unmasked"));
+        assert!(quantum_v2_activity_allowed(None).is_err());
         assert!(quantum_deposit_allowed(Pool::V1).is_err());
         assert_eq!(
             quantum_deposit_allowed(Pool::V2).is_ok(),
@@ -23923,10 +24094,160 @@ mod quantum_release_policy_tests {
                 amount: Some(1),
             },
         ] {
-            assert!(v2_allows(&guard, intent, None)
-                .unwrap_err()
-                .contains("unmasked"));
+            assert!(v2_allows(&guard, intent, None).is_err());
         }
+    }
+
+    fn v2_recovery_readiness_reply() -> Value {
+        json!({
+            "active": true,
+            "height": 28529,
+            "evaluatedHeight": 28530,
+            // The explicit next-block field must take precedence over the old alias.
+            "suite2Active": true,
+            "suite2CurrentActive": false,
+            "suite2NextBlockActive": false,
+            "suite2Compiled": true,
+            "suite2ParameterId": 2,
+            "creationAllowed": false,
+            "spendsAllowed": false,
+            "acceptedNewProofVersions": [],
+            "suite2Deployments": [{
+                "name": "shielded-v2-suite2-recovery",
+                "bit": 6,
+                "state": "Started",
+                "nextState": "Started",
+                "startHeight": 28512,
+                "timeoutHeight": 29376,
+                "period": 288,
+                "minActivationHeight": 28800,
+                "threshold": {"num": 260, "den": 288},
+                "lockinontimeout": false,
+                "windowStartHeight": 28512,
+                "windowEndHeight": 28800,
+                "windowBlocksMined": 18,
+                "windowSignalingBlocks": 18,
+                "requiredSignalingBlocks": 260,
+                "earliestActivationHeight": 29088,
+                "activationHeight": null
+            }]
+        })
+    }
+
+    #[test]
+    fn v2_readiness_parses_real_votes_and_never_invents_activation() {
+        let mut reply = v2_recovery_readiness_reply();
+        let info = shielded_v2_info(&reply).unwrap();
+        assert!(
+            !info.suite2_active,
+            "next-block policy overrides the old alias"
+        );
+        assert_eq!(info.suite2_current_active, Some(false));
+        assert_eq!(info.evaluated_height, Some(28530));
+        let deployment = &info.suite2_deployments[0];
+        assert_eq!(deployment.bit, 6);
+        assert_eq!(deployment.signaling_blocks, 18);
+        assert_eq!(deployment.required_blocks, 260);
+        assert_eq!(deployment.earliest_activation_height, Some(29088));
+        let text = v2_readiness_lines(true, Some(&info)).join("\n");
+        assert!(text.contains("votes 18 / 260 required"), "{text}");
+        assert!(text.contains("window 28512–28799"), "{text}");
+        assert!(text.contains("18 / 288 blocks mined"), "{text}");
+        assert!(text.contains("earliest activation block 29088"), "{text}");
+        assert!(!text.contains("V2 spends ready"), "{text}");
+        assert!(!v2_readiness_lines(false, Some(&info))
+            .join("\n")
+            .contains("18 / 260"));
+
+        reply["suite2Deployments"][0]["earliestActivationHeight"] = Value::Null;
+        let without_height = shielded_v2_info(&reply).unwrap();
+        let text = v2_readiness_lines(true, Some(&without_height)).join("\n");
+        assert!(!text.contains("activation block"), "{text}");
+        reply["suite2Deployments"][0]["windowSignalingBlocks"] = json!("18");
+        let malformed = shielded_v2_info(&reply).unwrap();
+        assert!(malformed.suite2_deployments.is_empty());
+        assert!(v2_readiness_lines(true, Some(&malformed))
+            .join("\n")
+            .contains("did not report miner readiness"));
+        assert!(quantum_v2_activity_allowed(Some(&malformed)).is_err());
+
+        let mut reply = v2_recovery_readiness_reply();
+        reply["suite2Deployments"][0]["state"] = json!("Failed");
+        reply["suite2Deployments"][0]["nextState"] = json!("Failed");
+        let failed = shielded_v2_info(&reply).unwrap();
+        let text = v2_readiness_lines(true, Some(&failed)).join("\n");
+        assert!(!text.contains("activation block"), "{text}");
+        reply["suite2Deployments"][0]["state"] = json!("LockedIn");
+        reply["suite2Deployments"][0]["nextState"] = json!("LockedIn");
+        reply["suite2Deployments"][0]["activationHeight"] = json!(29376);
+        let locked = shielded_v2_info(&reply).unwrap();
+        let text = v2_readiness_lines(true, Some(&locked)).join("\n");
+        assert!(text.contains("activation block 29376"), "{text}");
+        assert!(!text.contains("29088"), "{text}");
+        reply["suite2Deployments"][0]["state"] = json!("Started");
+        reply["suite2Deployments"][0]["nextState"] = json!("Started");
+        reply["suite2Deployments"][0]["activationHeight"] = Value::Null;
+        reply["evaluatedHeight"] = json!(29100);
+        let later_window = shielded_v2_info(&reply).unwrap();
+        let text = v2_readiness_lines(true, Some(&later_window)).join("\n");
+        assert!(!text.contains("activation block 29088"), "{text}");
+    }
+
+    #[cfg(feature = "zk-suite2")]
+    #[test]
+    fn v2_miner_activation_enables_spends_on_the_next_poll_without_resetting_wallet_state() {
+        const XUS: u64 = 100_000_000;
+        let mut reply = v2_recovery_readiness_reply();
+        let before = shielded_v2_info(&reply).unwrap();
+        let view = ShieldedV2View {
+            account: "owner".into(),
+            balance: 125_000 * XUS,
+            legacy_balance: 100_000 * XUS,
+            suite2_balance: 25_000 * XUS,
+            notes: 2,
+            scanned_height: 28529,
+            ..Default::default()
+        };
+        let guard = view.guard("owner", true, false, Some(u128::MAX));
+        let mut amount = V2WithdrawalAmount::default();
+        amount.synchronize("owner", Network::Mainnet, Some(guard.deshield_cap()), false);
+        amount.text = "100000".into();
+        amount.edited();
+        let spend = || V2Intent::Deshield {
+            amount: parse_xus(&amount.text),
+        };
+        assert!(v2_allows(&guard, spend(), Some(&before)).is_err());
+
+        reply["height"] = json!(29087);
+        reply["evaluatedHeight"] = json!(29088);
+        reply["suite2NextBlockActive"] = json!(true);
+        reply["creationAllowed"] = json!(true);
+        reply["spendsAllowed"] = json!(true);
+        reply["acceptedNewProofVersions"] = json!([2]);
+        reply["suite2Deployments"][0]["state"] = json!("LockedIn");
+        reply["suite2Deployments"][0]["nextState"] = json!("Active");
+        reply["suite2Deployments"][0]["activationHeight"] = json!(29088);
+        let after = shielded_v2_info(&reply).unwrap();
+        assert!(v2_allows(&guard, spend(), Some(&after)).is_ok());
+        assert_eq!(amount.text, "100000");
+        assert!(amount.context == Some(("owner".into(), Network::Mainnet)));
+        assert_eq!(view.balance, 125_000 * XUS);
+        assert_eq!(view.notes, 2);
+        assert_eq!(view.scanned_height, 28529);
+        let text = v2_readiness_lines(true, Some(&after)).join("\n");
+        assert!(text.contains("V2 spends ready for block 29088"), "{text}");
+        assert!(
+            text.contains("Miner activation applies to the next block"),
+            "{text}"
+        );
+        assert!(!v2_readiness_lines(false, Some(&after))
+            .join("\n")
+            .contains("V2 spends ready"));
+        let painted = tests::painted_text(|ui| v2_readiness_view(ui, true, Some(&after)));
+        assert!(
+            painted.contains("V2 spends ready for block 29088"),
+            "{painted}"
+        );
     }
 
     #[test]

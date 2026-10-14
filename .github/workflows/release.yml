@@ -318,9 +318,28 @@ jobs:
     # here (job-level permissions REPLACE the top-level set, they don't merge).
     permissions:
       contents: write
+      actions: read
       id-token: write
       attestations: write
     steps:
+      - name: Require successful cross-platform CI for this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          for attempt in $(seq 1 90); do
+            STATE="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow ci.yml \
+              --commit "${GITHUB_SHA}" --limit 100 --json status,conclusion \
+              --jq 'if any(.[]; .status == "completed" and (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required")) then "failed" elif any(.[]; .status == "completed" and .conclusion == "success") then "passed" else "waiting" end')"
+            case "$STATE" in
+              passed) echo "Cross-platform CI passed for ${GITHUB_SHA}"; break ;;
+              failed) echo "::error::Cross-platform CI failed for ${GITHUB_SHA}; release will not be published."; exit 1 ;;
+              waiting) echo "Waiting for cross-platform CI (${attempt}/90)" ;;
+              *) echo "::error::Unexpected CI status"; exit 1 ;;
+            esac
+            sleep 20
+          done
+          test "$STATE" = passed || { echo "::error::Cross-platform CI did not complete before the publication deadline."; exit 1; }
       - uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
         with: { path: artifacts }
       # Checkout is needed to generate the SBOM from the chain workspace.
@@ -398,10 +417,14 @@ jobs:
             version-1 transaction admission and proof creation remain disabled.
             The context-bound hiding replacement includes
             original-seed ownership proofs for existing notes. Mainnet bit-5
-            readiness starts at **27,648** (90% of a 288-block window); earliest
-            activation is **28,224**, with no forced lock-in. After activation,
-            deposits, mixed-key private sends and fee-funded withdrawals use
-            profile 2. Historical verification and wallet scanning remain.
+            readiness on bit 5 retains its published schedule. A fresh bit-6
+            readiness window starts at **28,512**, requiring **260/288** committed
+            signals. It locks at **28,800** and activates at **29,088** when readiness
+            succeeds; timeout is **29,376**, with no forced lock-in. Miner templates
+            signal the new window, and Station reports the actual vote progress.
+            After activation, existing-note recovery, deposits, mixed-key private
+            sends and fee-funded withdrawals use profile 2. Historical verification
+            and wallet scanning remain available.
             Existing wallet seeds and notes are preserved; scans authenticate
             receipts and roots, follow executed wrappers, and recover incomplete
             caches without overwriting the originals.
