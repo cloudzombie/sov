@@ -616,6 +616,10 @@ fn assert_no_panic(what: &str, input: &[u8], pub_inputs: &BundlePublicInputs) {
         ),
         Err(_) => panic!("{what}: decode_proof panicked"),
     }
+    let verify_res = std::panic::catch_unwind(|| {
+        let _ = verify_spend(input, pub_inputs);
+    });
+    assert!(verify_res.is_ok(), "{what}: verify_spend panicked");
     let ct_res = std::panic::catch_unwind(|| {
         let _ = decode_note_ciphertext(input);
     });
@@ -672,5 +676,112 @@ fn random_and_mutated_inputs_never_panic() {
             }
             assert_no_panic("mutated", &input, &f.pub_inputs);
         }
+    }
+}
+
+/// Locate every nested opening in an honest proof using the upstream reader.
+/// Each range includes its outer byte-length prefix so hostile nested lengths
+/// can be inserted without relying on an unrelated outer-frame rejection.
+fn opening_ranges(f: &Fixture) -> Vec<(usize, usize, usize, bool)> {
+    use winter_utils::ByteReader;
+    let mut r = std::io::Cursor::new(f.proof.as_slice());
+    r.set_position(expected_context_bytes(&f.pub_inputs).len() as u64);
+    r.read_u8().unwrap();
+    let n = r.read_u16().unwrap() as usize;
+    r.read_vec(n).unwrap();
+    let mut ranges = Vec::new();
+    for _ in 0..2 {
+        let n = r.read_usize().unwrap();
+        r.read_vec(n).unwrap();
+        let start = r.position() as usize;
+        let n = r.read_usize().unwrap();
+        let data = r.position() as usize;
+        r.read_vec(n).unwrap();
+        ranges.push((start, data, r.position() as usize, false));
+    }
+    for _ in 0..2 {
+        let n = r.read_u16().unwrap() as usize;
+        r.read_vec(n).unwrap();
+    }
+    let layers = r.read_u8().unwrap();
+    assert!(layers > 0);
+    for _ in 0..layers {
+        let n = r.read_u32().unwrap() as usize;
+        r.read_vec(n).unwrap();
+        let start = r.position() as usize;
+        let n = r.read_u32().unwrap() as usize;
+        let data = r.position() as usize;
+        r.read_vec(n).unwrap();
+        ranges.push((start, data, r.position() as usize, true));
+    }
+    ranges
+}
+
+#[test]
+fn nested_merkle_allocation_bombs_rejected_before_verifier_allocation() {
+    use winter_utils::ByteWriter;
+    let f = fixture();
+    for (start, data, end, fri) in opening_ranges(f) {
+        for count in [u64::MAX, u32::MAX as u64, 5_753_014_360] {
+            for digest_count in [false, true] {
+                let mut opening = vec![f.proof[data]]; // correct domain depth
+                if digest_count {
+                    opening.write_usize(1); // one node vector
+                }
+                opening.push(0); // full-width vint; upstream accepts this encoding
+                opening.extend_from_slice(&count.to_le_bytes());
+                let mut replacement = Vec::new();
+                if fri {
+                    replacement.write_u32(opening.len() as u32);
+                } else {
+                    replacement.write_usize(opening.len());
+                }
+                replacement.extend_from_slice(&opening);
+                let mut corrupt = f.proof.clone();
+                corrupt.splice(start..end, replacement);
+                let section = if digest_count {
+                    "Merkle digests"
+                } else {
+                    "Merkle node vectors"
+                };
+                assert!(
+                    matches!(
+                        verify_spend(&corrupt, &f.pub_inputs),
+                        Err(SpendProofError::Frame(ProofFrameError::LengthOverrun {
+                            section: found, declared, ..
+                        })) if found == section && declared == count
+                    ),
+                    "opening at {start}, count {count}, digests {digest_count}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_merkle_depth_and_fri_partition_overflow_rejected() {
+    let f = fixture();
+    for (_, data, _, _) in opening_ranges(f) {
+        for depth in [0, 63, 64, 255] {
+            let mut corrupt = f.proof.clone();
+            corrupt[data] = depth;
+            assert!(matches!(
+                verify_spend(&corrupt, &f.pub_inputs),
+                Err(SpendProofError::Frame(ProofFrameError::MerkleDepth(found, _))) if found == depth
+            ));
+        }
+    }
+    // The partition exponent is immediately before the eight-byte PoW nonce.
+    let domain = sov_shielded_pq::air::TRACE_LENGTH * proof_options().blowup_factor();
+    let fri = proof_options().to_fri_options();
+    let smallest_domain = domain / fri.folding_factor().pow(fri.num_fri_layers(domain) as u32);
+    for exponent in (smallest_domain.ilog2() as u8 + 1)..=255 {
+        let mut corrupt = f.proof.clone();
+        let offset = corrupt.len() - 9;
+        corrupt[offset] = exponent;
+        assert!(matches!(
+            verify_spend(&corrupt, &f.pub_inputs),
+            Err(SpendProofError::Frame(ProofFrameError::FriPartitions(found, _))) if found == exponent
+        ));
     }
 }

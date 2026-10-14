@@ -406,6 +406,11 @@ jobs:
             receipts and roots, follow executed wrappers, and recover incomplete
             caches without overwriting the originals.
 
+            **Proof decoder repair:** historical Winterfell verification now bounds
+            nested Merkle vector and digest counts before allocation and checks
+            Merkle domains and FRI exponents. Publication of v0.2.17 was stopped
+            when Ubuntu CI exposed this malformed-proof allocation abort.
+
             **V2 wallet repair:** both receiving keys share one authenticated,
             incremental scan with bounded block/receipt pages and visible progress.
             Withdrawal Max stays a gross amount and refreshes after completed

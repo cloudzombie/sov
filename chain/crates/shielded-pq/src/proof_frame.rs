@@ -39,7 +39,8 @@
 //!    [`crate::prover::proof_options`] and the AIR fixes the trace shape,
 //!    so any proof that could verify has exactly these context bytes.
 //! 3. Every declared length in the body (commitments, query sections, OOD
-//!    frame, FRI layers, remainder) is checked against the bytes ACTUALLY
+//!    frame, FRI layers, remainder), including nested Merkle vector/digest
+//!    counts later decoded by the verifier, is checked against the bytes ACTUALLY
 //!    remaining before winterfell is allowed to allocate for it.
 //! 4. Trailing bytes after the proof are rejected (canonical framing).
 //!
@@ -93,6 +94,15 @@ pub enum ProofFrameError {
     /// this too, but we refuse it before winterfell sees it).
     #[error("FRI layer {0} declares zero query-value bytes")]
     EmptyFriLayer(usize),
+    /// A Merkle opening declares a depth inconsistent with its query domain.
+    #[error("Merkle opening depth {0} does not match expected depth {1}")]
+    MerkleDepth(u8, u8),
+    /// The FRI layer count differs from the canonical options.
+    #[error("FRI layer count {0} does not match expected count {1}")]
+    FriLayers(u8, usize),
+    /// The FRI partition exponent would overflow or exceed the query domain.
+    #[error("FRI partition exponent {0} exceeds the domain depth {1}")]
+    FriPartitions(u8, u8),
     /// Bytes remain after a structurally complete proof.
     #[error("{0} trailing bytes after the proof")]
     TrailingBytes(usize),
@@ -124,6 +134,12 @@ impl<'a> Cursor<'a> {
         }
         self.pos += len as usize;
         Ok(())
+    }
+
+    fn section(&mut self, len: u64, section: &'static str) -> Result<&'a [u8], ProofFrameError> {
+        let start = self.pos;
+        self.take(len, section)?;
+        Ok(&self.data[start..self.pos])
     }
 
     fn bytes(&mut self, len: usize, section: &'static str) -> Result<&'a [u8], ProofFrameError> {
@@ -171,6 +187,43 @@ impl<'a> Cursor<'a> {
             Ok(u64::from_le_bytes(le) >> length)
         }
     }
+}
+
+/// Walk the nested BatchMerkleProof encoding before winterfell's verifier
+/// decodes it. The outer byte-vector bound alone does not constrain either
+/// nested Vec::with_capacity: each count must fit its own remaining payload.
+/// Blake3_256 digests occupy exactly 32 bytes. No allocation occurs here.
+fn validate_merkle_opening(bytes: &[u8], expected_depth: u8) -> Result<(), ProofFrameError> {
+    let mut c = Cursor::new(bytes);
+    let depth = c.u8("Merkle depth")?;
+    if depth != expected_depth {
+        return Err(ProofFrameError::MerkleDepth(depth, expected_depth));
+    }
+    let vectors = c.vint("Merkle node vectors")?;
+    // Even an empty vector needs at least one byte for its length prefix.
+    if vectors > c.remaining() as u64 {
+        return Err(ProofFrameError::LengthOverrun {
+            section: "Merkle node vectors",
+            declared: vectors,
+            remaining: c.remaining(),
+        });
+    }
+    for _ in 0..vectors {
+        let digests = c.vint("Merkle digests")?;
+        // Divide before multiplying so u64::MAX cannot wrap the byte count.
+        if digests > (c.remaining() / 32) as u64 {
+            return Err(ProofFrameError::LengthOverrun {
+                section: "Merkle digests",
+                declared: digests,
+                remaining: c.remaining(),
+            });
+        }
+        c.take(digests * 32, "Merkle digests")?;
+    }
+    if c.remaining() != 0 {
+        return Err(ProofFrameError::TrailingBytes(c.remaining()));
+    }
+    Ok(())
 }
 
 /// The exact context bytes an honest prover emits for this circuit with
@@ -241,14 +294,16 @@ pub fn validate_proof_frame(
     //    vectors (values, then opening proof). The vint lengths are the
     //    `Vec::with_capacity` abort path — checked against remaining bytes
     //    HERE, before winterfell allocates.
-    for section in [
-        "trace query values",
-        "trace query proof",
-        "constraint query values",
-        "constraint query proof",
+    let domain_size = TRACE_LENGTH * proof_options().blowup_factor();
+    let domain_depth = domain_size.ilog2() as u8;
+    for (values, opening) in [
+        ("trace query values", "trace query proof"),
+        ("constraint query values", "constraint query proof"),
     ] {
-        let len = c.vint(section)?;
-        c.take(len, section)?;
+        let len = c.vint(values)?;
+        c.take(len, values)?;
+        let len = c.vint(opening)?;
+        validate_merkle_opening(c.section(len, opening)?, domain_depth)?;
     }
 
     // 5. OOD frame: two u16-length byte vectors.
@@ -261,18 +316,34 @@ pub fn validate_proof_frame(
     //    (must be nonzero) and a u32-length path vector; then a u16-length
     //    remainder and a u8 partition count.
     let num_layers = c.u8("fri layer count")?;
+    let fri_options = proof_options().to_fri_options();
+    let expected_layers = fri_options.num_fri_layers(domain_size);
+    if num_layers as usize != expected_layers {
+        return Err(ProofFrameError::FriLayers(num_layers, expected_layers));
+    }
+    let mut fri_domain = domain_size;
     for layer in 0..num_layers as usize {
+        fri_domain /= fri_options.folding_factor();
         let values_len = c.u32_le("fri layer values length")?;
         if values_len == 0 {
             return Err(ProofFrameError::EmptyFriLayer(layer));
         }
         c.take(values_len as u64, "fri layer values")?;
         let paths_len = c.u32_le("fri layer paths length")?;
-        c.take(paths_len as u64, "fri layer paths")?;
+        validate_merkle_opening(
+            c.section(paths_len as u64, "fri layer paths")?,
+            fri_domain.ilog2() as u8,
+        )?;
     }
     let remainder_len = c.u16_le("fri remainder length")?;
     c.take(remainder_len as u64, "fri remainder")?;
-    let _num_partitions = c.u8("fri partition count")?;
+    let partitions = c.u8("fri partition count")?;
+    // Every layer maps positions using domain_size / num_partitions.
+    // Bound by the smallest folded domain to reject zero-sized partitions.
+    let partition_depth = fri_domain.ilog2() as u8;
+    if partitions > partition_depth {
+        return Err(ProofFrameError::FriPartitions(partitions, partition_depth));
+    }
 
     // 7. PoW nonce: 8 bytes, then the input must END (canonical framing).
     c.bytes(8, "pow nonce")?;
