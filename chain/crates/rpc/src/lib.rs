@@ -2121,6 +2121,22 @@ fn call(
                 "queued": matches!(admitted, sov_node::Admitted::Queued),
             }))
         }
+        // Drop one mempool transaction by id. Node-local. A pool uses this
+        // when a signed payout no longer matches the share window, so the
+        // stale transfer cannot be mined. Unknown ids are a no-op.
+        "sov_dropMempoolTx" => {
+            let id_s = params
+                .get("txId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcError::invalid_params("missing string param `txId`"))?;
+            let id = Hash::from_hex(id_s)
+                .map_err(|e| RpcError::invalid_params(format!("invalid txId: {e}")))?;
+            let present = node.mempool_contains(&id);
+            if present {
+                node.drop_tx(&id);
+            }
+            Ok(json!({ "dropped": present }))
+        }
         // A PAGE of the token registry — never the whole set, so the response
         // stays bounded no matter how many assets exist. Params: `offset`
         // (default 0) and `limit` (default 100, hard-capped at MAX_TOKEN_PAGE).
@@ -2367,8 +2383,15 @@ fn call(
             let ts = crate::daemon::clamp_block_timestamp(crate::daemon::now_ms(), parent_ts, mtp);
             // The consensus floor: strictly after the parent AND after MTP (BIP-113).
             let min_ts = parent_ts.saturating_add(1).max(mtp.saturating_add(1));
+            // Optional. Pool templates set this so one miner's signed payout
+            // is not mined inside another miner's block. Absent means the
+            // historical behavior: the whole executable mempool.
+            let proposer_txs_only = params
+                .get("coinbaseTxsOnly")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let (candidate, excluded) = match coinbase {
-                Some(cb) => node.build_candidate_for(ts, cb),
+                Some(cb) => node.build_candidate_for(ts, cb, proposer_txs_only),
                 None => node.build_candidate(ts),
             }
             .map_err(|e| RpcError::server(format!("build template failed: {e}")))?;

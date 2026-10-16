@@ -40,40 +40,45 @@ re-validation), so the bridge's word counts for nothing. Genesis
   per worker in fast mode (it transparently falls back to the light VM on
   RAM-constrained hosts).
 
-No secret material is handled anywhere: the coinbase account id is public and no
-key or seed ever enters this process — so there is deliberately nothing to
-zeroize.
+The pool process never holds a key. In the default (pool) mode the coinbase of
+a found block is the miner's login account. That miner signs ordinary transfers
+for the PPLNS window with `sov-miner-payout`, on their own machine. The pool
+checks the signatures and relays the transactions. `--solo` is the old
+single-account bridge and is the only mode that accepts `--coinbase` or
+`--workers`.
 
-## What it does NOT do yet
+## What it does not do
 
-- **No decentralized sharechain, no PPLNS payouts.** Shares are verified and
-  tallied per session (the `NOTE(Phase 3)` marker in `src/main.rs`), but nothing
-  is paid out from them: **the entire coinbase of a found block goes to the one
-  `--coinbase` account** (SOV's header pays a single `proposer`; there is no
-  multi-recipient coinbase). The sharechain + payout design — including the
-  single-recipient-coinbase problem and its options — is Sections 3–4 of
-  [`.github/RELEASE-0.1.92.md`](../../.github/RELEASE-0.1.92.md).
-- **No miner authentication or ban scoring** beyond per-session share
-  verification (every share is re-sealed, so fake work earns nothing).
-- **No TLS** on the Stratum port. Run it on a trusted network or behind a proxy.
+- **No multi-output coinbase.** A SOV header has one `proposer`. Paying several
+  miners from that reward is ordinary `Transfer` transactions inside the block,
+  which the finder signs. Changing the coinbase to multiple outputs would be a
+  hard fork and is not implemented.
+- **No in-process TLS.** Terminate TLS in stunnel or nginx. See [DEPLOY.md](DEPLOY.md).
+- **No share gossip.** A gossiped share does not carry the header blob, so the
+  pool cannot re-seal it. Unverified gossip is not accepted.
+- **Operator fee is 0.** A fee taken by the pool would be custody, or a
+  sharechain rule change. The stats page reports 0.
 
 ## Running it
 
 ```sh
 cd tools/sov-stratum
-export PATH=/opt/homebrew/bin:$PATH   # cmake, for the RandomX build
 cargo build --release
 
-# Bridge a local node, mine to a specific account, with 1 built-in worker:
+# Public pool. Miners log in as their payout account. No key on this host.
 ./target/release/sov-stratum \
   --node 127.0.0.1:8645 \
   --bind 0.0.0.0:3333 \
-  --coinbase <your-account-id> \
-  --workers 1
+  --stats-bind 0.0.0.0:8080
+
+# On each miner's machine, after xus-miner is pointed at the pool:
+./target/release/sov-miner-payout \
+  --pool http://<stats-host>:8080 \
+  --seed-hex <64 hex chars>
 ```
 
-`--help` lists every flag (start/min/max difficulty, vardiff timing, poll and
-refresh intervals).
+Deployment (systemd, TLS, keeping the node RPC private) is [DEPLOY.md](DEPLOY.md).
+`--help` lists every flag.
 
 ## Running xmrig against it — the honest caveat
 

@@ -168,6 +168,9 @@ fn spawn_bridge(node_addr: &str, extra: &[&str]) -> Bridge {
             "250",
             "--refresh-secs",
             "3600", // one template for the whole test: fully deterministic
+            "--solo",
+            "--stats-bind",
+            "none",
         ])
         .args(extra)
         .stdout(Stdio::piped())

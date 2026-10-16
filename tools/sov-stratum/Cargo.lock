@@ -2160,6 +2160,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sov-sharechain"
+version = "0.1.0"
+dependencies = [
+ "sov-mining",
+ "sov-network",
+ "sov-primitives",
+]
+
+[[package]]
 name = "sov-shielded"
 version = "0.0.0"
 dependencies = [
@@ -2229,12 +2238,16 @@ dependencies = [
 name = "sov-stratum"
 version = "0.1.0"
 dependencies = [
+ "bech32",
  "hex",
  "serde_json",
+ "sov-crypto",
  "sov-pow",
  "sov-primitives",
  "sov-rpc",
+ "sov-sharechain",
  "sov-types",
+ "sov-wallet",
 ]
 
 [[package]]
