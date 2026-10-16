@@ -259,12 +259,11 @@ fn expired_template_ttl_is_rejected_after_deadline() {
     handle.shutdown();
 }
 
-/// The cache is bounded at MAX_CACHED_TEMPLATES (64): requesting a 65th template
-/// evicts the single oldest, whose solution then fails with the refetch error, while
-/// the newest template is still live and submittable — the bound costs a miner one
-/// refetch, never a stuck chain.
+/// The cache used to keep 64 templates and drop the oldest on the 65th distinct
+/// coinbase. A public pool holds one live template per miner. Well past that old
+/// cap, the first template must still be submittable.
 #[test]
-fn cache_eviction_at_capacity_drops_only_the_oldest() {
+fn many_distinct_templates_stay_live_past_the_old_64_cap() {
     let (_node, handle, addr) = serve();
 
     // Oldest template first. Consecutive templates differ only by their clamped
@@ -273,50 +272,28 @@ fn cache_eviction_at_capacity_drops_only_the_oldest() {
     let mut oldest = get_template(addr, json!({}));
     let oldest_nonce = grind(&mut oldest.blob, oldest.nonce_offset, &oldest.target);
 
-    // 64 more templates: inserts 2..=64 fill the cache to capacity; insert 65 evicts
-    // the oldest (MAX_CACHED_TEMPLATES = 64 in sov-rpc).
+    // 80 further templates: 81 distinct coinbases, more than the old cap of 64.
     let mut ids = vec![oldest.id.clone()];
-    let mut newest = None;
-    for _ in 0..64 {
+    for _ in 0..80 {
         std::thread::sleep(Duration::from_millis(3));
         let t = get_template(addr, json!({}));
         ids.push(t.id.clone());
-        newest = Some(t);
     }
     let distinct: std::collections::HashSet<&String> = ids.iter().collect();
     assert_eq!(
         distinct.len(),
-        65,
-        "all 65 templates must be distinct cache entries for the eviction count to hold"
+        81,
+        "all 81 templates must be distinct cache entries"
     );
 
-    // The oldest was evicted: its perfectly valid solution now needs a refetch.
     let submit = rpc(
         addr,
         "sov_submitBlock",
         json!({ "templateId": oldest.id, "nonce": oldest_nonce }),
     );
     assert_eq!(
-        submit["error"]["code"], -32000,
-        "evicted template must error: {submit}"
-    );
-    assert!(submit["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("unknown or expired"));
-    assert_eq!(height(addr), 0);
-
-    // The newest survived eviction and still round-trips to an imported block.
-    let mut newest = newest.unwrap();
-    let nonce = grind(&mut newest.blob, newest.nonce_offset, &newest.target);
-    let submit = rpc(
-        addr,
-        "sov_submitBlock",
-        json!({ "templateId": newest.id, "nonce": nonce }),
-    );
-    assert_eq!(
         submit["result"]["accepted"], true,
-        "newest template must still be live: {submit}"
+        "the oldest of 81 templates must still be live: {submit}"
     );
     assert_eq!(height(addr), 1);
 

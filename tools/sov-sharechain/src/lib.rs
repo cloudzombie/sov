@@ -46,9 +46,12 @@
 pub mod gossip;
 pub mod wire;
 
+pub use gossip::GossipNode;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use sov_mining::Difficulty;
+use sov_pow::{pow_seal, PowAlgo};
 use sov_primitives::AccountId;
 
 /// A share's identity — the hash of the block candidate it seals.
@@ -97,6 +100,105 @@ pub const SHARE_TARGET_INTERVAL_MS: u64 = 10_000;
 /// under noise, short enough to follow a real hashrate change within a couple of
 /// minutes at a 10s interval.
 pub const RETARGET_WINDOW: usize = 45;
+
+/// Wire tag for SHA-256d. Unknown tags never reach [`reseal`].
+pub const ALGO_SHA256D: u8 = 0;
+/// Wire tag for RandomX.
+pub const ALGO_RANDOMX: u8 = 1;
+
+/// Largest header preimage accepted with a share.
+///
+/// A share seal is a header hash. A preimage past this bound is not a header a
+/// peer needs; it is an attempt to make verification expensive.
+pub const MAX_PREIMAGE_BYTES: usize = 256 * 1024;
+
+/// Largest proof-of-work key accepted with a share. A RandomX key is a hash.
+pub const MAX_POW_KEY_BYTES: usize = 128;
+
+/// The bytes a peer needs in order to recompute a share's seal.
+///
+/// The share id is a claim. It becomes that share's identity only when
+/// [`reseal`] of this preimage equals the id. Gossip carries the preimage so
+/// every peer can run that check itself; the channel's authentication does not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealProof {
+    /// [`ALGO_SHA256D`] or [`ALGO_RANDOMX`].
+    pub algo: u8,
+    /// RandomX key. Empty for SHA-256d, which ignores it.
+    pub key: Vec<u8>,
+    /// Header preimage with the nonce already in place.
+    pub preimage: Vec<u8>,
+}
+
+/// A share plus the proof a peer uses to re-seal it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedShare {
+    /// Accounting record.
+    pub share: Share,
+    /// Header bytes whose seal must equal [`Share::id`](Share::id).
+    pub proof: SealProof,
+    /// Grains the block share claims to split. Zero unless [`Share::is_block`].
+    pub reward_grains: u128,
+    /// Payouts the block share embeds. Empty unless [`Share::is_block`].
+    ///
+    /// A peer runs [`ShareChain::accept`] with this map. It is not trusted:
+    /// a block share whose map is not the window is refused.
+    pub payouts: Payouts,
+}
+
+/// Why a seal proof was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SealError {
+    /// The algo tag is not one this process can re-seal.
+    UnknownAlgo(u8),
+    /// No header bytes were attached, so there is nothing to hash.
+    EmptyPreimage,
+    /// The preimage exceeds [`MAX_PREIMAGE_BYTES`].
+    PreimageTooLarge(usize),
+    /// The proof-of-work key exceeds [`MAX_POW_KEY_BYTES`].
+    KeyTooLarge(usize),
+}
+
+impl std::fmt::Display for SealError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SealError::UnknownAlgo(tag) => write!(f, "unknown share algo tag {tag}"),
+            SealError::EmptyPreimage => write!(f, "share proof has no header"),
+            SealError::PreimageTooLarge(n) => write!(f, "share header is {n} bytes"),
+            SealError::KeyTooLarge(n) => write!(f, "share pow key is {n} bytes"),
+        }
+    }
+}
+
+impl std::error::Error for SealError {}
+
+/// Recompute the seal of `proof`.
+///
+/// Does not trust the share id. The caller compares the result to the id the
+/// peer announced. RandomX uses the light verifier, the same one block import
+/// uses.
+pub fn reseal(proof: &SealProof) -> Result<ShareId, SealError> {
+    if proof.preimage.is_empty() {
+        return Err(SealError::EmptyPreimage);
+    }
+    if proof.preimage.len() > MAX_PREIMAGE_BYTES {
+        return Err(SealError::PreimageTooLarge(proof.preimage.len()));
+    }
+    if proof.key.len() > MAX_POW_KEY_BYTES {
+        return Err(SealError::KeyTooLarge(proof.key.len()));
+    }
+    let algo = match proof.algo {
+        ALGO_SHA256D => PowAlgo::Sha256d,
+        ALGO_RANDOMX => PowAlgo::RandomX,
+        other => return Err(SealError::UnknownAlgo(other)),
+    };
+    Ok(pow_seal(algo, &proof.key, &proof.preimage))
+}
+
+/// `true` when `proof` re-seals to `share_id`.
+pub fn proof_matches(share_id: &ShareId, proof: &SealProof) -> bool {
+    reseal(proof).ok().as_ref() == Some(share_id)
+}
 
 /// One share: a block candidate that met the share target, plus the sharechain
 /// metadata that makes it accountable.
@@ -421,6 +523,87 @@ impl ShareChain {
     pub fn height_of(&self, id: &ShareId) -> Option<u64> {
         self.entries.get(id).map(|e| e.height)
     }
+
+    /// A known share, if this chain has accepted it.
+    pub fn share(&self, id: &ShareId) -> Option<&Share> {
+        self.entries.get(id).map(|e| &e.share)
+    }
+
+    /// Whether `id` sits on the path from `of` back to the root.
+    pub fn is_ancestor(&self, id: &ShareId, of: Option<ShareId>) -> bool {
+        let mut cur = of;
+        let mut guard = 0usize;
+        while let Some(at) = cur {
+            if &at == id {
+                return true;
+            }
+            if guard > self.entries.len() {
+                break;
+            }
+            guard += 1;
+            cur = self.entries.get(&at).and_then(|e| e.share.prev);
+        }
+        false
+    }
+
+    /// Whether some share from `parent` back already cites `uncle`.
+    ///
+    /// Citing the same orphan twice would pay one piece of work twice inside
+    /// one PPLNS window.
+    pub fn uncle_cited(&self, uncle: &ShareId, parent: Option<ShareId>) -> bool {
+        let mut cur = parent;
+        let mut guard = 0usize;
+        while let Some(at) = cur {
+            let Some(entry) = self.entries.get(&at) else {
+                break;
+            };
+            if entry.share.uncles.contains(uncle) {
+                return true;
+            }
+            if guard > self.entries.len() {
+                break;
+            }
+            guard += 1;
+            cur = entry.share.prev;
+        }
+        false
+    }
+
+    /// Orphan share ids the next share may cite, newest candidate first.
+    ///
+    /// A candidate is citeable when it is known, is not this share, is not an
+    /// ancestor of `parent`, and has not already been cited on that ancestry.
+    /// Ancestors are refused by [`ShareChain::accept`] because they would be
+    /// paid twice.
+    pub fn citeable_uncles(
+        &self,
+        parent: Option<ShareId>,
+        self_id: &ShareId,
+        candidates: &[ShareId],
+        limit: usize,
+    ) -> Vec<ShareId> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for id in candidates.iter().rev() {
+            if out.len() >= limit {
+                break;
+            }
+            if id == self_id || !seen.insert(*id) {
+                continue;
+            }
+            if !self.entries.contains_key(id) {
+                continue;
+            }
+            if self.is_ancestor(id, parent) {
+                continue;
+            }
+            if self.uncle_cited(id, parent) {
+                continue;
+            }
+            out.push(*id);
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -572,6 +755,76 @@ mod tests {
             Some(&75),
             "an uncle earns UNCLE_WEIGHT_PCT of a main-line share"
         );
+    }
+
+    /// A side branch is citeable once, and citing it pays the uncle on the next
+    /// window. An ancestor is not citeable: that work is already on the line.
+    #[test]
+    fn a_lost_race_is_citeable_and_then_earns_uncle_weight() {
+        let mut sc = ShareChain::new();
+        sc.accept(share(0, None, "alice.sov", 100), 0, &Payouts::new())
+            .expect("root");
+        sc.accept(share(1, Some(id(0)), "bob.sov", 100), 0, &Payouts::new())
+            .expect("winner");
+        sc.accept(share(2, Some(id(0)), "carol.sov", 100), 0, &Payouts::new())
+            .expect("orphan");
+        assert_eq!(sc.tip(), Some(id(1)), "equal work keeps the first tip");
+
+        let next = id(3);
+        let cited = sc.citeable_uncles(Some(id(1)), &next, &[id(0), id(2), id(2)], 8);
+        assert_eq!(cited, vec![id(2)], "the ancestor is not an uncle");
+
+        let mut s = share(3, Some(id(1)), "dave.sov", 100);
+        s.uncles = cited;
+        sc.accept(s, 0, &Payouts::new()).expect("cite");
+        assert!(
+            sc.citeable_uncles(Some(id(3)), &id(4), &[id(2)], 8)
+                .is_empty(),
+            "an uncle already on the ancestry is not cited again"
+        );
+
+        let p = sc.payouts_for(Some(id(3)), 375);
+        // dave 100 + bob 100 + alice 100 + carol 75 = 375.
+        assert_eq!(p.get(&acct("carol.sov")), Some(&75));
+        assert_eq!(p.values().sum::<u128>(), 375);
+    }
+
+    /// The announced id is nothing until the header re-seals to it.
+    #[test]
+    fn a_header_reseals_to_the_share_id_or_it_is_not_that_share() {
+        let header = b"header-preimage-with-nonce";
+        let seal = reseal(&SealProof {
+            algo: ALGO_SHA256D,
+            key: Vec::new(),
+            preimage: header.to_vec(),
+        })
+        .expect("sha256d");
+        assert!(proof_matches(
+            &seal,
+            &SealProof {
+                algo: ALGO_SHA256D,
+                key: b"ignored".to_vec(),
+                preimage: header.to_vec(),
+            }
+        ));
+        let mut flipped = header.to_vec();
+        flipped[0] ^= 0xff;
+        assert!(!proof_matches(
+            &seal,
+            &SealProof {
+                algo: ALGO_SHA256D,
+                key: Vec::new(),
+                preimage: flipped,
+            }
+        ));
+        assert!(matches!(
+            reseal(&SealProof {
+                algo: 9,
+                key: Vec::new(),
+                preimage: header.to_vec(),
+            }),
+            Err(SealError::UnknownAlgo(9))
+        ));
     }
 
     /// An uncle may not be an ancestor, itself, or repeated — each would pay the

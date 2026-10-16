@@ -37,6 +37,18 @@ pub struct Template {
     /// The timestamp baked into `blob`. Frozen per job and passed through to
     /// `sov_submitBlock` so the node reconstructs the identical preimage.
     pub timestamp_ms: u64,
+    /// Transaction ids this template commits to, in execution order.
+    ///
+    /// Empty when the node omitted the list (`txIdsOmitted`) or did not send
+    /// one. See [`tx_ids_known`](Self::tx_ids_known).
+    pub tx_ids: Vec<String>,
+    /// `true` when `tx_ids` is the complete list. A non-empty payout window
+    /// cannot be checked against an omitted list — the block might not contain
+    /// the transfers the sharechain requires.
+    pub tx_ids_known: bool,
+    /// Coinbase account the node put in this template. Pool mode refuses a
+    /// template whose proposer is not the miner's login.
+    pub proposer: String,
 }
 
 impl Template {
@@ -85,6 +97,27 @@ impl Template {
         let seed_hash = str_field("powKey")?;
         let pow_key =
             hex::decode(&seed_hash).map_err(|e| format!("template `powKey` is not hex: {e}"))?;
+        let proposer = v
+            .get("proposer")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        // A present `txIds` array is authoritative. `txIdsOmitted: true` (or a
+        // node too old to send the field) means we must not pretend the
+        // template pays anyone.
+        let tx_ids_omitted = v
+            .get("txIdsOmitted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let tx_ids = match v.get("txIds").and_then(Value::as_array) {
+            Some(arr) if !tx_ids_omitted => arr
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let tx_ids_known = !tx_ids_omitted && v.get("txIds").and_then(Value::as_array).is_some();
         Ok(Template {
             template_id,
             height,
@@ -96,6 +129,9 @@ impl Template {
             pow_key,
             seed_hash,
             timestamp_ms: u64_field("timestampMs")?,
+            tx_ids,
+            tx_ids_known,
+            proposer,
         })
     }
 
@@ -231,6 +267,9 @@ mod tests {
             pow_key: vec![],
             seed_hash: String::new(),
             timestamp_ms: 1_752_800_000_000,
+            tx_ids: Vec::new(),
+            tx_ids_known: true,
+            proposer: "81f4ccaa000000000000000000000000".into(),
         }
     }
 
@@ -297,6 +336,11 @@ mod tests {
         assert_eq!(t.timestamp_ms, 1_752_800_000_123);
         assert_eq!(t.network_target[..4], [0, 0, 0, 0]);
         assert_eq!(t.pow_key.len(), 32);
+        assert_eq!(t.proposer, "81f4ccaa000000000000000000000000");
+        assert!(
+            !t.tx_ids_known,
+            "txIds absent means the list is not authoritative"
+        );
 
         // A nonceOffset that disagrees with the blob layout is refused outright.
         let mut bad = v.clone();

@@ -153,6 +153,11 @@ impl Node {
         self.mempool.len()
     }
 
+    /// Whether `id` is in the READY mempool. Used by the pool's drop RPC.
+    pub fn mempool_contains(&self, id: &Hash) -> bool {
+        self.mempool.contains(id)
+    }
+
     /// Number of QUEUED (future-nonce, not yet mineable) pooled transactions.
     pub fn mempool_queued_len(&self) -> usize {
         self.mempool.queued_len()
@@ -479,8 +484,21 @@ impl Node {
                 }
             }
         }
+        // Mempool policy, not a consensus rule. A finder's block pays the
+        // coinbase before it runs transactions, and the template builder
+        // already lets a transaction spend that reward. Admission still
+        // measured only the balance held *now*, so a miner with an empty
+        // account could not enqueue the payout their own block would fund.
+        // Count the next subsidy here. A template whose coinbase is someone
+        // else still excludes the transaction (they cannot pay its fee) and
+        // the caller evicts it; import re-executes whatever a block actually
+        // carries. `prune` keeps using the real ledger balance.
+        let affordable = account
+            .balance
+            .checked_add(self.chain.mint_reward())
+            .unwrap_or(account.balance);
         self.mempool
-            .insert(stx, account.nonce, account.balance)
+            .insert(stx, account.nonce, affordable)
             .map_err(NodeError::Mempool)
     }
 
@@ -613,12 +631,21 @@ impl Node {
         &self,
         timestamp_ms: u64,
         coinbase: AccountId,
+        proposer_txs_only: bool,
     ) -> Result<(MiningCandidate, Vec<(SignedTransaction, String)>), NodeError> {
-        let batch = {
+        let mut batch = {
             let ledger = self.chain.ledger();
             self.mempool
                 .select(|a| ledger.account(a).nonce, self.max_block_txs)
         };
+        // A pool keeps one signed payout per miner in the mempool. Those
+        // payouts are only meaningful in the block that miner finds. Leaving
+        // another miner's transfer in this template would spend their existing
+        // balance inside someone else's block. Producer policy: the sealed
+        // block is still validated on import like any other.
+        if proposer_txs_only {
+            batch.retain(|stx| stx.transaction.signer == coinbase);
+        }
         self.chain
             .build_candidate_for(batch, timestamp_ms, coinbase)
             .map_err(NodeError::Chain)
