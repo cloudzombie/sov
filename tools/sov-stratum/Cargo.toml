@@ -45,8 +45,13 @@ hex = "0.4"
 # Checksummed `xust1…` logins. Same engine the wallet uses for this HRP.
 # Not sov-shielded: that crate pulls the proving system into the pool.
 bech32 = "0.11.1"
+# Stratum TLS. Plaintext remains the default so tests and a local devnet do
+# not need a certificate. ring is the rustls crypto provider.
+rustls = { version = "0.23.31", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2.2"
 
 [dev-dependencies]
+rcgen = "0.13"
 # The splice-equivalence test proves "splice LE nonce at nonceOffset" == "Borsh re-encode
 # of the header with that nonce" from the bridge side (Phase 1 proved it node-side).
 # sov-types is also a normal dependency (payout verification).

@@ -26,6 +26,29 @@ pub fn difficulty_to_target256(difficulty: u64) -> [u8; 32] {
     out
 }
 
+/// Largest difficulty whose target is still no harder than `target`.
+///
+/// This is the work a seal that merely meets `target` has actually proved.
+/// `difficulty_to_target256` floors, so a few difficulties can share one
+/// threshold; the result is the greatest of those. A zero target is
+/// unsatisfiable and reports [`u64::MAX`].
+pub fn max_difficulty_for_target(target: &[u8; 32]) -> u64 {
+    if *target == [0u8; 32] {
+        return u64::MAX;
+    }
+    let mut lo = 1u64;
+    let mut hi = u64::MAX;
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if &difficulty_to_target256(mid) >= target {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
 /// A share target must never be **harder** (numerically smaller) than the network
 /// target — a pool share is a superset of a block find, never the reverse. If
 /// vardiff ever drives a session's target below the network threshold, clamp it.
@@ -131,6 +154,30 @@ pub fn next_difficulty(current: u64, shares: u64, elapsed_secs: f64, cfg: &Vardi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_target_credits_only_the_difficulty_it_proves() {
+        assert_eq!(max_difficulty_for_target(&[0xff; 32]), 1);
+        assert_eq!(max_difficulty_for_target(&[0u8; 32]), u64::MAX);
+        for d in [1u64, 2, 64, 100, 1_000, 4_096, 1 << 20, u64::MAX] {
+            let target = difficulty_to_target256(d);
+            let back = max_difficulty_for_target(&target);
+            assert!(
+                back >= d,
+                "target of {d} credited {back}, which is less work than was asked"
+            );
+            assert!(
+                difficulty_to_target256(back) >= target,
+                "credited difficulty {back} is harder than the target of {d}"
+            );
+            if back < u64::MAX {
+                assert!(
+                    difficulty_to_target256(back + 1) < target,
+                    "a harder difficulty still meets the target of {d}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn difficulty_one_accepts_every_hash() {

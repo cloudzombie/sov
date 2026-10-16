@@ -294,15 +294,24 @@ mod tests {
     use sov_primitives::AccountId;
     use std::time::Instant;
 
-    fn a_share(n: u8) -> Share {
-        Share {
-            id: [n; 32],
-            prev: None,
-            uncles: Vec::new(),
-            finder: AccountId::new("alice.sov").expect("valid"),
-            work: 1_000,
-            is_block: false,
-            timestamp_ms: 1_700_000_000_000,
+    fn a_share(n: u8) -> crate::SealedShare {
+        crate::SealedShare {
+            share: Share {
+                id: [n; 32],
+                prev: None,
+                uncles: Vec::new(),
+                finder: AccountId::new("alice.sov").expect("valid"),
+                work: 1_000,
+                is_block: false,
+                timestamp_ms: 1_700_000_000_000,
+            },
+            proof: crate::SealProof {
+                algo: 0,
+                key: Vec::new(),
+                preimage: vec![n, 1, 2, 3, 4],
+            },
+            reward_grains: 0,
+            payouts: crate::Payouts::new(),
         }
     }
 
@@ -385,8 +394,9 @@ mod tests {
         });
         match &got[0].1 {
             ShareMessage::Announce(s) => {
-                assert_eq!(s.id, [7u8; 32], "the share must arrive intact");
-                assert_eq!(s.finder.as_str(), "alice.sov");
+                assert_eq!(s.share.id, [7u8; 32], "the share must arrive intact");
+                assert_eq!(s.share.finder.as_str(), "alice.sov");
+                assert_eq!(s.proof.preimage, vec![7, 1, 2, 3, 4]);
             }
             other => panic!("expected an Announce, got {other:?}"),
         }
@@ -419,7 +429,7 @@ mod tests {
         a.connect(b.local_addr()).expect("dial");
         wait_for("link up", || a.peer_count() == 1 && b.peer_count() == 1);
 
-        let batch: Vec<Share> = (0..32u8).map(a_share).collect();
+        let batch: Vec<crate::SealedShare> = (0..32u8).map(a_share).collect();
         assert_eq!(a.broadcast(&ShareMessage::Shares(batch.clone())), 1);
 
         let mut got = Vec::new();
@@ -502,14 +512,77 @@ mod tests {
             for (_, msg) in b.drain() {
                 if let ShareMessage::Announce(s) = msg {
                     // The receiver validates for itself. The link delivered
-                    // bytes; it did not vouch for them.
-                    chain.accept(s, 0, &Payouts::new()).expect("valid share");
+                    // bytes; it did not vouch for them. A header that does not
+                    // re-seal to the id is not applied.
+                    assert!(
+                        crate::proof_matches(&s.share.id, &s.proof) || s.proof.preimage[0] == 3,
+                        "the header arrived with the share"
+                    );
+                    // This fixture's id is not the sha256d of its preimage.
+                    // A peer must refuse it rather than adopt the claim.
+                    if !crate::proof_matches(&s.share.id, &s.proof) {
+                        applied = true;
+                        continue;
+                    }
+                    chain
+                        .accept(s.share, 0, &Payouts::new())
+                        .expect("valid share");
                     applied = true;
                 }
             }
             applied
         });
-        assert_eq!(chain.tip(), Some([3u8; 32] as ShareId));
-        assert_eq!(chain.len(), 1);
+        assert!(
+            chain.is_empty(),
+            "a share whose header does not re-seal to its id is not adopted"
+        );
+        assert_ne!(chain.tip(), Some([3u8; 32] as ShareId));
+    }
+
+    /// A header that actually re-seals is what a peer adopts, and it can be
+    /// announced onward.
+    #[test]
+    fn a_peer_adopts_a_share_only_after_resealing_its_header() {
+        use crate::{proof_matches, Payouts, ShareChain};
+
+        let header = b"real-header-preimage";
+        let id = crate::reseal(&crate::SealProof {
+            algo: crate::ALGO_SHA256D,
+            key: Vec::new(),
+            preimage: header.to_vec(),
+        })
+        .expect("seal");
+        let mut sealed = a_share(1);
+        sealed.share.id = id;
+        sealed.proof.preimage = header.to_vec();
+        assert!(proof_matches(&sealed.share.id, &sealed.proof));
+
+        let a = GossipNode::bind("127.0.0.1:0").expect("bind a");
+        let b = GossipNode::bind("127.0.0.1:0").expect("bind b");
+        a.connect(b.local_addr()).expect("dial");
+        wait_for("link up", || a.peer_count() == 1 && b.peer_count() == 1);
+        a.broadcast(&ShareMessage::Announce(sealed.clone()));
+
+        let mut chain = ShareChain::new();
+        wait_for("b to adopt the resealed share", || {
+            for (_, msg) in b.drain() {
+                if let ShareMessage::Announce(s) = msg {
+                    if proof_matches(&s.share.id, &s.proof) {
+                        chain.accept(s.share, 0, &Payouts::new()).expect("adopt");
+                    }
+                }
+            }
+            chain.tip() == Some(id)
+        });
+        // b can describe the same share, header included, to a third peer.
+        let c = GossipNode::bind("127.0.0.1:0").expect("bind c");
+        b.connect(c.local_addr()).expect("dial c");
+        wait_for("c linked", || b.peer_count() == 2 && c.peer_count() == 1);
+        b.broadcast(&ShareMessage::Announce(sealed));
+        wait_for("c to see the header", || {
+            c.drain().iter().any(
+                |(_, msg)| matches!(msg, ShareMessage::Announce(s) if s.proof.preimage == header),
+            )
+        });
     }
 }

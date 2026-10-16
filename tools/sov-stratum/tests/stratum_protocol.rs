@@ -171,6 +171,8 @@ fn spawn_bridge(node_addr: &str, extra: &[&str]) -> Bridge {
             "--solo",
             "--stats-bind",
             "none",
+            "--share-bind",
+            "none",
         ])
         .args(extra)
         .stdout(Stdio::piped())

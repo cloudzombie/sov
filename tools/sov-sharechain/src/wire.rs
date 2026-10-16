@@ -34,7 +34,7 @@
 //! allocated, because the length is attacker-chosen. There is no path here that
 //! allocates from a number read off the wire.
 
-use crate::{Share, ShareId};
+use crate::{SealProof, SealedShare, Share, ShareId, MAX_POW_KEY_BYTES, MAX_PREIMAGE_BYTES};
 use sov_primitives::AccountId;
 
 /// Largest gossip frame accepted, in bytes.
@@ -49,6 +49,9 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// Bounds both the work a single message can demand and the memory a batch can
 /// occupy. A peer with more to send simply sends more messages.
 pub const MAX_SHARES_PER_MESSAGE: usize = 256;
+
+/// Most payout entries one block share may declare.
+pub const MAX_PAYOUTS: usize = 1_024;
 
 /// Most uncles a single share may declare.
 ///
@@ -71,15 +74,15 @@ pub enum ShareMessage {
         /// The peer's current best tip, if it has one.
         tip: Option<ShareId>,
     },
-    /// One newly found share.
-    Announce(Share),
+    /// One newly found share, with the header a peer re-seals.
+    Announce(SealedShare),
     /// Ask for shares descending from `after`.
     GetShares {
         /// The requester's tip; the responder sends what follows it.
         after: Option<ShareId>,
     },
-    /// A batch, oldest first.
-    Shares(Vec<Share>),
+    /// A batch, oldest first. Each entry carries its header.
+    Shares(Vec<SealedShare>),
 }
 
 /// Why a frame was rejected.
@@ -99,6 +102,8 @@ pub enum WireError {
     TrailingBytes,
     /// An account id was not valid UTF-8 or not a legal account.
     BadAccount,
+    /// A seal proof failed its bounds (empty header, unknown algo).
+    BadProof,
 }
 
 impl std::fmt::Display for WireError {
@@ -109,6 +114,7 @@ impl std::fmt::Display for WireError {
             WireError::TooLarge => "declared length exceeds its bound",
             WireError::TrailingBytes => "trailing bytes after a complete message",
             WireError::BadAccount => "invalid account id",
+            WireError::BadProof => "seal proof failed its bounds",
         };
         write!(f, "{s}")
     }
@@ -137,6 +143,10 @@ impl<'a> Reader<'a> {
     }
     fn u8(&mut self) -> Result<u8, WireError> {
         Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16, WireError> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
     }
     fn u32(&mut self) -> Result<u32, WireError> {
         let b = self.take(4)?;
@@ -192,7 +202,8 @@ fn put_opt_id(out: &mut Vec<u8>, id: &Option<ShareId>) {
     }
 }
 
-fn put_share(out: &mut Vec<u8>, s: &Share) {
+fn put_share(out: &mut Vec<u8>, sealed: &SealedShare) {
+    let s = &sealed.share;
     out.extend_from_slice(&s.id);
     put_opt_id(out, &s.prev);
     out.push(s.uncles.len() as u8);
@@ -205,9 +216,28 @@ fn put_share(out: &mut Vec<u8>, s: &Share) {
     out.extend_from_slice(&s.work.to_le_bytes());
     out.push(u8::from(s.is_block));
     out.extend_from_slice(&s.timestamp_ms.to_le_bytes());
+    // Header last, so a peer that only wanted the accounting still has to
+    // carry the bytes it will hash. Decode checks the lengths before copying.
+    let proof = &sealed.proof;
+    out.push(proof.algo);
+    let key_len = u16::try_from(proof.key.len()).unwrap_or(u16::MAX);
+    out.extend_from_slice(&key_len.to_le_bytes());
+    out.extend_from_slice(&proof.key);
+    let pre_len = u32::try_from(proof.preimage.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&pre_len.to_le_bytes());
+    out.extend_from_slice(&proof.preimage);
+    out.extend_from_slice(&sealed.reward_grains.to_le_bytes());
+    let n = u16::try_from(sealed.payouts.len()).unwrap_or(u16::MAX);
+    out.extend_from_slice(&n.to_le_bytes());
+    for (account, amount) in &sealed.payouts {
+        let bytes = account.as_str().as_bytes();
+        out.push(bytes.len() as u8);
+        out.extend_from_slice(bytes);
+        out.extend_from_slice(&amount.to_le_bytes());
+    }
 }
 
-fn get_share(r: &mut Reader<'_>) -> Result<Share, WireError> {
+fn get_share(r: &mut Reader<'_>) -> Result<SealedShare, WireError> {
     let id = r.id()?;
     let prev = r.opt_id()?;
     let n = r.u8()? as usize;
@@ -222,14 +252,50 @@ fn get_share(r: &mut Reader<'_>) -> Result<Share, WireError> {
     let work = r.u128()?;
     let is_block = r.u8()? != 0;
     let timestamp_ms = r.u64()?;
-    Ok(Share {
-        id,
-        prev,
-        uncles,
-        finder,
-        work,
-        is_block,
-        timestamp_ms,
+    let algo = r.u8()?;
+    if algo > 1 {
+        return Err(WireError::BadProof);
+    }
+    let key_len = r.u16()? as usize;
+    if key_len > MAX_POW_KEY_BYTES {
+        return Err(WireError::TooLarge);
+    }
+    let key = r.take(key_len)?.to_vec();
+    let pre_len = r.u32()? as usize;
+    if pre_len == 0 || pre_len > MAX_PREIMAGE_BYTES {
+        return Err(WireError::BadProof);
+    }
+    let preimage = r.take(pre_len)?.to_vec();
+    let reward_grains = r.u128()?;
+    let payouts_n = r.u16()? as usize;
+    if payouts_n > MAX_PAYOUTS {
+        return Err(WireError::TooLarge);
+    }
+    let mut payouts = crate::Payouts::new();
+    for _ in 0..payouts_n {
+        let account = r.account()?;
+        let amount = r.u128()?;
+        if payouts.insert(account, amount).is_some() {
+            return Err(WireError::BadProof);
+        }
+    }
+    Ok(SealedShare {
+        share: Share {
+            id,
+            prev,
+            uncles,
+            finder,
+            work,
+            is_block,
+            timestamp_ms,
+        },
+        proof: SealProof {
+            algo,
+            key,
+            preimage,
+        },
+        reward_grains,
+        payouts,
     })
 }
 
@@ -307,15 +373,24 @@ mod tests {
         AccountId::new(s).expect("valid")
     }
 
-    fn a_share() -> Share {
-        Share {
-            id: [7u8; 32],
-            prev: Some([6u8; 32]),
-            uncles: vec![[5u8; 32], [4u8; 32]],
-            finder: acct("alice.sov"),
-            work: 123_456_789,
-            is_block: true,
-            timestamp_ms: 1_700_000_000_000,
+    fn a_share() -> SealedShare {
+        SealedShare {
+            share: Share {
+                id: [7u8; 32],
+                prev: Some([6u8; 32]),
+                uncles: vec![[5u8; 32], [4u8; 32]],
+                finder: acct("alice.sov"),
+                work: 123_456_789,
+                is_block: true,
+                timestamp_ms: 1_700_000_000_000,
+            },
+            proof: SealProof {
+                algo: 0,
+                key: vec![9, 8, 7],
+                preimage: b"header-bytes".to_vec(),
+            },
+            reward_grains: 0,
+            payouts: crate::Payouts::new(),
         }
     }
 
@@ -458,6 +533,27 @@ mod tests {
     fn an_unknown_tag_and_an_empty_frame_are_refused() {
         assert_eq!(decode(&[]), Err(WireError::Truncated));
         assert_eq!(decode(&[99]), Err(WireError::UnknownTag(99)));
+    }
+
+    /// A share with no header cannot be re-sealed, so the frame is refused.
+    #[test]
+    fn a_share_without_a_header_is_refused() {
+        let bytes = encode(&ShareMessage::Announce(a_share()));
+        // Cut off the header body. A peer must not guess where the message ends.
+        assert!(decode(&bytes[..bytes.len() - 8]).is_err());
+
+        let mut bare = a_share();
+        bare.proof.preimage.clear();
+        // Encoding an empty header is a programmer error; the decoder still
+        // refuses a zero length rather than hashing nothing.
+        let mut empty = encode(&ShareMessage::Announce(a_share()));
+        // Layout tail: preimage (12) || reward (16) || payout count (2).
+        // The u32 length sits immediately before the preimage.
+        let preimage_len = b"header-bytes".len();
+        let len_at = empty.len() - preimage_len - 16 - 2 - 4;
+        empty[len_at..len_at + 4].copy_from_slice(&0u32.to_le_bytes());
+        empty.truncate(len_at + 4);
+        assert_eq!(decode(&empty), Err(WireError::BadProof));
     }
 
     /// A frame beyond the outer wall is refused before it is even parsed.

@@ -41,9 +41,10 @@ re-validation), so the bridge's word counts for nothing. Genesis
   RAM-constrained hosts).
 
 The pool process never holds a key. In the default (pool) mode the coinbase of
-a found block is the miner's login account. That miner signs ordinary transfers
-for the PPLNS window with `sov-miner-payout`, on their own machine. The pool
-checks the signatures and relays the transactions. `--solo` is the old
+a found block is the miner's login account. `xus-miner --seed-hex` signs the
+PPLNS transfers locally; the seed never leaves that process. The pool checks
+the signatures and relays the transactions. `sov-miner-payout` is the same
+signature step for a miner binary that cannot sign. `--solo` is the old
 single-account bridge and is the only mode that accepts `--coinbase` or
 `--workers`.
 
@@ -53,9 +54,10 @@ single-account bridge and is the only mode that accepts `--coinbase` or
   miners from that reward is ordinary `Transfer` transactions inside the block,
   which the finder signs. Changing the coinbase to multiple outputs would be a
   hard fork and is not implemented.
-- **No in-process TLS.** Terminate TLS in stunnel or nginx. See [DEPLOY.md](DEPLOY.md).
-- **No share gossip.** A gossiped share does not carry the header blob, so the
-  pool cannot re-seal it. Unverified gossip is not accepted.
+- **No fee taken before the transfer.** Consensus debits a transfer's fee
+  before the balance check, then credits that fee back to the proposer. The
+  pool reserves one fee from the split so the transfer can execute. Reordering
+  that debit would be a hard fork.
 - **Operator fee is 0.** A fee taken by the pool would be custody, or a
   sharechain rule change. The stats page reports 0.
 
@@ -66,15 +68,16 @@ cd tools/sov-stratum
 cargo build --release
 
 # Public pool. Miners log in as their payout account. No key on this host.
+# Stratum TLS is optional: pass --tls-cert and --tls-key, or leave them unset.
+# Sharechain peers dial --share-bind (default 0.0.0.0:3434).
 ./target/release/sov-stratum \
   --node 127.0.0.1:8645 \
   --bind 0.0.0.0:3333 \
-  --stats-bind 0.0.0.0:8080
+  --stats-bind 0.0.0.0:8080 \
+  --share-peer <other-pool>:3434
 
-# On each miner's machine, after xus-miner is pointed at the pool:
-./target/release/sov-miner-payout \
-  --pool http://<stats-host>:8080 \
-  --seed-hex <64 hex chars>
+# On each miner's machine. The login must be this seed's implicit account.
+xus-miner --pool host:3333 --user <account> --seed-hex <64 hex chars>
 ```
 
 Deployment (systemd, TLS, keeping the node RPC private) is [DEPLOY.md](DEPLOY.md).

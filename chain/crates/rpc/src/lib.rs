@@ -227,9 +227,12 @@ pub const MAX_TEMPLATE_TX_IDS: usize = 4_096;
 const TEMPLATE_TTL: Duration = Duration::from_secs(120);
 
 /// Maximum number of live templates cached at once. A template holds a full candidate
-/// block (its transaction set), so the cache is bounded in count; the oldest is evicted
-/// past this. Ample for many concurrent out-of-process miners polling one node.
-const MAX_CACHED_TEMPLATES: usize = 64;
+/// block (its transaction set), so the cache is bounded in count. 64 was one slot per
+/// coinbase and dropped the oldest miner once a 65th distinct login polled. 4096 keeps
+/// a public pool's concurrent coinbases submittable for the 120s TTL. Past the cap,
+/// the least recently used entry is the one dropped — a lookup refreshes the stamp,
+/// so a miner who is still submitting is not the eviction victim.
+const MAX_CACHED_TEMPLATES: usize = 4096;
 
 /// A bounded, short-TTL cache of built mining candidates, keyed by template id (the
 /// unsealed header's hash). `sov_getBlockTemplate` inserts a candidate and returns its
@@ -259,11 +262,20 @@ impl TemplateCache {
     }
 
     /// Fetch a still-live candidate by template id, expiring stale entries first.
+    ///
+    /// A hit refreshes the entry's stamp. Eviction drops the least recently
+    /// used template, which is an idle coinbase, not one a miner just read
+    /// back for `sov_submitBlock`.
     fn get(&self, id: &Hash) -> Option<MiningCandidate> {
         let now = Instant::now();
         let mut m = self.inner.lock().unwrap();
         m.retain(|_, (t, _)| now.duration_since(*t) < TEMPLATE_TTL);
-        m.get(id).map(|(_, c)| c.clone())
+        if let Some((t, c)) = m.get_mut(id) {
+            *t = now;
+            Some(c.clone())
+        } else {
+            None
+        }
     }
 
     /// Fetch a still-live candidate whose block commits to `tx_root` — the lookup the
@@ -273,9 +285,15 @@ impl TemplateCache {
         let now = Instant::now();
         let mut m = self.inner.lock().unwrap();
         m.retain(|_, (t, _)| now.duration_since(*t) < TEMPLATE_TTL);
-        m.values()
-            .find(|(_, c)| &c.block().header.tx_root == tx_root)
-            .map(|(_, c)| c.clone())
+        let found = m
+            .iter()
+            .find(|(_, (_, c))| &c.block().header.tx_root == tx_root)
+            .map(|(k, _)| *k);
+        found.and_then(|id| {
+            let (t, c) = m.get_mut(&id)?;
+            *t = now;
+            Some(c.clone())
+        })
     }
 }
 

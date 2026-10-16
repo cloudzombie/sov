@@ -39,30 +39,38 @@ mod job;
 mod payout;
 mod share;
 mod stats;
+mod stream;
+mod tls;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufReader, Write};
-use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+use sov_pow::PowAlgo;
 use sov_primitives::{AccountId, SigningDomain};
 use sov_rpc::client::RpcClient;
-use sov_sharechain::{Payouts, Share, ShareChain, ShareId};
+use sov_sharechain::wire::{self, ShareMessage};
+use sov_sharechain::{
+    proof_matches, GossipNode, Payouts, SealProof, SealedShare, Share, ShareChain, ShareId,
+    ALGO_RANDOMX, ALGO_SHA256D,
+};
 use sov_types::{Action, SignedTransaction};
 
 use account::parse_login;
 use guard::Guard;
 use job::{parse_nonce_hex, Template};
-use payout::{outgoing_transfers, window_covered, TransferLeg};
+use payout::{fee_reserve_from_estimate, outgoing_transfers, window_covered, TransferLeg};
 use share::{
     classify_seal, difficulty_to_target256, effective_share_target, next_difficulty,
     stratum_target_hex, ShareOutcome, VardiffConfig,
 };
 use stats::Incoming;
+use stream::Stream;
 
 /// How many issued jobs stay submittable at once (across all sessions). Old jobs
 /// are evicted oldest-first; the whole book is cleared whenever the template
@@ -115,6 +123,16 @@ struct Config {
     max_per_ip: usize,
     /// Share attempts per second per address, counted before the seal.
     share_rate: u64,
+    /// Sharechain gossip listen address. `None` leaves the port closed.
+    share_bind: Option<String>,
+    /// Sharechain peers to dial.
+    share_peers: Vec<String>,
+    /// Genesis id announced on the share channel, so two pools do not merge.
+    share_genesis: ShareId,
+    /// PEM certificate for stratum TLS. Unset keeps the port plaintext.
+    tls_cert: Option<String>,
+    /// PEM private key for stratum TLS.
+    tls_key: Option<String>,
 }
 
 impl Default for Config {
@@ -132,6 +150,11 @@ impl Default for Config {
             stats_bind: None,
             max_per_ip: guard::DEFAULT_MAX_PER_IP,
             share_rate: guard::DEFAULT_SHARE_RATE,
+            share_bind: None,
+            share_peers: Vec::new(),
+            share_genesis: *sov_primitives::Hash::digest(b"sov-sharechain-v1").as_bytes(),
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -157,10 +180,14 @@ fn usage() -> ! {
            --stats-bind <addr|none>  read-only stats HTTP    [127.0.0.1:8080]\n\
            --max-conns-per-ip <n>    simultaneous connections per address [16]\n\
            --share-rate <n>          share attempts/sec/address, pre-seal [30]\n\
+           --share-bind <addr|none>  sharechain gossip listen     [0.0.0.0:3434]\n\
+           --share-peer <addr>       dial a sharechain peer (repeatable)\n\
+           --tls-cert <path>         PEM certificate; enables stratum TLS\n\
+           --tls-key <path>          PEM private key for --tls-cert\n\
            --help                    this text\n\n\
          Pool mode (the default) pays each miner's login account. The pool\n\
-         holds no key. Miners sign payouts with sov-miner-payout.\n\
-         --coinbase and --workers require --solo."
+         holds no key. xus-miner signs payouts locally from --seed-hex; the\n\
+         seed never reaches this process. --coinbase and --workers require --solo."
     );
     std::process::exit(2);
 }
@@ -170,6 +197,7 @@ fn parse_args() -> Config {
     // A real process opens the aggregator endpoint unless asked not to.
     let mut cfg = Config {
         stats_bind: Some("127.0.0.1:8080".into()),
+        share_bind: Some("0.0.0.0:3434".into()),
         ..Config::default()
     };
     let mut args = std::env::args().skip(1);
@@ -218,6 +246,13 @@ fn parse_args() -> Config {
             "--share-rate" => {
                 cfg.share_rate = parse_u64("--share-rate", value("--share-rate")).max(1)
             }
+            "--share-bind" => {
+                let raw = value("--share-bind");
+                cfg.share_bind = if raw == "none" { None } else { Some(raw) };
+            }
+            "--share-peer" => cfg.share_peers.push(value("--share-peer")),
+            "--tls-cert" => cfg.tls_cert = Some(value("--tls-cert")),
+            "--tls-key" => cfg.tls_key = Some(value("--tls-key")),
             "--help" | "-h" => usage(),
             other => {
                 eprintln!("error: unknown flag `{other}`\n");
@@ -246,9 +281,16 @@ fn parse_args() -> Config {
     }
     if !cfg.solo && cfg.workers > 0 {
         eprintln!(
-            "error: --workers is solo-only. Pool miners run xus-miner and sign payouts with sov-miner-payout.\n"
+            "error: --workers is solo-only. Pool miners run xus-miner and sign payouts from a seed that stays on the miner.\n"
         );
         usage()
+    }
+    match (&cfg.tls_cert, &cfg.tls_key) {
+        (None, None) | (Some(_), Some(_)) => {}
+        _ => {
+            eprintln!("error: --tls-cert and --tls-key must be set together\n");
+            usage()
+        }
     }
     cfg
 }
@@ -305,7 +347,12 @@ struct JobEntry {
 struct Round {
     parent: Option<ShareId>,
     expected: Payouts,
+    /// Full coinbase, in grains. The finder's balance starts here.
     reward: u128,
+    /// Grains `expected` was split from. This is `reward` minus the fee reserve.
+    split_of: u128,
+    /// Grains left with the proposer so a payout transfer can pay its fee.
+    fee_reserve: u128,
     frozen: bool,
 }
 
@@ -362,7 +409,9 @@ struct Miner {
     session: String,
     peer: String,
     /// Write half (a `try_clone` of the socket) — the poller pushes jobs here.
-    writer: Mutex<TcpStream>,
+    writer: Mutex<Stream>,
+    /// Last payout notice pushed to this session, so a share does not repeat it.
+    payout_fp: Mutex<String>,
     difficulty: AtomicU64,
     window: Mutex<ShareWindow>,
     accepted: AtomicU64,
@@ -405,7 +454,21 @@ struct Pool {
     /// Next-block mint, in grains. `None` until the node answers — pool mode
     /// withholds blocks rather than guessing the split.
     reward_grains: Mutex<Option<u128>>,
+    /// One transfer's fee, reserved from the split so a finder whose own share
+    /// is smaller than the fee can still move the other payouts. Zero until
+    /// `sov_estimateFee` answers, and zero on a fee-free chain.
+    fee_reserve: Mutex<u128>,
     round: Mutex<Round>,
+    /// Shares that lost a race and may be cited as uncles.
+    orphans: Mutex<VecDeque<ShareId>>,
+    /// What a peer needs to re-seal and re-check a share, including the block
+    /// payout map. Catch-up sends these; a header alone cannot satisfy
+    /// `accept` for a block share.
+    proofs: Mutex<HashMap<ShareId, SealedShare>>,
+    /// Sharechain gossip, when `--share-bind` opened a port.
+    gossip: Mutex<Option<Arc<GossipNode>>>,
+    /// How many accepted shares cited at least one uncle.
+    uncle_shares: AtomicU64,
     relayed: Mutex<HashMap<AccountId, Vec<Relayed>>>,
     network: Mutex<NetworkView>,
     samples: Mutex<VecDeque<ShareSample>>,
@@ -448,7 +511,12 @@ impl Pool {
         let raw = self.network.lock().expect("network").difficulty.clone();
         let network = raw.parse::<u128>().unwrap_or(0);
         if network == 0 {
-            return requested.max(1);
+            // The node has not published a difficulty number. The miner only
+            // had to meet `network_target`, so crediting `requested` would
+            // count work the seal did not prove and a peer would refuse it.
+            return share::max_difficulty_for_target(network_target)
+                .min(requested)
+                .max(1);
         }
         let network = u64::try_from(network).unwrap_or(u64::MAX);
         requested.min(network).max(1)
@@ -565,7 +633,14 @@ impl Pool {
         let ok = reward_known
             && list_ok
             && template.proposer == account.as_str()
-            && window_covered(account, round.reward, &round.expected, &ids, &legs);
+            && window_covered(
+                account,
+                round.reward,
+                round.fee_reserve,
+                &round.expected,
+                &ids,
+                &legs,
+            );
         (round.parent, round.expected, ok)
     }
 
@@ -850,6 +925,7 @@ impl Pool {
             return;
         }
         let reward = self.reward_grains.lock().expect("reward").unwrap_or(0);
+        let fee = *self.fee_reserve.lock().expect("fee");
         let mut round = self.round.lock().expect("round");
         if round.frozen {
             return;
@@ -857,7 +933,20 @@ impl Pool {
         let chain = self.sharechain.lock().expect("sharechain");
         round.parent = chain.tip();
         round.reward = reward;
-        round.expected = chain.payouts_for(round.parent, reward);
+        round.fee_reserve = fee.min(reward);
+        let split_of = reward.saturating_sub(round.fee_reserve);
+        let full = chain.payouts_for(round.parent, reward);
+        let adjusted = chain.payouts_for(round.parent, split_of);
+        // A fee that consumes the whole coinbase must not look like an empty
+        // window: that would forward a finder-takes-all block. Keep the full
+        // map so the template cannot cover it and the block stays withheld.
+        if full.is_empty() || !adjusted.is_empty() {
+            round.split_of = split_of;
+            round.expected = adjusted;
+        } else {
+            round.split_of = reward;
+            round.expected = full;
+        }
     }
 
     /// Record one accepted pool share and, when it is a block whose template
@@ -866,6 +955,7 @@ impl Pool {
         &self,
         miner: &Miner,
         entry: &JobEntry,
+        nonce: u64,
         seal: [u8; 32],
         outcome: ShareOutcome,
     ) -> Result<Option<Payouts>, String> {
@@ -877,6 +967,10 @@ impl Pool {
             .ok_or_else(|| "login is not a payout account".to_string())?;
         let reward_known = *self.reward_grains.lock().expect("reward");
         let round = self.round.lock().expect("round").clone();
+        let proof = header_proof(&entry.template, nonce);
+        if !proof_matches(&seal, &proof) {
+            return Err("local seal does not match the header preimage".into());
+        }
         let mut chain = self.sharechain.lock().expect("sharechain");
         let wants_block = outcome == ShareOutcome::Block
             && entry.payout_ok
@@ -888,35 +982,249 @@ impl Pool {
         } else {
             chain.tip()
         };
-        let reward = reward_known.unwrap_or(0);
         let mut embedded = Payouts::new();
         let mut forward = false;
+        let mut split_of = 0u128;
         if wants_block {
-            let expected = chain.payouts_for(prev, reward);
+            let expected = chain.payouts_for(prev, round.split_of);
             if expected == entry.expected {
                 embedded = expected;
+                split_of = round.split_of;
                 forward = true;
             }
         }
+        let candidates: Vec<ShareId> = self
+            .orphans
+            .lock()
+            .expect("orphans")
+            .iter()
+            .copied()
+            .collect();
+        let uncles = chain.citeable_uncles(prev, &seal, &candidates, wire::MAX_UNCLES);
+        let previous_tip = chain.tip();
         let share = Share {
             id: seal,
             prev,
-            uncles: Vec::new(),
+            uncles: uncles.clone(),
             finder: finder.clone(),
             work: u128::from(entry.difficulty),
             is_block: forward,
             timestamp_ms: unix_millis(),
         };
         chain
-            .accept(share, reward, &embedded)
+            .accept(share.clone(), split_of, &embedded)
             .map_err(|e| e.to_string())?;
+        let new_tip = chain.tip();
+        let displaced =
+            previous_tip.filter(|old| new_tip != Some(*old) && !chain.is_ancestor(old, new_tip));
+        let lost = new_tip != Some(seal) && !chain.is_ancestor(&seal, new_tip);
         drop(chain);
+        let sealed = SealedShare {
+            share,
+            proof,
+            reward_grains: split_of,
+            payouts: embedded.clone(),
+        };
+        self.proofs
+            .lock()
+            .expect("proofs")
+            .insert(seal, sealed.clone());
+        if !uncles.is_empty() {
+            self.uncle_shares.fetch_add(1, Ordering::Relaxed);
+            let mut queue = self.orphans.lock().expect("orphans");
+            queue.retain(|id| !uncles.contains(id));
+        }
+        if let Some(old) = displaced {
+            self.note_orphan(old);
+        }
+        if lost {
+            self.note_orphan(seal);
+        }
+        self.announce_share(sealed);
         self.note_share(finder, u128::from(entry.difficulty));
         self.sync_round_to_tip();
+        self.notify_payouts();
         if forward {
             Ok(Some(embedded))
         } else {
             Ok(None)
+        }
+    }
+
+    /// Remember a share that is not on the winning sharechain branch.
+    fn note_orphan(&self, id: ShareId) {
+        let mut queue = self.orphans.lock().expect("orphans");
+        if queue.contains(&id) {
+            return;
+        }
+        queue.push_back(id);
+        while queue.len() > 64 {
+            queue.pop_front();
+        }
+    }
+
+    fn announce_share(&self, sealed: SealedShare) {
+        let Some(node) = self.gossip.lock().expect("gossip").clone() else {
+            return;
+        };
+        node.broadcast(&ShareMessage::Announce(sealed));
+    }
+
+    /// Tell each logged-in miner the transfers their own key must sign.
+    ///
+    /// The notice is the same JSON as `GET /api/payouts`. The seed that signs
+    /// it stays in the miner. An unchanged schedule is not pushed again.
+    fn notify_payouts(&self) {
+        if self.cfg.solo {
+            return;
+        }
+        let miners: Vec<Arc<Miner>> = self.miners.lock().expect("miners lock").clone();
+        for miner in &miners {
+            if !miner.alive.load(Ordering::Relaxed) || !miner.logged_in.load(Ordering::Relaxed) {
+                continue;
+            }
+            let Some(account) = miner.payout.lock().expect("payout").clone() else {
+                continue;
+            };
+            let Ok(body) = self.payouts_json(account.as_str()) else {
+                continue;
+            };
+            let fp = body.to_string();
+            let mut seen = miner.payout_fp.lock().expect("payout notice");
+            if *seen == fp {
+                continue;
+            }
+            *seen = fp;
+            drop(seen);
+            self.push(
+                miner,
+                &json!({"jsonrpc": "2.0", "method": "payout", "params": body}),
+            );
+        }
+    }
+
+    fn shares_following(&self, after: Option<ShareId>) -> Vec<SealedShare> {
+        let chain = self.sharechain.lock().expect("sharechain");
+        let stored = self.proofs.lock().expect("proofs");
+        let mut branch: Vec<ShareId> = chain
+            .best_branch()
+            .into_iter()
+            .map(|share| share.id)
+            .collect();
+        branch.reverse();
+        if let Some(after) = after {
+            if let Some(index) = branch.iter().position(|id| *id == after) {
+                branch = branch.split_off(index + 1);
+            }
+        }
+        // A cited uncle is not on the best branch, but the share that cites it
+        // cannot be accepted until that uncle is known. Send those first.
+        let mut seen: HashSet<ShareId> = HashSet::new();
+        if let Some(after) = after {
+            if chain.share(&after).is_some() {
+                let mut cur = Some(after);
+                while let Some(id) = cur {
+                    if !seen.insert(id) {
+                        break;
+                    }
+                    cur = chain.share(&id).and_then(|share| share.prev);
+                }
+            }
+        }
+        let mut needed: Vec<ShareId> = Vec::new();
+        for id in branch {
+            collect_share(&chain, id, &mut seen, &mut needed);
+        }
+        let mut out = Vec::new();
+        for id in needed {
+            let Some(sealed) = stored.get(&id) else {
+                break;
+            };
+            out.push(sealed.clone());
+            if out.len() == wire::MAX_SHARES_PER_MESSAGE {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Apply one gossiped share after re-sealing it. `reannounce` is false for
+    /// shares that arrived in a batch we asked for, so a catch-up does not
+    /// echo the whole history back onto the link.
+    fn ingest_sealed(&self, sealed: SealedShare, reannounce: bool) {
+        if !proof_matches(&sealed.share.id, &sealed.proof) {
+            log("gossip: header does not re-seal to the announced share id");
+            return;
+        }
+        let claimed = u64::try_from(sealed.share.work).unwrap_or(u64::MAX).max(1);
+        let target = difficulty_to_target256(claimed);
+        if sealed.share.id.as_slice() > target.as_slice() {
+            log("gossip: claimed work is harder than the seal");
+            return;
+        }
+        let mut chain = self.sharechain.lock().expect("sharechain");
+        if chain.share(&sealed.share.id).is_some() {
+            return;
+        }
+        let id = sealed.share.id;
+        let previous_tip = chain.tip();
+        if let Err(e) = chain.accept(sealed.share.clone(), sealed.reward_grains, &sealed.payouts) {
+            log(&format!("gossip share refused: {e}"));
+            return;
+        }
+        let new_tip = chain.tip();
+        let displaced =
+            previous_tip.filter(|old| new_tip != Some(*old) && !chain.is_ancestor(old, new_tip));
+        let lost = new_tip != Some(id) && !chain.is_ancestor(&id, new_tip);
+        drop(chain);
+        self.proofs
+            .lock()
+            .expect("proofs")
+            .insert(id, sealed.clone());
+        if let Some(old) = displaced {
+            self.note_orphan(old);
+        }
+        if lost {
+            self.note_orphan(id);
+        }
+        if reannounce {
+            self.announce_share(sealed);
+        }
+        self.sync_round_to_tip();
+    }
+
+    fn ingest_gossip(&self, node: &GossipNode, from: SocketAddr, msg: ShareMessage) {
+        match msg {
+            ShareMessage::Hello { genesis, tip } => {
+                if genesis != self.cfg.share_genesis {
+                    log(&format!(
+                        "gossip: {from} is on a different sharechain — ignoring"
+                    ));
+                    return;
+                }
+                let ours = self.sharechain.lock().expect("sharechain").tip();
+                if tip != ours {
+                    // `after` is the requester's tip. Asking for shares after
+                    // *their* tip returns nothing: that tip is already their head.
+                    let _ = node.send(&from, &ShareMessage::GetShares { after: ours });
+                    let shares = self.shares_following(tip);
+                    if !shares.is_empty() {
+                        let _ = node.send(&from, &ShareMessage::Shares(shares));
+                    }
+                }
+            }
+            ShareMessage::GetShares { after } => {
+                let shares = self.shares_following(after);
+                if !shares.is_empty() {
+                    let _ = node.send(&from, &ShareMessage::Shares(shares));
+                }
+            }
+            ShareMessage::Announce(sealed) => self.ingest_sealed(sealed, true),
+            ShareMessage::Shares(list) => {
+                for sealed in list {
+                    self.ingest_sealed(sealed, false);
+                }
+            }
         }
     }
 
@@ -934,6 +1242,48 @@ impl Pool {
         {
             samples.pop_front();
         }
+    }
+}
+
+/// Depth-first: parents and uncles before the share that names them.
+fn collect_share(
+    chain: &ShareChain,
+    id: ShareId,
+    seen: &mut HashSet<ShareId>,
+    needed: &mut Vec<ShareId>,
+) {
+    if seen.contains(&id) {
+        return;
+    }
+    let Some(share) = chain.share(&id) else {
+        return;
+    };
+    let prev = share.prev;
+    let uncles = share.uncles.clone();
+    if let Some(prev) = prev {
+        collect_share(chain, prev, seen, needed);
+    }
+    for uncle in uncles {
+        collect_share(chain, uncle, seen, needed);
+    }
+    if seen.insert(id) {
+        needed.push(id);
+    }
+}
+
+/// Header preimage for `nonce`, which is what a peer re-seals.
+fn header_proof(template: &Template, nonce: u64) -> SealProof {
+    let mut preimage = template.blob.clone();
+    let off = template.nonce_offset;
+    preimage[off..off + 8].copy_from_slice(&nonce.to_le_bytes());
+    let algo = match template.algo {
+        PowAlgo::Sha256d => ALGO_SHA256D,
+        PowAlgo::RandomX => ALGO_RANDOMX,
+    };
+    SealProof {
+        algo,
+        key: template.pow_key.clone(),
+        preimage,
     }
 }
 
@@ -1112,6 +1462,18 @@ fn refresh_network(pool: &Pool) {
             *pool.domain.lock().expect("domain") = Some(domain);
         }
     }
+    if let Ok(v) = pool
+        .rpc
+        .call("sov_estimateFee", json!({ "kind": "transfer" }))
+    {
+        if let Some(fee) = fee_reserve_from_estimate(&v) {
+            let changed = *pool.fee_reserve.lock().expect("fee") != fee;
+            *pool.fee_reserve.lock().expect("fee") = fee;
+            if changed {
+                pool.sync_round_to_tip();
+            }
+        }
+    }
 }
 
 impl Pool {
@@ -1139,7 +1501,12 @@ fn open_pool(cfg: Config, template: Option<Template>) -> Arc<Pool> {
         blocks_found: AtomicU64::new(0),
         sharechain: Mutex::new(ShareChain::new()),
         reward_grains: Mutex::new(None),
+        fee_reserve: Mutex::new(0),
         round: Mutex::new(Round::default()),
+        orphans: Mutex::new(VecDeque::new()),
+        proofs: Mutex::new(HashMap::new()),
+        gossip: Mutex::new(None),
+        uncle_shares: AtomicU64::new(0),
         relayed: Mutex::new(HashMap::new()),
         network: Mutex::new(NetworkView::default()),
         samples: Mutex::new(VecDeque::new()),
@@ -1251,6 +1618,8 @@ impl Pool {
             "fee": 0,
             "feePercent": 0,
             "payoutScheme": "PPLNS",
+            "feeReserveGrains": *self.fee_reserve.lock().expect("fee"),
+            "uncleShares": self.uncle_shares.load(Ordering::Relaxed),
             "recentBlocks": recent.iter().map(block_json).collect::<Vec<_>>(),
         })
     }
@@ -1524,9 +1893,15 @@ fn handle_submit(pool: &Pool, miner: &Miner, params: &Value) -> Result<Value, (i
                     forwarded = pool.submit_block(&entry.template, nonce, &seal, &Payouts::new());
                 }
             } else {
-                match pool.accept_share(miner, &entry, seal, outcome) {
+                match pool.accept_share(miner, &entry, nonce, seal, outcome) {
                     Ok(Some(payouts)) => {
                         forwarded = pool.submit_block(&entry.template, nonce, &seal, &payouts);
+                        if !forwarded {
+                            // The node kept a different block at this height.
+                            // The share is still work; if it is no longer the
+                            // sharechain tip it is already queued as an uncle.
+                            pool.note_orphan(seal);
+                        }
                     }
                     Ok(None) => {
                         // Work counts. A network-difficulty share whose template
@@ -1603,14 +1978,12 @@ fn maybe_retarget(pool: &Pool, miner: &Miner) {
 }
 
 /// One Stratum session: read line-delimited JSON-RPC requests until EOF/timeout.
-fn serve_conn(pool: Arc<Pool>, stream: TcpStream) {
-    let peer_addr = stream.peer_addr().ok();
-    let peer = peer_addr
-        .map(|a| a.to_string())
-        .unwrap_or_else(|| "?".into());
-    let ip = peer_addr
-        .map(|a| a.ip())
-        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+///
+/// `peer_ip` is the TCP peer, including when `stream` is the plaintext end of
+/// a TLS splice. The rate limit has to see the miner, not the socket pair.
+fn serve_conn(pool: Arc<Pool>, stream: Stream, peer_ip: IpAddr, peer_label: String) {
+    let peer = peer_label;
+    let ip = peer_ip;
     if !pool.guard.allow_conn(ip) {
         log(&format!("{peer}: refused (per-address cap or ban)"));
         return;
@@ -1649,6 +2022,7 @@ fn serve_conn(pool: Arc<Pool>, stream: TcpStream) {
         logged_in: AtomicBool::new(false),
         alive: AtomicBool::new(true),
         payout: Mutex::new(None),
+        payout_fp: Mutex::new(String::new()),
         worker: Mutex::new("default".into()),
         ip,
         work: RwLock::new(None),
@@ -1721,7 +2095,10 @@ fn serve_conn(pool: Arc<Pool>, stream: TcpStream) {
                                 login.worker
                             ));
                             match pool.refresh_miner(&miner, false) {
-                                Ok(Some(job)) => reply_login_ok(&pool, &miner, id, job),
+                                Ok(Some(job)) => {
+                                    reply_login_ok(&pool, &miner, id, job);
+                                    pool.notify_payouts();
+                                }
                                 Ok(None) => reply_err(
                                     &pool,
                                     &miner,
@@ -1745,6 +2122,21 @@ fn serve_conn(pool: Arc<Pool>, stream: TcpStream) {
                 Err((code, msg)) => reply_err(&pool, &miner, id, code, &msg),
             },
             Some("keepalived") => reply_ok(&pool, &miner, id, json!({ "status": "KEEPALIVED" })),
+            Some("payout_txs") => {
+                let Some(account) = miner.payout.lock().expect("payout").clone() else {
+                    reply_err(&pool, &miner, id, -1, "login before signing payouts");
+                    continue;
+                };
+                let txs = params.get("txs").cloned().unwrap_or_else(|| json!([]));
+                let body = json!({"account": account.as_str(), "txs": txs}).to_string();
+                match pool.accept_payout_txs(body.as_bytes()) {
+                    Ok(v) => {
+                        reply_ok(&pool, &miner, id, v);
+                        pool.notify_payouts();
+                    }
+                    Err(e) => reply_err(&pool, &miner, id, -1, &e),
+                }
+            }
             Some(other) => reply_err(
                 &pool,
                 &miner,
@@ -1801,8 +2193,7 @@ impl Drop for ConnGuard<'_> {
 ///
 /// On overflow the error string starts with `overflow:` plus the first 512
 /// bytes, so the caller can still answer the request id.
-fn read_stratum_line(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<String>> {
-    use std::io::BufRead;
+fn read_stratum_line(reader: &mut impl BufRead) -> std::io::Result<Option<String>> {
     let mut buf: Vec<u8> = Vec::new();
     loop {
         let data = reader.fill_buf()?;
@@ -1957,6 +2348,19 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let tls_config = match (&cfg.tls_cert, &cfg.tls_key) {
+        (Some(cert), Some(key)) => match tls::load_server_config(cert, key) {
+            Ok(config) => {
+                log(&format!("stratum TLS enabled ({cert})"));
+                Some(config)
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        },
+        _ => None,
+    };
 
     let pool = open_pool(cfg.clone(), None);
     if let Some(addr) = &cfg.stats_bind {
@@ -1986,6 +2390,31 @@ fn main() {
             .expect("spawn worker thread");
     }
 
+    if let Some(addr) = &cfg.share_bind {
+        match GossipNode::bind(addr) {
+            Ok(node) => {
+                log(&format!("sharechain gossip on {}", node.local_addr()));
+                for peer in &cfg.share_peers {
+                    match node.connect(peer) {
+                        Ok(connected) => log(&format!("sharechain peer {connected}")),
+                        Err(e) => log(&format!("sharechain dial {peer} failed: {e}")),
+                    }
+                }
+                let node = Arc::new(node);
+                *pool.gossip.lock().expect("gossip") = Some(Arc::clone(&node));
+                let gossip_pool = Arc::clone(&pool);
+                thread::Builder::new()
+                    .name("share-gossip".into())
+                    .spawn(move || gossip_loop(gossip_pool, node))
+                    .expect("spawn share gossip");
+            }
+            Err(e) => {
+                eprintln!("error: cannot bind sharechain {addr}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Report the socket actually owned by this process (including an OS-assigned
     // port when --bind uses :0), only after worker initialization is complete.
     log(&format!(
@@ -1994,19 +2423,37 @@ fn main() {
     ));
     for stream in listener.incoming() {
         match stream {
-            Ok(s) => {
+            Ok(tcp) => {
                 // Shed load past the cap so a connection flood can't exhaust threads/memory.
                 if ACTIVE_CONNS.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
                     log("connection cap reached — refusing new miner");
-                    drop(s);
+                    drop(tcp);
                     continue;
                 }
+                let peer_addr = tcp.peer_addr().ok();
+                let peer_ip = peer_addr
+                    .map(|addr| addr.ip())
+                    .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+                let peer_label = peer_addr
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_else(|| "?".into());
+                let stream = if let Some(config) = tls_config.clone() {
+                    match tls::splice(tcp, config) {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            log(&format!("{peer_label}: tls handshake setup failed: {e}"));
+                            continue;
+                        }
+                    }
+                } else {
+                    Stream::tcp(tcp)
+                };
                 ACTIVE_CONNS.fetch_add(1, Ordering::Relaxed);
                 let pool = Arc::clone(&pool);
                 if thread::Builder::new()
                     .name("stratum-conn".into())
                     .spawn(move || {
-                        serve_conn(pool, s);
+                        serve_conn(pool, stream, peer_ip, peer_label);
                         ACTIVE_CONNS.fetch_sub(1, Ordering::Relaxed);
                     })
                     .is_err()
@@ -2020,11 +2467,36 @@ fn main() {
     }
 }
 
+fn gossip_loop(pool: Arc<Pool>, node: Arc<GossipNode>) {
+    let mut last_hello = Instant::now()
+        .checked_sub(Duration::from_secs(30))
+        .unwrap_or_else(Instant::now);
+    loop {
+        if last_hello.elapsed() >= Duration::from_secs(5) {
+            let tip = pool.sharechain.lock().expect("sharechain").tip();
+            node.broadcast(&ShareMessage::Hello {
+                genesis: pool.cfg.share_genesis,
+                tip,
+            });
+            last_hello = Instant::now();
+        }
+        let batch = node.drain();
+        if batch.is_empty() {
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        for (from, msg) in batch {
+            pool.ingest_gossip(&node, from, msg);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sov_pow::PowAlgo;
     use std::io::BufRead;
+    use std::net::TcpStream;
 
     #[test]
     fn submit_params_carry_the_frozen_job_timestamp() {
@@ -2118,7 +2590,8 @@ mod tests {
             id,
             session: format!("{id:08x}"),
             peer: format!("test-miner-{id}"),
-            writer: Mutex::new(server),
+            writer: Mutex::new(Stream::tcp(server)),
+            payout_fp: Mutex::new(String::new()),
             difficulty: AtomicU64::new(difficulty),
             window: Mutex::new(ShareWindow {
                 since: Instant::now(),
@@ -2135,6 +2608,380 @@ mod tests {
         });
         pool.miners.lock().unwrap().push(Arc::clone(&miner));
         (miner, client)
+    }
+
+    /// Two block shares on one parent: the loser is cited by the next share,
+    /// and PPLNS then pays that finder at the uncle weight.
+    #[test]
+    fn an_orphan_share_is_cited_and_paid_at_uncle_weight() {
+        let (node_addr, _submits) = spawn_mock_node();
+        let mut cfg = Config {
+            node: node_addr,
+            start_diff: 100,
+            solo: false,
+            share_rate: 1_000_000,
+            ..Config::default()
+        };
+        cfg.vardiff.min_diff = 1;
+        let pool = open_pool(cfg, None);
+        *pool.reward_grains.lock().unwrap() = Some(10_000);
+
+        let alice = AccountId::new("alice.sov").unwrap();
+        let bob = AccountId::new("bob.sov").unwrap();
+        let (miner_a, _) = test_miner(&pool, 100);
+        let (miner_b, _) = test_miner(&pool, 100);
+        *miner_a.payout.lock().unwrap() = Some(alice.clone());
+        *miner_b.payout.lock().unwrap() = Some(bob.clone());
+        *miner_a.work.write().unwrap() = Some(Arc::new(share_template_for(
+            "alice.sov",
+            UNREACHABLE,
+            Vec::new(),
+        )));
+        *miner_b.work.write().unwrap() = Some(Arc::new(share_template_for(
+            "bob.sov",
+            UNREACHABLE,
+            Vec::new(),
+        )));
+        for miner in [&miner_a, &miner_b] {
+            let template = miner.work.read().unwrap().clone().unwrap();
+            let job = pool.new_job_for(miner).unwrap();
+            let nonce = first_meeting_nonce(&template, job["target_full"].as_str().unwrap());
+            handle_submit(
+                &pool,
+                miner,
+                &json!({"job_id": job_id_of(&job), "nonce": nonce_wire(nonce)}),
+            )
+            .expect("share");
+        }
+
+        let owed_bob = *pool.round.lock().unwrap().expected.get(&bob).unwrap();
+        let owed_alice = *pool.round.lock().unwrap().expected.get(&alice).unwrap();
+        let tx_a = "aa".repeat(32);
+        let tx_b = "bb".repeat(32);
+        pool.relayed.lock().unwrap().insert(
+            alice.clone(),
+            vec![Relayed {
+                leg: TransferLeg {
+                    tx_id: tx_a.clone(),
+                    from: alice.clone(),
+                    to: bob.clone(),
+                    amount: owed_bob,
+                },
+                stx: dummy_transfer(&alice, &bob, owed_bob),
+            }],
+        );
+        pool.relayed.lock().unwrap().insert(
+            bob.clone(),
+            vec![Relayed {
+                leg: TransferLeg {
+                    tx_id: tx_b.clone(),
+                    from: bob.clone(),
+                    to: alice.clone(),
+                    amount: owed_alice,
+                },
+                stx: dummy_transfer(&bob, &alice, owed_alice),
+            }],
+        );
+
+        // A block has to clear a real network target. An all-ones target would
+        // clamp the credit to difficulty 1, and the uncle's 75% weight would
+        // round down to nothing.
+        let block_target = difficulty_to_target256(100);
+        let alice_block = share_template_for("alice.sov", block_target, vec![tx_a]);
+        *miner_a.work.write().unwrap() = Some(Arc::new(alice_block.clone()));
+        let alice_job = pool.new_job_for(&miner_a).unwrap();
+        let alice_nonce =
+            first_meeting_nonce(&alice_block, alice_job["target_full"].as_str().unwrap());
+        handle_submit(
+            &pool,
+            &miner_a,
+            &json!({"job_id": job_id_of(&alice_job), "nonce": nonce_wire(alice_nonce)}),
+        )
+        .expect("alice block");
+
+        let bob_block = share_template_for("bob.sov", block_target, vec![tx_b]);
+        *miner_b.work.write().unwrap() = Some(Arc::new(bob_block.clone()));
+        let bob_job = pool.new_job_for(&miner_b).unwrap();
+        let bob_nonce = first_meeting_nonce(&bob_block, bob_job["target_full"].as_str().unwrap());
+        handle_submit(
+            &pool,
+            &miner_b,
+            &json!({"job_id": job_id_of(&bob_job), "nonce": nonce_wire(bob_nonce)}),
+        )
+        .expect("bob orphan block");
+        assert!(
+            !pool.orphans.lock().unwrap().is_empty(),
+            "the share that lost the race is an orphan"
+        );
+
+        let mut follow = share_template_for("alice.sov", UNREACHABLE, Vec::new());
+        follow.blob[2] = 0x5e;
+        *miner_a.work.write().unwrap() = Some(Arc::new(follow.clone()));
+        let follow_job = pool.new_job_for(&miner_a).unwrap();
+        let follow_nonce =
+            first_meeting_nonce(&follow, follow_job["target_full"].as_str().unwrap());
+        handle_submit(
+            &pool,
+            &miner_a,
+            &json!({"job_id": job_id_of(&follow_job), "nonce": nonce_wire(follow_nonce)}),
+        )
+        .expect("share citing the orphan");
+        assert!(
+            pool.uncle_shares.load(Ordering::Relaxed) >= 1,
+            "the next share cites the orphan"
+        );
+
+        let chain = pool.sharechain.lock().unwrap();
+        let tip = chain.tip().unwrap();
+        let citing = chain.share(&tip).unwrap();
+        assert_eq!(
+            citing.uncles.len(),
+            1,
+            "the follow-up share cites the loser"
+        );
+        let uncle = chain.share(&citing.uncles[0]).unwrap();
+        assert!(uncle.is_block, "the orphan was a block share");
+        assert!(
+            !chain.is_ancestor(&citing.uncles[0], Some(tip)),
+            "an uncle is a side branch, not an ancestor"
+        );
+        let finder = uncle.finder.clone();
+        let uncle_weight = uncle.work * 75 / 100;
+        assert!(uncle_weight > 0, "the lost block must carry weight");
+        let paid = chain.payouts_for(Some(tip), 10_000);
+        let mut main_line = 0u128;
+        let mut total = 0u128;
+        let mut cur = Some(tip);
+        while let Some(id) = cur {
+            let share = chain.share(&id).unwrap();
+            total += share.work;
+            if share.finder == finder {
+                main_line += share.work;
+            }
+            cur = share.prev;
+        }
+        let with_uncle = total + uncle_weight;
+        let expected = (main_line + uncle_weight) * 10_000 / with_uncle;
+        let got = *paid.get(&finder).expect("the orphan finder is paid");
+        assert!(
+            got + 2 >= expected && expected + 2 >= got,
+            "finder {got} should include uncle weight {uncle_weight}, expected ~{expected}, map {paid:?}"
+        );
+    }
+
+    /// A peer that connects after the race still re-seals every share, including
+    /// the orphan that is not on the winning branch and the payout map of the
+    /// block that won.
+    #[test]
+    fn a_late_peer_reseals_the_orphan_and_the_block_payouts() {
+        let (node_addr, _) = spawn_mock_node();
+        let make = |node: String| {
+            let mut cfg = Config {
+                node,
+                start_diff: 1,
+                solo: false,
+                share_rate: 1_000_000,
+                ..Config::default()
+            };
+            cfg.vardiff.min_diff = 1;
+            let pool = open_pool(cfg, None);
+            *pool.reward_grains.lock().unwrap() = Some(10_000);
+            pool
+        };
+        let pool_a = make(node_addr.clone());
+        let pool_b = make(node_addr);
+
+        let alice = AccountId::new("alice.sov").unwrap();
+        let bob = AccountId::new("bob.sov").unwrap();
+        let (miner_a, _) = test_miner(&pool_a, 1);
+        let (miner_b, _) = test_miner(&pool_a, 1);
+        *miner_a.payout.lock().unwrap() = Some(alice.clone());
+        *miner_b.payout.lock().unwrap() = Some(bob.clone());
+        *miner_a.work.write().unwrap() = Some(Arc::new(share_template_for(
+            "alice.sov",
+            UNREACHABLE,
+            Vec::new(),
+        )));
+        *miner_b.work.write().unwrap() = Some(Arc::new(share_template_for(
+            "bob.sov",
+            UNREACHABLE,
+            Vec::new(),
+        )));
+        for miner in [&miner_a, &miner_b] {
+            let template = miner.work.read().unwrap().clone().unwrap();
+            let job = pool_a.new_job_for(miner).unwrap();
+            let nonce = first_meeting_nonce(&template, job["target_full"].as_str().unwrap());
+            handle_submit(
+                &pool_a,
+                miner,
+                &json!({"job_id": job_id_of(&job), "nonce": nonce_wire(nonce)}),
+            )
+            .expect("share");
+        }
+
+        let owed_bob = *pool_a.round.lock().unwrap().expected.get(&bob).unwrap();
+        let owed_alice = *pool_a.round.lock().unwrap().expected.get(&alice).unwrap();
+        let tx_a = "aa".repeat(32);
+        let tx_b = "bb".repeat(32);
+        pool_a.relayed.lock().unwrap().insert(
+            alice.clone(),
+            vec![Relayed {
+                leg: TransferLeg {
+                    tx_id: tx_a.clone(),
+                    from: alice.clone(),
+                    to: bob.clone(),
+                    amount: owed_bob,
+                },
+                stx: dummy_transfer(&alice, &bob, owed_bob),
+            }],
+        );
+        pool_a.relayed.lock().unwrap().insert(
+            bob.clone(),
+            vec![Relayed {
+                leg: TransferLeg {
+                    tx_id: tx_b.clone(),
+                    from: bob.clone(),
+                    to: alice.clone(),
+                    amount: owed_alice,
+                },
+                stx: dummy_transfer(&bob, &alice, owed_alice),
+            }],
+        );
+
+        let alice_block = share_template_for("alice.sov", [0xff; 32], vec![tx_a]);
+        *miner_a.work.write().unwrap() = Some(Arc::new(alice_block.clone()));
+        let alice_job = pool_a.new_job_for(&miner_a).unwrap();
+        let alice_nonce =
+            first_meeting_nonce(&alice_block, alice_job["target_full"].as_str().unwrap());
+        handle_submit(
+            &pool_a,
+            &miner_a,
+            &json!({"job_id": job_id_of(&alice_job), "nonce": nonce_wire(alice_nonce)}),
+        )
+        .expect("alice block");
+
+        let bob_block = share_template_for("bob.sov", [0xff; 32], vec![tx_b]);
+        *miner_b.work.write().unwrap() = Some(Arc::new(bob_block.clone()));
+        let bob_job = pool_a.new_job_for(&miner_b).unwrap();
+        let bob_nonce = first_meeting_nonce(&bob_block, bob_job["target_full"].as_str().unwrap());
+        handle_submit(
+            &pool_a,
+            &miner_b,
+            &json!({"job_id": job_id_of(&bob_job), "nonce": nonce_wire(bob_nonce)}),
+        )
+        .expect("bob block");
+
+        let mut follow = share_template_for("alice.sov", UNREACHABLE, Vec::new());
+        follow.blob[2] = 0x5e;
+        *miner_a.work.write().unwrap() = Some(Arc::new(follow.clone()));
+        let follow_job = pool_a.new_job_for(&miner_a).unwrap();
+        let follow_nonce =
+            first_meeting_nonce(&follow, follow_job["target_full"].as_str().unwrap());
+        handle_submit(
+            &pool_a,
+            &miner_a,
+            &json!({"job_id": job_id_of(&follow_job), "nonce": nonce_wire(follow_nonce)}),
+        )
+        .expect("citing share");
+
+        let (tip, uncle) = {
+            let chain = pool_a.sharechain.lock().unwrap();
+            let tip = chain.tip().unwrap();
+            let citing = chain.share(&tip).unwrap();
+            assert_eq!(citing.uncles.len(), 1);
+            (tip, citing.uncles[0])
+        };
+        let local_uncle = pool_a.proofs.lock().unwrap().get(&uncle).unwrap().clone();
+        assert!(local_uncle.share.is_block);
+        assert!(!local_uncle.payouts.is_empty());
+        assert!(proof_matches(&uncle, &local_uncle.proof));
+
+        let node_a = Arc::new(GossipNode::bind("127.0.0.1:0").unwrap());
+        let node_b = Arc::new(GossipNode::bind("127.0.0.1:0").unwrap());
+        *pool_a.gossip.lock().unwrap() = Some(Arc::clone(&node_a));
+        *pool_b.gossip.lock().unwrap() = Some(Arc::clone(&node_b));
+        node_a.connect(node_b.local_addr()).unwrap();
+
+        let genesis = pool_a.cfg.share_genesis;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let tip_a = pool_a.sharechain.lock().unwrap().tip();
+            let tip_b = pool_b.sharechain.lock().unwrap().tip();
+            node_a.broadcast(&ShareMessage::Hello {
+                genesis,
+                tip: tip_a,
+            });
+            node_b.broadcast(&ShareMessage::Hello {
+                genesis,
+                tip: tip_b,
+            });
+            thread::sleep(Duration::from_millis(30));
+            for (from, msg) in node_a.drain() {
+                pool_a.ingest_gossip(&node_a, from, msg);
+            }
+            for (from, msg) in node_b.drain() {
+                pool_b.ingest_gossip(&node_b, from, msg);
+            }
+            let synced = pool_b.sharechain.lock().unwrap().share(&uncle).is_some()
+                && pool_b.sharechain.lock().unwrap().tip() == Some(tip);
+            if synced {
+                break;
+            }
+            assert!(Instant::now() < deadline, "peer never re-sealed the orphan");
+        }
+
+        let remote = pool_b.proofs.lock().unwrap().get(&uncle).unwrap().clone();
+        assert!(proof_matches(&uncle, &remote.proof));
+        assert_eq!(remote.payouts, local_uncle.payouts);
+        assert_eq!(remote.reward_grains, local_uncle.reward_grains);
+        assert_eq!(remote.proof.preimage, local_uncle.proof.preimage);
+    }
+
+    /// The stratum port can terminate TLS itself. A client completes login
+    /// without a separate stunnel.
+    #[test]
+    fn a_miner_logs_in_over_built_in_tls() {
+        use std::io::BufRead;
+
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let server =
+            tls::server_config(&certified.cert.pem(), &certified.key_pair.serialize_pem()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pool = test_pool("127.0.0.1:1", Some(share_template([0xff; 32])), 1);
+        let pool_t = Arc::clone(&pool);
+        thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("tls accept");
+            let peer = tcp.peer_addr().expect("peer");
+            let stream = tls::splice(tcp, server).expect("splice");
+            serve_conn(pool_t, stream, peer.ip(), peer.to_string());
+        });
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certified.cert.der().clone()).unwrap();
+        let client_cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let tcp = TcpStream::connect(addr).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        tcp.set_nodelay(true).unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let conn = rustls::ClientConnection::new(Arc::new(client_cfg), name).unwrap();
+        let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
+        writeln!(
+            tls_stream,
+            r#"{{"id":1,"method":"login","params":{{"login":"alice","pass":"x","agent":"tls-test"}}}}"#
+        )
+        .unwrap();
+        tls_stream.flush().unwrap();
+        let mut reader = BufReader::new(tls_stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("login reply");
+        assert!(
+            line.contains("\"job\""),
+            "tls login did not return a job: {line}"
+        );
     }
 
     fn nonce_wire(nonce: u64) -> String {

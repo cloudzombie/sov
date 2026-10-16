@@ -14,17 +14,24 @@ hard fork. It is not in this deploy.
 ## Layout
 
 - `sov-rpcd` bound to `127.0.0.1` only. Do not publish the RPC port.
-- `sov-stratum` on `:3333`, reached by miners through TLS.
+- `sov-stratum` on `:3333`. Pass `--tls-cert` and `--tls-key` to terminate TLS
+  in the process, or leave them unset and put stunnel in front.
 - Stats HTTP (`--stats-bind`) can be public. It is read-only except
   `POST /api/payout-txs`, which accepts only transfers that match the current
-  payout schedule and carry a valid signature.
-- `sov-miner-payout` runs on the miner host, next to `xus-miner`. It does not
-  run on the pool host. The seed never crosses the pool.
+  payout schedule and carry a valid signature. The same payload arrives on the
+  miner's stratum connection as a `payout` notice, and the signed reply is
+  `payout_txs`.
+- Sharechain gossip listens on `--share-bind` (default `0.0.0.0:3434`). Each
+  share carries the header preimage, so a peer re-seals it before accepting.
+  Dial other pools with repeatable `--share-peer`. `--share-bind none` closes
+  the port.
+- The node keeps 4096 block templates and drops the least recently used. A
+  lookup refreshes the entry, so a miner who is still submitting is not the
+  one evicted. Templates still expire after 120 seconds.
 
-The node keeps at most 64 block templates, one per coinbase account. A 65th
-distinct login evicts the oldest template. Miners past that still receive work,
-but a template can go stale sooner than the usual 120 seconds. Raise that only
-by changing the node; this pool does not.
+The seed stays on the miner. `xus-miner --seed-hex` signs payouts in that
+process. `sov-miner-payout` does the same job for a miner binary that has no
+seed flag. Neither runs on the pool host.
 
 ## systemd
 
@@ -51,8 +58,11 @@ Wants=sov-rpcd.service
 [Service]
 ExecStart=/usr/local/bin/sov-stratum \
   --node 127.0.0.1:8645 \
-  --bind 127.0.0.1:3333 \
+  --bind 0.0.0.0:3333 \
+  --tls-cert /etc/sov/pool.fullchain.pem \
+  --tls-key /etc/sov/pool.key.pem \
   --stats-bind 0.0.0.0:8080 \
+  --share-bind 0.0.0.0:3434 \
   --refresh-secs 30 \
   --start-diff 1000 \
   --min-diff 100
@@ -75,14 +85,16 @@ coinbase, because that transfer is valid in the block that pays them. Use this
 repo's `sov-rpcd`. An older node rejects the payout before it can enter the
 template.
 
-Firewall: allow 3333 only from the TLS terminator, and 8080 if you publish
-stats. Do not allow 8645 from anywhere but this host.
+Firewall: allow 3333 from miners, 3434 from sharechain peers, and 8080 if
+you publish stats. Do not allow 8645 from anywhere but this host.
 
 ## TLS
 
-Stratum is plaintext JSON lines. Terminate TLS outside the process.
+`--tls-cert` and `--tls-key` are PEM paths. Set both or neither. With both
+set, the stratum port speaks TLS and miners use `stratum+ssl://pool.example:3333`.
+The rate limit still sees the TCP peer, not the local splice.
 
-stunnel, client-facing `443` or `3333`, backend `127.0.0.1:3333`:
+stunnel remains fine when you want the pool process on plaintext:
 
 ```ini
 [sov-stratum]
@@ -92,26 +104,48 @@ cert = /etc/sov/pool.fullchain.pem
 key = /etc/sov/pool.key.pem
 ```
 
-nginx `stream` does the same job. Miners then use `stratum+ssl://pool.example:3333`.
-The pool binary does not speak TLS itself.
+In that layout, bind the pool to `127.0.0.1:3333` and do not pass `--tls-cert`.
 
 ## What miners run
 
-`xus-miner` connects with `--pool host:3333 --user <account>`. The account is a
-SOV account id or a checksummed `xust1…` address. An optional `/worker` suffix
-is a label, not a payee.
+`xus-miner` connects with `--pool host:3333 --user <account> --seed-hex <64-hex>`.
+The account is a SOV account id or a checksummed `xust1…` address, and it must
+be the implicit account of that seed. An optional `/worker` suffix is a label,
+not a payee. The seed is not written to the socket, the log, or the JSON event
+stream. The pool pushes a `payout` notice when the schedule changes; the miner
+replies with signed transfers.
 
-`xus-miner` does not hold the wallet seed and cannot sign the payout
-transfers. On the same machine:
+A miner binary that cannot hold a seed can still use the separate tool, on the
+miner host only:
 
 ```sh
 sov-miner-payout --pool http://pool.example:8080 --seed-hex <64-hex-seed>
 ```
 
-`--print-account` prints the implicit account id for that seed. Re-run the
-payout tool when the schedule changes (a new window after a block, or when the
-tool exits without `satisfied`). If the schedule is already satisfied it does
-not sign again.
+`--print-account` on that tool prints the implicit account id. If the schedule
+is already satisfied it does not sign again.
+
+## Uncles
+
+A share that loses a race to a heavier share is an orphan. The next share may
+cite it. Cited uncles earn 75% of their work in the PPLNS window. A share that
+stays on the sharechain tip keeps full weight even if the SOV node later
+prefers a different block at that height: the work happened, and this pool
+does not submit a block that fails to pay the window.
+
+## Fee reserve
+
+A transfer's fee is debited before the balance check, then credited back to
+the block proposer. One fee has to sit in the finder's balance for the debit
+to succeed, even when that finder's own share of the reward is smaller than
+the fee. The pool asks `sov_estimateFee` and splits `reward - fee` across the
+window. The reserved grains stay with the proposer, which is where consensus
+returns the fee. They are not a pool fee. `fee` in the stats JSON stays 0.
+`feeReserveGrains` is the amount held back so the transfer can execute.
+
+If the fee would consume the whole coinbase of a non-empty window, the pool
+keeps the full map and withholds the block rather than treating the window as
+empty.
 
 ## Stats
 
